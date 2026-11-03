@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - '@earendil-works/pi-tui@1.5.0'

@@ -1,0 +1,37 @@
+{
+  "name": "dsh-pi-tui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A CC-style terminal UI for DeepSeek Harness, using a vendored Pi TUI.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "dsh-tui": "./bin/dsh-tui.mjs",
+    "dsh-pi-tui": "./bin/dsh-pi-tui.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "start": "node bin/dsh-tui.mjs",
+    "demo": "node bin/dsh-tui.mjs --demo",
+    "build:pi-tui": "tsc -p vendor/pi-tui/tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-concurrency=1 test/*.test.ts",
+    "check": "pnpm build:pi-tui && pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "file:vendor/pi-tui",
+    "diff": "8.0.4",
+    "get-east-asian-width": "1.6.0",
+    "highlight.js": "11.11.1",
+    "marked": "18.0.11",
+    "marked-cjk-friendly": "0.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0",
+    "@types/diff": "7.0.2",
+    "@xterm/headless": "6.0.0",
+    "typescript": "5.9.3"
+  }
+}
