@@ -494,6 +494,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	protected override resetRenderState(): void {
+		// The next frame is a full redraw from an unknown terminal state. Anything
+		// cached about uploaded Kitty images was learned from the previous screen,
+		// and that screen is about to be replaced and cleared, so it cannot be
+		// trusted (see the clear handling in doRender).
+		this.uploadedKittyImages.clear();
 		this.previousScreen = [];
 		this.previousScreenWidth = 0;
 		this.previousScreenHeight = 0;
@@ -1736,6 +1741,16 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			});
 		const imagesNeedRedraw = imageAnchorsNeedRedraw || imageCellsNeedRedraw;
 		const redrawImages = fullRedraw || imagesNeedRedraw;
+		// A full redraw clears the screen. Terminals are allowed to recycle Kitty image
+		// data that no longer has a placement once the screen is cleared (Ghostty 1.4.x
+		// and Rex's ImageStorage.clearScreen do exactly that), so a cached upload only
+		// proves the bytes are still in terminal memory while the screen was not cleared.
+		// Conservatively drop the cache here: every visible image is transmitted again
+		// below and the placement-only optimisation stays enabled for ordinary frames.
+		// Exit condition: a terminal-level capability guarantee that clears keep images.
+		if (fullRedraw && this.imageProtocol === "kitty") {
+			this.uploadedKittyImages.clear();
+		}
 		const hadUploadedKittyImages = this.uploadedKittyImages.size > 0;
 		const preparedKittyScreen =
 			redrawImages && this.imageProtocol === "kitty"

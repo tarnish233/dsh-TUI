@@ -1,12 +1,12 @@
 // Hermetic model stream: intercept the public llm/stream waterfall, never call next().
 import { setTimeout as delay } from 'node:timers/promises'
-export const name = 'dsh-pi-tui-test-stream'
+export const name = 'dsh-tui-test-stream'
 export const inject = ['llm', 'agents', 'approval', 'commands', 'sessionTitle']
 const approvals = new Map()
 export function apply(ctx) {
   ctx.on('llm/stream', (options, _next) => stream(ctx, options))
   ctx.effect(() => ctx.commands.register({
-    definitionId: '@dsh-pi-tui-test/command-wait',
+    definitionId: '@dsh-tui-test/command-wait',
     name: 'fixture-wait', description: 'Hermetic cancellation probe',
     handler: async ({ signal }) => {
       await new Promise(resolve => {
@@ -17,7 +17,7 @@ export function apply(ctx) {
     },
   }), 'hermetic command fixture')
   ctx.effect(() => ctx.commands.register({
-    definitionId: '@dsh-pi-tui-test/command-title',
+    definitionId: '@dsh-tui-test/command-title',
     name: 'fixture-title', description: 'Hermetic native title API probe',
     handler: ({ agent }) => {
       const title = ctx.sessionTitle.rename(agent.session, 'Native fixture title')

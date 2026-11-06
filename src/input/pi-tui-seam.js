@@ -8,16 +8,27 @@
  *
  * Upstream: @earendil-works/pi-tui 1.5.0 (MIT), Copyright (c) 2025 Mario Zechner.
  */
-import { Editor, SelectList } from '@earendil-works/pi-tui'
-import { KillRing } from '../../vendor/pi-tui/src/kill-ring.ts'
-import { UndoStack } from '../../vendor/pi-tui/src/undo-stack.ts'
-import { findWordBackward, findWordForward } from '../../vendor/pi-tui/src/word-navigation.ts'
-import { isWhitespaceChar } from '../../vendor/pi-tui/src/utils.ts'
-import { getKeybindings } from '../../vendor/pi-tui/src/keybindings.ts'
+import { Editor, SelectList } from '#pi-tui'
+// The helpers below come from the same vendored build as the classes above: the
+// `#pi-tui/*` package-import subpaths map to vendor/pi-tui/dist, so `KillRing`,
+// `UndoStack` and the editor instances are single module identities.
+import { KillRing } from '#pi-tui/kill-ring'
+import { UndoStack } from '#pi-tui/undo-stack'
+import { findWordBackward, findWordForward } from '#pi-tui/word-navigation'
+import { isWhitespaceChar } from '#pi-tui/utils'
+import { getKeybindings } from '#pi-tui/keybindings'
 
 const PASTE_MARKER_SINGLE = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/
+const IMAGE_MARKER_SINGLE = /^\[Image #(\d+)\]$/
 function isPasteMarker(segment) {
   return segment.length >= 10 && PASTE_MARKER_SINGLE.test(segment)
+}
+/** Image attachment markers are atomic like paste markers. */
+function isImageMarker(segment) {
+  return segment.length >= 10 && IMAGE_MARKER_SINGLE.test(segment)
+}
+function isAtomicMarker(segment) {
+  return isPasteMarker(segment) || isImageMarker(segment)
 }
 
 let installed = false
@@ -65,6 +76,8 @@ ccCaptureSnapshot() {
         jumpMode: this.jumpMode,
         isInPaste: this.isInPaste,
         pasteBuffer: this.pasteBuffer,
+        imageAttachments: this.getImageAttachmentEntries(),
+        imageCounter: this.imageCounter,
         text: this.getText(),
         expandedText: this.getExpandedText(),
     };
@@ -143,6 +156,16 @@ ccRestoreSnapshot(snapshot, options = {}) {
         snapshot.jumpMode === "forward" || snapshot.jumpMode === "backward" ? snapshot.jumpMode : null;
     this.isInPaste = snapshot.isInPaste === true;
     this.pasteBuffer = typeof snapshot.pasteBuffer === "string" ? snapshot.pasteBuffer : "";
+    this.setImageAttachmentEntries(
+        Array.isArray(snapshot.imageAttachments)
+            ? snapshot.imageAttachments.filter((entry) => Array.isArray(entry) && entry.length === 2)
+            : [],
+        Number.isFinite(snapshot.imageCounter) ? snapshot.imageCounter : 0,
+    );
+    // An older snapshot must never roll the global id high-water mark back: ids
+    // allocated after it was captured stay reserved, and markers in the restored
+    // text reserve their own ids too.
+    for (const line of this.state.lines) this.noteImageMarkerIds(line);
     this.cancelAutocomplete();
     if (options.notify !== false && this.onChange) {
         this.onChange(this.getText());
@@ -155,6 +178,22 @@ ccIsEmpty() {
 
 ccGetJumpMode() {
     return this.jumpMode;
+}
+
+/** Enter Pi's character-jump mode for the next target character. */
+ccStartJump(direction) {
+    this.jumpMode = direction === "backward" ? "backward" : "forward";
+}
+
+/** Leave character-jump mode without performing a jump. */
+ccCancelJump() {
+    this.jumpMode = null;
+}
+
+/** Jump to `char`; only called with a single actual target character. */
+ccJumpToChar(char, direction) {
+    this.jumpMode = null;
+    this.jumpToChar(char, direction === "backward" ? "backward" : "forward");
 }
 
 ccIsOnFirstVisualLine() {
@@ -220,14 +259,14 @@ ccPageScroll(direction) {
 ccWordBoundaryBackward(text, cursor) {
     return findWordBackward(text, cursor, {
         segment: (value) => this.segment(value, "word"),
-        isAtomicSegment: isPasteMarker,
+        isAtomicSegment: isAtomicMarker,
     });
 }
 
 ccWordBoundaryForward(text, cursor) {
     return findWordForward(text, cursor, {
         segment: (value) => this.segment(value, "word"),
-        isAtomicSegment: isPasteMarker,
+        isAtomicSegment: isAtomicMarker,
     });
 }
 
@@ -237,22 +276,22 @@ ccWordBoundaryForward(text, cursor) {
  */
 ccWhitespaceBoundaryBackward(text, cursor) {
     const units = [...this.segment(text, "grapheme")].filter((unit) => unit.index < cursor);
-    const isSpace = (unit) => !isPasteMarker(unit.segment) && isWhitespaceChar(unit.segment);
+    const isSpace = (unit) => !isAtomicMarker(unit.segment) && isWhitespaceChar(unit.segment);
     let index = units.length;
     while (index > 0 && isSpace(units[index - 1])) index -= 1;
     if (index === 0) return 0;
-    if (isPasteMarker(units[index - 1].segment)) return units[index - 1].index;
+    if (isAtomicMarker(units[index - 1].segment)) return units[index - 1].index;
     while (index > 0 && !isSpace(units[index - 1])) index -= 1;
     return index === 0 ? 0 : units[index].index;
 }
 
 ccWhitespaceBoundaryForward(text, cursor) {
     const units = [...this.segment(text, "grapheme")].filter((unit) => unit.index >= cursor);
-    const isSpace = (unit) => !isPasteMarker(unit.segment) && isWhitespaceChar(unit.segment);
+    const isSpace = (unit) => !isAtomicMarker(unit.segment) && isWhitespaceChar(unit.segment);
     let index = 0;
     while (index < units.length && isSpace(units[index])) index += 1;
     if (index >= units.length) return text.length;
-    if (isPasteMarker(units[index].segment)) return units[index].index + units[index].segment.length;
+    if (isAtomicMarker(units[index].segment)) return units[index].index + units[index].segment.length;
     while (index < units.length && !isSpace(units[index])) index += 1;
     return index >= units.length ? text.length : units[index].index;
 }
@@ -398,6 +437,12 @@ ccSetHistory(entries) {
     if (this.historyIndex >= this.history.length) {
         this.historyIndex = Math.max(-1, this.history.length - 1);
     }
+    // Persisted history carries marker text but no payloads. Keep the markers
+    // unresolved (never silently dropped) and reserve their ids so a later paste
+    // cannot allocate an id an older entry already points at.
+    for (const entry of this.history) this.noteImageMarkerIds(entry);
+    // Drop attachment payloads of entries the host no longer lists (bounded registry).
+    this.pruneHistoryImages();
 }
 
 // --- insertion / submit -------------------------------------------------
@@ -490,6 +535,38 @@ ccSetCursor(line, col) {
     this.state.cursorLine = targetLine;
     const targetCol = Math.max(0, Math.min(Math.floor(col), (this.state.lines[targetLine] || "").length));
     this.setCursorCol(targetCol);
+}
+
+/**
+ * Transpose the two graphemes around the cursor as one undoable edit.
+ * Uses Pi's marker-aware grapheme segmentation, so a large-paste marker is
+ * moved as a whole and can never be split into raw text.
+ */
+ccTransposeChars() {
+    const line = this.state.lines[this.state.cursorLine] || "";
+    if (!line) return false;
+    const segments = [...this.segment(line, "grapheme")];
+    if (segments.length < 2) return false;
+    const cursor = this.state.cursorCol;
+    let rightIndex = segments.findIndex((segment) => segment.index === cursor);
+    if (rightIndex === -1) {
+        if (cursor !== line.length) return false;
+        rightIndex = segments.length;
+    }
+    if (rightIndex === 0) return false;
+    const leftIndex = rightIndex === segments.length ? segments.length - 2 : rightIndex - 1;
+    const left = segments[leftIndex];
+    const right = segments[rightIndex === segments.length ? segments.length - 1 : rightIndex];
+    if (!left || !right) return false;
+    const end = right.index + right.segment.length;
+    const replaced = this.ccReplaceRange(
+        { line: this.state.cursorLine, col: left.index },
+        { line: this.state.cursorLine, col: end },
+        right.segment + left.segment,
+    );
+    if (!replaced) return false;
+    this.ccSetCursor(this.state.cursorLine, end);
+    return true;
 }
 
 // --- autocomplete -------------------------------------------------------

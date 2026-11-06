@@ -1,0 +1,68 @@
+# Native TUI application layer over @deepseek-ai/dsh-base.
+# Agent-owned capabilities come from DSH's official preset declarations;
+# this bundle mounts services and a terminal frontend, never another Harness.
+- id: tool-plugin-manager
+  disabled: true
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: compaction-basic
+  disabled: true
+- id: command-compact
+  disabled: true
+- id: tool-result-pruner
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: agent-instructions
+  disabled: true
+- id: tool-todo
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: hmr
+  disabled: false
+- insert:
+    - id: dsh-tui-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: standard
+    - id: dsh-tui-subagent-model-selection-settings
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+    - id: dsh-tui-cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
+    - id: dsh-tui-cordis-host-providers
+      name: '@deepseek-ai/dsh-tool-cordis/host'
+    - id: dsh-tui-session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+    - id: dsh-tui-startup
+      name: 'dsh-tui/startup'
+    - id: dsh-tui
+      name: 'dsh-tui'

@@ -1,7 +1,7 @@
 /** A single Settings-owned shortcut list and inline editor; no profiles or command UI. */
-import { matchesKey, type Component, type Focusable, type TUI } from '@earendil-works/pi-tui'
+import { matchesKey, type Component, type Focusable, type TUI } from '#pi-tui'
 import { formatBinding, parseBindingSpec, type CcActionDefinition, type CcKeymap } from '../input/index.ts'
-import { listAction, rowBudget, windowRows } from './dialogs.ts'
+import { isInterruptKey, listAction, rowBudget, windowRows } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
 import { bold, cc, dim, t } from './theme.ts'
 import { fit, sanitize, tildePath, visibleWidth, wrap } from './text.ts'
@@ -40,7 +40,7 @@ const LABELS: Record<string, string> = {
   'editor.yank-pop': 'Cycle deleted text after pasting',
   'app.interrupt': 'Interrupt / clear draft / confirm exit',
   'app.todo': 'Todo panel (not implemented)',
-  'app.thinking.toggle': 'Show / hide reasoning text (display only)',
+  'app.thinking.toggle': 'Expand or collapse the latest thinking summary (hidden reasoning is revealed first)',
   'app.clipboard.pasteImage': 'Paste clipboard text (images not implemented)',
   'app.help': 'Show commands and help',
 }
@@ -67,6 +67,13 @@ export interface KeybindingsDialogOptions {
   /** undefined removes just this override; null disables just this action. */
   onChange: (actionId: string, bindings: string[] | null | undefined) => Promise<void>
   onBack: () => void
+  /**
+   * Optional global interrupt hook. When provided, the configured
+   * `app.interrupt` key (Ctrl+C by default) calls it instead of leaving
+   * Settings; when omitted this pane keeps its local recovery behaviour
+   * (cancel the inline edit, otherwise go back).
+   */
+  onInterrupt?: () => void
 }
 
 export class KeybindingsDialog implements Component, Focusable {
@@ -78,6 +85,7 @@ export class KeybindingsDialog implements Component, Focusable {
   private editing = false
   private saving = false
   private done = false
+  private disposed = false
   private message = ''
   private failed = false
 
@@ -95,6 +103,7 @@ export class KeybindingsDialog implements Component, Focusable {
   get selectedActionId(): string | undefined { return this.rows[this.index]?.action.id }
   get isEditing(): boolean { return this.editing }
   get isSaving(): boolean { return this.saving }
+  get isDisposed(): boolean { return this.disposed }
   get bindingText(): string { return this.answer.raw }
   get focused(): boolean { return this.focusedState }
   set focused(value: boolean) {
@@ -105,6 +114,16 @@ export class KeybindingsDialog implements Component, Focusable {
   }
 
   invalidate(): void { this.answer.invalidate() }
+
+  /** Release the inline binding editor and its shared-keymap listeners. Idempotent. */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    // Shared keymap: an inactive Settings pane must not cancel a chord that the
+    // focused prompt is still typing.
+    if (this.focusedState) this.options.keymap.cancelChord()
+    this.answer.dispose()
+  }
 
   private keys(row: ShortcutRow): string[] { return this.options.keymap.getBindings(row.action.id) }
   private keyLabel(row: ShortcutRow): string {
@@ -157,8 +176,14 @@ export class KeybindingsDialog implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    if (this.done || this.saving) return
+    if (this.done || this.saving || this.disposed) return
     const pasting = this.editing && this.answer.editor.isPasting()
+    if (!pasting && this.options.onInterrupt !== undefined && isInterruptKey(this.options.keymap, data)) {
+      this.options.keymap.cancelChord()
+      this.options.onInterrupt()
+      this.tui.requestRender()
+      return
+    }
     // These are recovery controls for this configuration pane only. Editing
     // them cannot lock the user out; normal dialogs retain the user's keymap.
     if (!pasting && matchesKey(data, 'escape')) {
@@ -174,7 +199,7 @@ export class KeybindingsDialog implements Component, Focusable {
         if (result === 'submit') {
           this.answer.editor.restoreDraft(before)
           this.saveText(this.answer.lastSubmittedText ?? before.expandedText)
-        } else if (result === 'cancel') { this.editing = false; this.answer.focused = false; this.message = '' }
+        } else if (result === 'cancel' || result === 'interrupt') { this.editing = false; this.answer.focused = false; this.message = '' }
       }
     } else if (matchesKey(data, 'enter')) this.edit()
     else if (data === 'd' || data === 'D') void this.save(null)

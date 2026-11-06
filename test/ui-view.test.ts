@@ -1,9 +1,13 @@
+// Must stay the FIRST import: forces truecolor before any src module (theme
+// snapshots the terminal color mode at import time).
+import './helpers/truecolor.ts'
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { stripTerminalSequences, visibleWidth } from '@earendil-works/pi-tui'
+import { stripTerminalSequences, visibleWidth } from '#pi-tui'
 import type { SessionEvent, SessionInfo } from '../src/backend/types.ts'
 import { TranscriptStore } from '../src/state/transcript.ts'
 import { TranscriptView } from '../src/ui/transcript.ts'
+import { createItemBlock } from '../src/ui/blocks.ts'
 import { DEMO_TRANSCRIPT_CODEC } from '../src/demo.ts'
 
 const info = (events: SessionEvent[] = []): SessionInfo => ({
@@ -171,12 +175,22 @@ test('expandTools folds long tool output and opens it on option change', () => {
   const store = longToolStore(14)
   const view = new TranscriptView(store, { showThinking: false, expandTools: false })
   const folded = stripTerminalSequences(view.render(70).join('\n'))
-  assert.match(folded, /ctrl\+o to expand/)
-  assert.doesNotMatch(folded, /result line 14/)
+  // The folded card is a one-line count summary, not a six-line preview. No
+  // keymap hints were supplied, so no shortcut is advertised (the old
+  // hardcoded Ctrl+O text was a lie once the action is remapped or disabled).
+  assert.match(folded, /14 lines returned/)
+  assert.doesNotMatch(folded, /result line \d+/)
+  assert.doesNotMatch(folded, /to expand/)
+  view.options.hints = { expand: 'ctrl+o' }
+  assert.match(stripTerminalSequences(view.render(70).join('\n')), /ctrl\+o to expand/)
   view.options.expandTools = true
   const opened = stripTerminalSequences(view.render(70).join('\n'))
-  assert.match(opened, /result line 14/)
-  assert.doesNotMatch(opened, /ctrl\+o to expand/)
+  // The expanded preview honors expandedOutputMaxLines (default 10) while the
+  // full result stays reachable through details/copy.
+  assert.match(opened, /result line 10/)
+  assert.match(opened, /4 more lines/)
+  assert.doesNotMatch(opened, /result line 14/)
+  assert.doesNotMatch(opened, /to expand/)
 })
 
 test('reuses one cached block per stable item and only invalidates the live item', () => {
@@ -203,11 +217,11 @@ test('reuses one cached block per stable item and only invalidates the live item
   assert.deepEqual(view.render(80), view.render(80))
 })
 
-test('human turns use the DSH mist-blue background band', () => {
+test('human turns use the cc-dark selection background band', () => {
   const store = newStore([ev('user/message', 1, user('my query'), { surfaceOp: 'append' })])
   const view = new TranscriptView(store, { showThinking: false, expandTools: false })
   const raw = view.render(60).join('\n')
-  assert.match(raw, /\x1b\[48;2;59;74;102m/, 'DSH selectionBg #3B4A66 fills the human turn')
+  assert.match(raw, /\x1b\[48;2;26;68;128m/, 'cc-dark selection #1a4480 fills the human turn')
 })
 
 test('removes cache entries for reset or removed items', () => {
@@ -321,7 +335,7 @@ test('renders native card intents for pending, diff, read and terminal results',
   assertWidths(view, [32, 60, 100, 140])
   const output = stripTerminalSequences(view.render(110).join('\n'))
   // Diff card: applied hunk from the tool, no invented line numbers.
-  assert.match(output, /Update\(src\/a\.ts\)/)
+  assert.match(output, /Update src\/a\.ts/)
   assert.match(output, /Updated src\/a\.ts with 1 addition and 1 removal/)
   assert.doesNotMatch(output, /^\s*\d+\s*\d*\s*[+-]/m)
   // Read card keeps the native absolute line numbers (they are real coordinates).
@@ -329,7 +343,7 @@ test('renders native card intents for pending, diff, read and terminal results',
   assert.match(output, /\(120-121 of 400 · ts\)/)
   assert.match(output, /120 export const b = 2/)
   // Terminal card: command header + captured output + exit code.
-  assert.match(output, /Bash\(npm test\)/)
+  assert.match(output, /Bash npm test/)
   assert.match(output, /Run the test suite/)
   assert.match(output, /2 passing/)
   assert.match(output, /exit code 0/)
@@ -388,8 +402,11 @@ test('generic fallback keeps the CC tool summary when no native card is forwarde
   ])
   const view = new TranscriptView(store, { showThinking: false, expandTools: false })
   const output = stripTerminalSequences(view.render(80).join('\n'))
-  assert.match(output, /Bash\(npm test\)/)
-  assert.match(output, /ok/)
+  assert.match(output, /Bash npm test/)
+  // Folded output is a count summary; the result text itself is only reachable
+  // after expanding (and then within the preview budget).
+  assert.match(output, /1 line returned/)
+  assert.doesNotMatch(output, /^ok$/m)
   assertWidths(view, [24, 40, 80])
 })
 
@@ -429,5 +446,80 @@ test('removing streaming diagnostics still marks discarded and unconfirmed respo
     assert.match(content, outcome === 'closed' ? /Response result unknown/ : /Incomplete response/)
     assert.match(content, /◌/)
     assert.equal(store.items.some(item => item.kind === 'assistant'), false)
+  }
+})
+
+test('error notices follow the CC API-error layout and stay red', () => {
+  const store = newStore([])
+  const view = new TranscriptView(store, { showThinking: false, expandTools: false })
+  store.report('agent error: 400 event:error\ndata:{"code":"InvalidParameter"}', 'error')
+  store.report('Could not start DSH: synthetic startup failure', 'error')
+  store.report('Reloaded settings, keybindings and DSH configuration.', 'info')
+  const lines = view.render(80)
+  const plain = lines.map(line => stripTerminalSequences(line))
+  const red = '\x1b[38;2;255;123;114m'
+  // The bridge's `agent error:` wire prefix becomes CC's `API Error` label.
+  assert.equal(plain[0], '● API Error: 400 event:error')
+  assert.ok(lines[0]!.startsWith(red + '● '), 'the marker and headline are red')
+  // The message detail is indented to the marker width, not an elbow row.
+  assert.equal(plain[1], '  data:{"code":"InvalidParameter"}')
+  assert.ok(lines[1]!.startsWith('  ' + red), 'the detail row keeps the error red')
+  assert.ok(plain.every(line => !line.includes('⎿')), 'errors no longer render as tool-elbow rows')
+  // Other error notices keep their own text under the same marker.
+  const failure = plain.findIndex(line => line.startsWith('● Could not start DSH:'))
+  assert.ok(failure > 0)
+  assert.ok(lines[failure]!.startsWith(red + '● '))
+  // Info notices keep the quiet muted bullet style.
+  const info = plain.findIndex(line => line.startsWith('· Reloaded settings'))
+  assert.ok(info > 0)
+  assert.ok(!lines[info]!.includes(red), 'info notices are not red')
+  for (const width of [24, 40, 80, 120]) {
+    for (const line of view.render(width)) assert.ok(visibleWidth(line) <= width, `width ${width}`)
+  }
+})
+
+test('tool cards render one aligned elbow row and a consistent header column', () => {
+  const flags = { showThinking: false, expandTools: false }
+  const base = {
+    kind: 'tool' as const, id: 't1', callId: 'c1', name: 'bash', arguments: '{}',
+    status: 'done' as const, resultText: '', resultImages: 0, resultIsError: false,
+    meta: undefined, version: 1,
+  }
+  const terminal = {
+    ...base,
+    presentation: {
+      call: { card: 'terminal', title: "grep -n 'stdio' src/backend/client.ts", description: 'Confirm how the client spawns the bridge', diffs: [], contentText: '' },
+      result: { card: 'terminal', output: '164:    this.spawn()\n192:      stdio:', exitCode: 0, diffs: [], contentText: '' },
+    },
+  }
+  const read = {
+    ...base, id: 't2', name: 'read',
+    presentation: {
+      call: { card: 'generic', title: 'Read /tmp/runtime/bridge.mjs (610 - 709)', diffs: [], contentText: '' },
+      result: { card: 'read', path: 'runtime/bridge.mjs', offset: 610, totalLines: 2596, lang: 'js', lines: [{ number: 610, text: 'client-side write' }], diffs: [], contentText: '' },
+    },
+  }
+  const lines = [
+    ...createItemBlock(terminal, flags).render(84),
+    ...createItemBlock(read, flags).render(84),
+  ].map(line => stripTerminalSequences(line))
+  // Exactly one elbow per tool card: the description (or first body row) owns it,
+  // later body rows align under it instead of repeating the marker.
+  const elbows = lines.filter(line => line.startsWith('  ⎿  '))
+  assert.equal(elbows.length, 2, 'one elbow per tool card')
+  assert.equal(lines[0], '⏺ Bash grep -n \'stdio\' src/backend/client.ts')
+  assert.equal(lines[1], '  ⎿  Confirm how the client spawns the bridge')
+  // Folded results are one-line counts; captured output and exit code belong to
+  // the expanded Input/Output view.
+  assert.match(lines[2] ?? '', /2 lines returned/)
+  const readHeader = lines.indexOf('⏺ Read /tmp/runtime/bridge.mjs (610 - 709)')
+  assert.ok(readHeader >= 0, 'the native read title is the header once')
+  assert.equal(lines[readHeader + 1], '  ⎿  1 line loaded')
+  for (const width of [24, 40, 84, 120]) {
+    for (const item of [terminal, read]) {
+      for (const line of createItemBlock(item, flags).render(width)) {
+        assert.ok(visibleWidth(line) <= width, `width ${width}: ${visibleWidth(line)}`)
+      }
+    }
   }
 })

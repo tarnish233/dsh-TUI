@@ -5,8 +5,15 @@
  * Unlike the streaming renderer, this module refuses to highlight large or
  * very long code blocks and reuses a small LRU by code+language, so a token
  * update cannot re-run highlight.js on already-stable code.
+ *
+ * The core is the one CommonJS file in this module graph (`es/core.js` is a thin
+ * wrapper over `lib/core.js`). Loading it through Node's CommonJS loader keeps a
+ * single cached public instance when the native host has already required
+ * highlight.js, instead of making the ESM loader translate that CJS file again.
+ * Language definitions stay ESM: those files have no CJS counterpart in this path.
  */
-import hljs from 'highlight.js/lib/core'
+import { createRequire } from 'node:module'
+import type { HLJSApi } from 'highlight.js'
 import bash from 'highlight.js/lib/languages/bash'
 import c from 'highlight.js/lib/languages/c'
 import cpp from 'highlight.js/lib/languages/cpp'
@@ -27,7 +34,11 @@ import swift from 'highlight.js/lib/languages/swift'
 import typescript from 'highlight.js/lib/languages/typescript'
 import xml from 'highlight.js/lib/languages/xml'
 import yaml from 'highlight.js/lib/languages/yaml'
-import { foregroundAnsi, getTerminalColorMode, parseColor } from '@earendil-works/pi-tui'
+import { foregroundAnsi, getTerminalColorMode, parseColor } from '#pi-tui'
+
+const requireFromHere = createRequire(import.meta.url)
+/** Public package, CommonJS build: `module.exports` is the highlight.js instance. */
+const hljs = requireFromHere('highlight.js/lib/core') as HLJSApi
 
 const languages: Record<string, unknown> = {
   bash, c, cpp, css, diff, go, ini, java, javascript, json, kotlin, markdown, python, rust, shell, sql, swift, typescript, xml, yaml,
@@ -42,6 +53,13 @@ const aliases: Record<string, string> = {
 
 const mode = getTerminalColorMode()
 const color = (hex: string): string => foregroundAnsi(parseColor(hex), mode)
+/**
+ * Content syntax palette: independent of the interface chrome brand color.
+ * `#79c0ff` (numbers, literals, properties, selectors) merely happens to equal
+ * the brand blue's current value — it is NOT derived from src/ui/brand.ts.
+ * Do not "tidy" these into the theme tokens: code color is content, the brand
+ * hue is chrome, and a future brand change must not recolor syntax.
+ */
 const scopeColors: Record<string, string> = {
   keyword: color('#ff7b72'), 'selector-tag': color('#ff7b72'), 'template-tag': color('#ff7b72'), doctag: color('#ff7b72'),
   built_in: color('#ffa657'), type: color('#ffa657'), 'title.class': color('#ffa657'), 'title.class.inherited': color('#ffa657'),

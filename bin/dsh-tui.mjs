@@ -1,4 +1,4 @@
 #!/usr/bin/env node
-// DSH TUI entry. The older dsh-pi-tui entry remains a source-path alias.
-import { main } from '../src/cli.ts'
+// Compatibility alias; the native DSH profile owns the production application.
+import { main } from '../lib/cli.js'
 await main(process.argv.slice(2))

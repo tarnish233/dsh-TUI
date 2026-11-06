@@ -6,11 +6,23 @@
  * - `cc-app-override`: CC repurposes this key for an application action instead
  *   of the GNU readline command with the same key.
  * - `pi-extension`: Pi capability kept for compatibility, not a CC default.
+ * - `tui-extension`: DSH TUI capability added on purpose; not observed in CC
+ *   and therefore never presented as a CC-verified default.
  * - `unverified`: plausible GNU/readline command, not verified against CC.
  * - `unsupported`: knowingly not implemented or not distinguishable.
  */
 
-export type CcContext = "editor" | "autocomplete" | "list" | "dialog" | "historySearch" | "global"
+export type CcContext =
+  | "editor"
+  | "autocomplete"
+  | "list"
+  | "dialog"
+  | "historySearch"
+  | "modelPickerList"
+  | "modelPickerSearch"
+  | "toolDetails"
+  | "imageDetails"
+  | "global"
 
 export const CC_CONTEXTS: readonly CcContext[] = [
   "editor",
@@ -18,6 +30,10 @@ export const CC_CONTEXTS: readonly CcContext[] = [
   "list",
   "dialog",
   "historySearch",
+  "modelPickerList",
+  "modelPickerSearch",
+  "toolDetails",
+  "imageDetails",
   "global",
 ]
 
@@ -39,16 +55,26 @@ export type CcCompatibilityStatus =
   | "cc-match"
   | "cc-app-override"
   | "pi-extension"
+  | "tui-extension"
   | "unverified"
   | "unsupported"
 
 export type CcActionImplementor = "editor" | "app"
+
+/** Host platform bucket for key defaults; WSL follows Windows conventions here. */
+export type CcKeybindingPlatform = "windows" | "wsl" | "posix"
 
 export interface CcActionDefinition {
   id: string
   family: CcActionFamily
   contexts: readonly CcContext[]
   defaultBindings: readonly string[]
+  /**
+   * Extra default bindings that only exist on one platform, e.g. the Alt+V
+   * clipboard alias on Windows/WSL. They extend `defaultBindings` and are ignored
+   * when the user overrides the action, so an explicit binding always wins.
+   */
+  platformBindings?: Partial<Record<CcKeybindingPlatform, readonly string[]>>
   implementor: CcActionImplementor
   status: CcCompatibilityStatus
   description: string
@@ -61,6 +87,27 @@ const listContext = ["list"] as const
 const dialogContext = ["dialog"] as const
 const searchContext = ["historySearch"] as const
 const appContext = ["global"] as const
+/**
+ * Read-only tool-details modal. It deliberately has no `editor` fallback, so
+ * editor movement/kill/undo bindings cannot reach into a read-only surface.
+ * Shared list/dialog/global actions provide scrolling, closing and app keys.
+ */
+const toolDetailsContext = ["toolDetails"] as const
+/**
+ * Read-only image viewer modal. Same shape as `toolDetails`: shared list/dialog/
+ * global actions provide scrolling and closing, but there is no `editor`
+ * fallback, so printable input can never reach a hidden text field.
+ */
+const imageDetailsContext = ["imageDetails"] as const
+/** Browse mode of the provider-grouped /model picker (list + provider keys). */
+const modelPickerListContext = ["modelPickerList"] as const
+const modelPickerBothContexts = ["modelPickerList", "modelPickerSearch"] as const
+/**
+ * list.select / list.cancel also apply to the picker query field, so Enter and
+ * Esc are forwarded as list actions. Other list keys (j/k/digits/arrows) stay
+ * in the browse (`list`) context only.
+ */
+const listAndModelPickerSearchContexts = ["list", "modelPickerSearch"] as const
 
 /**
  * Default CC keymap. Keys are Pi key identifiers; a binding with several keys
@@ -246,7 +293,8 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: ["escape"],
     implementor: "editor",
     status: "cc-match",
-    description: "Close completion, otherwise forward app.cancel",
+    description: "Close completion or restore the history-browsing draft first; only otherwise forward app.cancel",
+    note: "Esc is contextual: a local completion/history layer consumes it so it never interrupts the Agent.",
   },
 
   // --- deletion / kill --------------------------------------------------
@@ -431,7 +479,8 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: ["ctrl+c"],
     implementor: "app",
     status: "cc-match",
-    description: "Interrupt / cancel the current operation or dialog",
+    description: "Interrupt the active operation globally (completion, jump, chord and dialog UI do not block it)",
+    note: "Esc handles local layers first; Ctrl+C always reaches the app. Busy drafts are preserved by the app.",
   },
   {
     id: "app.cancel",
@@ -440,7 +489,7 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: ["escape"],
     implementor: "app",
     status: "cc-match",
-    description: "Cancel the focused app surface",
+    description: "Cancel the focused app surface (Esc only after no local layer consumed it)",
   },
   {
     id: "app.exit",
@@ -449,7 +498,8 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: ["ctrl+d"],
     implementor: "app",
     status: "cc-match",
-    description: "Exit when the prompt is empty (Ctrl+D)",
+    description: "Exit when the prompt is empty (Ctrl+D); never exits on a non-empty draft",
+    note: "The empty-draft guard does not depend on binding priority, so disabling/rebinding forward-delete cannot resurrect global exit.",
   },
   {
     id: "app.redraw",
@@ -497,6 +547,26 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     description: "Expand or collapse tool output / transcript",
   },
   {
+    id: "app.tools.details",
+    family: "app",
+    contexts: appContext,
+    defaultBindings: ["ctrl+x ctrl+o"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Open tools inspector (initial latest)",
+    note: "DSH TUI capability, not a verified CC default. Plain Ctrl+O keeps the CC expand/collapse meaning; the chord is app-owned and forwards to the App like other APP_FALLBACK actions. The inspector always opens on the latest tool; browse with tool.details.previous-tool/next-tool.",
+  },
+  {
+    id: "app.images.details",
+    family: "app",
+    contexts: appContext,
+    defaultBindings: ["ctrl+x ctrl+i"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Open the image details viewer for the focused image",
+    note: "DSH TUI capability, not a verified CC default. Shown only when the surface has an image; the chord keeps Ctrl+I available for tab completion.",
+  },
+  {
     id: "app.todo",
     family: "app",
     contexts: appContext,
@@ -512,8 +582,8 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: [],
     implementor: "app",
     status: "unverified",
-    description: "Show or hide reasoning text (display only; unbound by default)",
-    note: "This does not change model reasoning effort. CC uses Ctrl+T for todos.",
+    description: "Expand or collapse the latest thinking summary; hidden reasoning is revealed first (unbound by default)",
+    note: "This does not change model reasoning effort. The show/hide master switch lives in /settings → Thinking.",
   },
   {
     id: "app.model.select",
@@ -539,9 +609,11 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     family: "app",
     contexts: appContext,
     defaultBindings: ["ctrl+v"],
+    platformBindings: { windows: ["alt+v"], wsl: ["alt+v"] },
     implementor: "app",
     status: "cc-app-override",
-    description: "Paste clipboard content / image attachment (CC Ctrl+V)",
+    description: "Paste clipboard content / image attachment (CC Ctrl+V; Alt+V on Windows/WSL)",
+    note: "Alt+V is added only on Windows and WSL, matching terminal clipboard conventions; no existing binding is taken over.",
   },
   {
     id: "app.suspend",
@@ -559,8 +631,18 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: [],
     implementor: "app",
     status: "unverified",
-    description: "Send the queued message immediately while streaming",
-    note: "App-state dependent; unbound by default so Enter keeps its CC meaning.",
+    description: "Cancel the current turn and send this draft, or the first queued message, now",
+    note: "Bound in the prompt to Ctrl+Enter. Enter still queues. Empty Ctrl+Enter sends the first queued row.",
+  },
+  {
+    id: "app.message.steer",
+    family: "app",
+    contexts: appContext,
+    defaultBindings: [],
+    implementor: "app",
+    status: "unverified",
+    description: "Steer the draft into the current turn at the next DSH step",
+    note: "Bound in the prompt to Ctrl+X Ctrl+S.",
   },
   {
     id: "app.message.followUp",
@@ -641,20 +723,22 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
   {
     id: "list.select",
     family: "list",
-    contexts: listContext,
+    contexts: listAndModelPickerSearchContexts,
     defaultBindings: ["enter"],
     implementor: "app",
     status: "cc-app-override",
     description: "Accept the selected list item",
+    note: "Also applies in modelPickerSearch: Enter must confirm the picker, not submit/clear the query field.",
   },
   {
     id: "list.cancel",
     family: "list",
-    contexts: listContext,
+    contexts: listAndModelPickerSearchContexts,
     defaultBindings: ["escape", "ctrl+c"],
     implementor: "app",
     status: "cc-app-override",
     description: "Close the list without selecting",
+    note: "Also applies in modelPickerSearch (Esc dismisses). In picker and toolDetails contexts the configured app.interrupt key keeps priority over ctrl+c.",
   },
   {
     id: "list.select-digit",
@@ -664,6 +748,132 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     implementor: "app",
     status: "unverified",
     description: "Select a numbered list item (list context only)",
+  },
+
+  // --- tool details modal (read-only) ----------------------------------
+  {
+    id: "tool.details.next-section",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["tab", "right"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the next section of the tool details view",
+    note: "Modal-only. It cannot reach editor completion or cursor movement.",
+  },
+  {
+    id: "tool.details.previous-section",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["shift+tab", "left"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the previous section of the tool details view",
+    note: "Modal-only. It does not cycle DSH permission presets while the modal is open.",
+  },
+  {
+    id: "tool.details.previous-tool",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["[", "alt+left"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the previous tool in the tools inspector",
+    note: "Modal-only. ASCII `[` and Alt+Left stay plain text/word-motion in the main editor.",
+  },
+  {
+    id: "tool.details.next-tool",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["]", "alt+right"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the next tool in the tools inspector",
+    note: "Modal-only. ASCII `]` and Alt+Right stay plain text/word-motion in the main editor.",
+  },
+  {
+    id: "tool.details.copy",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["c"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Copy the focused tool details content",
+    note: "Bound in toolDetails only, so `c` remains plain text in the main editor.",
+  },
+
+  // --- image details viewer (read-only) --------------------------------
+  {
+    id: "image.details.previous-image",
+    family: "dialog",
+    contexts: imageDetailsContext,
+    defaultBindings: ["[", "alt+left"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the previous image in the details viewer",
+    note: "Modal-only. ASCII `[` and Alt+Left stay plain text/word motion in the main editor.",
+  },
+  {
+    id: "image.details.next-image",
+    family: "dialog",
+    contexts: imageDetailsContext,
+    defaultBindings: ["]", "alt+right"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show the next image in the details viewer",
+    note: "Modal-only. ASCII `]` and Alt+Right stay plain text/word motion in the main editor.",
+  },
+  {
+    id: "image.details.close",
+    family: "dialog",
+    contexts: imageDetailsContext,
+    defaultBindings: ["escape"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Close the image details viewer",
+    note: "Context-local close wins over list.cancel for Esc. The configured app.interrupt key (Ctrl+C) always keeps priority in this context.",
+  },
+
+  // --- /model picker navigation ----------------------------------------
+  {
+    id: "model.provider.previous",
+    family: "list",
+    contexts: modelPickerBothContexts,
+    defaultBindings: ["shift+tab"],
+    implementor: "app",
+    status: "cc-app-override",
+    description: "Select the previous provider group in the /model picker",
+    note: "Picker-local UI navigation in browse and search mode; it does not switch DSH permission or plan modes.",
+  },
+  {
+    id: "model.provider.next",
+    family: "list",
+    contexts: modelPickerBothContexts,
+    defaultBindings: ["tab"],
+    implementor: "app",
+    status: "cc-app-override",
+    description: "Select the next provider group in the /model picker",
+    note: "Picker-local UI navigation in browse and search mode; the query text is kept.",
+  },
+  {
+    id: "model.provider.previousArrow",
+    family: "list",
+    contexts: modelPickerListContext,
+    defaultBindings: ["left"],
+    implementor: "app",
+    status: "cc-app-override",
+    description: "Select the previous provider group in the /model picker (browse mode)",
+    note: "Only in modelPickerList; in the search field Left/Right edit the query text.",
+  },
+  {
+    id: "model.provider.nextArrow",
+    family: "list",
+    contexts: modelPickerListContext,
+    defaultBindings: ["right"],
+    implementor: "app",
+    status: "cc-app-override",
+    description: "Select the next provider group in the /model picker (browse mode)",
+    note: "Only in modelPickerList; in the search field Left/Right edit the query text.",
   },
 
   // --- dialogs / approvals ---------------------------------------------

@@ -26,7 +26,7 @@ def run(mode):
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
-        os.execv(NODE, [NODE, str(ROOT / 'bin/dsh-pi-tui.mjs'), '--demo', '--' + mode,
+        os.execv(NODE, [NODE, str(ROOT / 'bin/dsh-tui.mjs'), '--demo', '--' + mode,
                            '--config-dir', config, 'PTY streaming demonstration'])
     records, raw = [], bytearray()
     started = time.monotonic()
@@ -82,8 +82,11 @@ def run(mode):
                 os.write(fd, b'/settings\r')
                 keyboard_stage = 3
             elif keyboard_stage == 3 and b'Keyboard shortcuts' in raw[keyboard_offset:]:
+                # The tabbed Settings list no longer prints SelectDialog's
+                # numeric labels. Keyboard shortcuts is last on General:
+                # End selects it, Enter opens it, Enter edits its first binding.
                 keyboard_offset = len(raw)
-                os.write(fd, b'4\r')  # Select shortcuts, edit the first row.
+                os.write(fd, b'\x1b[F\r\r')
                 keyboard_stage = 4
             elif keyboard_stage == 4 and b'One binding per line' in raw[keyboard_offset:]:
                 keyboard_offset = len(raw)

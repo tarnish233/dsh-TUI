@@ -1,17 +1,24 @@
 /**
  * Live output-token and rate projection for the working indicator.
  *
- * DSH owns tokenization and provider usage; this module only presents the
- * stream it already sends. Text/reasoning/tool-argument deltas provide an
- * immediate estimate (CJK 1 token, other characters / 4) until an attempt's
- * provider `usage.outputTokens` arrives, which is authoritative for that
- * attempt. Attempts are summed across the steps of one turn, then reset when
- * the next turn starts.
+ * DSH owns tokenization, provider usage and the settled per-instruction
+ * numbers: the footer's rate and TTFT come from DSH's native `sessionStats`
+ * projection, never from this module. What remains here is the *live* view the
+ * editor border needs while a turn is still streaming — an immediate estimate
+ * of how much output is arriving right now. Text/reasoning/tool-argument
+ * deltas provide that estimate (CJK 1 token, other characters / 4) until an
+ * attempt's provider `usage.outputTokens` arrives, which is authoritative for
+ * that attempt. Attempts are summed across the steps of one turn, then reset
+ * when the next turn starts.
+ *
+ * There is deliberately no local "settled" fold, footer rate or TTFT here:
+ * duplicating DSH's sessionStats in the TUI was the bug. Unknown values stay
+ * 0 / empty; nothing is invented.
  *
  * The delta estimate and compact count/duration formatting follow
  * pi-cc-extensions (MIT), adapted to DSH's `usage.outputTokens` stream.
  *
- * @module dsh-pi-tui/state/output-stats
+ * @module dsh-tui/state/output-stats
  */
 import type { JsonRecord } from '../backend/types.ts'
 
@@ -53,7 +60,7 @@ function outputUsageOf(chunk: JsonRecord): number {
   return typeof output === 'number' && Number.isFinite(output) && output > 0 ? Math.round(output) : 0
 }
 
-/** One turn's output-token projection and rate samples. */
+/** One turn's live output-token projection and rate samples. */
 export class OutputTracker {
   private turn: number | undefined
   private startedAt = 0
@@ -66,6 +73,7 @@ export class OutputTracker {
     this.reset(turn, at)
   }
 
+  /** Clear the turn projection. */
   reset(turn: number | undefined = undefined, at = 0): void {
     this.turn = turn
     this.startedAt = at
@@ -108,7 +116,8 @@ export class OutputTracker {
   /**
    * Live window rate when enough recent tokens exist; otherwise the average
    * over this turn. Returns 0 before the first token or during the first
-   * 250ms, where a rate would be misleading.
+   * 250ms, where a rate would be misleading. Streaming presentation only — the
+   * settled footer numbers belong to DSH's sessionStats.
    */
   rate(now = Date.now()): number {
     const total = this.total()

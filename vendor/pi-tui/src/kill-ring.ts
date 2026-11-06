@@ -32,6 +32,11 @@ export class KillRing {
 		return this.ring.length > 0 ? this.ring[this.ring.length - 1] : undefined;
 	}
 
+	/** Read-only view of the ring entries, newest last. */
+	entries(): readonly string[] {
+		return this.ring;
+	}
+
 	/** Move last entry to front (for yank-pop cycling). */
 	rotate(): void {
 		if (this.ring.length > 1) {

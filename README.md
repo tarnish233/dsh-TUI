@@ -1,72 +1,67 @@
-# DSH TUI（体验版）
+# DSH TUI · v0.2.0
 
-这是 **DeepSeek Harness 的终端前端**。Agent、模型、认证、配置、工具、权限和会话归 DSH；Pi TUI 只提供终端/输入组件，CC 只作为交互体验参考。版本 `0.1.0`，不是 Pi Agent 或 CC 后端。
+**DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-## 直接体验
+当前本地版本标记为 **v0.2.0**（`private: true`），收录原生 DSH 插件化与独立批量验收发现的问题修复；没有 commit、Git tag、push 或公开发布。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
 
-使用当前安装的 DSH 原生配置。需要 Node >=22.19；实际验收版本线为 DSH `0.2.1-rc.5`。本机已将 `dsh-tui` 软链到本项目入口；项目目录移动后需要重新建链接。
+## 安装与启动（当前本机边界）
 
-首次 clone 或更新 vendored TUI 后执行 `pnpm install --ignore-scripts && pnpm build:pi-tui`；之后直接运行。
+需要 Node >= 24.9 与 DSH `0.2.2-rc.1`（与原生 DSH 的最低 Node 要求一致）。插件装载的是编译后的 `lib/*.js`，构建产物（`lib/`、`vendor/pi-tui/dist/`）不提交到仓库，首次使用或有源码变更后需要先构建：
 
 ```bash
 cd /Users/fulei/workspace/dsh-tui
-
-# 本机已移除旧全局 dsh-TUI；dsh-tui 软链到本项目
-# 采用 DSH 原生默认配置
-dsh-tui
-
-# 复用 DSH 原生 profile 的 provider / 默认模型 / 凭据
-dsh-tui --profile your-profile
-
-# 从该 profile 的原生目录选择模型；不读取 Pi 模型或认证文件
-dsh-tui --profile dsh-tui --model cloudagent/deepseek-v4.1-flash-1017
-
-# 同一 DSH 后端，全屏固定输入区
-dsh-tui --fullscreen --profile your-profile
-
-# 离线界面演示，零模型调用
-dsh-tui --demo --fullscreen
+pnpm install --ignore-scripts
+pnpm build          # 先构建 vendor/pi-tui，再把 src 编译到 lib
 ```
 
-**模型和凭据必须在 DSH 中配置。** TUI 直接消费运行时原生目录；不会从 `~/.pi/agent/models.json` 或 `auth.json` 导入、拆分 provider、迁移密钥或提供另一套模型配置。原 `--models-file` 路径已撤销，旧导入环境变量不再触发读取。
-
-CloudAgent / OpenCode Go 是否可选，以当前 DSH profile 实际声明和认证的路由为准。已经原生配置好时，可直接传对应 `--model`，或者按 `Alt+P` / `/model` 选择；未配置时不会悄悄借用 Pi 凭据。`--profile dsh-tui` 可复用已有 profile 的 CloudAgent / OpenCode Go 配置；如果该 profile 的 patch 还插入旧 TUI，本应用只会在私有 overlay 中禁用那一行，不修改你的 patch。配置接缝与原生路由说明见 [模型说明](docs/PROVIDERS.md)。
-
-从其他项目启动：
+构建后日常直接启动，**不需要先手动挂载，也不需要 screen 参数**：
 
 ```bash
-cd /path/to/your/project
-/Users/fulei/workspace/dsh-tui/bin/dsh-tui.mjs --profile your-profile
+dsh-tui
 ```
 
-`bin/dsh-pi-tui.mjs` 保留为旧源码入口别名，不再代表 Pi 模型导入。TUI 键位/显示偏好的原配置目录保持兼容，避免丢失已有设置。
+- **首次安全自动挂载。** 入口从将要执行的 DSH 安装加载公开 package/profile API；缺少本应用时，通过 DSH 原生 package operation 把当前已构建包以 `link:` 加入默认 `dsh-tui` profile。后续已挂载时不重复安装。首次出现一行挂载提示；包操作有取消、静默和总时限，失败明确退出，不再留一个没有界面的后台 profile。
+- **只处理本应用。** 本项目同一路径的旧名称依赖由原生包管理先安装新身份，再移除旧别名；失败不会先删掉原应用。其他插件、模型、凭据和用户 patch 不迁移、不重建。另一个来源占用同名包、明确禁用本 bundle，或 profile 已选择其他已知前端时，会报错而非擅自替换。
+- **默认 fullscreen。** 要主屏/终端 scrollback 才用 `dsh-tui --inline`。显式保存的 screen 偏好仍然生效，`--inline`/`--fullscreen` 可覆盖它。
+- **原生同进程入口。** 本机 `/opt/homebrew/bin/dsh-tui` 软链仍指向项目 `bin`，不需要更换全局可执行文件。包检查/挂载完成后别名委托 native `dsh`，并通过一层原生 startup assertion 验证终端真的激活；不是私有 backend、profile 镜像或第二套启动树。
+- **其他 profile。** `dsh-tui --profile <name>` 对指定 profile 做相同安全检查；不会自动关闭它原有的前端。`--dsh` 指向原生 DSH launcher，不能是无法定位公开 SDK 的任意 shell wrapper。
+- **仍可手动用 DSH 管理。** `dsh plugin --profile dsh-tui add /Users/fulei/workspace/dsh-tui` 是可选的显式安装方式。之后也可直接 `dsh --profile dsh-tui`；原生 `dsh` 本身不会替一个尚未包含本插件的 profile 做 TUI 的自动挂载。
+- 通过 native DSH 启动时，应用版本参数要越过 launcher 边界：`dsh --profile dsh-tui -- --version`。裸 `--version` 属于 DSH 启动器。直接运行别名时 `dsh-tui --version` 由别名自身处理。
+- `dsh-tui` 在 POSIX 上用 `process.execve` 把自己替换成 native `dsh`：TUI 与 DSH 处于同一进程，没有前端/后端 IPC 或 supervisor。没有 `execve` 的平台只做整应用委托（spawn native dsh），不保留 TUI 壳层。
 
-`--demo` 始终标注 DEMO，不会在真实连接失败时自动启用。直接运行 `dsh-tui --demo --fullscreen` 会自动展示 `tools` 场景：安全 `bash(pwd)` terminal 卡、输出和 exit code，以及 `edit` diff；也可输入 `tools` 重放。普通文字展示 Markdown / diff；`question`、`approval`、`abort` / `fail` 展示问卷、审批、中断与失败。
+### 离线 demo（不需要 DSH）
 
-## 原生 DSH 边界
+```bash
+dsh-tui --demo                 # 默认 fullscreen + tools 场景
+dsh-tui --demo tools-group     # 连续工具分组、I/O 详情与独立 Diff
+dsh-tui --demo images          # 用户/assistant/工具图片与重复附件
+```
 
-Pi TUI 是选择性复用的输入/渲染底座，不是业务逻辑的权威，也没有引入 Pi AgentSession。
+demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型、不执行真实工具。它不会在真实连接失败时自动启用。
 
-- `/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等业务命令调用 DSH 原生命令注册表，保留校验、结果与 `command/run` / `command/done` 审计；不维护另一套压缩/权限/计划逻辑。
-- `/preset` 使用 DSH 原生 `agentPresets` 名册；`/effort` 使用当前 provider/model 的 `resolveModelInfo().reasoning`。新会话按空白会话规则挂载 preset，已开始的会话只把选择留到下一次 `/new`；effort 只作用于当前会话的下一次请求。
-- 实时/持久流通过 DSH 公开 `BlockAssembler`、assistant-stream 与 surface helpers 解码，不再维护生产镜像。
-- 工具卡优先消费原生 `presentCall/presentResult`；模型提出调用不等于已执行，没有结果不冒充成功/失败。
-- 保留原生 `surfaceOp/sourceEventSeqs`：模型上下文的裁剪副本不会覆盖人类历史。
-- 审批/问卷按请求 ID 排队；同会话重新附着也会重置旧 Agent 的流式生命周期。
-- 原生 SDK 未覆盖的实时事件/取消面仍用薄 IPC；仅保留必要的终端/进程隔离，不承担 provider、认证或配置规则。
+## 原生同进程边界
 
-## 当前支持
+启动与组合归 DSH，本插件只做终端界面和窄适配：
 
-- CC 风格主输入、工具卡、Markdown、中文 / emoji、折叠工具输出与思考显示。
-- 用户消息使用 DSH mist-blue 背景带，启动标题与交互强调使用 DSH 主题蓝色。
-- Ctrl+P/N 的视觉行 / 历史边界；Ctrl+A/E/B/F；词移动与删除；Ctrl+W 的空白边界；kill/yank/yank-pop、undo、原子大段粘贴。
-- Ctrl+R 反向历史搜索、草稿暂存、清空草稿找回、外部编辑器、Unix 挂起恢复。
-- 独立且可热更新的编辑 / 列表 / 对话框键位；不会让 Pi 的模型切换抢 Ctrl+P。
-- 真正订阅 DSH `agent/assistant-stream` 与持久 `session/event`，不把已提交记录假装实时流。
-- 中断、排队 / steering、排队文本取回、会话新建 / 恢复、模型选择、原生权限预设、基础审批与问卷。
-- 模型目录、provider 参数、认证、能力与默认路由全部由原生 DSH 提供；TUI 只选择和展示，不维护目录或导入算法。
-- 两种 Pi renderer；stdout/stderr 都不承载后端控制协议，后端使用独立 fd3 管道。
-- 原生 DSH home/profile 配置复用，不覆盖任何用户已有 profile；启动与模块解析由 DSH 负责。
+- **生命周期**：startup 插件负责 native 命令行解析与选项服务，主插件通过 native `appReady` 启动。卸载时 `ctx.effect` 先**同步**恢复终端，再异步关闭 App 与 backend；`appExit` 属于 DSH，本插件不调用 `process.exit`，也不 dispose 宿主 root。
+- **没有第二套 Harness**：不存在 bridge/protocol/discover/runtime-home/native-profile，不存在 scratch home、profile 镜像、YAML 合并器、第二个 Agent loop、调度器或前端/后端 IPC。`src/backend/context.ts` 只是同进程薄适配，直接使用宿主 Cordis context 的公开服务。
+- **preset**：从宿主 `profileContext.installAnchor`（嵌入宿主可用公开 `pluginPackages` lookup）解析 DSH 公开 resource 和原生 `AgentPreset` 类，用 native `loadOverlayPatches` / `composeEntries` 组合；不从本包目录找可选 peer、不挂 Web 前端，也不复制工具清单、权限规则或 plan 语义。
+- **模型目录**：`ctx.llm.listProviders()` / `listModels()` / `resolveModelInfo()` 加 native `agentDefaultModel` 的只读投影（`src/backend/model-view.ts`）；不挂完整 SessionController，不导入 Pi 目录/凭据，不维护第二套默认策略。
+- **默认保存**：模型/effort 的落盘由真实 native ConfigEditor 负责。适配器无法从 getter 证明已落盘，因此正常确认返回 `defaultsPersisted:false` / `defaultPersistence:'native'`；正常成功只更新底栏，不向对话区追加确认，失效/未知警告仍然可见。
+- **工具**：优先消费原生 `presentCall/presentResult`；模型提出调用不等于已执行，没有结果不冒充成功/失败。命令执行、校验与审计由 DSH 拥有。
+- **流式与会话**：真实订阅 `agent/assistant-stream`、`session/event`、`agent/status`、`agent/error`；保留原生 `surfaceOp` / `sourceEventSeqs`，模型上下文裁剪不覆盖人类历史。普通启动不创建 Agent，首次真正发送或需要会话的命令才物化；`--resume` / `-r` 显式恢复。
+- **附件与图片**：`ctx.attachments` 原生准入与按引用读取；同进程没有 8 MiB IPC 帧或 6 MiB 图像传输上限，图像仍受 DSH 存储/准入限制和本层显示/编辑内存预算约束。模型 vision 准入仍归 DSH。
+- **诊断**：TUI 生命周期内的原生 JS `console.*`/stdout/stderr 写入通过独立受控日志通道；Pi renderer/protocol 用专用原始终端 writer，目录刷新成功不会进入编辑框/对话。日志脱敏、限长与轮换；警告通过现有 notice 去重限流，致命错误先恢复终端再保留原生错误输出/退出。不改 provider 刷新、会话/工具/图片事实。原生 addon、子进程直接 fd 或 `/dev/tty` 写入不属于这个 JS 层隔离范围。
+
+## 当前能力
+
+- CC 风格主输入、历史搜索、kill/yank、undo、原子大段粘贴、外部编辑器、Unix 挂起恢复；一套可热更新的键位设置。
+- inline / fullscreen 两种 Pi renderer；工具卡、Markdown、原生 Diff、连续工具分组、Input/Output 预览与只读 Inspector；思考折叠摘要。
+- 真实模型流式上屏与结算、排队/steering、取消、权限预设、审批与问题；`/model` 模型选择器（搜索、provider 分组、effort 保留）。
+- 原生 preset 选择、原生命令透传、会话新建/恢复与启动会话选择器；`/reload` 走 native HMR 配置重组合。
+- 图片：`[Image #N]` 原子附件输入、显式只读查看器、用户/assistant/工具/历史图片保序投影；`history.json` 只存文字，不写 base64；队列图片 refs 需要显式 Up 取回重试，不新增调度器。
+- 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、cwd 与 git 只读状态。
+- 品牌蓝主题与静态字符块 DeepSeek logo；无启动动画、无原生图片 logo。
 
 ## 常用键
 
@@ -81,97 +76,93 @@ Pi TUI 是选择性复用的输入/渲染底座，不是业务逻辑的权威，
 | Ctrl+Backspace / Alt+Backspace | 普通词删除，与 Ctrl+W 分开 |
 | Ctrl+U / K / Y、Alt+Y | 行 kill / yank / yank-pop |
 | Ctrl+_ / Ctrl+Shift+- | 撤销 |
-| Ctrl+R | 历史搜索；主屏 Tab/Esc 放回编辑，Enter 发送，Ctrl+C 取消 |
+| Ctrl+R | 历史搜索；Tab/Esc 放回编辑，Enter 发送，Ctrl+C 取消 |
 | Ctrl+S | 暂存 / 恢复完整草稿 |
-| Ctrl+C | 工作中中断；空闲清草稿；空输入重复确认退出 |
-| Esc | 关闭当前层 / 中断；空闲非空草稿双 Esc 清空 |
-| Ctrl+D | 有文本删字符，空输入重复确认退出；空 Delete 不退出 |
+| Ctrl+C | 全局中断前台操作（包括审批/问题中）；空闲有草稿时先清空并保存，再按一次退出 |
+| Esc | 关闭局部面板；审批中拒绝该工具；问题中取消该问题。回合进行中或已有排队消息时，不发送当前草稿，把队列发出去。空闲且没有队列时，非空草稿双 Esc 清空 |
+| Ctrl+D | 有文本删字符，空输入重复确认退出 |
 | Ctrl+L | 重绘，保留草稿和会话 |
 | Ctrl+G / Ctrl+X Ctrl+E | 外部编辑器（VISUAL / EDITOR / nano） |
-| Ctrl+O | 工具输出折叠 / 展开 |
+| Ctrl+O | 全局工具折叠 / 展开 |
+| Ctrl+X Ctrl+O | 工具 Inspector；`[` / `]` 或 Alt+Left/Right 浏览调用，Tab 切 Input/Output，c 复制 |
 | Alt+P | 模型选择 |
 | Shift+Tab | 循环 DSH 暴露的权限预设（执行原生 `/permission`，不切换 plan） |
-| Ctrl+Enter / Ctrl+X Ctrl+S | DSH steering；具体生效边界由 DSH 决定 |
-| Ctrl+X Enter | 明确排队 |
+| Ctrl+Enter | 取消当前回合，立刻发送草稿；输入框为空时发送队列第一条。其余排队消息留在 inbox |
+| Ctrl+X Ctrl+S | 把草稿插进当前回合的下一步（DSH steer） |
+| Ctrl+X Enter | 明确排到下一回合 |
 | Ctrl+Z | Unix 挂起，`fg` 恢复 |
-| Ctrl+V | 原生剪贴板文本；图片发送尚未接入 |
+| Ctrl+V | 原生剪贴板图片附件；无图片时回退为文本（Windows/WSL 另有 Alt+V） |
+| Ctrl+X Ctrl+I | 查看当前草稿或会话图片；`[`/`]` 或 Alt+Left/Right 切换，Esc 关闭 |
 
-macOS Option/Alt 快捷键需要终端发送 Meta。传统终端无法区分的控制字节会标记诊断，不伪造支持。
+回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
 
-## 命令与配置
+macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节会标记诊断，不伪造支持。完整动作与兼容说明见 [输入说明](docs/INPUT.md)。
 
-`/help`、`/settings`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务。快捷键入口已收进 Settings，不再单独暴露 `/hotkeys`。
+## 命令与设置
 
-`/preset` 打开原生 Agent preset 名册；空白会话可原地切换，已开始的会话会提示选择已保留给下一次 `/new`。`/effort` 打开当前模型的推理等级选择器，`default` 清除显式等级并回到模型/适配器默认；底栏显示当前 preset 和显式 effort。
+`/help`、`/settings`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
 
-`/compact`、`/permission [preset]`、`/plan [off]`、`/goal`、`/feedback` 等以当前 DSH 注册表为准；`/help` / 补全动态读取原生描述，业务命令原样转交 DSH。Esc / Ctrl+C 会把取消信号传给正在运行的原生命令。
+- **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
+- **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。
+- **`/preset`**：原生 Agent preset 名册；空白会话可原地切换，已开始的会话保留给下一次 `/new`，底栏用 `next preset` 区分。
+- **正常成功不刷对话区**：模型、effort、权限和 preset 的成功切换只更新底栏（自动标题显示在 Settings）；失败、保存异常和原生警告仍可见。`/preset status`、`/effort status`、裸 `/permission` 不回显状态列表，当前值看底栏。
+- **取消与排队**：中断调用原生 `Agent.cancel({kind:'user'}, {keepInbox:true})`；草稿与两个 inbox 队列保留，取消本身不主动续发。空输入 Up/Ctrl+P 取回可编辑的人类文本；后台任务唤醒仍归 DSH。已完成工具副作用不回滚。
+- **审批与问题**：问题中 Esc 以原生 `{cancelled:true}` 结算；Ctrl+C 中止整个回合；审批 Esc 返回原生 `rejected`，与回合 abort 的 `cancelled` 区分。
+- **`/reload`**：空闲且无待决策时，先做本层 idle 检查，再调用 `hmr.runExclusive(() => hmr.reconcileProfile())`。当前 Agent、会话、transcript、草稿和缓存不重建；结果与 restart/pending 提示来自 DSH。忙碌、保留队列或待决策时拒绝。普通配置与插件启停由 DSH 原生重组；需要重启的情况以原生结果为准。直接重载前端插件会卸载/重建界面，不自动恢复最近会话。
+- **`/settings`**：General / Thinking / Tools 三个 tab，加 Keyboard shortcuts 分组编辑。Tools 统一管理分组、默认展开、预览行数、摘要长度与 Diff 布局；设置写同一个 `settings.json`，不增加 profile/覆盖层级。
+- **`/resume`**：启动参数 `--resume <id>` / `-r <id>`，或 `-r` 不带 id 打开当前目录会话选择器（Tab 切当前目录/全部，模糊搜索，Esc 保留新会话）；不自动选择最近会话。重复恢复当前 id 按 DSH 原生语义保留已有 Agent/attachment，不取消流式、队列或待决策；切换其他 id 先准备成功再释放旧连接，失败仍可继续使用当前会话。
+- **状态栏**：第一行模型、effort、状态、preset、上下文占用、缓存命中、速率/TTFT 与瞬态提示；第二行 cwd、git 分支/状态、权限值。usage/sessionStats 来自原生投影，git 只读本地轮询，绝不 fetch/写索引。
 
-- **权限与计划分开**：本机 DSH `0.2.1-rc.5` 的 base 组合原生提供 `/plan`，它是规划引导/评审流程，不是权限预设，也不强制禁用工具。`/permission` 控制沙箱与审批；没有额外的 `/mode` 包装或伪造的 Plan 权限选项。
-- **快捷键设置**：`/settings` → **Keyboard shortcuts**。按导航、编辑、应用、补全、列表/对话框、历史搜索分组显示当前“按键 → 用途”，包括未绑定项；不显示动作 ID/兼容状态列。选中后 Enter 修改，`d` 禁用，`r` 恢复该项默认，Esc 返回。编辑框每行一个可选绑定，空格组成 chord（如 `ctrl+x ctrl+e`），Shift+Enter 增加一行；Enter 保存并立即生效。复用同一个 CC keymap 的解析与诊断，不自动抢占其他绑定，不增加 profile/覆盖层级。
-- **`/reload` 热更新**：重新读取 TUI `settings.json` / `keybindings.json`，把真实 profile/home patch 同步到私有 runtime，然后调用 DSH 原生 HMR 重载配置与插件。当前 Agent、会话、transcript、草稿和缓存不重建；模型回合或原生命令运行中、或有待处理 DSH 决策时会拒绝。
-- **/reload 的边界**：`screen`、profile bundle/package 迁移、凭据文件变化和 TUI 核心源码变化仍需要重启；HMR 会报告 `restartReason` / pending modules。Pi 式 TUI 扩展热插拔暂未纳入。
-- **正常流式没有 attempt 占位行**：正文直接增长，Working 状态（实时输出 token、耗时与速率）和取消提示嵌入编辑框上边框；流式/持久去重仍在内部。只有确实未完成或未确认的响应才显示相应提示。
+## 偏好文件
+
+界面偏好、键位与输入 recall 默认在 `~/.dsh-tui/`（`--config-dir` 优先，其次 `DSH_TUI_CONFIG_DIR`）：
+
+```text
+~/.dsh-tui/
+├── settings.json      # 显示、思考、Tools 预览/Diff、自动标题偏好
+├── keybindings.json   # 自定义快捷键；保存覆盖时才创建
+├── history.json       # 按工作目录保存的文字 recall，不含图片 bytes/base64
+└── logs/
+    ├── terminal-diagnostics.log    # 0600、限长、脱敏的原生运行诊断
+    └── terminal-diagnostics.log.1  # 至多一个轮换副本
+```
+
+这里不读取 Pi / CC 配置；模型、认证、权限、会话和插件组合仍使用 DSH 原生 profile/home。`--models-file` 已移除并明确失败，Pi 的 `models.json`/`auth.json` 永不被读取。
+
+## 构建与验证
 
 ```bash
-./bin/dsh-pi-tui.mjs -c --model deepseek-account/deepseek-flash
-./bin/dsh-pi-tui.mjs -r <session-id> --model deepseek-account/deepseek-flash
-./bin/dsh-pi-tui.mjs --dsh /opt/homebrew/bin/dsh --dsh-home /path/to/data-home
+pnpm build          # vendor/pi-tui 先构建，再 src -> lib
+pnpm typecheck
+pnpm test
+pnpm check          # build + typecheck + test
 ```
 
-TUI 偏好/键位默认在 `~/.config/dsh-pi-tui/`，可用 `--config-dir`、`DSH_PI_TUI_CONFIG_DIR` 或 XDG_CONFIG_HOME 隔离。这些仅是 TUI 偏好，不读取 Pi / CC 配置；模型、认证和业务配置使用 DSH 原生目录与 profile。
-
-`keybindings.json` 使用动作 → 键，可多键 / `null` / 空数组禁用。例如：
-
-```json
-{
-  "editor.move.line-up": ["up", "ctrl+p"],
-  "editor.move.line-down": ["down", "ctrl+n"],
-  "editor.kill.whitespace-backward": "ctrl+w",
-  "editor.kill.word-backward": ["alt+backspace", "ctrl+backspace"],
-  "list.next": ["down", "ctrl+n", "j"],
-  "app.model.select": "alt+p",
-  "app.thinking.toggle": "alt+t"
-}
-```
-
-最后一项只是显示 / 隐藏思考，不改变模型的 reasoning effort；真正的推理强度用 `/effort`（DSH 模型目录），不是 CC 的 extended-thinking 开关。当前快捷键可在 `/settings` → Keyboard shortcuts 中查看和修改；完整动作 / 兼容说明见 [输入说明](docs/INPUT.md)。配置错误会显示，不能静默覆盖坏文件。
+- 离线测试使用临时 home/workspace 与 fake Cordis 宿主；不读真实 profile、凭据、会话日志，也不访问真实 provider。
+- 覆盖同进程原生流式/结算、模型选择器（搜索/effort）、权限/取消/ask/approval、HMR 配置重组合，以及原有 UI/input/image 回归。插件化之前的图片/PTY 与旧 CloudAgent 实网数字标为**历史记录**，不构成当前健康证明；本轮原生图片与 PTY 验收单独记录。
+- 私有 native PTY（`test/plugin-pty.test.ts`）保留 inline/fullscreen × 正常退出、外部 SIGINT 130、demo 和卸载-重挂载的 8 个 case；`test/plugin-attachment-pty.test.ts` 额外覆盖无参数首启、全新 profile、幂等再启、同源旧名称升级、包操作失败/取消，以及整个前端行被禁用。全部使用临时 profile，要求终端恢复，不发送模型 prompt。当前完整结果见 [验收记录](docs/ACCEPTANCE.md)。
+- 真实模型/vision/GPU 像素截图验收**不在本轮**：没有宣称真实 provider 请求、真机像素或真实模型 vision 已通过。
+- 可选的手动真实小 prompt（明确 opt-in，不推荐自动运行）：`DSH_TUI_LIVE=1 DSH_TUI_LIVE_PROFILE=dsh-tui node scripts/live-smoke.ts`，会通过原生 CLI 启动完整 TUI。原 `scripts/live-providers-smoke.ts` 已删除。
 
 ## 已知边界
 
-- 首版仍有 CC 差异，不宣称 GNU Readline 所有命令完整实现。redo、quoted insert、数字参数、case conversion 等未接入；具体未核验项见输入文档。
-- 取回多条排队文本会合并到草稿，不是 CC 的逐条选择器。注入上下文与带附件的排队消息不会被取回操作删除。
-- 子 Agent 面板、todo/goal 面板、fork/rewind、图片发送 / 预览尚未做；Ctrl+T 会明确提示，而不是变成 transpose。
-- Pi 式 TUI 扩展热插拔（extensions 发现、卸载/重载）暂列为 TODO；当前 `/reload` 只重载内置 TUI 资源与 DSH 配置/插件。
-- DSH steering、权限模式与工具安全语义由 DSH 保有，不假装等同 CC 后端。
-- 历史恢复有事件数 / UTF-8 字节预算，截断会提示；完整持久日志仍在 DSH 数据 home。`--continue` 当前表示最新创建的会话，不伪造最后活动时间。
-- 当前仅锁定验收 DSH `0.2.1-rc.5`。私有 profile 中通过 DSH settings 写入的配置不会永久修改用户命名 profile；home 隔离仍需要最小 link glue。
-- 模型能力、上下文、推理级别与网关参数以 DSH 原生配置/目录为准；TUI 不根据其它应用的配置推断，也不另存一份模型定义。
-- 主屏在 resize 或视口上方必须更新时可能全量重绘；全屏可避开原生 scrollback 的这一限制。不要把任何 TUI 写入同一终端的普通日志。
-- 已做 ANSI 仿真和真实 PTY 验收，但 Rex 的实际输入法 / 字体 / GPU 手感仍需你亲手试。
+- 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。
+- Pi 式 TUI 扩展热插拔暂未纳入；`/reload` 只做 native HMR 配置重组合，不重载 TUI 核心源码。
+- 模型能力、上下文、推理级别与网关参数以 DSH 原生目录为准；TUI 不推断或另存第二份模型定义。默认模型的持久化由宿主 ConfigEditor 负责，本层只能如实报告 `defaultsPersisted:false`。
+- 历史恢复有事件数/UTF-8 字节预算，截断会提示；完整持久日志仍在 DSH 数据 home。工具耗时包含审批/策略等待，不另抓取逐行输出；大 Diff 超预算时提示并保留完整 Before/After 源。
+- 图片显示转换独立于模型 vision；被拒绝的附件不会绕过 DSH 准入。终端 inline-image 能力由 Pi TUI 公共实现决定，tmux/screen 等未确认环境保守降级文字。
+- 主屏在 resize 或视口上方更新时可能全量重绘；全屏可避开原生 scrollback 限制。不要把任何 TUI 写入同一终端的普通日志。
+- 已做 ANSI 仿真与真实 PTY 验收，但具体终端的输入法/字体/GPU 手感仍需亲手试用。
 
-## 验证与开发
+## 相关文档
 
-```bash
-pnpm install --ignore-scripts
-pnpm check
-python3 scripts/pty-smoke.py
+- [输入 API 与限制](docs/INPUT-API.md) · [输入行为](docs/INPUT.md) · [输入生命周期](docs/INPUT-LIFECYCLE.md)
+- [Tools 分组、详情与设置](docs/TOOLS.md) · [工具 Diff 归属](docs/TOOLS-DIFF-ATTRIBUTION.md)
+- [图片投影、预览、附件输入与边界](docs/IMAGES.md)
+- [模型/provider 原生投影](docs/PROVIDERS.md)
+- [DSH 同进程集成](docs/BACKEND.md)
+- [主题与启动区](docs/THEME.md) · [鼠标抽象](docs/MOUSE.md)
+- [总体方案](docs/PROPOSAL.zh-CN.md) · [验收记录](docs/ACCEPTANCE.md)
+- [Review 修复与取消最终验收（历史）](docs/REVIEW-ACCEPTANCE-2026-11-03.md)
 
-# 明确 opt-in，使用你已在 DSH 原生配置好的 profile/home 发一个很小的 prompt
-DSH_TUI_LIVE=1 DSH_TUI_LIVE_PROFILE=<name> node scripts/live-smoke.ts
-
-# 明确 opt-in，验证已配置路由的 Messages/Responses/Chat Completions 持续显示
-DSH_TUI_LIVE=1 DSH_TUI_LIVE_PROFILE=<name> \
-  DSH_TUI_LIVE_MODELS=provider/model node scripts/live-providers-smoke.ts
-```
-
-最新 `pnpm check`：210 tests / 210 pass。vendored TUI 下原生 `dsh-tui` profile 实网复测获得 215 个文本 chunk、结束前 153 个不同正文画面；单条 smoke 返回 `dsh-tui-ok`。验收包含 Settings 内快捷键分组展示、修改/禁用/还原、冲突与坏文件保护、原草稿/paste 状态保留、原生 preset 切换/空白会话锁定、effort 目录与选择、working token/速率投影、/reload 的 TUI/DSH 配置热更新，以及原生命令参数/审计/取消/超时、真实文件读取/presenter/裁剪与恢复、同会话重附着、并发审批 ID 隔离、生成结束前上屏与最终去重。两种实际 CLI PTY 都验证了设置中修改键位、返回后继续发送、缩放和终端恢复。常规测试使用离线 `llm/stream` fixture 和原生 provider / loopback SSE，不使用真实凭据或远程模型。
-
-Pi TUI 1.5.0 源码 vendored 在 `vendor/pi-tui/`，由 `pnpm build:pi-tui` 编译；CC Editor/SelectList 入口位于 `src/input/pi-tui-seam.js`，不再使用 pnpm patch，也不改全局 Pi。模型/provider 仍只来自 DSH。
-
-- [总体方案](docs/PROPOSAL.zh-CN.md)
-- [输入 API 与限制](docs/INPUT-API.md)
-- [DSH 后端与协议](docs/BACKEND.md)
-- [原生模型/profile 配置](docs/PROVIDERS.md)
-- [验收记录](docs/ACCEPTANCE.md)
-
-MIT；来源和许可见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
+MIT；来源与许可见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。

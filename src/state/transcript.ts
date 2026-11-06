@@ -26,13 +26,17 @@
  * output, no timers and no DSH runtime imports; tests can drive it directly.
  */
 
+import { asImageAttachmentRef, displayContentParts } from '../attachments.ts'
 import type {
   BackendEvent,
+  DisplayContentPart,
   DisplayStream,
   JsonRecord,
   SessionEvent,
   SessionInfo,
   StreamPresentation,
+  TodoItem,
+  TodosSnapshot,
   TranscriptCodec,
 } from '../backend/types.ts'
 
@@ -42,14 +46,43 @@ export type TranscriptItem =
   | ToolTranscriptItem
   | AttemptTranscriptItem
   | NoticeTranscriptItem
+  | TodosTranscriptItem
 
 export interface UserTranscriptItem {
   readonly kind: 'user'
   readonly id: string
   readonly seq?: number
   readonly text: string
+  /** Number of native image blocks, including blocks without a usable ref. */
   readonly imageCount: number
+  /**
+   * Ordered display content when the durable message carried images.
+   * `text` stays the joined text projection for every consumer that does not
+   * need image positions; this array preserves the original text/image order.
+   */
+  readonly content?: readonly DisplayContentPart[]
   readonly version: number
+}
+
+/**
+ * One reasoning run of an assistant/attempt item.
+ *
+ * A run starts at the first reasoning chunk of an attempt and ends at the first
+ * text/tool-call chunk (or when the attempt settles), so a turn that thinks,
+ * answers, thinks again yields several runs — each one gets its own collapsed
+ * summary block in the transcript.
+ *
+ * Timing is honest by construction: `startedAt` exists only while the run is
+ * still producing text, and `durationMs` only once a real measurement exists.
+ * A durable replay that carries no usable event times leaves both undefined, so
+ * the UI shows a plain `✻ Thought` instead of a made-up number.
+ */
+export interface TranscriptThinkingRun {
+  readonly text: string
+  /** Clock reading (epoch ms) at which this run started; in-progress runs only. */
+  readonly startedAt?: number
+  /** Settled duration in ms; absent when nobody measured it. */
+  readonly durationMs?: number
 }
 
 export interface AssistantTranscriptItem {
@@ -58,6 +91,12 @@ export interface AssistantTranscriptItem {
   readonly seq?: number
   readonly text: string
   readonly thinking: string
+  /** Per-run reasoning projection; parallel to `thinking`, never a replacement for it. */
+  readonly thinkingRuns?: readonly TranscriptThinkingRun[]
+  /** Ordered text/image content when the message carried images. */
+  readonly content?: readonly DisplayContentPart[]
+  /** Native image block count, including legacy blocks without a usable ref. */
+  readonly imageCount?: number
   readonly interrupted: boolean
   readonly version: number
 }
@@ -80,11 +119,24 @@ export interface ToolTranscriptItem {
   readonly id: string
   readonly callId: string
   readonly seq?: number
+  readonly callSeq?: number
+  readonly resultSeq?: number
+  readonly turn?: number
+  readonly step?: number
+  /** DSH call-to-settlement wall time, including permission/policy waiting. */
+  readonly startedAt?: number
+  readonly settledAt?: number
+  readonly durationMs?: number
+  /** Original result blocks/envelope for lossless detail viewing; never reconstructed. */
+  readonly resultContent?: readonly unknown[]
+  readonly rawResult?: JsonRecord
   readonly name: string
   readonly arguments: string
   readonly status: ToolTranscriptStatus
   readonly resultText: string
   readonly resultImages: number
+  /** Ordered text/image parts of the durable result blocks, when images exist. */
+  readonly resultContentParts?: readonly DisplayContentPart[]
   readonly resultIsError: boolean
   /** Opaque DSH tool/result meta. Presentation may read it; it is never a success guess. */
   readonly meta: unknown
@@ -110,7 +162,13 @@ export interface AttemptTranscriptItem {
   readonly step: number
   readonly text: string
   readonly thinking: string
+  /** Per-run reasoning projection; same rules as on an assistant item. */
+  readonly thinkingRuns?: readonly TranscriptThinkingRun[]
   readonly toolNames: readonly string[]
+  /** Ordered text/image content when the live/settled stream carried images. */
+  readonly content?: readonly DisplayContentPart[]
+  /** Native image block count, including legacy blocks without a usable ref. */
+  readonly imageCount?: number
   readonly status: AttemptTranscriptStatus
   /** True until a durable settlement (assistant/message or assistant/attempt) replaced it. */
   readonly tentative: boolean
@@ -122,6 +180,20 @@ export interface NoticeTranscriptItem {
   readonly id: string
   readonly level: 'info' | 'error'
   readonly text: string
+  readonly version: number
+}
+
+/**
+ * DSH's native `todos` projection as one live checklist block.
+ *
+ * The checklist is a single piece of session state, not a stream of events: a
+ * non-null snapshot updates this item in place, and null removes it again.
+ * Exactly one todos item exists per transcript, like the web client.
+ */
+export interface TodosTranscriptItem {
+  readonly kind: 'todos'
+  readonly id: string
+  readonly todos: readonly TodoItem[]
   readonly version: number
 }
 
@@ -142,30 +214,137 @@ const asNumber = (value: unknown): number | undefined =>
 
 const asArray = (value: unknown): readonly unknown[] => (Array.isArray(value) ? value : [])
 
+/** Durable integer field (turn/step/log index); never coerced from a string. */
+const asIndex = (value: unknown): number | undefined => {
+  const index = asNumber(value)
+  return index !== undefined && Number.isSafeInteger(index) ? index : undefined
+}
+
+/**
+ * Durable event wall clock (epoch ms), passed through exactly as DSH recorded
+ * it. DSH's public `SessionEvent.time` has no "0 = unrecorded" convention and
+ * epoch 0 is a real instant, so this layer must not invent its own sentinel.
+ * Only a missing/non-finite reading stays unrecorded; it is never replaced with
+ * the local `Date.now()` (which would fabricate history).
+ */
+const eventClock = (value: unknown): number | undefined => {
+  const time = asNumber(value)
+  return time !== undefined && time >= 0 ? time : undefined
+}
+
+/**
+ * DSH call-to-settlement wall time, including approval/policy waiting — the
+ * same window native `toolMs` folds. A clock that ran backwards is clamped to
+ * zero; a missing endpoint yields no duration at all.
+ */
+function toolDuration(startedAt: number | undefined, settledAt: number | undefined): number | undefined {
+  if (startedAt === undefined || settledAt === undefined) return undefined
+  return Math.max(0, settledAt - startedAt)
+}
+
 interface TextBlocks {
   text: string
   thinking: string
   images: number
+  /** Ordered text/image parts; only image-bearing messages need this array. */
+  content: DisplayContentPart[]
 }
 
+/**
+ * Project durable content blocks without rewriting them.
+ *
+ * Images are counted even when the wire shape is only a legacy placeholder
+ * (no usable attachment ref), so an item is never dropped just because its
+ * bytes are unreachable. Only real, shape-valid refs become display parts —
+ * the UI reads bytes lazily through `Backend.readImage`, never from the log.
+ */
 function projectBlocks(content: unknown): TextBlocks {
   const texts: string[] = []
   const thinking: string[] = []
+  const parts: DisplayContentPart[] = []
   let images = 0
   for (const block of asArray(content)) {
     if (!isRecord(block)) continue
     const type = asString(block.type)
     if (type === 'text') {
       const text = asString(block.text)
-      if (text !== undefined) texts.push(text)
+      if (text !== undefined) {
+        texts.push(text)
+        parts.push({ type: 'text', text })
+      }
     } else if (type === 'reasoning') {
       const text = asString(block.text)
       if (text !== undefined) thinking.push(text)
     } else if (type === 'image') {
       images += 1
+      const attachment = asImageAttachmentRef(block.attachment)
+      if (attachment !== undefined) parts.push({ type: 'image', attachment })
     }
   }
-  return { text: texts.join('\n\n'), thinking: thinking.join('\n\n'), images }
+  return { text: texts.join('\n\n'), thinking: thinking.join('\n\n'), images, content: parts }
+}
+
+/**
+ * Native stream projection for a live/durable attempt. `content` is the
+ * ordered wire value; `images` is the legacy replay-only convenience array.
+ * Text-only content is not stored on the item (the joined `text`/`thinking`
+ * fields already cover it) unless an image actually needs a position.
+ */
+function streamImageContent(view: StreamPresentation): DisplayContentPart[] {
+  const parts = displayContentParts(view.content)
+  const explicit = parts.filter(part => part.type === 'image')
+  if (explicit.length > 0) return parts
+  const legacy = (view.images ?? []).flatMap(ref => {
+    const attachment = asImageAttachmentRef(ref)
+    return attachment === undefined ? [] : [{ type: 'image' as const, attachment }]
+  })
+  return legacy.length === 0 ? [] : [...parts.filter(part => part.type === 'text'), ...legacy]
+}
+
+function imagePartsCount(parts: readonly DisplayContentPart[]): number {
+  return parts.reduce((count, part) => count + (part.type === 'image' ? 1 : 0), 0)
+}
+
+/** Image fields to attach to an attempt item; `{}` for a text-only stream. */
+function streamImageFields(view: StreamPresentation): {
+  content?: readonly DisplayContentPart[]
+  imageCount?: number
+} {
+  const content = streamImageContent(view)
+  const count = Math.max(imagePartsCount(content), view.images?.length ?? 0)
+  if (count === 0) return {}
+  return { content, imageCount: count }
+}
+
+/**
+ * Split a settled message's content into reasoning runs: one run per maximal
+ * group of consecutive `reasoning` blocks, closed by the next text or tool-call
+ * block. This mirrors the live chunk rule so a settled item and the live
+ * preview of the same turn fold identically.
+ */
+function projectThinkingRuns(content: unknown): TranscriptThinkingRun[] {
+  const runs: TranscriptThinkingRun[] = []
+  let current: string[] | undefined
+  const flush = (): void => {
+    if (current === undefined) return
+    const text = current.join('\n\n')
+    if (text.trim() !== '') runs.push({ text })
+    current = undefined
+  }
+  for (const block of asArray(content)) {
+    if (!isRecord(block)) continue
+    const type = asString(block.type)
+    if (type === 'reasoning') {
+      const text = asString(block.text)
+      if (text === undefined) continue
+      if (current === undefined) current = []
+      current.push(text)
+      continue
+    }
+    if (type === 'text' || type === 'tool-call') flush()
+  }
+  flush()
+  return runs
 }
 
 interface FinalToolCall {
@@ -196,8 +375,14 @@ const SURFACE_MESSAGE_TYPES: ReadonlySet<string> = new Set([
 
 const EMPTY_STREAM: StreamPresentation = { text: '', thinking: '', toolNames: [] }
 
+/** One live todos block per transcript; the id keeps the view's block cache stable. */
+const TODOS_ITEM_ID = 'todos:current'
+
 function hasVisibleStream(view: StreamPresentation): boolean {
-  return view.text.trim() !== '' || view.thinking.trim() !== '' || view.toolNames.length > 0
+  if (view.text.trim() !== '' || view.thinking.trim() !== '' || view.toolNames.length > 0) return true
+  // A pure-image assistant turn is still real content; never drop it because
+  // it has no text. Legacy image counts are visible placeholders, not silence.
+  return streamImageContent(view).some(part => part.type === 'image') || (view.images?.length ?? 0) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +399,13 @@ interface LiveAttempt {
   /** Native stream projection; undefined when no codec was installed. */
   readonly stream: DisplayStream | undefined
   view: StreamPresentation
+  /**
+   * Reasoning runs of this attempt, built from the chunk sequence itself (the
+   * native snapshot only joins blocks into one string and drops boundaries).
+   */
+  runs: TranscriptThinkingRun[]
+  /** Index into `runs` of the run still receiving deltas, if any. */
+  openRun: number | undefined
   nextIndex: number
   chunkCount: number
   pendingSeq?: number
@@ -224,6 +416,11 @@ export interface TranscriptStoreOptions {
   onChange?: () => void
   /** Same codec `Backend.transcriptCodec` exposes; install before reset/ready. */
   codec?: TranscriptCodec
+  /**
+   * Clock for live reasoning-run durations. Defaults to `Date.now`; tests inject
+   * a deterministic reading so a run's elapsed time is reproducible.
+   */
+  now?: () => number
 }
 
 export class TranscriptStore {
@@ -233,6 +430,12 @@ export class TranscriptStore {
   private statusValue: 'running' | 'idle' = 'idle'
   private liveAttempt: LiveAttempt | undefined
   private codecValue: TranscriptCodec | undefined
+  private readonly clock: () => number
+  /**
+   * Event time of the current step, used only to derive an APPROXIMATE attempt
+   * duration for durable replays (resume). Never used to fake per-run timing.
+   */
+  private stepStartedAt: number | undefined
   private readonly processedSeqs = new Set<number>()
   private noticeCounter = 0
   private versionCounter = 0
@@ -242,9 +445,11 @@ export class TranscriptStore {
   constructor(options: TranscriptStoreOptions | (() => void) = {}) {
     if (typeof options === 'function') {
       this.onChange = options
+      this.clock = Date.now
     } else {
       this.onChange = options.onChange ?? (() => {})
       this.codecValue = options.codec
+      this.clock = options.now ?? Date.now
     }
   }
 
@@ -287,6 +492,7 @@ export class TranscriptStore {
   reset(info: SessionInfo): void {
     this.list = []
     this.liveAttempt = undefined
+    this.stepStartedAt = undefined
     this.processedSeqs.clear()
     this.infoValue = info
     this.sessionIdValue = info.sessionId
@@ -302,6 +508,7 @@ export class TranscriptStore {
   clear(): void {
     this.list = []
     this.liveAttempt = undefined
+    this.stepStartedAt = undefined
     this.notify()
   }
 
@@ -324,6 +531,10 @@ export class TranscriptStore {
       case 'stream_end':
         this.handleStreamEnd(event)
         return
+      case 'todos':
+        if (!this.isCurrent(event.sessionId)) return
+        this.applyTodos(event.value)
+        return
       case 'session_event':
         if (!this.isCurrent(event.sessionId)) return
         this.projectSessionEvent(event.event)
@@ -344,8 +555,11 @@ export class TranscriptStore {
       case 'permissions':
       case 'decision':
       case 'decision_closed':
-        // Controls and connection status are parent-owned; the transcript does
-        // not invent entries for control-plane messages.
+      case 'metrics':
+        // Controls, connection status and footer projections are parent-owned;
+        // the transcript does not invent entries for control-plane messages.
+        // `metrics` needs this explicit no-op: the store sees every frame before
+        // the app filters by session, so frames of any session must be swallowed.
         return
     }
   }
@@ -393,6 +607,8 @@ export class TranscriptStore {
       itemId,
       stream: this.codecValue?.createStream(),
       view: EMPTY_STREAM,
+      runs: [],
+      openRun: undefined,
       nextIndex: 0,
       chunkCount: 0,
       ended: false,
@@ -419,6 +635,7 @@ export class TranscriptStore {
     live.chunkCount += 1
     live.stream?.push(event.chunk)
     if (live.stream !== undefined) live.view = live.stream.snapshot()
+    this.trackThinkingRun(live, event.chunk)
     this.replaceItem(live.itemId, this.liveItem(live, live.pendingSeq === undefined ? 'streaming' : 'committing'))
     this.notify()
   }
@@ -430,6 +647,8 @@ export class TranscriptStore {
     if (!Number.isSafeInteger(event.revision) || event.revision <= live.revision) return
     live.revision = event.revision
     live.ended = true
+    // The stream is over: whatever run is still open stops accruing time now.
+    this.closeThinkingRun(live)
     if (event.outcome === 'committed') {
       if (event.seq !== undefined) live.pendingSeq = event.seq
       this.replaceItem(live.itemId, this.liveItem(live, 'committing'))
@@ -456,6 +675,8 @@ export class TranscriptStore {
       step: live.step,
       text: live.view.text,
       thinking: live.view.thinking,
+      ...(live.runs.length === 0 ? {} : { thinkingRuns: [...live.runs] }),
+      ...streamImageFields(live.view),
       toolNames: live.view.toolNames,
       status,
       tentative: true,
@@ -473,6 +694,8 @@ export class TranscriptStore {
       step: live.step,
       text: live.view.text,
       thinking: live.view.thinking,
+      ...(live.runs.length === 0 ? {} : { thinkingRuns: [...live.runs] }),
+      ...streamImageFields(live.view),
       toolNames: live.view.toolNames,
       status,
       tentative,
@@ -523,8 +746,94 @@ export class TranscriptStore {
     const live = this.liveAttempt
     if (live === undefined) return
     this.liveAttempt = undefined
+    // An attempt nobody settled can no longer accrue reasoning time.
+    this.closeThinkingRun(live)
     this.removeLiveItem(live)
     if (hasVisibleStream(live.view)) this.list.push(this.attemptItem(live, 'unknown', true))
+  }
+
+  // -------------------------------------------------------------------------
+  // Live reasoning runs
+
+  /**
+   * Follow the raw chunk sequence to keep per-run reasoning boundaries.
+   *
+   * The native snapshot only joins reasoning blocks into one string, so the
+   * run structure (and therefore `n more lines` per thought) has to be read
+   * from the chunks themselves. Only the store's own accepted frames reach
+   * this method, so stale/duplicate replays never affect it.
+   */
+  private trackThinkingRun(live: LiveAttempt, chunk: JsonRecord): void {
+    const type = asString(chunk.type)
+    const text = asString(chunk.text) ?? ''
+    switch (type) {
+      case 'block-start': {
+        const blockType = asString(chunk.blockType)
+        if (blockType === 'reasoning') this.openThinkingRun(live)
+        else if (blockType === 'text' || blockType === 'tool-call') this.closeThinkingRun(live)
+        return
+      }
+      case 'reasoning-delta':
+        if (text === '') return
+        this.appendThinkingRun(live, text)
+        return
+      case 'block-end': {
+        // Delta-only protocols may deliver the finished block instead of deltas.
+        const block = isRecord(chunk.block) ? chunk.block : undefined
+        const blockType = block === undefined ? undefined : asString(block.type)
+        if (blockType === 'reasoning') {
+          const finalText = block === undefined ? '' : asString(block.text) ?? ''
+          const openText = live.openRun === undefined ? '' : live.runs[live.openRun]?.text ?? ''
+          if (finalText !== '' && openText === '') this.appendThinkingRun(live, finalText)
+          return
+        }
+        if (blockType === 'text' || blockType === 'tool-call') this.closeThinkingRun(live)
+        return
+      }
+      case 'text-delta':
+        // Whitespace-only deltas belong to formatting, not to a new phase.
+        if (text.trim() === '') return
+        this.closeThinkingRun(live)
+        return
+      case 'tool-call-delta':
+        // A name-bearing tool delta is the first content of a tool-call block.
+        if (asString(chunk.name) !== undefined) this.closeThinkingRun(live)
+        return
+      default:
+        return
+    }
+  }
+
+  private openThinkingRun(live: LiveAttempt): void {
+    if (live.openRun !== undefined) return
+    live.runs.push({ text: '', startedAt: this.clock() })
+    live.openRun = live.runs.length - 1
+  }
+
+  private appendThinkingRun(live: LiveAttempt, text: string): void {
+    if (live.openRun === undefined) this.openThinkingRun(live)
+    const index = live.openRun
+    if (index === undefined) return
+    const current = live.runs[index]
+    if (current === undefined) return
+    live.runs[index] = { text: current.text + text, startedAt: current.startedAt ?? this.clock() }
+  }
+
+  /**
+   * Freeze one run's duration. A measurement below one millisecond is dropped
+   * rather than reported as `0ms`: the clock simply did not advance, which is
+   * not a duration claim, and it keeps a settled item identical to the live
+   * frame it replaces.
+   */
+  private closeThinkingRun(live: LiveAttempt): void {
+    const index = live.openRun
+    if (index === undefined) return
+    live.openRun = undefined
+    const run = live.runs[index]
+    if (run === undefined) return
+    const started = run.startedAt
+    const elapsed = started === undefined ? undefined : this.clock() - started
+    live.runs[index] = { text: run.text, ...(elapsed !== undefined && elapsed > 0 ? { durationMs: elapsed } : {}) }
   }
 
   // -------------------------------------------------------------------------
@@ -569,24 +878,27 @@ export class TranscriptStore {
         return
       }
       case 'assistant/message': {
-        this.projectAssistantMessage(seq, data)
+        this.projectAssistantMessage(seq, data, asNumber(event.time))
         return
       }
       case 'assistant/attempt': {
-        this.projectAssistantAttempt(seq, data)
+        this.projectAssistantAttempt(seq, data, asNumber(event.time))
         return
       }
       case 'tool/call': {
-        this.upsertToolCall(seq, data, presentation)
+        this.upsertToolCall(seq, data, presentation, eventClock(event.time))
         return
       }
       case 'tool/result': {
-        this.applyToolResult(seq, data, presentation)
+        this.applyToolResult(seq, data, presentation, eventClock(event.time))
         return
       }
       case 'turn/start':
       case 'step/start':
         this.statusValue = 'running'
+        // Start of the step's own clock, used only for the approximate
+        // attempt-level duration of a durable replay (see approximateRuns).
+        this.stepStartedAt = asNumber(event.time) ?? this.stepStartedAt
         return
       case 'turn/end':
         // Turn-end reasons are parent/status concerns. Failures already arrive
@@ -619,25 +931,48 @@ export class TranscriptStore {
       seq,
       text: blocks.text,
       imageCount: blocks.images,
+      ...(blocks.images > 0 ? { content: blocks.content } : {}),
       version: ++this.versionCounter,
     })
   }
 
-  private projectAssistantMessage(seq: number, data: Record<string, unknown>): void {
+  /**
+   * Approximate a durable reasoning duration for resume replay.
+   *
+   * A durable assistant message/attempt carries no per-run timing (the codec's
+   * `StreamPresentation` only exposes joined text), so the only honest number
+   * available is the step window: `step/start` time -> settlement time. It is
+   * applied only when the message has exactly one reasoning run, where that
+   * window really is the thinking attempt. Otherwise every run keeps no
+   * duration and the UI prints a plain `✻ Thought`.
+   */
+  private approximateRuns(runs: TranscriptThinkingRun[], settledAt: number | undefined): TranscriptThinkingRun[] {
+    if (runs.length !== 1) return runs
+    const startedAt = this.stepStartedAt
+    if (startedAt === undefined || settledAt === undefined) return runs
+    const duration = settledAt - startedAt
+    if (!Number.isFinite(duration) || duration <= 0) return runs
+    return [{ ...runs[0]!, durationMs: duration }]
+  }
+
+  private projectAssistantMessage(seq: number, data: Record<string, unknown>, settledAt: number | undefined): void {
     const turn = asNumber(data.turn)
     const step = asNumber(data.step)
     const index = this.settleLive(seq, turn, step)
     const message = isRecord(data.message) ? data.message : {}
     const blocks = projectBlocks(message.content)
+    const runs = this.approximateRuns(projectThinkingRuns(message.content), settledAt)
     const tools = projectMessageTools(message.content)
     const items: TranscriptItem[] = []
-    if (blocks.text.trim() !== '' || blocks.thinking.trim() !== '') {
+    if (blocks.text.trim() !== '' || blocks.thinking.trim() !== '' || blocks.images > 0) {
       items.push({
         kind: 'assistant',
         id: `assistant:${seq}`,
         seq,
         text: blocks.text,
         thinking: blocks.thinking,
+        ...(runs.length === 0 ? {} : { thinkingRuns: runs }),
+        ...(blocks.images > 0 ? { content: blocks.content, imageCount: blocks.images } : {}),
         interrupted: data.interrupted === true,
         version: ++this.versionCounter,
       })
@@ -647,8 +982,11 @@ export class TranscriptStore {
       items.push(this.newToolItem({
         callId: tool.id,
         seq,
+        turn: asIndex(data.turn),
+        step: asIndex(data.step),
         name: tool.name,
         arguments: tool.arguments,
+        // Keep the declaration's native boundary without claiming admission.
         // The model proposed this call; DSH has not admitted it yet.
         status: 'proposed',
       }))
@@ -657,12 +995,16 @@ export class TranscriptStore {
     else this.list.splice(index, 0, ...items)
   }
 
-  private projectAssistantAttempt(seq: number, data: Record<string, unknown>): void {
+  private projectAssistantAttempt(seq: number, data: Record<string, unknown>, settledAt: number | undefined): void {
     const turn = asNumber(data.turn)
     const step = asNumber(data.step)
     const index = this.settleLive(seq, turn, step)
     const view = this.codecValue?.assemble(data.stream, true) ?? EMPTY_STREAM
     if (!hasVisibleStream(view)) return
+    const runs = view.thinking.trim() === ''
+      ? []
+      : this.approximateRuns([{ text: view.thinking }], settledAt)
+    const images = streamImageFields(view)
     const item: AttemptTranscriptItem = {
       kind: 'attempt',
       id: `attempt:${seq}`,
@@ -671,6 +1013,8 @@ export class TranscriptStore {
       step: step ?? 0,
       text: view.text,
       thinking: view.thinking,
+      ...(runs.length === 0 ? {} : { thinkingRuns: runs }),
+      ...images,
       toolNames: view.toolNames,
       status: 'abandoned',
       tentative: false,
@@ -683,27 +1027,47 @@ export class TranscriptStore {
   private newToolItem(fields: {
     callId: string
     seq?: number
+    callSeq?: number
+    resultSeq?: number
+    turn?: number
+    step?: number
+    startedAt?: number
+    settledAt?: number
     name: string
     arguments: string
     status: ToolTranscriptStatus
     resultText?: string
     resultImages?: number
+    resultContentParts?: readonly DisplayContentPart[]
     resultIsError?: boolean
+    resultContent?: readonly unknown[]
+    rawResult?: JsonRecord
     meta?: unknown
     presentation?: JsonRecord
     error?: ToolTranscriptItem['error']
   }): ToolTranscriptItem {
+    const durationMs = toolDuration(fields.startedAt, fields.settledAt)
     return {
       kind: 'tool',
       id: `tool:${fields.callId}`,
       callId: fields.callId,
       ...(fields.seq === undefined ? {} : { seq: fields.seq }),
+      ...(fields.callSeq === undefined ? {} : { callSeq: fields.callSeq }),
+      ...(fields.resultSeq === undefined ? {} : { resultSeq: fields.resultSeq }),
+      ...(fields.turn === undefined ? {} : { turn: fields.turn }),
+      ...(fields.step === undefined ? {} : { step: fields.step }),
+      ...(fields.startedAt === undefined ? {} : { startedAt: fields.startedAt }),
+      ...(fields.settledAt === undefined ? {} : { settledAt: fields.settledAt }),
+      ...(durationMs === undefined ? {} : { durationMs }),
       name: fields.name,
       arguments: fields.arguments,
       status: fields.status,
       resultText: fields.resultText ?? '',
       resultImages: fields.resultImages ?? 0,
+      ...(fields.resultContentParts === undefined ? {} : { resultContentParts: fields.resultContentParts }),
       resultIsError: fields.resultIsError ?? false,
+      ...(fields.resultContent === undefined ? {} : { resultContent: fields.resultContent }),
+      ...(fields.rawResult === undefined ? {} : { rawResult: fields.rawResult }),
       meta: fields.meta,
       ...(fields.presentation === undefined ? {} : { presentation: fields.presentation }),
       ...(fields.error === undefined ? {} : { error: fields.error }),
@@ -711,16 +1075,33 @@ export class TranscriptStore {
     }
   }
 
-  private upsertToolCall(seq: number, data: Record<string, unknown>, presentation: JsonRecord | undefined): void {
+  /**
+   * `tool/call` is the durable admission fact. Applying the same call twice is
+   * idempotent: the first accepted event owns the real start time, name and
+   * arguments, so a duplicate or delayed copy can only fill what is still
+   * missing. It never rewrites an established outcome, result or timestamp.
+   */
+  private upsertToolCall(
+    seq: number,
+    data: Record<string, unknown>,
+    presentation: JsonRecord | undefined,
+    startedAt: number | undefined,
+  ): void {
     const callId = asString(data.callId)
     if (callId === undefined || callId === '') return
     const name = asString(data.name) ?? 'tool'
     const args = asString(data.arguments) ?? ''
+    const turn = asIndex(data.turn)
+    const step = asIndex(data.step)
     const index = this.list.findIndex(item => item.kind === 'tool' && item.id === `tool:${callId}`)
     if (index < 0) {
       this.list.push(this.newToolItem({
         callId,
         seq,
+        callSeq: seq,
+        ...(turn === undefined ? {} : { turn }),
+        ...(step === undefined ? {} : { step }),
+        ...(startedAt === undefined ? {} : { startedAt }),
         name,
         arguments: args,
         // DSH admitted the call at its durable log position.
@@ -731,10 +1112,26 @@ export class TranscriptStore {
     }
     const current = this.list[index]
     if (current?.kind !== 'tool') return
+    // A result that arrived first (window missing the call, or an async event
+    // order) still gets its real name/input/time from this late call, but its
+    // done/error outcome is stable. A model proposal is promoted to running.
+    // Only the first accepted call supplies identity and timing: duplicates and
+    // delayed copies can never re-date or rename an established call.
+    const firstCall = current.callSeq === undefined
+    const callSeq = current.callSeq ?? seq
+    const callStartedAt = firstCall ? startedAt : current.startedAt
+    const resolvedTurn = firstCall ? turn ?? current.turn : current.turn
+    const resolvedStep = firstCall ? step ?? current.step : current.step
+    const durationMs = toolDuration(callStartedAt, current.settledAt)
     this.list[index] = {
       ...current,
-      name,
-      arguments: args,
+      callSeq,
+      ...(resolvedTurn === undefined ? {} : { turn: resolvedTurn }),
+      ...(resolvedStep === undefined ? {} : { step: resolvedStep }),
+      ...(callStartedAt === undefined ? {} : { startedAt: callStartedAt }),
+      ...(durationMs === undefined ? {} : { durationMs }),
+      name: firstCall ? name : current.name,
+      arguments: firstCall ? args : current.arguments,
       seq: current.seq ?? seq,
       // A late duplicate call must not overwrite an already-settled result.
       status: current.status === 'proposed' ? 'running' : current.status,
@@ -743,13 +1140,25 @@ export class TranscriptStore {
     }
   }
 
-  private applyToolResult(seq: number, data: Record<string, unknown>, presentation: JsonRecord | undefined): void {
+  /**
+   * `tool/result` is the durable settlement fact. The first accepted result owns
+   * the settlement time, content blocks, raw envelope and outcome; a duplicate
+   * or delayed copy (same callId) cannot rewrite them later. Native presentation
+   * intent stays display-only and never becomes a tool identity.
+   */
+  private applyToolResult(
+    seq: number,
+    data: Record<string, unknown>,
+    presentation: JsonRecord | undefined,
+    settledAt: number | undefined,
+  ): void {
     const message = isRecord(data.message) ? data.message : {}
     const source = isRecord(message.source) ? message.source : undefined
     const callId = asString(message.toolCallId) ?? (source === undefined ? undefined : asString(source.callId))
     if (callId === undefined || callId === '') return
     const blocks = projectBlocks(message.content)
     const isError = message.isError === true
+    const content = Array.isArray(message.content) ? message.content : undefined
     const errorValue = isRecord(data.error) ? data.error : undefined
     const reason = errorValue === undefined ? undefined : asString(errorValue.reason)
     const error = errorValue === undefined
@@ -759,17 +1168,29 @@ export class TranscriptStore {
           code: asString(errorValue.code) ?? '',
           ...(reason === undefined ? {} : { reason }),
         }
+    const turn = asIndex(data.turn)
+    const step = asIndex(data.step)
     const index = this.list.findIndex(item => item.kind === 'tool' && item.id === `tool:${callId}`)
     if (index < 0) {
+      // The durable window may not include the call (truncated replay): keep the
+      // result truthful, but leave the identity/input missing rather than
+      // guessing them from a presentation title.
       this.list.push(this.newToolItem({
         callId,
         seq,
+        resultSeq: seq,
+        ...(turn === undefined ? {} : { turn }),
+        ...(step === undefined ? {} : { step }),
+        ...(settledAt === undefined ? {} : { settledAt }),
         name: 'tool',
         arguments: '',
         status: isError ? 'error' : 'done',
         resultText: blocks.text,
         resultImages: blocks.images,
+        ...(blocks.images > 0 ? { resultContentParts: blocks.content } : {}),
         resultIsError: isError,
+        ...(content === undefined ? {} : { resultContent: content }),
+        rawResult: data,
         meta: data.meta,
         ...(presentation === undefined ? {} : { presentation }),
         ...(error === undefined ? {} : { error }),
@@ -778,18 +1199,55 @@ export class TranscriptStore {
     }
     const current = this.list[index]
     if (current?.kind !== 'tool') return
+    // The first result is the stable settlement; nothing older or repeated may
+    // replace its time, raw blocks or outcome.
+    if (current.resultSeq !== undefined) return
+    const durationMs = toolDuration(current.startedAt, settledAt)
+    const resolvedTurn = current.turn ?? turn
+    const resolvedStep = current.step ?? step
     this.list[index] = {
       ...current,
+      resultSeq: seq,
+      ...(resolvedTurn === undefined ? {} : { turn: resolvedTurn }),
+      ...(resolvedStep === undefined ? {} : { step: resolvedStep }),
+      ...(settledAt === undefined ? {} : { settledAt }),
+      ...(durationMs === undefined ? {} : { durationMs }),
       seq: current.seq ?? seq,
       status: isError ? 'error' : 'done',
       resultText: blocks.text,
       resultImages: blocks.images,
+      ...(blocks.images > 0 ? { resultContentParts: blocks.content } : {}),
       resultIsError: isError,
+      ...(content === undefined ? {} : { resultContent: content }),
+      rawResult: data,
       meta: data.meta,
       presentation: mergePresentation(current.presentation, presentation),
       ...(error === undefined ? {} : { error }),
       version: ++this.versionCounter,
     }
+  }
+
+  /**
+   * DSH's native `todos` projection is the whole live checklist of a turn, so
+   * it is one item: append it once, replace it in place afterwards, and drop it
+   * when the fold reports null. The statuses are DSH's; nothing is inferred.
+   */
+  private applyTodos(value: TodosSnapshot): void {
+    const index = this.list.findIndex(item => item.kind === 'todos')
+    if (value === null) {
+      if (index >= 0) this.list.splice(index, 1)
+      this.notify()
+      return
+    }
+    const item: TodosTranscriptItem = {
+      kind: 'todos',
+      id: TODOS_ITEM_ID,
+      todos: value.map(todo => ({ content: todo.content, status: todo.status })),
+      version: ++this.versionCounter,
+    }
+    if (index < 0) this.list.push(item)
+    else this.list[index] = item
+    this.notify()
   }
 
   private notify(): void {

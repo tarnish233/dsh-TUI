@@ -9,7 +9,7 @@
 import { createRequire } from "node:module"
 import path from "node:path"
 
-import type { EditorTheme, SelectListTheme, TUI } from "@earendil-works/pi-tui"
+import type { EditorTheme, SelectListTheme, TUI } from "#pi-tui"
 
 export type InputModule = typeof import("../index.ts")
 
@@ -25,7 +25,7 @@ let prepared: PreparedPi | undefined
 export async function ensurePatchedPi(): Promise<PreparedPi> {
   if (prepared) return prepared
   const require = createRequire(import.meta.url)
-  const packageDir = path.dirname(require.resolve("@earendil-works/pi-tui/package.json"))
+  const packageDir = path.dirname(require.resolve("#pi-tui/package.json"))
   prepared = { packageDir, installedPatched: true }
   return prepared
 }

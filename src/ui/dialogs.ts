@@ -9,15 +9,30 @@
  *
  * Constructors (exact):
  *
- *   new SelectDialog(tui, { title, items, onSelect, onCancel, keymap? })
+ *   new SelectDialog(tui, { title, items, onSelect, onCancel, onInterrupt?, keymap? })
  *
  *   new DecisionDialog(tui, {
- *     request, onSubmit, onCancel, keymap?
+ *     request, onSubmit, onCancel, onInterrupt?, keymap?
  *   })
  *
  * DecisionDialog returns exactly what the backend contract expects:
  *   approval -> the selected option's opaque `value`
  *   question -> { answers: (string | string[])[] } in question order
+ *
+ * Cancellation routing (shared keymap, never a hardcoded key):
+ *   - `app.interrupt` (Ctrl+C by default) is global turn cancellation and only
+ *     calls `onInterrupt`. It never responds with `{cancelled:true}` and never
+ *     invents a local answer; the parent's `backend.cancel()` settles the
+ *     request natively and closes the surface.
+ *   - an approval's local cancel (Esc/list.cancel/dialog.cancel/app.cancel)
+ *     submits the request's own rejected opaque option, so the native decision
+ *     settles as `rejected` instead of cancelling the turn or leaving the tool
+ *     pending. Only when no rejection option exists does it fall back to
+ *     `onCancel` (the parent must still settle that request).
+ *   - a question's local cancel dismisses the surface through `onCancel`
+ *     without answering and without marking the dialog done, so the same
+ *     instance (selection, checks, custom draft and confirmed text) can be
+ *     reopened while the backend request stays pending.
  *
  * The custom answer row uses the same shared keymap through CcEditor, so
  * editor-context typing, word kill, yank and user overrides work without a
@@ -30,13 +45,15 @@
 import {
   type Component,
   type Focusable,
+  type KeyId,
+  Markdown,
   matchesKey,
   type TUI,
-} from '@earendil-works/pi-tui'
+} from '#pi-tui'
 import type { DecisionOption, DecisionRequest, Question } from '../backend/types.ts'
 import { createCcKeymap, type CcKeymap } from '../input/index.ts'
 import { InlineAnswer } from './inline-editor.ts'
-import { bold, cc, dim, t } from './theme.ts'
+import { bold, cc, dim, markdownTheme, t } from './theme.ts'
 import { fit, truncateToWidth, visibleWidth, wrap } from './text.ts'
 
 // ---------------------------------------------------------------------------
@@ -62,16 +79,54 @@ export function listAction(keymap: CcKeymap, data: string): ResolvedDialogAction
   const list = keymap.resolve(data, 'list')
   if (list.kind === 'action') {
     const id = list.action.id
-    if (id.startsWith('list.') || isCancelAction(id)) return actionOf(list)
+    if (id.startsWith('list.') || isCancelAction(id) || isInterruptAction(id)) return actionOf(list)
     // Another global/app action (help, expand, …) is not a list action.
     return undefined
   }
   if (list.kind !== 'none') return undefined
   const dialog = keymap.resolve(data, 'dialog')
-  if (dialog.kind === 'action' && (dialog.action.id === 'dialog.confirm' || dialog.action.id === 'dialog.cancel')) {
+  if (dialog.kind === 'action' && (dialog.action.id === 'dialog.confirm' || dialog.action.id === 'dialog.cancel' || dialog.action.id === 'app.interrupt')) {
     return actionOf(dialog)
   }
   return undefined
+}
+
+/**
+ * Interrupt priority inside a modal surface.
+ *
+ * The shared registry also binds Ctrl+C to `list.cancel`/`dialog.cancel`, and a
+ * list-context resolve would win over the global `app.interrupt` action. Global
+ * turn cancellation must stay distinguishable from local dismissal, so an
+ * effective single-key binding of `app.interrupt` is checked first. It is never
+ * a literal `ctrl+c` test: rebinding or disabling `app.interrupt` changes this,
+ * and a chord-bound interrupt is left to normal keymap resolution.
+ */
+export function isInterruptKey(keymap: CcKeymap, data: string): boolean {
+  if (keymap.isPendingChord()) return false
+  return keymap
+    .getBindings('app.interrupt')
+    .some(binding => !binding.includes(' ') && matchesKey(data, binding as KeyId))
+}
+
+const REJECT_WORDS = /^(reject|rejected|deny|denied|decline|declined|no|cancel|cancelled)$/i
+
+/** True when an approval option's opaque value means "reject" (not "cancel"). */
+function isRejectedValue(value: unknown): boolean {
+  if (typeof value === 'string') return REJECT_WORDS.test(value.trim())
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  if (record.reject === true || record.rejected === true || record.allow === false) return true
+  return typeof record.outcome === 'string' && REJECT_WORDS.test(record.outcome.trim())
+}
+
+/**
+ * The request's own rejected option, by opaque value first and label second.
+ * Undefined means this request has no rejection option, which is not the same as
+ * a cancelled turn: the caller falls back to the parent's local cancel handler.
+ */
+export function rejectedOption(items: readonly DecisionOption[]): DecisionOption | undefined {
+  return items.find(item => isRejectedValue(item.value))
+    ?? items.find(item => REJECT_WORDS.test(item.label.trim()))
 }
 
 const digitOf = (action: ResolvedDialogAction): number | undefined => {
@@ -80,7 +135,8 @@ const digitOf = (action: ResolvedDialogAction): number | undefined => {
 }
 
 const isCancelAction = (id: string): boolean =>
-  id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel' || id === 'app.interrupt'
+  id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel'
+const isInterruptAction = (id: string): boolean => id === 'app.interrupt'
 const isSelectAction = (id: string): boolean => id === 'list.select' || id === 'dialog.confirm'
 
 const isTab = (data: string): boolean => matchesKey(data, 'tab')
@@ -91,6 +147,15 @@ const isSpace = (data: string): boolean => matchesKey(data, 'space')
 // Layout helpers
 
 const rule = (width: number): string => cc.inactive('─'.repeat(Math.max(1, width)))
+
+/**
+ * Long-form question body (`detail`): the native plan review carries the whole
+ * plan markdown here. Presentation only — the text is DSH's, the TUI renders it.
+ */
+const questionDetail = (question: Question): string | undefined => {
+  const detail = question.detail
+  return typeof detail === 'string' && detail.trim() !== '' ? detail : undefined
+}
 const hints = (parts: string[]): string => dim(cc.inactive(parts.join(' · ')))
 const pointer = (focused: boolean): string => (focused ? cc.suggestion('❯') : ' ')
 const numberLabel = (value: number, numberWidth: number): string => dim(`${value}.`.padEnd(numberWidth + 1))
@@ -177,6 +242,11 @@ export interface SelectDialogOptions {
   items: DecisionOption[]
   onSelect: (value: unknown) => void
   onCancel: () => void
+  /**
+   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). When omitted
+   * the interrupt key closes this surface through `onCancel`.
+   */
+  onInterrupt?: () => void
   /** Shared keymap from the input subsystem. A default CC keymap is used when omitted. */
   keymap?: CcKeymap
 }
@@ -225,6 +295,13 @@ export class SelectDialog implements Component, Focusable {
     this.options.onCancel()
   }
 
+  /** Global interrupt: never converted into a local select/cancel answer. */
+  private interrupt(): void {
+    this.keymap.cancelChord()
+    if (this.options.onInterrupt !== undefined) this.options.onInterrupt()
+    else this.cancel()
+  }
+
   private move(delta: number): void {
     const count = this.options.items.length
     if (count === 0) return
@@ -233,8 +310,16 @@ export class SelectDialog implements Component, Focusable {
 
   handleInput(raw: string): void {
     if (this.done) return
+    if (isInterruptKey(this.keymap, raw)) {
+      this.interrupt()
+      return
+    }
     const action = listAction(this.keymap, raw)
     if (action === undefined) return
+    if (isInterruptAction(action.id)) {
+      this.interrupt()
+      return
+    }
     if (isCancelAction(action.id)) {
       this.cancel()
       return
@@ -285,7 +370,19 @@ interface QuestionState {
 export interface DecisionDialogOptions {
   request: DecisionRequest
   onSubmit: (value: unknown) => void
+  /**
+   * Local dismissal of the surface. For a question this must NOT settle the
+   * backend request: the parent keeps it pending and can reopen the same
+   * dialog instance. For an approval it is only reached when the request has
+   * no identifiable rejected option, and then the parent must still settle it.
+   */
   onCancel: () => void
+  /**
+   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). The dialog
+   * never converts this into `onCancel` or a cancelled answer; the parent runs
+   * `backend.cancel()` and the native decision closure closes the surface.
+   */
+  onInterrupt?: () => void
   /** Shared keymap from the input subsystem. A default CC keymap is used when omitted. */
   keymap?: CcKeymap
 }
@@ -298,12 +395,16 @@ export class DecisionDialog implements Component, Focusable {
   private readonly options: DecisionDialogOptions
   private readonly questions: readonly Question[]
   private readonly states: QuestionState[]
+  /** One markdown renderer for the current question's `detail` body. */
+  private readonly detailMarkdown = new Markdown('', 0, 0, markdownTheme)
   private readonly approvalItems: readonly DecisionOption[]
   private approvalIndex = 0
   private tab = 0
   private reviewFocus = 0
   private focusedState = false
   private done = false
+  private dismissedState = false
+  private disposedState = false
 
   constructor(tui: TUI, options: DecisionDialogOptions) {
     this.tui = tui
@@ -330,7 +431,35 @@ export class DecisionDialog implements Component, Focusable {
     if (value === this.focusedState) return
     this.keymap.cancelChord()
     this.focusedState = value
+    if (value) this.dismissedState = false
     this.syncFocus()
+  }
+
+  /** True after a question was locally dismissed; the request is still pending. */
+  get dismissed(): boolean {
+    return this.dismissedState
+  }
+
+  /** True once every inline editor released its shared-keymap listener. */
+  get isDisposed(): boolean {
+    return this.disposedState
+  }
+
+  /**
+   * Release the custom-answer editors (and their shared-keymap chord
+   * listeners). Call this after a settled decision closure, session reset or
+   * shutdown. Do NOT call it merely because a question was hidden with Esc: a
+   * hidden question stays pending and is reopened with the same instance, so
+   * transient checks, selection, draft and confirmed text must survive. Idempotent.
+   */
+  dispose(): void {
+    if (this.disposedState) return
+    this.disposedState = true
+    // The keymap is shared by every surface: only the surface that currently
+    // owns input may cancel a pending chord. Disposing an inactive (hidden)
+    // dialog must not steal a half-typed chord from the focused prompt.
+    if (this.focusedState) this.keymap.cancelChord()
+    for (const state of this.states) state.answer.dispose()
   }
 
   /** Parent hook for focus changes; safe to call repeatedly. */
@@ -339,6 +468,8 @@ export class DecisionDialog implements Component, Focusable {
   }
 
   invalidate(): void {
+    // The theme may have changed: the detail body styles markdown too.
+    this.detailMarkdown.invalidate()
     for (const state of this.states) state.answer.invalidate()
   }
 
@@ -386,11 +517,30 @@ export class DecisionDialog implements Component, Focusable {
     return !this.isApproval && !this.onReview && this.state.focus === this.customRow()
   }
 
+  /**
+   * The custom answer the dialog would return for this question.
+   *
+   * One rule for single- and multi-select: the live editor text is effective
+   * while it exists, and a confirmed text (stored before CcEditor clears its
+   * buffer on submit) stays effective afterwards. A draft is therefore never
+   * dropped just because the editor was cleared or the tab was left.
+   */
+  private effectiveText(state: QuestionState): string {
+    return state.answer.text !== '' ? state.answer.text : state.customText
+  }
+
   private syncFocus(): void {
     this.states.forEach((state, index) => {
       const question = this.questions[index]
       const customRow = question?.options.length ?? -1
-      state.answer.focused = this.focusedState && !this.isApproval && !this.onReview && index === this.tab && state.focus === customRow
+      const focused = this.focusedState && !this.isApproval && !this.onReview && index === this.tab && state.focus === customRow
+      // Re-entering a confirmed custom row restores its text into the single
+      // editor state, so revisiting a question shows (and can edit) the real
+      // answer instead of an empty editor with a check mark.
+      if (focused && !state.answer.editor.focused && state.answer.empty && state.customText !== '') {
+        state.answer.editor.replaceDraftText(state.customText)
+      }
+      state.answer.focused = focused
     })
   }
 
@@ -421,11 +571,45 @@ export class DecisionDialog implements Component, Focusable {
     this.options.onSubmit({ answers: this.answers() })
   }
 
+  /** Approval local cancel: settle with this request's own rejected option. */
+  private rejectApproval(): void {
+    const rejected = rejectedOption(this.approvalItems)
+    if (rejected !== undefined) {
+      this.finishApproval(rejected.value)
+      return
+    }
+    // No rejection option in this request: the parent's local cancel handler
+    // must still settle the request instead of leaving the tool pending.
+    this.cancel()
+  }
+
+  /** Approval fallback only; a question dismissal never marks the dialog done. */
   private cancel(): void {
     if (this.done) return
     this.done = true
     this.syncFocus()
     this.options.onCancel()
+  }
+
+  /**
+   * Question local dismissal: hide the surface without answering and without
+   * accepting a cancellation answer. The request stays pending and this same
+   * instance keeps its checks, selection, draft and confirmed text.
+   */
+  private dismissQuestion(): void {
+    if (this.done) return
+    this.keymap.cancelChord()
+    this.dismissedState = true
+    this.syncFocus()
+    this.options.onCancel()
+  }
+
+  /** Global interrupt: never turned into a local decision answer. */
+  private interrupt(): void {
+    if (this.done) return
+    if (this.options.onInterrupt === undefined) return
+    this.keymap.cancelChord()
+    this.options.onInterrupt()
   }
 
   private finishApproval(value: unknown): void {
@@ -437,15 +621,19 @@ export class DecisionDialog implements Component, Focusable {
   private answers(): (string | string[])[] {
     return this.questions.map((question, index) => {
       const state = this.states[index]!
-      const text = state.answer.text !== '' ? state.answer.text : state.customText
+      const text = this.effectiveText(state)
       if (question.multiSelect === true) {
         const values = [...state.checked].sort((a, b) => a - b).map(option => question.options[option]?.label ?? '').filter(label => label !== '')
         if (text !== '') values.push(text)
         return values
       }
+      // An explicitly submitted custom answer replaces the selection.
       if (state.custom && text !== '') return text
       if (state.selected !== undefined) return question.options[state.selected]?.label ?? ''
-      return ''
+      // A typed-but-not-submitted draft is still the only input this question
+      // has, so it is returned rather than silently dropped. Empty stays empty:
+      // DSH permits unanswered questions and this dialog does not require them.
+      return text
     })
   }
 
@@ -457,7 +645,7 @@ export class DecisionDialog implements Component, Focusable {
   }
 
   private chooseCustom(text?: string): void {
-    const value = text ?? (this.state.answer.text !== '' ? this.state.answer.text : this.state.customText)
+    const value = text ?? this.effectiveText(this.state)
     if (value === '') return
     this.state.customText = value
     this.state.custom = true
@@ -474,7 +662,17 @@ export class DecisionDialog implements Component, Focusable {
   // Input
 
   handleInput(raw: string): void {
-    if (this.done) return
+    if (this.done || this.disposedState) return
+    // A bracketed paste owns its bytes; it is never an interrupt or a decision
+    // answer, so it goes straight to the single editor state.
+    if (this.editing() && this.state.answer.editor.isPasting()) {
+      this.editorKey(raw)
+      return
+    }
+    if (isInterruptKey(this.keymap, raw)) {
+      this.interrupt()
+      return
+    }
     if (this.isApproval) {
       this.approvalKey(raw)
       return
@@ -494,8 +692,13 @@ export class DecisionDialog implements Component, Focusable {
     const action = listAction(this.keymap, raw)
     if (action === undefined) return
     const count = this.approvalItems.length
+    if (isInterruptAction(action.id)) {
+      this.interrupt()
+      return
+    }
     if (isCancelAction(action.id)) {
-      this.cancel()
+      // Esc/local cancel on an approval is a rejection, not a turn cancellation.
+      this.rejectApproval()
       return
     }
     if (action.id === 'list.previous' && count > 0) this.approvalIndex = (this.approvalIndex - 1 + count) % count
@@ -532,8 +735,12 @@ export class DecisionDialog implements Component, Focusable {
   }
 
   private applyQuestionAction(action: ResolvedDialogAction): void {
+    if (isInterruptAction(action.id)) {
+      this.interrupt()
+      return
+    }
     if (isCancelAction(action.id)) {
-      this.cancel()
+      this.dismissQuestion()
       return
     }
     const state = this.state
@@ -583,18 +790,22 @@ export class DecisionDialog implements Component, Focusable {
     const state = this.state
     const result = state.answer.handleKey(raw)
     switch (result) {
+      case 'interrupt':
+        this.interrupt()
+        return
       case 'cancel':
-        this.cancel()
+        this.dismissQuestion()
         return
       case 'submit': {
         const submitted = state.answer.lastSubmittedText ?? state.answer.text
-        if (submitted === '') {
+        const text = submitted !== '' ? submitted : this.effectiveText(state)
+        if (text === '') {
           if (this.question.multiSelect === true) this.setFocus(this.nextRow())
           return
         }
-        state.customText = submitted
+        state.customText = text
         if (this.question.multiSelect === true) this.advance()
-        else this.chooseCustom(submitted)
+        else this.chooseCustom(text)
         return
       }
       case 'tab':
@@ -615,8 +826,12 @@ export class DecisionDialog implements Component, Focusable {
   private reviewKey(raw: string): void {
     const action = listAction(this.keymap, raw)
     if (action !== undefined) {
+      if (isInterruptAction(action.id)) {
+        this.interrupt()
+        return
+      }
       if (isCancelAction(action.id)) {
-        this.cancel()
+        this.dismissQuestion()
         return
       }
       if (action.id === 'list.previous' || action.id === 'list.next') {
@@ -633,13 +848,13 @@ export class DecisionDialog implements Component, Focusable {
       }
       if (isSelectAction(action.id)) {
         if (this.reviewFocus === 0) this.submit()
-        else this.cancel()
+        else this.dismissQuestion()
         return
       }
       if (action.id === 'list.select-digit') {
         const number = digitOf(action)
         if (number === 1) this.submit()
-        else if (number === 2) this.cancel()
+        else if (number === 2) this.dismissQuestion()
       }
       return
     }
@@ -657,7 +872,7 @@ export class DecisionDialog implements Component, Focusable {
 
   render(width: number): string[] {
     const safeWidth = Math.max(4, Math.floor(width))
-    const out: string[] = [...head(this.request.title, safeWidth)]
+    const out: string[] = [...head(this.dialogTitle(), safeWidth)]
     const message = this.request.message?.trim() ?? ''
     if (message !== '') {
       out.push(...wrap(message, Math.max(4, safeWidth - 2)).map(line => ` ${dim(t.text(line))}`))
@@ -665,6 +880,27 @@ export class DecisionDialog implements Component, Focusable {
     if (this.isApproval) out.push(...this.renderApproval(safeWidth))
     else out.push(...this.renderQuestions(safeWidth))
     return out.map(line => fit(line, safeWidth))
+  }
+
+  /**
+   * One question that carries its own body is the whole dialog (DSH's native
+   * plan review: header / question / plan / options). It only gets that
+   * treatment when there is no tab navigation to lose — a multi-select question
+   * keeps its tabs and review step.
+   */
+  private presentsOwnBody(): boolean {
+    const question = this.questions[0]
+    return this.hideSubmitTab && question !== undefined && questionDetail(question) !== undefined
+  }
+
+  /**
+   * Dialog title. The self-presenting question contributes its own header;
+   * every other shape keeps the request title the backend adapter supplied.
+   */
+  private dialogTitle(): string {
+    if (this.isApproval || !this.presentsOwnBody()) return this.request.title
+    const header = this.questions[0]?.header?.trim() ?? ''
+    return header === '' ? this.request.title : header
   }
 
   private renderApproval(width: number): string[] {
@@ -675,25 +911,56 @@ export class DecisionDialog implements Component, Focusable {
     }
     const blocks = choiceBlocks(this.approvalItems, this.approvalIndex, this.approvalIndex, width, true, false, new Set())
     out.push(...windowRows(blocks, rowBudget(this.tui)))
-    out.push('', ` ${hints(['Enter to select', '↑/↓ to navigate', 'Esc to cancel'])}`)
+    out.push('', ` ${hints(['Enter to select', '↑/↓ to navigate', 'Esc to reject'])}`)
     return out
   }
 
   private renderQuestions(width: number): string[] {
-    const out: string[] = ['', this.renderTabs(width), '']
+    const out: string[] = []
     if (this.onReview) {
-      out.push(...this.renderReview(width))
+      out.push('', this.renderTabs(width), '', ...this.renderReview(width))
       return out
     }
     const question = this.question
+    // A self-presenting question already carries its header as the title, so
+    // the tab chip would only repeat it.
+    if (this.presentsOwnBody()) out.push('')
+    else out.push('', this.renderTabs(width), '')
+    // Subtitle: the native question text.
     const title = wrap(question.question, Math.max(4, width))
     out.push(...title.map(line => bold(t.text(line))), '')
+    // Body: the native long-form detail (the plan review's plan markdown).
+    const detail = this.detailLines(question, width)
+    if (detail.length > 0) out.push(...detail, '')
+    // Options: the existing rows, unchanged answer semantics.
     const blocks = question.multiSelect === true ? this.multiRows(width) : this.singleRows(width)
-    out.push(...windowRows(blocks, rowBudget(this.tui) - title.length - 4))
+    const budget = Math.max(2, rowBudget(this.tui) - title.length - detail.length - 4)
+    out.push(...windowRows(blocks, budget))
     const preview = this.previewLines(width)
     if (preview.length > 0) out.push('', ...preview)
     out.push('', ` ${this.renderHints()}`)
     return out
+  }
+
+  /**
+   * The question's long-form `detail` as a readable body above the options:
+   * markdown through the repo's transcript theme (no new dependency), capped so
+   * a long plan never pushes the answer rows out of the surface.
+   */
+  private detailLines(question: Question, width: number): string[] {
+    const detail = questionDetail(question)
+    if (detail === undefined) return []
+    this.detailMarkdown.setText(detail)
+    const body = this.detailMarkdown.render(Math.max(1, width - 1))
+    while (body.length > 0 && (body[0] ?? '').trim() === '') body.shift()
+    while (body.length > 0 && (body[body.length - 1] ?? '').trim() === '') body.pop()
+    if (body.length === 0) return []
+    const cap = Math.max(3, Math.min(14, rowBudget(this.tui) - 6))
+    // Markdown pads its lines to the rendered width; the dialog has no reason
+    // to emit trailing blanks.
+    const shown = body.slice(0, cap).map(line => (line.trim() === '' ? '' : ` ${line.trimEnd()}`))
+    if (body.length <= cap) return shown
+    return [...shown, ` ${dim(t.muted(`… +${body.length - cap} lines`))}`]
   }
 
   private renderTabs(width: number): string {
@@ -726,8 +993,8 @@ export class DecisionDialog implements Component, Focusable {
     const question = this.questions[index]
     const state = this.states[index]
     if (question === undefined || state === undefined) return false
-    if (question.multiSelect === true) return state.checked.size > 0 || state.answer.text !== '' || state.customText !== ''
-    if (state.custom && (state.answer.text !== '' || state.customText !== '')) return true
+    if (this.effectiveText(state) !== '') return true
+    if (question.multiSelect === true) return state.checked.size > 0
     return state.selected !== undefined
   }
 
@@ -740,8 +1007,8 @@ export class DecisionDialog implements Component, Focusable {
     const blocks = choiceBlocks(options, state.focus, state.custom ? undefined : state.selected, width, true, false, new Set())
     const indent = ' '.repeat(numberWidth + 4)
     const focused = this.editing()
-    const body = state.answer.render(Math.max(4, width - indent.length), focused, 'Type something.')
-    const chosen = state.custom && (state.answer.text !== '' || state.customText !== '')
+    const body = state.answer.render(Math.max(4, width - indent.length), focused, 'Type something.', state.customText)
+    const chosen = state.custom && this.effectiveText(state) !== ''
     const lines = [`${pointer(focused)} ${numberLabel(count + 1, numberWidth)} ${body[0] ?? ''}${chosen ? ` ${cc.success('✔')}` : ''}`]
     for (const line of body.slice(1)) lines.push(indent + line)
     blocks.push({ lines, focused })
@@ -767,8 +1034,8 @@ export class DecisionDialog implements Component, Focusable {
       return { lines, focused }
     })
     const editing = this.editing()
-    const customChecked = state.answer.text !== '' || state.customText !== ''
-    const body = state.answer.render(Math.max(4, width - indent.length), editing, 'Type something (optional)')
+    const customChecked = this.effectiveText(state) !== ''
+    const body = state.answer.render(Math.max(4, width - indent.length), editing, 'Type something (optional)', state.customText)
     const custom = [`${pointer(editing)} ${numberLabel(count + 1, numberWidth)} ${box(customChecked)} ${body[0] ?? ''}`]
     for (const line of body.slice(1)) custom.push(indent + line)
     blocks.push({ lines: custom, focused: editing })
@@ -794,6 +1061,8 @@ export class DecisionDialog implements Component, Focusable {
     if (this.questions.length > 1) parts.push('Tab to switch questions')
     if (this.question.multiSelect === true) parts.push('Space to toggle')
     if (this.editing()) parts.push('Enter to submit answer')
+    // Esc cancels this question natively (CC/Pi semantics): the pending
+    // request is settled with a cancelled answer; nothing stays hidden.
     parts.push('Esc to cancel')
     return hints(parts)
   }

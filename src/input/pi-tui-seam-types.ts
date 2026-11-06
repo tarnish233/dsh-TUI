@@ -12,7 +12,8 @@
  * vague `undefined is not a function`.
  */
 
-import type { Editor } from "@earendil-works/pi-tui"
+import type { Editor } from "#pi-tui"
+import type { ImageUploadPart } from "../ui/image-view.ts"
 
 /** One undo-stack entry, flattened from the Pi editor snapshot. */
 export interface CcUndoSnapshot {
@@ -49,18 +50,31 @@ export interface CcEditorSnapshot {
   jumpMode: "forward" | "backward" | null
   isInPaste: boolean
   pasteBuffer: string
+  /**
+   * Image attachment payloads keyed by `[Image #N]` marker id.
+   *
+   * This is the only place encoded image bytes may live: drafts, stashes and
+   * cleared-draft recovery are memory-only. A snapshot must never be written to
+   * `history.json` or any other durable file.
+   */
+  imageAttachments: Array<[number, ImageUploadPart]>
+  /** Monotonic image marker counter; ids are never reused after a submit. */
+  imageCounter: number
   /** `getText()` at capture time (large pastes appear as `[paste #n ...]`). */
   text: string
   /** `getExpandedText()` at capture time (paste markers expanded). */
   expandedText: string
 }
 
-declare module "@earendil-works/pi-tui" {
+declare module "#pi-tui" {
   interface Editor {
     ccCaptureSnapshot(): CcEditorSnapshot
     ccRestoreSnapshot(snapshot: CcEditorSnapshot, options?: { notify?: boolean }): void
     ccIsEmpty(): boolean
     ccGetJumpMode(): "forward" | "backward" | null
+    ccStartJump(direction: "forward" | "backward"): void
+    ccCancelJump(): void
+    ccJumpToChar(char: string, direction: "forward" | "backward"): void
     ccIsOnFirstVisualLine(): boolean
     ccIsOnLastVisualLine(): boolean
     ccMoveCursor(deltaLine: number, deltaCol: number): void
@@ -103,6 +117,7 @@ declare module "@earendil-works/pi-tui" {
       options?: { undo?: boolean },
     ): boolean
     ccSetCursor(line: number, col: number): void
+    ccTransposeChars(): boolean
     ccHasAutocompleteProvider(): boolean
     ccTriggerCompletion(): void
     ccCancelAutocomplete(): void
@@ -131,6 +146,10 @@ const SEAM_METHODS = [
   "ccHistoryNext",
   "ccPaste",
   "ccReplaceRange",
+  "ccTransposeChars",
+  "ccStartJump",
+  "ccCancelJump",
+  "ccJumpToChar",
   "ccAutocompleteStep",
   "ccAutocompleteAccept",
 ] as const

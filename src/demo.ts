@@ -12,11 +12,18 @@
  *
  * It performs no network or filesystem work. Keywords select fixtures:
  *   anything  ordinary Markdown/code + Chinese/emoji + edit tool with diff
+ *   tools-group adjacent Bash/MCP cards (long input/output) + a native diff separator
  *   question  ordered AskUserQuestion fixture (multi-select + single select)
  *   approval  opaque approval values
  *   abort     a streamed attempt that is abandoned mid-flight
  *   fail      a committed assistant/attempt settlement + nonfatal error
  *   pending   an admitted tool call that never receives a result
+ *
+ * Decision cancellation follows DSH: a cancelled approval/question (native
+ * `{cancelled:true}` or the local cancel sentinel) is reported as cancelled, not
+ * recorded as a deny or an unexpected answer. `cancel()` mirrors native
+ * `keepInbox:true`: queued input is preserved and paused, and the next explicit
+ * `send()` resumes it.
  *
  * The real backend injects DSH's own public BlockAssembler/assistant-stream/
  * surface helpers as `transcriptCodec`. This file ships a clearly separate
@@ -28,6 +35,10 @@ import type {
   BackendEvent,
   DecisionRequest,
   DisplayStream,
+  DisplayContentPart,
+  ImageAttachmentRef,
+  ImageAttachmentValue,
+  ImageMediaType,
   JsonRecord,
   SessionEvent,
   SessionInfo,
@@ -44,9 +55,13 @@ export const DEMO_PROVIDER = 'demo (offline)'
 export const DEMO_MODEL = 'deepseek-demo'
 export const DEMO_HINTS = [
   'tools    → terminal 工具调用 + edit diff',
+  'tools-group → 相邻/混合工具组（长输入输出）+ native diff 隔断',
+  'thinking → 折叠的思考摘要（/settings → Thinking 打开显示）',
+  'images   → 真实图片 ref（PNG/JPEG、重复出现、纯图 assistant/工具结果）+ 相邻工具/长输出/diff',
   '任何文本  → Markdown、代码块、中文/emoji、edit 工具与 diff',
   'question → 多选 + 单选 AskUserQuestion 问卷',
-  'approval → 审批选项（opaque value）',
+  'approval → 审批选项（opaque value）；Esc 返回原生拒绝值',
+  'Esc/Ctrl+C → 问卷隐藏可重开；Ctrl+C 中断但保留排队输入',
   'abort    → 流式尝试被放弃',
   'fail     → assistant/attempt 结算 + 非致命错误',
   'pending  → 已受理但没有结果的工具调用（显示 unknown）',
@@ -120,6 +135,64 @@ const CANCELLED = Symbol('demo-cancelled')
 const DEMO_BASE_TIME = 1_750_000_000_000
 const DEMO_CWD_FALLBACK = process.cwd()
 
+/**
+ * Offline image fixtures: real encoded bytes, canonical DSH-shaped refs.
+ * `readImage` serves them from memory; no file, clipboard or network is read.
+ */
+interface DemoImageFixture {
+  readonly attachment: ImageAttachmentRef
+  readonly value: ImageAttachmentValue
+}
+
+function demoImageValue(
+  attachmentId: string,
+  mediaType: ImageMediaType,
+  name: string,
+  width: number,
+  height: number,
+  data: string,
+): DemoImageFixture {
+  const attachment: ImageAttachmentRef = {
+    attachmentId,
+    mediaType,
+    bytes: Buffer.from(data, 'base64').byteLength,
+    width,
+    height,
+    name,
+  }
+  return { attachment, value: { attachment, data } }
+}
+
+/** 4×4 synthetic PNG/JPEG generated offline for fixtures only. */
+const DEMO_PNG = demoImageValue(
+  'demo:image:png-quadrants',
+  'image/png',
+  'quadrants.png',
+  4,
+  4,
+  'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAL0lEQVQImR3GQREAMBACsVOCEkQgGxGIWAmdaV45Omp1qo+aP3VHRqxM8RHzp+wB5tIZ8f97ukgAAAAASUVORK5CYII=',
+)
+const DEMO_JPEG = demoImageValue(
+  'demo:image:jpeg-quadrants',
+  'image/jpeg',
+  'quadrants.jpg',
+  4,
+  4,
+  '/9j/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAAEAAQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAiEAAABAQHAAAAAAAAAAAAAAAAAQIDBQYHEQQTMUFEUfD/xAAVAQEBAAAAAAAAAAAAAAAAAAAGB//EACQRAAADBQkAAAAAAAAAAAAAAAABBAIDBSNCBhQVMjNRUmFx/9oADAMBAAIRAxEAPwCIqPVCacXO8UWuLWMsnisHqy2rdB9+O5gACmo0KW7OpTOUqS28AK0kNRY2ukMarykuZ9D/2Q==',
+)
+
+const DEMO_IMAGE_VALUES: ReadonlyMap<string, ImageAttachmentValue> = new Map([
+  [DEMO_PNG.attachment.attachmentId, DEMO_PNG.value],
+  [DEMO_JPEG.attachment.attachmentId, DEMO_JPEG.value],
+])
+
+function throwIfDemoAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return
+  const error = new Error('Demo image read was cancelled.')
+  error.name = 'AbortError'
+  throw error
+}
+
 /** Event types that carry native surface metadata (append/replace origin). */
 const DEMO_SURFACE_TYPES: ReadonlySet<string> = new Set([
   'system/message',
@@ -138,7 +211,7 @@ const DEMO_SURFACE_TYPES: ReadonlySet<string> = new Set([
  * `BlockAssembler` and `assembleAssistantStream` through `transcriptCodec`.
  */
 class DemoStreamBuilder implements DisplayStream {
-  private readonly parts = new Map<number, { kind: 'text' | 'reasoning' | 'tool-call'; text: string; toolName: string }>()
+  private readonly parts = new Map<number, { kind: 'text' | 'reasoning' | 'tool-call' | 'image'; text: string; toolName: string; attachment?: ImageAttachmentRef }>()
   private readonly order: number[] = []
 
   push(chunk: JsonRecord): void {
@@ -147,7 +220,8 @@ class DemoStreamBuilder implements DisplayStream {
     switch (type) {
       case 'block-start': {
         const blockType = typeof chunk.blockType === 'string' ? chunk.blockType : ''
-        this.ensure(index, blockType === 'reasoning' ? 'reasoning' : blockType === 'tool-call' ? 'tool-call' : 'text')
+        const part = this.ensure(index, blockType === 'reasoning' ? 'reasoning' : blockType === 'tool-call' ? 'tool-call' : blockType === 'image' ? 'image' : 'text')
+        if (blockType === 'image') part.attachment = asDemoAttachment(chunk.attachment) ?? part.attachment
         return
       }
       case 'text-delta':
@@ -167,9 +241,10 @@ class DemoStreamBuilder implements DisplayStream {
           ? chunk.block as Record<string, unknown>
           : undefined
         const blockType = block !== undefined && typeof block.type === 'string' ? block.type : ''
-        const part = this.ensure(index, blockType === 'reasoning' ? 'reasoning' : blockType === 'tool-call' ? 'tool-call' : 'text')
+        const part = this.ensure(index, blockType === 'reasoning' ? 'reasoning' : blockType === 'tool-call' ? 'tool-call' : blockType === 'image' ? 'image' : 'text')
         if ((blockType === 'text' || blockType === 'reasoning') && part.text === '' && typeof block?.text === 'string') part.text = block.text
         if (blockType === 'tool-call' && part.toolName === '' && typeof block?.name === 'string') part.toolName = block.name
+        if (blockType === 'image') part.attachment = asDemoAttachment(block?.attachment) ?? part.attachment
         return
       }
       default:
@@ -181,23 +256,54 @@ class DemoStreamBuilder implements DisplayStream {
     const text: string[] = []
     const thinking: string[] = []
     const toolNames: string[] = []
+    const content: DisplayContentPart[] = []
+    const images: ImageAttachmentRef[] = []
     for (const index of this.order) {
       const part = this.parts.get(index)
       if (part === undefined) continue
-      if (part.kind === 'text') text.push(part.text)
-      else if (part.kind === 'reasoning') thinking.push(part.text)
-      else if (part.toolName !== '') toolNames.push(part.toolName)
+      if (part.kind === 'text') {
+        text.push(part.text)
+        content.push({ type: 'text', text: part.text })
+      } else if (part.kind === 'reasoning') thinking.push(part.text)
+      else if (part.kind === 'tool-call' && part.toolName !== '') toolNames.push(part.toolName)
+      else if (part.kind === 'image' && part.attachment !== undefined) {
+        content.push({ type: 'image', attachment: part.attachment })
+        images.push(part.attachment)
+      }
     }
-    return { text: text.join(''), thinking: thinking.join(''), toolNames }
+    return {
+      text: text.join(''),
+      thinking: thinking.join(''),
+      toolNames,
+      ...(images.length === 0 ? {} : { content, images }),
+    }
   }
 
-  private ensure(index: number, kind: 'text' | 'reasoning' | 'tool-call'): { kind: 'text' | 'reasoning' | 'tool-call'; text: string; toolName: string } {
+  private ensure(index: number, kind: 'text' | 'reasoning' | 'tool-call' | 'image'): { kind: 'text' | 'reasoning' | 'tool-call' | 'image'; text: string; toolName: string; attachment?: ImageAttachmentRef } {
     const existing = this.parts.get(index)
     if (existing !== undefined) return existing
     const part = { kind, text: '', toolName: '' }
     this.parts.set(index, part)
     this.order.push(index)
     return part
+  }
+}
+
+/** Shape-validate a fixture stream image ref; no policy, just the wire shape. */
+function asDemoAttachment(value: unknown): ImageAttachmentRef | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.attachmentId !== 'string' || record.attachmentId === '') return undefined
+  if (record.mediaType !== 'image/png' && record.mediaType !== 'image/jpeg' && record.mediaType !== 'image/webp' && record.mediaType !== 'image/gif') return undefined
+  const numbers = [record.bytes, record.width, record.height]
+  if (!numbers.every(entry => typeof entry === 'number' && Number.isSafeInteger(entry) && entry > 0)) return undefined
+  return {
+    attachmentId: record.attachmentId,
+    mediaType: record.mediaType,
+    bytes: record.bytes as number,
+    width: record.width as number,
+    height: record.height as number,
+    ...(typeof record.name === 'string' ? { name: record.name } : {}),
   }
 }
 
@@ -337,6 +443,8 @@ export class DemoBackend implements Backend {
   private running = false
   private closed = false
   private abortFlag = false
+  /** Native `keepInbox:true`: a cancelled turn pauses the queue instead of dropping it. */
+  private paused = false
 
   constructor(options: DemoBackendOptions = {}) {
     const delay = options.delayMs ?? 24
@@ -380,18 +488,24 @@ export class DemoBackend implements Backend {
   async send(text: string, _mode: 'followup' | 'steer' = 'followup'): Promise<void> {
     if (this.closed) throw new Error('DemoBackend is closed')
     if (text.trim() === '') throw new Error('DemoBackend refuses empty input')
+    // An explicit user send is the only thing that resumes a paused queue.
+    this.paused = false
     this.queue.push(text)
     this.runQueue()
   }
 
   async cancel(): Promise<void> {
     this.abortFlag = true
-    this.queue.length = 0
+    // Mirrors native SessionController.cancel({ keepInbox: true }): queued
+    // inputs stay in the inbox and the queue is paused. There is no automatic
+    // drain and no remove-then-re-add; the next explicit send resumes it.
+    this.paused = true
     for (const [id, pending] of this.pendingDecisions) {
       this.pendingDecisions.delete(id)
       pending.resolve(CANCELLED)
       this.emit({ type: 'decision_closed', sessionId: this.infoValue.sessionId, id })
     }
+    if (!this.running) this.resolveIdle()
   }
 
   async respond(id: string, value: unknown): Promise<void> {
@@ -400,6 +514,20 @@ export class DemoBackend implements Backend {
     this.pendingDecisions.delete(id)
     this.emit({ type: 'decision_closed', sessionId: this.infoValue.sessionId, id })
     pending.resolve(value)
+  }
+
+  /**
+   * Fixture-only `readImage`: serves the known canonical refs from memory and
+   * honors the caller's signal. Unknown ids fail instead of fabricating bytes;
+   * no DSH admission or display policy is reimplemented here.
+   */
+  async readImage(attachment: ImageAttachmentRef, signal?: AbortSignal): Promise<ImageAttachmentValue> {
+    throwIfDemoAborted(signal)
+    await this.pause()
+    throwIfDemoAborted(signal)
+    const value = DEMO_IMAGE_VALUES.get(attachment.attachmentId)
+    if (value === undefined) throw new Error(`No demo image attachment "${attachment.attachmentId}"`)
+    return value
   }
 
   async command(name: string, args: JsonRecord = {}): Promise<unknown> {
@@ -419,7 +547,10 @@ export class DemoBackend implements Backend {
         this.infoValue = { ...this.infoValue, sessionId, events: [] }
         this.events.length = 0
         this.seq = 0
+        this.queue.length = 0
+        this.paused = false
         this.emit({ type: 'ready', info: this.infoValue })
+        this.resolveIdle()
         return this.infoValue
       }
       case 'model': {
@@ -503,7 +634,16 @@ export class DemoBackend implements Backend {
           status: this.running ? 'running' : 'idle',
           demo: true,
           pendingDecisions: [...this.pendingDecisions.keys()],
-          queued: this.queue.length,
+          // Native session state exposes the inbox counts, not a TUI-owned
+          // `queued` field: `pending.nextTurn` survives a cancel.
+          pending: { nextTurn: this.queue.length, nextStep: 0 },
+          queue: this.queue.map((text, index) => ({
+            messageId: 'demo-pending-' + index,
+            text,
+            target: 'next-turn' as const,
+            images: 0,
+          })),
+          usage: null,
         }
       case 'compact':
         // Compatibility alias for the native command path; never its own
@@ -519,7 +659,40 @@ export class DemoBackend implements Backend {
       case 'dequeue': {
         const removed = this.queue.map((text, index) => ({ text, target: 'next-turn', messageId: 'demo-pending-' + index }))
         this.queue.length = 0
+        this.paused = false
+        this.resolveIdle()
         return removed
+      }
+      case 'queue-remove': {
+        const index = this.demoQueueIndex(args.messageId)
+        this.queue.splice(index, 1)
+        return { removed: args.messageId }
+      }
+      case 'queue-replace': {
+        const index = this.demoQueueIndex(args.messageId)
+        const text = typeof args.text === 'string' ? args.text : ''
+        if (text.trim() === '') throw new Error('queue-replace requires text')
+        this.queue[index] = text
+        return { messageId: 'demo-pending-' + index }
+      }
+      case 'queue-send-now': {
+        const text = typeof args.text === 'string' ? args.text : undefined
+        const messageId = typeof args.messageId === 'string' ? args.messageId : undefined
+        let chosen: string | undefined
+        if (messageId !== undefined) {
+          const index = this.demoQueueIndex(messageId)
+          const current = this.queue[index] ?? ''
+          this.queue.splice(index, 1)
+          chosen = text !== undefined && text.trim() !== '' ? text : current
+        } else if (text !== undefined && text.trim() !== '') {
+          chosen = text
+        }
+        if (chosen === undefined || chosen.trim() === '') throw new Error('queue-send-now requires text or messageId')
+        this.queue.unshift(chosen)
+        this.abortFlag = true
+        this.paused = false
+        if (!this.running) this.runQueue()
+        return { ok: true }
       }
       default:
         throw new Error(`DemoBackend does not implement command "${name}" (demo is not a real backend)`)
@@ -545,9 +718,13 @@ export class DemoBackend implements Backend {
     this.emit({ type: 'closed', code: 0 })
   }
 
-  /** Test/demo helper: resolves when no turn, queue or decision remains. */
+  /**
+   * Test/demo helper modelling native session idleness: no active turn and no
+   * pending decision. A paused inbox still holds queued input, but that input
+   * is not active work, so it does not keep the fixture busy forever.
+   */
   whenIdle(): Promise<void> {
-    if (!this.running && this.queue.length === 0 && this.pendingDecisions.size === 0) return Promise.resolve()
+    if (this.isIdle()) return Promise.resolve()
     return new Promise(resolve => this.idleWaiters.push(resolve))
   }
 
@@ -563,7 +740,12 @@ export class DemoBackend implements Backend {
     }
     this.events.length = 0
     this.seq = 0
+    // A fresh Agent attachment has its own inbox: the old queued input is not
+    // silently carried into the new session.
+    this.queue.length = 0
+    this.paused = false
     this.emit({ type: 'ready', info: this.infoValue })
+    this.resolveIdle()
   }
 
   private emit(event: BackendEvent): void {
@@ -667,9 +849,24 @@ export class DemoBackend implements Backend {
     })
   }
 
+  /** No active turn/decision; a paused inbox is retained but not "running". */
+  private isIdle(): boolean {
+    if (this.running || this.pendingDecisions.size > 0) return false
+    return this.paused || this.queue.length === 0
+  }
+
   private resolveIdle(): void {
-    if (this.running || this.queue.length > 0 || this.pendingDecisions.size > 0) return
+    if (!this.isIdle()) return
     for (const idle of this.idleWaiters.splice(0)) idle()
+  }
+
+  private demoQueueIndex(messageId: unknown): number {
+    const id = typeof messageId === 'string' ? messageId : ''
+    const index = Number(id.slice('demo-pending-'.length))
+    if (!id.startsWith('demo-pending-') || !Number.isInteger(index) || index < 0 || index >= this.queue.length) {
+      throw new Error('queued message is gone')
+    }
+    return index
   }
 
   private runQueue(): void {
@@ -694,7 +891,8 @@ export class DemoBackend implements Backend {
           return
         }
         this.emit({ type: 'status', sessionId: this.infoValue.sessionId, status: 'idle' })
-        if (this.queue.length > 0) this.runQueue()
+        // A paused queue is retained but never drained automatically.
+        if (!this.paused && this.queue.length > 0) this.runQueue()
         else this.resolveIdle()
       })
   }
@@ -704,17 +902,30 @@ export class DemoBackend implements Backend {
     const step = 1
     this.abortFlag = false
     this.append('turn/start', { turn })
+    const lower = text.toLowerCase()
+    const imageRequest = lower.includes('images') || lower.includes('image') || text.includes('图片')
     this.append('user/message', {
       id: `demo-user-${turn}`,
       role: 'user',
-      content: [{ type: 'text', text }],
+      // The images fixture carries real canonical refs in text/image order;
+      // every other flow stays the historical single text block.
+      content: imageRequest
+        ? [
+            { type: 'text', text: text.trim() === '' ? '请查看这两张图片。' : text },
+            { type: 'image', attachment: DEMO_PNG.attachment },
+            { type: 'text', text: '第一张是 PNG，第二张是 JPEG；同一张 PNG 会在工具结果里再次出现。' },
+            { type: 'image', attachment: DEMO_JPEG.attachment },
+            { type: 'image', attachment: DEMO_PNG.attachment },
+          ]
+        : [{ type: 'text', text }],
       source: { kind: 'user' },
     })
     this.append('step/start', { turn, step })
 
-    const lower = text.toLowerCase()
     let reason: unknown = { kind: 'completed' }
-    if (lower.includes('question') || text.includes('问题') || text.includes('问卷')) {
+    if (imageRequest) {
+      reason = await this.imagesFlow(turn, step)
+    } else if (lower.includes('question') || text.includes('问题') || text.includes('问卷')) {
       reason = await this.questionFlow(turn, step)
     } else if (lower.includes('approval') || lower.includes('permission') || text.includes('审批')) {
       reason = await this.approvalFlow(turn, step)
@@ -722,6 +933,8 @@ export class DemoBackend implements Backend {
       reason = await this.abortFlow(turn, step)
     } else if (lower.includes('fail') || lower.includes('error') || text.includes('错误')) {
       reason = await this.failFlow(turn, step)
+    } else if (lower.includes('tools-group') || lower.includes('tools group')) {
+      reason = await this.toolsGroupFlow(turn, step)
     } else if (lower.includes('tool') || text.includes('工具')) {
       reason = await this.toolsFlow(turn, step)
     } else if (lower.includes('pending') || lower.includes('unresolved')) {
@@ -805,6 +1018,17 @@ export class DemoBackend implements Backend {
     ]
   }
 
+  /**
+   * Image block in the fixture stream. Only this offline codec produces it;
+   * the store still treats the resulting ref as opaque display data.
+   */
+  private imageChunks(index: number, attachment: ImageAttachmentRef): DemoChunk[] {
+    return [
+      { type: 'block-start', index, blockType: 'image', attachment },
+      { type: 'block-end', index, block: { type: 'image', attachment } },
+    ]
+  }
+
   private terminalChunks(): DemoChunk[] {
     return [
       { type: 'usage', usage: { inputTokens: 42, outputTokens: 128, totalTokens: 170 } },
@@ -815,8 +1039,148 @@ export class DemoBackend implements Backend {
   // -------------------------------------------------------------------------
   // Fixtures
 
+  /**
+   * Offline image showcase: canonical PNG/JPEG refs, a duplicate occurrence,
+   * a pure-image assistant turn, a pure-image tool result, and an adjacent
+   * long-output/diff tool group. No bytes are fetched while folded/streaming:
+   * the UI reads them only when an image viewer opens.
+   */
+  private async imagesFlow(turn: number, step: number): Promise<unknown> {
+    const reasoning = [
+      'Demo reasoning: the user attached real image refs, so the projection must keep their positions.',
+      'The reply itself also carries images: one JPEG and one PNG that repeats the user turn ref.',
+      'After the answer a pure-image assistant message proves it is not dropped for having no text.',
+      'Then a read_image tool result returns another canonical ref, followed by adjacent bash/edit tools.',
+    ].join('\n')
+    const intro = '图片按 text/image 原始顺序投影：先 PNG，后 JPEG，再重复一次 PNG。\n\n下面是我的两张图。'
+    const chunks = [
+      ...this.textChunks(0, reasoning, 'reasoning'),
+      ...this.textChunks(1, intro, 'text'),
+      ...this.imageChunks(2, DEMO_JPEG.attachment),
+      ...this.imageChunks(3, DEMO_PNG.attachment),
+      ...this.terminalChunks(),
+    ]
+    const meta = await this.liveStream(turn, step, chunks)
+    if (meta === undefined) return { kind: 'aborted' }
+    this.commitMessage(meta, turn, step, [
+      { type: 'reasoning', text: reasoning },
+      { type: 'text', text: intro },
+      { type: 'image', attachment: DEMO_JPEG.attachment },
+      { type: 'image', attachment: DEMO_PNG.attachment },
+    ])
+
+    // Pure-image assistant message: no text block at all, still a real reply.
+    this.append('assistant/message', {
+      turn,
+      step,
+      message: {
+        id: `demo-assistant-image-${this.seq + 1}`,
+        role: 'assistant',
+        content: [{ type: 'image', attachment: DEMO_PNG.attachment }],
+        source: { kind: 'model', provider: DEMO_PROVIDER, model: this.infoValue.model },
+      },
+      usage: { inputTokens: 42, outputTokens: 12 },
+    })
+
+    // Adjacent tool calls in one turn: the pure-image read_image result, a long
+    // terminal output and an applied diff. The UI may group them; the image
+    // ref stays a per-tool entry and never merges with transcript occurrences.
+    const readId = `call-demo-image-${turn}`
+    const readArgs = JSON.stringify({ path: 'demo/quadrants.png' })
+    this.append('tool/call', { turn, step, callId: readId, name: 'read_image', arguments: readArgs }, {
+      toolPresentation: {
+        call: { card: 'generic', title: 'Read demo/quadrants.png', content: [{ type: 'text', text: 'read the synthetic image fixture' }] },
+      },
+    })
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: readId,
+        content: [{ type: 'image', attachment: DEMO_PNG.attachment }],
+        isError: false,
+        source: { kind: 'tool', callId: readId },
+      },
+      meta: { mediaType: DEMO_PNG.attachment.mediaType },
+    }, {
+      toolPresentation: { result: { card: 'generic', content: [{ type: 'image', attachment: DEMO_PNG.attachment }] } },
+    })
+
+    const bashId = `call-demo-image-bash-${turn}`
+    const bashOutput = Array.from({ length: 16 }, (_, index) => `image fixture line ${index + 1}`).join('\n')
+    const bashArgs = JSON.stringify({ command: 'printf "image fixture\\n"', description: 'Long adjacent output' })
+    this.append('tool/call', { turn, step, callId: bashId, name: 'bash', arguments: bashArgs }, {
+      toolPresentation: { call: { card: 'terminal', title: 'image fixture output', description: 'Adjacent long terminal output', cwd: this.infoValue.cwd } },
+    })
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: bashId,
+        content: [{ type: 'text', text: bashOutput }],
+        isError: false,
+        source: { kind: 'tool', callId: bashId },
+      },
+    }, {
+      toolPresentation: { result: { card: 'terminal', output: bashOutput + '\n', exitCode: 0 } },
+    })
+
+    const editId = `call-demo-image-edit-${turn}`
+    const editArgs = JSON.stringify({ file_path: 'src/image-demo.ts', old_string: 'before', new_string: 'after' })
+    this.append('tool/call', { turn, step, callId: editId, name: 'edit', arguments: editArgs }, {
+      toolPresentation: {
+        call: {
+          card: 'diff',
+          title: 'Edit src/image-demo.ts',
+          diffs: [{ path: 'src/image-demo.ts', oldText: null, newText: 'after  // synthetic image fixture' }],
+          locations: [{ path: 'src/image-demo.ts' }],
+        },
+      },
+    })
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: editId,
+        content: [{ type: 'text', text: 'Updated src/image-demo.ts with 1 addition.' }],
+        isError: false,
+        source: { kind: 'tool', callId: editId },
+      },
+      meta: {
+        diffs: [{ path: 'src/image-demo.ts', oldText: 'before\n', newText: 'after  // synthetic image fixture\n' }],
+        operation: 'update',
+      },
+    }, {
+      toolPresentation: {
+        result: { card: 'diff', diffs: [{ path: 'src/image-demo.ts', oldText: 'before\n', newText: 'after  // synthetic image fixture\n' }] },
+      },
+    })
+
+    const finalText = '图片 fixture 完成：PNG/JPEG、重复 ref、纯图 assistant、纯图工具结果与相邻工具组都来自离线 fixture；没有读取真实文件或调用模型。'
+    const second = await this.liveStream(turn, step, [
+      ...this.textChunks(0, finalText, 'text'),
+      ...this.terminalChunks(),
+    ])
+    if (second === undefined) return { kind: 'aborted' }
+    this.commitMessage(second, turn, step, [{ type: 'text', text: finalText }])
+    return { kind: 'completed' }
+  }
+
   private async normalFlow(turn: number, step: number): Promise<unknown> {
-    const reasoning = 'Demo reasoning: build a deterministic reply, then update a file through the edit tool.'
+    // Long enough to fold: the transcript shows `✻ Thought for … · n more lines`
+    // with the tail of this text as the preview (default 3 lines), and clicking
+    // the summary (or `app.thinking.toggle`) expands the whole reasoning.
+    const reasoning = [
+      'Demo reasoning: build a deterministic reply, then update a file through the edit tool.',
+      'The reply needs Markdown, a Chinese sentence and an emoji so the projection is visible in one pass.',
+      'After that the edit tool gets a native diff card, which the transcript renders from the presentation intent.',
+    ].join('\n')
     const firstText = [
       'Here is a deterministic **demo** of the DSH → Pi TUI projection.',
       '',
@@ -980,6 +1344,213 @@ export class DemoBackend implements Backend {
     return { kind: 'completed' }
   }
 
+  /**
+   * Explicit offline tool-group showcase.
+   *
+   * Two Bash cards and one generic MCP card are proposed together, so the
+   * renderer sees an adjacent mixed group. Their command inputs and outputs are
+   * deliberately longer than one preview screen (collapsed input/output row
+   * limits), which makes a non-last item's expanded tree lines observable. A
+   * native Edit diff follows after a plain assistant line and separates the
+   * group from the final answer. Nothing executes and no file changes.
+   *
+   * Every call/result id carries the turn number: replaying the keyword in the
+   * same demo session creates fresh cards instead of overwriting settled ones.
+   * Event times come from `append`, and short pauses keep `tool/call` visible as
+   * Running before its `tool/result` settles.
+   */
+  private async toolsGroupFlow(turn: number, step: number): Promise<unknown> {
+    const bashOneId = `call-demo-group-${turn}-bash-1`
+    const bashTwoId = `call-demo-group-${turn}-bash-2`
+    const mcpId = `call-demo-group-${turn}-mcp`
+    const editId = `call-demo-group-${turn}-edit`
+
+    const bashOneCommand = Array.from({ length: 8 }, (_, index) => `printf 'bash-one line ${index + 1}\\n'`).join('\n')
+    const bashTwoCommand = Array.from({ length: 9 }, (_, index) => `printf 'bash-two line ${index + 1}\\n'`).join('\n')
+    const bashOneOutput = Array.from({ length: 14 }, (_, index) => `bash-one output line ${index + 1}`).join('\n')
+    const bashTwoOutput = Array.from({ length: 18 }, (_, index) => `bash-two output line ${index + 1}`).join('\n')
+    const bashOneArgs = JSON.stringify({ command: bashOneCommand, description: 'Print the first grouped Bash fixture' })
+    const bashTwoArgs = JSON.stringify({ command: bashTwoCommand, description: 'Print the second grouped Bash fixture', timeout: 5000 })
+    const mcpArgs = JSON.stringify({
+      server: 'demo',
+      tool: 'notes.lookup',
+      query: 'group fixture',
+      filters: { scope: 'synthetic', limit: 3 },
+    }, null, 2)
+    const mcpOutput = [
+      'Demo MCP note 1: synthetic group entry.',
+      'Demo MCP note 2: a longer preview line keeps the generic card expandable.',
+      'Demo MCP note 3: no network call was made.',
+    ].join('\n')
+
+    const editPath = 'src/group-demo.ts'
+    const oldText = [
+      'export function groupDemo(): string {',
+      "  return 'before'  // synthetic fixture",
+      '}',
+      '',
+    ].join('\n')
+    const newText = [
+      'export function groupDemo(): string {',
+      "  return 'after'  // synthetic fixture",
+      '  // no file was written by the demo',
+      '}',
+      '',
+    ].join('\n')
+    const editArgs = JSON.stringify({ file_path: editPath, old_string: oldText, new_string: newText })
+
+    const intro = [
+      'Here is an offline **tool group** fixture.',
+      '',
+      'Two Bash calls and one generic MCP call are proposed together and stay adjacent.',
+      'Their inputs and outputs are longer than one preview screen, so expanding a non-last output shows the nested tree lines.',
+    ].join('\n')
+    const first = await this.liveStream(turn, step, [
+      ...this.textChunks(0, intro, 'text'),
+      ...this.toolChunks(1, bashOneId, 'bash', bashOneArgs),
+      ...this.toolChunks(2, bashTwoId, 'bash', bashTwoArgs),
+      ...this.toolChunks(3, mcpId, 'mcp__demo__notes', mcpArgs),
+      ...this.terminalChunks(),
+    ])
+    if (first === undefined) return { kind: 'aborted' }
+    // The proposals are model requests only; no call is admitted yet.
+    this.commitMessage(first, turn, step, [
+      { type: 'text', text: intro },
+      { type: 'tool-call', id: bashOneId, name: 'bash', arguments: bashOneArgs },
+      { type: 'tool-call', id: bashTwoId, name: 'bash', arguments: bashTwoArgs },
+      { type: 'tool-call', id: mcpId, name: 'mcp__demo__notes', arguments: mcpArgs },
+    ])
+    await this.pause()
+
+    // Each admitted call stays visible as Running until its result settles.
+    this.append('tool/call', { turn, step, callId: bashOneId, name: 'bash', arguments: bashOneArgs }, {
+      toolPresentation: {
+        call: { card: 'terminal', title: 'bash-one grouped fixture', description: 'First adjacent Bash card', cwd: this.infoValue.cwd },
+      },
+    })
+    await this.pause()
+    await this.pause()
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: bashOneId,
+        content: [{ type: 'text', text: bashOneOutput }],
+        isError: false,
+        source: { kind: 'tool', callId: bashOneId },
+      },
+    }, {
+      toolPresentation: { result: { card: 'terminal', output: bashOneOutput + '\n', exitCode: 0 } },
+    })
+    await this.pause()
+
+    this.append('tool/call', { turn, step, callId: bashTwoId, name: 'bash', arguments: bashTwoArgs }, {
+      toolPresentation: {
+        call: { card: 'terminal', title: 'bash-two grouped fixture', description: 'Second adjacent Bash card', cwd: this.infoValue.cwd },
+      },
+    })
+    await this.pause()
+    await this.pause()
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: bashTwoId,
+        content: [{ type: 'text', text: bashTwoOutput }],
+        isError: false,
+        source: { kind: 'tool', callId: bashTwoId },
+      },
+    }, {
+      toolPresentation: { result: { card: 'terminal', output: bashTwoOutput + '\n', exitCode: 0 } },
+    })
+    await this.pause()
+
+    this.append('tool/call', { turn, step, callId: mcpId, name: 'mcp__demo__notes', arguments: mcpArgs }, {
+      toolPresentation: {
+        call: {
+          card: 'generic',
+          title: 'MCP demo notes lookup',
+          kind: 'mcp',
+          content: [{ type: 'text', text: 'query: group fixture (synthetic MCP call)' }],
+        },
+      },
+    })
+    await this.pause()
+    await this.pause()
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: mcpId,
+        content: [{ type: 'text', text: mcpOutput }],
+        isError: false,
+        source: { kind: 'tool', callId: mcpId },
+      },
+      meta: { server: 'demo', tool: 'notes.lookup', matches: 3 },
+    }, {
+      toolPresentation: { result: { card: 'generic', content: [{ type: 'text', text: mcpOutput }] } },
+    })
+    await this.pause()
+
+    // The native Edit diff is the boundary between the mixed group and the answer.
+    const divider = 'One native diff card now separates the mixed group from the final answer.'
+    const second = await this.liveStream(turn, step, [
+      ...this.textChunks(0, divider, 'text'),
+      ...this.toolChunks(1, editId, 'edit', editArgs),
+      ...this.terminalChunks(),
+    ])
+    if (second === undefined) return { kind: 'aborted' }
+    this.commitMessage(second, turn, step, [
+      { type: 'text', text: divider },
+      { type: 'tool-call', id: editId, name: 'edit', arguments: editArgs },
+    ])
+    await this.pause()
+    this.append('tool/call', { turn, step, callId: editId, name: 'edit', arguments: editArgs }, {
+      toolPresentation: {
+        call: {
+          card: 'diff',
+          title: `Edit ${editPath}`,
+          diffs: [{ path: editPath, oldText: null, newText }],
+          locations: [{ path: editPath }],
+        },
+      },
+    })
+    await this.pause()
+    await this.pause()
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tool-result-${this.seq + 1}`,
+        role: 'tool',
+        toolCallId: editId,
+        content: [{ type: 'text', text: `Updated ${editPath} with 2 additions and 1 removal.` }],
+        isError: false,
+        source: { kind: 'tool', callId: editId },
+      },
+      meta: { diffs: [{ path: editPath, oldText, newText }], operation: 'update' },
+    }, {
+      toolPresentation: { result: { card: 'diff', diffs: [{ path: editPath, oldText, newText }] } },
+    })
+    await this.pause()
+
+    const finalText = [
+      'The group, the generic MCP card and the native diff all came from offline fixtures.',
+      '',
+      'No command ran, no MCP server was contacted and no file was changed.',
+    ].join('\n')
+    const final = await this.liveStream(turn, step, [...this.textChunks(0, finalText, 'text'), ...this.terminalChunks()])
+    if (final === undefined) return { kind: 'aborted' }
+    this.commitMessage(final, turn, step, [{ type: 'text', text: finalText }])
+    return { kind: 'completed' }
+  }
+
   private async questionFlow(turn: number, step: number): Promise<unknown> {
     const intro = 'I have two demo questions. Choose options, add a custom answer, then submit.'
     const meta = await this.liveStream(turn, step, [...this.textChunks(0, intro, 'text'), ...this.terminalChunks()])
@@ -1014,7 +1585,7 @@ export class DemoBackend implements Backend {
       ],
     }
     const value = await this.waitDecision(request)
-    if (value === CANCELLED) return { kind: 'aborted' }
+    if (isCancelledDecisionValue(value)) return this.cancelledDecision(turn, step, 'question')
     const summary = questionAnswerSummary(value)
     const text = `Recorded demo answers: ${summary}`
     const answerMeta = await this.liveStream(turn, step, [...this.textChunks(0, text, 'text'), ...this.terminalChunks()])
@@ -1040,7 +1611,7 @@ export class DemoBackend implements Backend {
         { label: 'Deny', description: 'Return deny without running anything.', value: { allow: false, scope: 'deny' } },
       ],
     })
-    if (value === CANCELLED) return { kind: 'aborted' }
+    if (isCancelledDecisionValue(value)) return this.cancelledDecision(turn, step, 'approval')
     const allowed = isRecord(value) && value.allow === true
     const text = allowed ? 'Demo approval recorded: allow (no tool ran).' : 'Demo approval recorded: deny.'
     const answerMeta = await this.liveStream(turn, step, [...this.textChunks(0, text, 'text'), ...this.terminalChunks()])
@@ -1074,6 +1645,22 @@ export class DemoBackend implements Backend {
    * `tool/result`, so the card must report an unknown outcome, not Running and
    * not a fabricated success/failure.
    */
+  /**
+   * A cancelled decision (native `{cancelled:true}` or the local `CANCELLED`
+   * sentinel) settles the request without inventing an answer, a deny or a tool
+   * outcome. The demo records the cancellation truthfully and completes the
+   * turn, matching the native approval/question cancellation path.
+   */
+  private async cancelledDecision(turn: number, step: number, kind: 'question' | 'approval'): Promise<unknown> {
+    const text = kind === 'question'
+      ? 'Demo question cancelled; no answers were recorded.'
+      : 'Demo approval cancelled; no tool ran and no decision was recorded.'
+    const meta = await this.liveStream(turn, step, [...this.textChunks(0, text, 'text'), ...this.terminalChunks()])
+    if (meta === undefined) return { kind: 'aborted' }
+    this.commitMessage(meta, turn, step, [{ type: 'text', text }])
+    return { kind: 'completed' }
+  }
+
   private async pendingToolFlow(turn: number, step: number): Promise<unknown> {
     const text = 'I will inspect the file before editing it.'
     const args = '{"file_path":"src/greet.ts","limit":20}'
@@ -1108,6 +1695,17 @@ export class DemoBackend implements Backend {
       this.emit({ type: 'decision', sessionId: this.infoValue.sessionId, request })
     })
   }
+}
+
+/**
+ * Native decision cancellation: the local sentinel, the wire's
+ * `{cancelled:true}` and the bridge's `'cancelled'` string. These are not
+ * answers, so the demo must never record them as deny/unexpected data.
+ */
+function isCancelledDecisionValue(value: unknown): boolean {
+  if (value === CANCELLED) return true
+  if (typeof value === 'string') return value.trim().toLowerCase() === 'cancelled'
+  return isRecord(value) && value.cancelled === true
 }
 
 function questionAnswerSummary(value: unknown): string {

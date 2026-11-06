@@ -1,6 +1,6 @@
-import { matchesKey, type Component, type Focusable, type TUI, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
+import { matchesKey, type Component, type Focusable, type TUI, truncateToWidth, wrapTextWithAnsi } from '#pi-tui'
 import { CcEditor, type CcActionEvent, type CcKeymap } from './input/index.ts'
-import { editorTheme } from './ui/theme.ts'
+import { editorTheme, t } from './ui/theme.ts'
 
 /** Search input is an editor, with contextual search actions above normal editing. */
 export class HistorySearch implements Component, Focusable {
@@ -51,18 +51,24 @@ export class HistorySearch implements Component, Focusable {
   handleInput(data: string): void { this.editor.handleInput(data); this.tui.requestRender() }
   invalidate(): void { this.editor.invalidate() }
 
+  /** Release the search editor's shared-keymap hooks when the dialog closes. */
+  dispose(): void {
+    const editor = this.editor as CcEditor & { dispose?: () => void }
+    editor.dispose?.()
+  }
+
   render(width: number): string[] {
     const query = this.editor.getExpandedText()
     const result = this.results[this.selected]
     const count = this.results.length ? this.selected + 1 : 0
-    const lines = [truncateToWidth('History search · ' + count + '/' + this.results.length, width), ...this.editor.render(width)]
+    const lines = [truncateToWidth(t.accent('History search') + t.muted(' · ' + count + '/' + this.results.length), width), ...this.editor.render(width)]
     if (result === undefined) lines.push(truncateToWidth('  No matching prompts', width))
     else {
       const position = result.toLocaleLowerCase().indexOf(query.toLocaleLowerCase())
       const preview = query && position >= 0
-        ? result.slice(0, position) + '\x1b[38;2;215;119;87m' + result.slice(position, position + query.length) + '\x1b[39m' + result.slice(position + query.length)
+        ? result.slice(0, position) + t.accent(result.slice(position, position + query.length)) + result.slice(position + query.length)
         : result
-      lines.push(...wrapTextWithAnsi('❯ ' + preview, Math.max(1, width)).slice(0, 5))
+      lines.push(...wrapTextWithAnsi(t.accent('❯') + ' ' + preview, Math.max(1, width)).slice(0, 5))
     }
     lines.push(truncateToWidth(this.mode === 'inline' ? 'Ctrl+R next · Tab/Esc edit · Enter send · Ctrl+C cancel' : 'Ctrl+P/N choose · Tab/Enter edit · Esc cancel', width))
     return lines

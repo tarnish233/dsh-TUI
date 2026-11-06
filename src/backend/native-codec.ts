@@ -1,17 +1,17 @@
 /**
- * Pure display projections backed by the selected DSH installation's public
- * exports. No Agent, model client, persistence or copied assembly algorithm.
- * Loading happens before the runtime can emit ready; missing helpers fail
- * startup instead of silently substituting a display mirror.
+ * Pure transcript codec backed by DSH's public helpers.
  *
- * The same loader binds the installed launcher's *public* profile/composition
- * helpers, so profile selection, bundle resolution and user patch parsing stay
- * DSH behaviour. Nothing here re-implements YAML merging, composition order or
- * package resolution.
+ * No Agent, model, persistence or copied assembly algorithm lives here: the
+ * caller supplies the public `@deepseek-ai/dsh-llm` and
+ * `@deepseek-ai/dsh-session` module namespaces (production imports them, tests
+ * inject fixtures). The returned `TranscriptCodec` is installed by the UI
+ * before it resets a transcript, so live chunks and durable settlements share
+ * one native assembly algorithm.
+ *
+ * @module dsh-tui/backend/native-codec
  */
-import { pathToFileURL } from 'node:url'
+import { displayContentParts } from '../attachments.ts'
 import { backendError } from './errors.ts'
-import { resolveDshModule } from './discover.ts'
 import type { DisplayStream, JsonRecord, SessionEvent, StreamPresentation, TranscriptCodec } from './types.ts'
 
 interface NativeAssembler {
@@ -21,120 +21,61 @@ interface NativeAssembler {
 }
 
 /**
- * Installed public profile helpers used for native profile selection.
- *
- * `dsh-app-boot` owns profile discovery, manifest reading/writing, bundle
- * resolution and patch parsing; this adapter only supplies the arguments and
- * keeps every write inside its own scratch directory.
+ * Rendering only: pick the already assembled native blocks the UI supports.
+ * Image blocks keep DSH's canonical `{type:'image', attachment}` reference and
+ * order; bytes are never inlined, copied or decoded here.
  */
-export interface NativeProfileApi {
-  /** `DEFAULT_PROFILE_BUNDLES`: the bundle list a base-only profile is initialized with. */
-  defaultBundles: readonly string[]
-  /** Shipped application-surface bundles declared by `PROFILE_TEMPLATES`. */
-  shippedSurfaceBundles: readonly string[]
-  resolveProfileDir(name: string, home: string): string
-  readManifest(dir: string): JsonRecord
-  writeManifest(dir: string, manifest: JsonRecord): void
-  initProfile(dir: string, bundles: readonly string[]): void
-  /** Resolve one entry module name from the installation, then the profile directory. */
-  resolvePackageDir(name: string, installAnchor: string, profileDir: string): string
-  /** Parse one native patch list, returning `undefined` when the file is absent. */
-  loadPatches(file: string): readonly JsonRecord[] | undefined
-}
-
-export interface NativeHelpers {
-  transcriptCodec: TranscriptCodec
-  resolveHome(configured?: string): string
-  profile: NativeProfileApi
-}
-
-function record(value: unknown): JsonRecord | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : undefined
-}
-
-function exportedFunction<T>(module: JsonRecord, name: string): T {
-  const value = module[name]
-  if (typeof value !== 'function') throw backendError('STARTUP_FAILED', `DSH public helper is unavailable: ${name}`)
-  return value as T
-}
-
-async function loadExport(anchor: string, specifier: string): Promise<JsonRecord> {
-  const path = resolveDshModule(anchor, specifier)
-  if (!path) throw backendError('STARTUP_FAILED', `The selected DSH installation does not provide ${specifier}`)
-  try {
-    const loaded: unknown = await import(pathToFileURL(path).href)
-    const module = record(loaded)
-    if (!module) throw new Error('module namespace unavailable')
-    return module
-  } catch {
-    throw backendError('STARTUP_FAILED', `Could not load DSH public helpers from ${specifier}`)
-  }
-}
-
-/** Rendering only: pick the already assembled native blocks our current UI supports. */
 function present(blocks: unknown): StreamPresentation {
   if (!Array.isArray(blocks)) throw backendError('PROTOCOL_ERROR', 'DSH assembler returned invalid content blocks')
   const text: string[] = []
   const thinking: string[] = []
   const toolNames: string[] = []
   for (const value of blocks) {
-    const block = record(value)
-    if (!block) continue
+    const block = value !== null && typeof value === 'object' ? value as Record<string, unknown> : undefined
+    if (block === undefined) continue
     if (block.type === 'text' && typeof block.text === 'string') text.push(block.text)
     else if (block.type === 'reasoning' && typeof block.text === 'string') thinking.push(block.text)
-    else if (block.type === 'tool-call' && typeof block.name === 'string' && block.name) toolNames.push(block.name)
+    else if (block.type === 'tool-call' && typeof block.name === 'string' && block.name.length > 0) toolNames.push(block.name)
   }
-  return { text: text.join(''), thinking: thinking.join(''), toolNames }
+  const view: StreamPresentation = { text: text.join(''), thinking: thinking.join(''), toolNames }
+  const content = displayContentParts(blocks)
+  const images = content.flatMap(part => part.type === 'image' ? [part.attachment] : [])
+  if (images.length === 0) return view
+  // Text-only streams keep the legacy shape; an image occurrence needs its
+  // position, so ordered content rides beside the reference list.
+  return { ...view, images, content }
 }
 
-function stringArray(value: unknown, label: string): readonly string[] {
-  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.length === 0)) {
-    throw backendError('STARTUP_FAILED', `DSH public helper is unavailable or incompatible: ${label}`)
+function exportedFunction(module: unknown, name: string): (...args: never[]) => unknown {
+  const value = module !== null && typeof module === 'object'
+    ? (module as Record<string, unknown>)[name]
+    : undefined
+  if (typeof value !== 'function') {
+    throw backendError('STARTUP_FAILED', `the installed DSH helpers do not expose ${name}`)
   }
-  return value as string[]
+  return value as (...args: never[]) => unknown
 }
 
-/** Shipped surface bundles named by `PROFILE_TEMPLATES`, excluding the shared core. */
-function shippedSurfaceBundles(templates: JsonRecord, core: readonly string[]): string[] {
-  const surfaces = new Set<string>()
-  for (const template of Object.values(templates)) {
-    const profile = record(template)
-    if (!profile) continue
-    for (const bundle of stringArray(profile.bundles, 'PROFILE_TEMPLATES.bundles')) {
-      if (!core.includes(bundle)) surfaces.add(bundle)
-    }
-  }
-  return [...surfaces].sort()
-}
-
-export async function loadNativeHelpers(packageJsonPath: string): Promise<NativeHelpers> {
-  const [llm, surface, home, boot] = await Promise.all([
-    loadExport(packageJsonPath, '@deepseek-ai/dsh-llm'),
-    loadExport(packageJsonPath, '@deepseek-ai/dsh-session/surface'),
-    loadExport(packageJsonPath, '@deepseek-ai/dsh-home-paths'),
-    loadExport(packageJsonPath, '@deepseek-ai/dsh-app-boot'),
-  ])
-  const Assembler = exportedFunction<new () => NativeAssembler>(llm, 'BlockAssembler')
-  const expand = exportedFunction<(stream: unknown) => unknown>(llm, 'expandAssistantStream')
-  const assemble = exportedFunction<(stream: unknown) => NativeAssembler>(llm, 'assembleAssistantStream')
-  const isAppend = exportedFunction<(event: SessionEvent) => boolean>(surface, 'isAppendSurfaceEvent')
-  const isReplacement = exportedFunction<(event: SessionEvent) => boolean>(surface, 'isReplacementSurfaceEvent')
-  const resolveHome = exportedFunction<(configured?: string) => string>(home, 'resolveDshHome')
-  const defaultBundles = stringArray(boot.DEFAULT_PROFILE_BUNDLES, 'DEFAULT_PROFILE_BUNDLES')
-  const templates = record(boot.PROFILE_TEMPLATES)
-  if (!templates) throw backendError('STARTUP_FAILED', 'DSH public helper is unavailable or incompatible: PROFILE_TEMPLATES')
-  const resolveProfileDir = exportedFunction<(name: string, home?: string) => string>(boot, 'resolveProfileDir')
-  const readProfileManifest = exportedFunction<(binName: string, dir: string) => JsonRecord>(boot, 'readProfileManifest')
-  const writeProfileManifest = exportedFunction<(dir: string, manifest: JsonRecord) => void>(boot, 'writeProfileManifest')
-  const initProfile = exportedFunction<(dir: string, bundles: readonly string[]) => void>(boot, 'initProfile')
-  const resolveBundleDir = exportedFunction<(binName: string, name: string, installAnchor: string, profileDir: string) => string>(boot, 'resolveBundleDir')
-  const loadOptionalPatches = exportedFunction<(binName: string, file: string) => unknown>(boot, 'loadOptionalPatches')
-  const shipped = shippedSurfaceBundles(templates, defaultBundles)
+/**
+ * Build the production transcript codec from public DSH modules.
+ *
+ * @param llm - the `@deepseek-ai/dsh-llm` namespace (`BlockAssembler`,
+ *   `expandAssistantStream`, `assembleAssistantStream`).
+ * @param session - the `@deepseek-ai/dsh-session` namespace
+ *   (`isAppendSurfaceEvent`, `isReplacementSurfaceEvent`).
+ * @returns the codec the UI installs before resetting history.
+ */
+export function makeTranscriptCodec(llm: unknown, session: unknown): TranscriptCodec {
+  const Assembler = exportedFunction(llm, 'BlockAssembler') as unknown as new () => NativeAssembler
+  const expand = exportedFunction(llm, 'expandAssistantStream')
+  const assemble = exportedFunction(llm, 'assembleAssistantStream') as unknown as (stream: unknown) => NativeAssembler
+  const isAppend = exportedFunction(session, 'isAppendSurfaceEvent')
+  const isReplacement = exportedFunction(session, 'isReplacementSurfaceEvent')
 
   function createStream(): DisplayStream {
     const assembler = new Assembler()
     if (typeof assembler.push !== 'function' || typeof assembler.blocks !== 'function' || typeof assembler.interruptedBlocks !== 'function') {
-      throw backendError('STARTUP_FAILED', 'The selected DSH BlockAssembler has an incompatible public interface')
+      throw backendError('STARTUP_FAILED', 'the installed DSH BlockAssembler has an incompatible public interface')
     }
     return {
       push: chunk => assembler.push(chunk),
@@ -144,9 +85,9 @@ export async function loadNativeHelpers(packageJsonPath: string): Promise<Native
         try {
           blocks = assembler.blocks()
         } catch {
-          // A tentative stream can contain an open unknown block. The native
-          // prefix accessor already knows what is safe to show in that case;
-          // durable decoding below never suppresses validation/assembly errors.
+          // A tentative stream can contain an open unknown block; the native
+          // prefix accessor already knows what is safe to show in that case.
+          // Durable decoding below never suppresses validation errors.
           blocks = assembler.interruptedBlocks()
         }
         return present(blocks)
@@ -154,60 +95,19 @@ export async function loadNativeHelpers(packageJsonPath: string): Promise<Native
     }
   }
 
-  const transcriptCodec: TranscriptCodec = {
+  return {
     createStream,
     assemble(stream, interrupted = false) {
       // DSH explicitly requires validation at the durable boundary. The second
-      // helper then assembles packed runs without re-expanding them ourselves.
-      expand(stream)
+      // helper assembles packed runs without re-expanding them here.
+      expand(stream as never)
       const assembler = assemble(stream)
       return present(interrupted ? assembler.interruptedBlocks() : assembler.blocks())
     },
-    surfaceKind(event) {
-      if (isAppend(event)) return 'append'
-      if (isReplacement(event)) return 'replace'
+    surfaceKind(event: SessionEvent) {
+      if (isAppend(event as never) === true) return 'append'
+      if (isReplacement(event as never) === true) return 'replace'
       return 'none'
-    },
-  }
-  return {
-    transcriptCodec,
-    resolveHome(configured) {
-      const value = resolveHome(configured)
-      if (typeof value !== 'string' || value.length === 0) throw backendError('STARTUP_FAILED', 'DSH home-path helper returned an invalid path')
-      return value
-    },
-    profile: {
-      defaultBundles,
-      shippedSurfaceBundles: shipped,
-      resolveProfileDir(name, homeDir) {
-        const value = resolveProfileDir(name, homeDir)
-        if (typeof value !== 'string' || value.length === 0) {
-          throw backendError('STARTUP_FAILED', 'DSH profile resolver returned an invalid path')
-        }
-        return value
-      },
-      readManifest(dir) {
-        const manifest = record(readProfileManifest('dsh', dir))
-        if (!manifest) throw backendError('STARTUP_FAILED', `DSH profile manifest is unavailable: ${dir}`)
-        return manifest
-      },
-      writeManifest(dir, manifest) {
-        writeProfileManifest(dir, manifest)
-      },
-      initProfile(dir, bundles) {
-        initProfile(dir, bundles)
-      },
-      resolvePackageDir(name, installAnchor, profileDir) {
-        return resolveBundleDir('dsh', name, installAnchor, profileDir)
-      },
-      loadPatches(file) {
-        const patches: unknown = loadOptionalPatches('dsh', file)
-        if (patches === undefined) return undefined
-        if (!Array.isArray(patches) || patches.some(item => record(item) === undefined)) {
-          throw backendError('STARTUP_FAILED', `DSH patch parser returned an invalid list: ${file}`)
-        }
-        return patches as JsonRecord[]
-      },
     },
   }
 }

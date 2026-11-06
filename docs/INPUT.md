@@ -16,7 +16,8 @@ Short API handoff: `docs/INPUT-API.md`.
 - **Seam installer** (`src/input/pi-tui-seam.js`) adds *only* the app entry
   points to Editor/SelectList prototypes: `ccCaptureSnapshot`,
   `ccRestoreSnapshot`, cursor/word/whitespace primitives, kill/yank/undo,
-  history browsing, atomic replacement, paste/insert, submit/newline,
+  history browsing, atomic replacement, marker-aware transpose, character
+  jump (`ccStartJump`/`ccJumpToChar`), paste/insert, submit/newline,
   autocomplete step/accept, and completion selection access. It replaces the
   former pnpm patch; upstream source remains readable and updateable.
 - **Keymap is independent.** `CcKeymap` does not import Pi's global
@@ -31,28 +32,34 @@ Short API handoff: `docs/INPUT-API.md`.
 
 ## Vendored TUI integration (parent)
 
-1. `pnpm install` links the local file dependency
-   `@earendil-works/pi-tui: file:vendor/pi-tui`; there is no pnpm patch.
+1. The vendored package is reached through the single package-import seam
+   `#pi-tui` → `./vendor/pi-tui/dist/index.js` (plus `#pi-tui/package.json` for
+   the manifest), so a DSH installation cannot resolve a different
+   `@earendil-works/pi-tui` copy. `src/input/` and `test/input*.test.ts` import
+   only `#pi-tui`; upstream names in copyright/attribution comments are kept.
 2. `pnpm build:pi-tui` compiles the vendored TypeScript to
-   `vendor/pi-tui/dist/` (the package entry). `pnpm check` runs it first.
+   `vendor/pi-tui/dist/` (the mapped entry). `pnpm check` runs it first.
 3. `CcEditor` installs `src/input/pi-tui-seam.js` once at module load and
    throws an actionable error if the seam is missing.
 4. Offline tests use the same vendored package; no module-loader redirect,
    patch hash or scratch-package copy is required. Refresh the vendored source
    from the pinned upstream release when upgrading, then rebuild and run the
    full input/terminal suite.
+5. Terminal ownership, start/stop, raw-mode and exit restoration live in
+   `docs/INPUT-LIFECYCLE.md` (`test/input-lifecycle.test.ts`).
 
 ## Behaviour coverage
 
 Status vocabulary: **match** (intended CC/readline parity), **app override**
-(CC repurposes the key), **Pi extension**, **unverified**, **unsupported**.
+(CC repurposes the key), **Pi extension**, **TUI extension** (a DSH TUI
+capability that is not a verified CC default), **unverified**, **unsupported**.
 
 | Family | Keys | Semantics / status |
 | --- | --- | --- |
 | Line/char motion | Ctrl+A/E, Home/End, Ctrl+B/F, Left/Right | logical line start/end; grapheme movement; line-boundary wrap follows Pi. match |
 | Word motion | Alt+B/F, Alt+Left/Right, Ctrl+Left/Right | punctuation + CJK aware via Intl.Segmenter; platform aliases bound together. match (terminal coverage caveat) |
 | Vertical/history | Up/Down, Ctrl+P/N | visual line first; on first/last visual line browse history; **no Pi jump-to-column-0 step**; draft, cursor and paste markers restored. match |
-| Char delete | Backspace, Ctrl+H, Delete, Ctrl+D | grapheme-safe; line-boundary merge; Ctrl+D exits only when empty **and** Ctrl+D is still bound to enabled `app.exit`; empty Delete no-ops. match |
+| Char delete | Backspace, Ctrl+H, Delete, Ctrl+D | grapheme-safe; line-boundary merge; Ctrl+D exits only when empty, and the empty guard is independent of binding priority (disabling/rebinding forward-delete cannot resurrect global exit); empty Delete no-ops. match |
 | Whitespace kill | Ctrl+W | shell-whitespace boundary: whole path/flag; paste markers atomic; column-0 merges newline. match |
 | Word kill | Alt+Backspace, Ctrl+Backspace, Alt+D/Alt+Delete | punctuation/CJK boundaries (Option+Delete on macOS). match |
 | Line kill | Ctrl+U, Ctrl+K | kill ring, newline merge at boundaries, empty-line behaviour = Pi. match |
@@ -60,12 +67,16 @@ Status vocabulary: **match** (intended CC/readline parity), **app override**
 | Undo | Ctrl+_ / Ctrl+- / Ctrl+Shift+- | restores text+cursor+paste registry; typing coalesced, kills/yanks/pastes atomic. match (byte equivalence documented) |
 | Submit/newline | Enter, Shift+Enter, Ctrl+J, Alt+Enter, backslash+Enter | Enter submits; others newline; backslash fallback. match |
 | Completion | Tab, Enter/Esc with menu, Ctrl+P/N in menu | menu owns nav/accept/cancel; editor editing works beneath. unverified for exact CC accept/submit split |
-| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; pasted bytes never dispatched as keys/chords; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands. match |
+| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands. match |
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
-| Chords | Ctrl+X Ctrl+E + user chords | prefix wait, **3000 ms** default timeout (expires at the deadline), cancel on mismatch and redispatch, `onChordChange` hint hook. match (timeout value per CC docs) |
+| Tool details | Ctrl+X Ctrl+O, `[`/`]`, Alt+Left/Right, Tab/Right, Shift+Tab/Left, c | `app.tools.details` opens the tools inspector on the **latest tool** (TUI extension, not a CC default; plain Ctrl+O keeps expand/collapse). The read-only modal context `toolDetails → list → dialog → global` adds previous/next tool (`[` + Alt+Left, `]` + Alt+Right; Pi's legacy ESC-b/ESC-f reads alias Alt+Left/Right in this context), next/previous section, copy, shared list scrolling (`Up/Down`, `Ctrl+P/N`, `j/k`, PageUp/Down, Home/End), `Esc`/`list.cancel` close. `c` and brackets exist only in `toolDetails`, so they are ordinary text in the editor; unbound printable bytes are inert in the modal. |
+| Chords | Ctrl+X Ctrl+E + user chords | prefix wait, **3000 ms** default timeout (expires at the deadline), cancel on mismatch and redispatch, paste/focus/config changes cancel; the keymap owns pending state and hint notification (`onChordChange`), the editor only owns the timeout timer. match (timeout value per CC docs) |
+| Cancel | Esc, Ctrl+C | Esc is contextual: close completion, restore the history-browsing draft, and only then forward `app.cancel`; a consumed local action never also reaches the app. Ctrl+C always resolves `app.interrupt` through the keymap (completion, jump mode, pending chord and dialogs do not swallow it); paste bytes are not keys. match |
+| Character jump | Ctrl+] / Ctrl+Alt+] | Pi extension: only an actual target character (one grapheme) is consumed; DEL/Backspace, control keys and escape sequences cancel the jump and are re-dispatched through `CcKeymap`, so CC whitespace Ctrl+W, CC deletion, remaps and disabled actions still apply. No Pi default fallback. match |
 | Config | all actions | multiple keys, disable (`null`), remap, contexts, hot reload, conflicts/byte-ambiguity/chord-shadow diagnostics, grouped Settings editor. match |
 | Lists/dialogs/search | j/k/1-9, arrows, Enter/Esc, Ctrl+R | separate contexts; list keys never leak into text fields; search keeps editor editing fallback. app override |
+| /model picker | Tab/Shift+Tab, Left/Right (browse), printable text | two contexts: `modelPickerList → list → editor → global` and `modelPickerSearch → editor → global`. Provider cycling uses registered `model.provider.*` actions only. In the picker `CcEditor` path, a plain printable chunk with no pending chord is query text in **both** contexts (first typed `j`/`k`/digit from browse focus, and cancelled-chord passthrough) instead of `list.next`/`list.select-digit`; text fields never lose letters. Enter/Esc are forwarded as `list.select`/`list.cancel`; Ctrl+C remains global. Raw `keymap.resolve(modelPickerList)` keeps the list defaults for custom list components. app override; see `docs/MODEL-INPUT-API.md` |
 
 ### Keyboard settings and native permissions
 
@@ -98,8 +109,9 @@ a separate command owned by the mounted DSH plugin.
 ### Grapheme handling
 
 Movement/deletion uses Pi's grapheme+paste-marker segmentation. ZWJ emoji,
-combining marks and large-paste markers are atomic. `ccReplaceRange` (used by
-transpose) is grapheme-boundary safe as called by the editor glue.
+combining marks and large-paste markers are atomic. Transpose now runs through
+the seam (`ccTransposeChars`) with the same marker-aware segmentation, so it
+cannot split a large-paste marker; it stays one undoable edit.
 
 ### Context fallback chains
 
@@ -108,10 +120,39 @@ transpose) is grapheme-boundary safe as called by the editor glue.
 - `historySearch → editor → global`
 - `dialog → editor → global`
 - `list → global`
+- `modelPickerList → list → editor → global`
+- `modelPickerSearch → editor → global`
+- `toolDetails → list → dialog → global` (no editor fallback: editor
+  movement/kill/undo bindings never reach a read-only details surface; an
+  unbound printable byte is inert even if the modal is hosted by `CcEditor`)
 
 Local actions win; global app bindings are a fallback. This is why Ctrl+W,
 Ctrl+A, Alt+B etc. still edit while completion or history search is open, and
 why Ctrl+C/Esc still reach the app in dialogs.
+
+In `modelPickerList`, `modelPickerSearch` and `toolDetails`, the configured
+**simple** `app.interrupt` binding (Ctrl+C by default) is checked before a
+pending chord and before the context chain. A typed chord prefix therefore
+cannot swallow the interrupt: the pending chord is cancelled (the key hint
+clears once) and `app.interrupt` is dispatched. Disabling/remapping the action
+moves or removes this priority; Ctrl+C then falls back to `list.cancel`.
+Existing `list`/`dialog` behaviour is unchanged.
+
+Picker specifics (details: `docs/MODEL-INPUT-API.md`):
+
+- `list.select` / `list.cancel` also apply in `modelPickerSearch`, so Enter and
+  Esc are forwarded as list actions; Enter never submits/clears the query.
+- The picker `CcEditor` path inserts a plain printable chunk into the query
+  before the keymap (when no chord is pending), in both picker contexts. This
+  includes the first `j`/`k`/digit typed from browse focus and printable bytes
+  re-dispatched after a chord mismatch/timeout. Modifier-led pending chords
+  still complete first, and existing editor/list/dialog/history-search
+  contexts are unchanged.
+- `model.provider.*` are the only events that may change the provider group.
+  If `model.provider.next` is disabled, the generic `editor.complete` fallback
+  for Tab is consumed in picker contexts instead of being emitted.
+- In both picker contexts the configured `app.interrupt` key keeps priority
+  over the local `list.cancel` Ctrl+C binding.
 
 ### Disabled/remapped keys
 
@@ -121,7 +162,19 @@ why Ctrl+C/Esc still reach the app in dialogs.
   than silently using defaults; unknown action ids are reported and ignored.
 - Byte-equivalent bindings (`^H`, `^M`, `^[`, `^_`, Tab/Ctrl+I) are reported as
   `byte-ambiguous` when they collide in one context.
-- `app.exit` remap/disable is honoured contextually for Ctrl+D.
+- `render / invalidate()` never changes input state: a spinner refresh no
+  longer drops a pending chord timer or leaves a stale hint. `cancelChord()`
+  is the single editor entry point (timer + keymap pending + hint); the keymap
+  itself notifies on open/complete/cancel/timeout.
+- `dispose()` is idempotent. It clears this editor's timer and detaches only
+  its own shared-keymap chord listener, so an App editor replacement or a
+  closed question/dialog cannot leave the old editor receiving hints; other
+  live editors stay attached. Shared pending is cancelled only when this
+  editor still owns it (generation match): disposing a hidden editor does not
+  disturb the focused prompt's chord. `setKeymap(sameInstance)` re-attaches
+  rather than disposing.
+- `app.exit` remap/disable is honoured contextually for Ctrl+D, and the
+  empty-draft guard applies before any global fallback.
 
 ## Draft / stash / search / external editor
 
@@ -132,11 +185,46 @@ why Ctrl+C/Esc still reach the app in dialogs.
   and undo stack; `onChange` unless `notify:false`.
 - `replaceDraftText(text, {cursor})` — undoable whole-draft replacement;
   Pi-normalizes CRLF/CR→LF and tabs→4 spaces, clears large-paste markers, and
-  pushes the old state (including pastes) on the undo stack.
+  pushes the old state (including pastes) on the undo stack. An unchanged text
+  is a true no-op: it returns false without calling Pi `setText`, so the paste
+  registry, undo stack, cursor and held paste framing are preserved.
 - `captureDraftForExternalEditor()` / `applyExternalEdit(text, snapshot)`.
-- `restoreHistoryDraft()` — Esc while browsing returns the pre-browsing draft.
+- `restoreHistoryDraft()` — Esc while browsing returns the pre-browsing draft
+  and consumes the key (no `app.cancel`/interrupt for that Esc).
 - History entries are restored by snapshot, so search cancel can restore the
   exact draft without string hacks.
+
+## Image attachments (CC style, memory only)
+
+- `insertImage(upload)` inserts one atomic `[Image #N]` marker; the encoded
+  upload stays in the editor's in-memory registry. `captureDraft()` /
+  `restoreDraft()` carry it (memory snapshots only — never `history.json`).
+- Atomicity uses the same segmentation as large-paste markers, so Backspace,
+  Delete, Ctrl+W, Alt+Backspace, Ctrl+U/K, transpose, word motion and wrapped
+  cursor movement never split a marker into bare text.
+- Marker ids are monotonic and never reused. The high-water mark is raised by
+  marker text that arrives from outside the editor — restored snapshots and
+  `history.json` entries — so a new paste cannot take an id an older entry
+  already points at. Restoring a *newer* draft or an older snapshot never rolls
+  the mark back. At `Number.MAX_SAFE_INTEGER` the id space is exhausted and
+  `insertImage` throws instead of wrapping.
+- Unknown markers stay unresolved: a history entry or hand-typed `[Image #N]`
+  without an upload is preserved verbatim, never upgraded to an attachment, and
+  blocks the send through `onSubmitBlocked` (the draft is not cleared, so nothing
+  is silently sent as text only).
+- In-session history keeps images: submitting records the payloads referenced by
+  that entry's own text, so Up recalls real images and a payload can never be
+  attached to a marker it did not come from. The history payload registry is
+  pruned with the history list and trimmed oldest-first by budget.
+- Ordered content: one image part per visible marker occurrence, in place —
+  repeating the same marker sends the same upload twice (the input layer never
+  de-duplicates or rewrites the prompt; DSH stores content-addressed bytes).
+- Budget: payloads still reachable from the draft, the real undo stack, the kill
+  ring, the pre-browsing draft or the in-session history registry are never
+  reclaimed; only unreachable spares are dropped. If the protected set would
+  exceed the hard budget, `insertImage` refuses with `CcImageBudgetError`
+  *before* editing the draft, so a new paste is rejected instead of breaking
+  Ctrl+_ / Ctrl+Y on an older image.
 
 ## Terminal limitations (honest gaps)
 
@@ -176,9 +264,59 @@ why Ctrl+C/Esc still reach the app in dialogs.
   paste, large-paste marker + submit expansion, chord actions/cancel/timer,
   app overrides, disabled/remapped keys, printable vs list, submit/newline,
   completion nav/accept/edit-fallback.
+- `test/input-image.test.ts` — `[Image #N]` atomicity (Backspace, Ctrl+W,
+  Alt+Backspace, kill/yank), undo restores marker + payload, prompt content
+  interleaving with repeated occurrences kept in order, undo/kill-ring payload
+  protection and budget refusal, hand-typed markers blocked, pre-clear submit payload, image-only
+  submit, no-content-consumer refusal, stash/snapshot round-trip, in-session
+  history recall, persisted-history identity (id reservation, unresolved
+  markers), safe-integer boundary, budget reclaim.
+- `test/input-image-details.test.ts` — `imageDetails` context/chain, locked
+  action ids and bindings, Esc close precedence, global interrupt priority,
+  read-only inertness (printable/editing/paste), Windows/WSL Alt+V alias.
+- `test/input-image-screen.test.ts` — kitty full-redraw re-upload after a clear
+  (Ghostty/Rex), placement-only optimisation on ordinary frames, resize
+  cell-size re-query, no image work when the terminal reports no image
+  protocol. The file injects the Kitty capability and restores default cell
+  geometry through an `afterEach` hook (also after failed assertions), so it
+  never depends on the host terminal's `TERM_PROGRAM`/`COLORTERM`.
 - `test/input-snapshot.test.ts` — JSON snapshot round-trip, undo/kill/pastes,
   history-browsing restore, external-editor round trip, `replaceDraftText`
   undo, validation, one-editor-state invariants.
+- `test/input-cancellation.test.ts` — review R08-R12 regressions: no-op
+  replacement preserving pastes/undo/cursor, marker-aware transpose + undo,
+  spinner invalidation vs chord timeout, paste/chord isolation, focus/config
+  chord cancellation, non-empty Ctrl+D with disabled/rebound forward-delete or
+  `app.exit`, jump target/control-key routing (Ctrl+W remap and DEL/Backspace),
+  history-Esc consumption, completion Esc vs global Ctrl+C, Ctrl+C through
+  pending chord/jump state, and idempotent `dispose()` with shared-keymap
+  listener isolation.
+- `test/input-model-picker.test.ts` — /model picker: new contexts/chains,
+  raw keymap vs `CcEditor` text-first routing in both picker contexts, printable
+  chord-prefix suppression, pending modifier chords and mismatch/timeout
+  passthrough, digit quick-select suppression, action remap/disable
+  (disabled Tab never emits `editor.complete`), `setContext()` snapshot and
+  chord-ownership preservation, Enter/Esc forwarding without submit/clear,
+  Ctrl+C priority, standard readline edits, fragmented paste and old-context
+  regressions.
+- `test/input-tool-details.test.ts` — tool details: action contract and one
+  grouped Settings list registration; Ctrl+X Ctrl+O opens the latest-tool
+  inspector while bare Ctrl+O keeps expand; draft/cursor/kill-ring/undo
+  preservation; modal bytes for `[`/`]`/Alt+Left/Right tool switching,
+  Tab/Shift+Tab/arrows/copy/list scrolling/Esc; no editor fallthrough in the
+  read-only context; editor brackets stay text and Alt+Left/Right stay word
+  motion; remap/disable of every new binding with old keys inert; Ctrl+C
+  priority through a pending chord and local list.cancel; and the return to the
+  editor where `c` is text again and readline edits still work.
+- `test/input-lifecycle.test.ts` — terminal start/stop ownership: one exit
+  hook, one stdin/resize wiring, suspend/resume cycles without accumulation,
+  a stopped renderer ignoring stale key/resize callbacks, stop-before-start and
+  repeated stop, exit-restore on a direct process exit, failed start keeping
+  the restore hook, debounced+cancelled cell-size query, disposed `CcEditor`
+  inertness; plus private-PTY (`script -q`) cases for real raw-mode
+  capture/restore, repeated `start()` idempotency with a single dispatch, and
+  the fatal `process.exit()` restore byte stream (bracketed paste, keyboard
+  protocol, cursor, alt screen). See `docs/INPUT-LIFECYCLE.md`.
 
 Vendored TUI build: `pnpm build:pi-tui` (writes `vendor/pi-tui/dist/`).
 

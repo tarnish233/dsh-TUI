@@ -16,6 +16,12 @@ import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-imag
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 /**
+ * Resize events arrive in bursts while a window is dragged. The cell-size query
+ * is only needed once the geometry settled, so it is coalesced by this delay.
+ */
+const CELL_SIZE_QUERY_DEBOUNCE_MS = 150;
+
+/**
  * Component interface - all components must implement this
  */
 export type TuiMouseEventType = "press" | "release" | "move" | "drag" | "click" | "wheel";
@@ -520,6 +526,8 @@ export abstract class TuiBase extends Container implements TUI {
 	private renderRequested = false;
 	private immediateRenderScheduled = false;
 	private renderTimer: NodeJS.Timeout | undefined;
+	/** Debounce for the cell-size query re-sent after a terminal resize. */
+	private cellSizeQueryTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
 	private showHardwareCursor = false;
@@ -960,7 +968,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
-			() => this.requestRender(),
+			() => this.handleTerminalResize(),
 		);
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
@@ -1009,10 +1017,36 @@ export abstract class TuiBase extends Container implements TUI {
 		this.terminal.write("\x1b[16t");
 	}
 
+	/**
+	 * Resize handler: redraw and re-query the cell size.
+	 *
+	 * The initial query only runs in `start()`, so an image-capable terminal that
+	 * reports its cell geometry late (or changes it, e.g. font zoom on resize)
+	 * would keep rendering images at stale cell dimensions. The query goes through
+	 * the same terminal stream and is consumed by `consumeCellSizeResponse`; no
+	 * second stdin reader and no direct tty control is involved. Rapid resize
+	 * events are coalesced so window dragging does not flood the terminal.
+	 */
+	private handleTerminalResize(): void {
+		this.requestRender();
+		if (!getCapabilities().images) return;
+		if (this.cellSizeQueryTimer) clearTimeout(this.cellSizeQueryTimer);
+		this.cellSizeQueryTimer = setTimeout(() => {
+			this.cellSizeQueryTimer = undefined;
+			if (this.stopped) return;
+			this.queryCellSize();
+		}, CELL_SIZE_QUERY_DEBOUNCE_MS);
+		this.cellSizeQueryTimer.unref?.();
+	}
+
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
 		process.off("exit", this.exitRestoreHandler);
 		this.cancelRenderTimer();
+		if (this.cellSizeQueryTimer) {
+			clearTimeout(this.cellSizeQueryTimer);
+			this.cellSizeQueryTimer = undefined;
+		}
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}

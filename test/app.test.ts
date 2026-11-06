@@ -9,9 +9,10 @@ import { PromptHistory } from '../src/config.ts'
 import type { Backend, BackendEvent, JsonRecord, SessionInfo } from '../src/backend/types.ts'
 import { VirtualTerminal, delay, until } from './helpers/terminal.ts'
 
-async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen', config?: JsonRecord) {
+async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen', config?: JsonRecord, settings?: JsonRecord) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-pi-app-'))
   if (config) await writeFile(join(directory, 'keybindings.json'), JSON.stringify(config))
+  if (settings) await writeFile(join(directory, 'settings.json'), JSON.stringify(settings))
   const terminal = new VirtualTerminal(90, 30)
   const backend = new DemoBackend({ cwd: directory, delayMs: 1 })
   const app = new App({ backend, cwd: directory, configDir: directory, terminal, screen, demo: true, registerSignals: false })
@@ -115,9 +116,10 @@ test('App model picker, shared configured list keys and actual Shift+Tab permiss
     await until(() => f.app.session?.permissions?.currentValue === 'danger-full-access', 'permission preset changes via native-shaped command')
     assert.ok(f.backend.info.events?.every(event => event.type !== 'plan/mode'), 'permission shortcut never creates a plan mode')
     await f.app.submit('/settings'); await painted(f.terminal)
+    f.terminal.type('\t'); await painted(f.terminal)
     f.terminal.type('\x06'); await painted(f.terminal)
     const screen = f.terminal.screen()
-    assert.ok(screen.split('\n').some(line => line.includes('❯') && line.includes('Thinking')), screen)
+    assert.ok(screen.split('\n').some(line => line.includes('❯') && line.includes('Preview lines')), screen)
     f.terminal.type('\x1b'); await painted(f.terminal)
     f.terminal.type('abc'); f.terminal.type('\x02')
     assert.equal(f.app.editor.getCursor().col, 2, 'Ctrl+B remains text movement outside lists')
@@ -235,22 +237,27 @@ test('recall-history write failure never retries an accepted backend prompt', as
     await delay(30)
     assert.deepEqual(backend.sent, ['accepted prompt'])
     assert.equal(app.editor.getText(), 'fresh draft')
+    assert.match(app.store.items.filter(item => item.kind === 'notice').map(item => item.text).join('\n'), /recall history was not saved/)
   } finally { await app.shutdown(); terminal.dispose(); await rm(directory, { recursive: true, force: true }) }
 })
 
 
 test('keyboard help lives in Settings; /reload applies TUI resources and keeps the DSH boundary', async () => {
-  const f = await fixture('inline')
+  const f = await fixture('inline', undefined, { screen: 'inline' })
   try {
     const events: BackendEvent[] = []
     f.backend.onEvent(event => events.push(event))
     const lastNotice = () => f.app.store.items.filter(item => item.kind === 'notice').at(-1)?.text ?? ''
-    await f.app.submit('/help')
-    assert.ok(!lastNotice().includes('/hotkeys'))
-    assert.match(lastNotice(), /\/reload —/)
+    const beforeHelp = f.app.store.items.length
+    await f.app.submit('/help'); await painted(f.terminal)
+    assert.doesNotMatch(f.terminal.screen(), /\/hotkeys/)
+    f.terminal.type('\x1b[F'); await painted(f.terminal)
+    assert.match(f.terminal.screen(), /\/reload\b/, 'long command lists are browsed by scrolling, not selecting')
+    assert.equal(f.app.store.items.length, beforeHelp, 'Help is a display panel, not a transcript notice')
+    f.terminal.type('\x1b'); await painted(f.terminal)
     await f.app.submit('/settings'); await painted(f.terminal)
     assert.match(f.terminal.screen(), /Keyboard shortcuts/)
-    f.terminal.type('4'); await painted(f.terminal)
+    f.terminal.type('3'); await painted(f.terminal)
     assert.match(f.terminal.screen(), /Navigation/)
     assert.match(f.terminal.screen(), /Start of line/)
     f.terminal.type(String.fromCharCode(27)); await painted(f.terminal)
@@ -292,7 +299,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       f.terminal.type('draft preserved ')
       f.terminal.type('\x1b[200~' + '中文 draft\n'.repeat(30) + '\x1b[201~')
       const editor = f.app.editor, before = editor.captureDraft()
-      await f.app.submit('/settings'); f.terminal.type('4'); await painted(f.terminal)
+      await f.app.submit('/settings'); f.terminal.type('3'); await painted(f.terminal)
       assert.match(f.terminal.screen(), /Keyboard shortcuts/)
       assert.match(f.terminal.screen(), /Navigation/)
       assert.doesNotMatch(f.terminal.screen(), /cc-match|editor\.move/)
@@ -315,7 +322,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       f.terminal.type('\x11')
       assert.equal(editor.getCursor().col, 0, 'the edited shortcut executes on the real main editor')
 
-      await f.app.submit('/settings'); f.terminal.type('4'); await painted(f.terminal)
+      await f.app.submit('/settings'); f.terminal.type('3'); await painted(f.terminal)
       f.terminal.type('d')
       await until(() => !f.app.keymap.getBindings('editor.move.line-start').length, 'disabled action is live')
       await painted(f.terminal)
@@ -335,7 +342,7 @@ test('shortcut conflicts stay in the edit pane and malformed configuration is ne
     const file = join(f.directory, 'keybindings.json')
     await writeFile(file, JSON.stringify({ 'app.model.select': 'alt+m' }))
     await until(() => f.app.keymap.getBindings('app.model.select')[0] === 'alt+m', 'unrelated override applied')
-    await f.app.submit('/settings'); f.terminal.type('4'); f.terminal.type('\r'); await painted(f.terminal)
+    await f.app.submit('/settings'); f.terminal.type('3'); f.terminal.type('\r'); await painted(f.terminal)
     for (let count = 0; count < 4; count++) f.terminal.type('\x15')
     f.terminal.type('ctrl+e'); f.terminal.type('\r')
     await until(() => f.terminal.screen().includes('Shortcut conflict'), 'conflict rendered without saving')
@@ -360,34 +367,32 @@ test('App exposes /preset and /effort pickers; started sessions stage the preset
     assert.match(f.terminal.screen(), /Minimal mode/)
     f.terminal.type('\x1b[B'); f.terminal.type('\r'); await painted(f.terminal)
     assert.equal(f.app.session?.preset, 'minimal')
-    assert.match(f.terminal.screen(), /Agent preset: Minimal mode/)
-    assert.match(f.terminal.screen(), /preset: minimal/)
+    assert.doesNotMatch(f.terminal.screen(), /Agent preset: Minimal mode/)
+    assert.match(f.terminal.screen(), / · minimal/, 'the preset value shows without its label prefix')
 
+    const beforePresetStatus = f.app.store.items.length
     await f.app.submit('/preset status')
-    let notice = f.app.store.items.filter(item => item.kind === 'notice').at(-1)?.text ?? ''
-    assert.match(notice, /Agent preset: minimal/)
-    assert.match(notice, /Available: standard, minimal/)
+    assert.equal(f.app.store.items.length, beforePresetStatus, 'preset status is already shown in the footer')
 
     await f.app.submit('/effort'); await painted(f.terminal)
     assert.match(f.terminal.screen(), /Choose reasoning effort/)
     assert.match(f.terminal.screen(), /High/)
     f.terminal.type('\x1b[B'); f.terminal.type('\r'); await painted(f.terminal)
     assert.equal(f.app.session?.reasoningEffort, 'low')
-    assert.match(f.terminal.screen(), /Reasoning effort: low/)
-    assert.match(f.terminal.screen(), /effort: low/)
+    assert.doesNotMatch(f.terminal.screen(), /Reasoning effort: low/)
+    assert.match(f.terminal.screen(), /deepseek-demo low/, 'the text-only effort rides behind the model')
 
+    const beforeEffortStatus = f.app.store.items.length
     await f.app.submit('/effort status')
-    notice = f.app.store.items.filter(item => item.kind === 'notice').at(-1)?.text ?? ''
-    assert.match(notice, /Reasoning effort: low/)
-    assert.match(notice, /Available: low, medium, high, max/)
+    assert.equal(f.app.store.items.length, beforeEffortStatus, 'effort status is already shown in the footer')
 
     await f.app.submit('tools')
     await f.backend.whenIdle(); await painted(f.terminal)
+    const beforeStaging = f.app.store.items.length
     await f.app.submit('/preset'); await painted(f.terminal)
     f.terminal.type('\r'); await painted(f.terminal)
     assert.equal(f.app.session?.preset, 'minimal', 'a started session keeps its preset')
-    notice = f.app.store.items.filter(item => item.kind === 'notice').at(-1)?.text ?? ''
-    assert.match(notice, /next \/new session/)
+    assert.equal(f.app.store.items.length, beforeStaging, 'the staged preset is shown only in status')
     assert.match(f.terminal.screen(), /next preset: standard/)
 
     await f.app.submit('/new'); await painted(f.terminal)

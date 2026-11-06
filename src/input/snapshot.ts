@@ -9,6 +9,7 @@
  */
 
 import type { CcEditorSnapshot, CcUndoSnapshot } from "./pi-tui-seam-types.ts"
+import type { ImageUploadPart } from "../ui/image-view.ts"
 
 export type CcDraftSnapshot = CcEditorSnapshot
 
@@ -32,6 +33,26 @@ function isPastePairs(value: unknown): value is Array<[number, string]> {
         typeof entry[1] === "string",
     )
   )
+}
+
+/**
+ * Image attachment payloads in a snapshot.
+ *
+ * Only the marker id and the encoded upload are validated here; DSH remains the
+ * authority for image formats and admission, exactly as for a live paste. A
+ * snapshot with image payloads is memory-only and must never be persisted.
+ */
+function isImageAttachmentEntries(value: unknown): value is Array<[number, ImageUploadPart]> {
+  if (!Array.isArray(value)) return false
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 2) return false
+    const id = entry[0]
+    const payload = entry[1]
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) return false
+    if (typeof payload !== "object" || payload === null) return false
+    const part = payload as Record<string, unknown>
+    return part.type === "image" && typeof part.data === "string" && part.data.length > 0
+  })
 }
 
 function isUndoSnapshot(value: unknown): value is CcUndoSnapshot {
@@ -60,7 +81,11 @@ export function isCcDraftSnapshot(value: unknown): value is CcDraftSnapshot {
     typeof value.historyIndex === "number" &&
     Array.isArray(value.undoStack) &&
     value.undoStack.every(isUndoSnapshot) &&
-    isStringArray(value.killRing)
+    isStringArray(value.killRing) &&
+    // Older snapshots (pre image attachments) simply carry no image payloads.
+    (value.imageAttachments === undefined || isImageAttachmentEntries(value.imageAttachments)) &&
+    (value.imageCounter === undefined ||
+      (typeof value.imageCounter === "number" && Number.isSafeInteger(value.imageCounter) && value.imageCounter >= 0))
   )
 }
 
@@ -71,12 +96,17 @@ export function parseCcDraftSnapshot(value: unknown): CcDraftSnapshot {
       "Invalid CcDraftSnapshot: expected version 1 with lines/cursor/pastes/history/undoStack/killRing fields",
     )
   }
-  return value
+  return {
+    ...value,
+    imageAttachments: value.imageAttachments ?? [],
+    imageCounter: value.imageCounter ?? 0,
+  }
 }
 
 /**
- * Strip derived convenience fields before persisting, keeping the authoritative
- * editor state. Cheap to call; returns a new object.
+ * Serialize a draft snapshot. Image payloads are still part of the returned
+ * JSON: only use this for memory/transport, never for `history.json` or any
+ * durable draft file.
  */
 export function serializeCcDraftSnapshot(snapshot: CcDraftSnapshot): string {
   return JSON.stringify(snapshot)

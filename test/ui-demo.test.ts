@@ -11,7 +11,7 @@ import {
 } from '../src/demo.ts'
 import { TranscriptStore } from '../src/state/transcript.ts'
 import { TranscriptView } from '../src/ui/transcript.ts'
-import { stripTerminalSequences, visibleWidth } from '@earendil-works/pi-tui'
+import { stripTerminalSequences, visibleWidth } from '#pi-tui'
 
 function waitFor(backend: DemoBackend, predicate: (event: BackendEvent) => boolean): Promise<BackendEvent> {
   return new Promise(resolve => {
@@ -174,16 +174,21 @@ test('tools fixture emits a native terminal call and result card', async () => {
   assert.equal(presentation.result?.card, 'terminal')
   assert.equal(presentation.result?.exitCode, 0)
   assert.match(presentation.result?.output ?? '', /\/tmp\/demo/)
-  const rendered = stripTerminalSequences(new TranscriptView(store, { showThinking: false, expandTools: false }).render(90).join('\n'))
+  const view = new TranscriptView(store, { showThinking: false, expandTools: false })
+  const rendered = stripTerminalSequences(view.render(90).join('\n'))
   const edit = store.items.find(item => item.kind === 'tool' && item.callId === 'call-demo-tools-edit')
   assert.equal(edit?.kind, 'tool')
   if (edit?.kind !== 'tool') return
   assert.equal(edit.status, 'done')
   assert.equal((edit.presentation as { result?: { card?: string } } | undefined)?.result?.card, 'diff')
-  assert.match(rendered, /Bash\(pwd\)/)
+  assert.match(rendered, /Bash pwd/)
   assert.match(rendered, /Show the demo workspace/)
-  assert.match(rendered, /exit code 0/)
-  assert.match(rendered, /Update\(src\/greet\.ts\)/)
+  assert.match(rendered, /1 line returned/)
+  assert.doesNotMatch(rendered, /Update Edit/, 'the native tool verb is not duplicated by its CC label')
+  assert.match(rendered, /Update src\/greet\.ts/)
+  view.options.expandTools = true
+  const details = stripTerminalSequences(view.render(90).join('\n'))
+  assert.match(details, /exit code 0/, 'native exit code belongs to expanded Output')
   assert.match(rendered, /你好/)
   assert.match(rendered, /Both cards came from the offline demo/)
   assert.match(rendered, /No command\s+ran/)

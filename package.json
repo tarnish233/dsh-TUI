@@ -1,36 +1,100 @@
 {
-  "name": "dsh-pi-tui",
-  "version": "0.1.0",
+  "name": "dsh-tui",
+  "version": "0.2.0",
   "private": true,
-  "description": "A CC-style terminal UI for DeepSeek Harness, using a vendored Pi TUI.",
+  "description": "A native DeepSeek Harness terminal application plugin, using a vendored Pi TUI.",
   "type": "module",
   "license": "MIT",
+  "imports": {
+    "#pi-tui": "./vendor/pi-tui/dist/index.js",
+    "#pi-tui/package.json": "./vendor/pi-tui/package.json",
+    "#pi-tui/*": "./vendor/pi-tui/dist/*.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/plugin/index.d.ts",
+      "import": "./lib/plugin/index.js"
+    },
+    "./startup": {
+      "types": "./lib/plugin/startup.d.ts",
+      "import": "./lib/plugin/startup.js"
+    },
+    "./launcher-check": {
+      "types": "./lib/plugin/launcher-check.d.ts",
+      "import": "./lib/plugin/launcher-check.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "assets",
+    "vendor/pi-tui/dist",
+    "vendor/pi-tui/package.json",
+    "vendor/pi-tui/LICENSE",
+    "vendor/pi-tui/SOURCE.md",
+    "cordis.patch.yml",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "bin": {
-    "dsh-tui": "./bin/dsh-tui.mjs",
-    "dsh-pi-tui": "./bin/dsh-pi-tui.mjs"
+    "dsh-tui": "./bin/dsh-tui.mjs"
   },
   "engines": {
-    "node": ">=22.19"
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-rc.1"
   },
   "scripts": {
     "start": "node bin/dsh-tui.mjs",
     "demo": "node bin/dsh-tui.mjs --demo",
     "build:pi-tui": "tsc -p vendor/pi-tui/tsconfig.build.json",
+    "build": "pnpm build:pi-tui && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 test/*.test.ts",
-    "check": "pnpm build:pi-tui && pnpm typecheck && pnpm test"
+    "check": "pnpm build && pnpm typecheck && pnpm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-agent-preset": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-cmdline": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-web-app": "0.2.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-agent-preset": { "optional": true },
+    "@deepseek-ai/dsh-app-boot": { "optional": true },
+    "@deepseek-ai/dsh-cmdline": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true },
+    "@deepseek-ai/dsh-session": { "optional": true },
+    "@deepseek-ai/dsh-web-app": { "optional": true }
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "file:vendor/pi-tui",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "commander": "15.0.0",
     "diff": "8.0.4",
     "get-east-asian-width": "1.6.0",
     "highlight.js": "11.11.1",
     "marked": "18.0.11",
-    "marked-cjk-friendly": "0.1.2"
+    "marked-cjk-friendly": "0.1.2",
+    "sharp": "0.35.5"
   },
   "devDependencies": {
-    "@types/node": "24.0.0",
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent-preset": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-cmdline": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
     "@types/diff": "7.0.2",
+    "@types/node": "24.0.0",
     "@xterm/headless": "6.0.0",
     "typescript": "5.9.3"
   }

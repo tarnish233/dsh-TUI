@@ -12,6 +12,16 @@ export class UndoStack<S> {
 		this.stack.push(structuredClone(state));
 	}
 
+	/**
+	 * Read-only view of the stored snapshots (oldest first).
+	 *
+	 * Used by the host layer to keep side data that an undo step can still reach
+	 * alive; it never mutates or reorders the stack.
+	 */
+	snapshots(): readonly S[] {
+		return this.stack;
+	}
+
 	/** Pop and return the most recent snapshot, or undefined if empty. */
 	pop(): S | undefined {
 		return this.stack.pop();

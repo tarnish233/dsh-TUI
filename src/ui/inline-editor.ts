@@ -23,12 +23,12 @@ import {
   matchesKey,
   renderFakeCursor,
   type TUI,
-} from '@earendil-works/pi-tui'
+} from '#pi-tui'
 import { CcEditor, type CcKeymap } from '../input/index.ts'
 import { cc, editorTheme, t } from './theme.ts'
 import { wrap } from './text.ts'
 
-export type InlineKey = 'handled' | 'submit' | 'cancel' | 'up' | 'down' | 'tab'
+export type InlineKey = 'handled' | 'submit' | 'cancel' | 'interrupt' | 'up' | 'down' | 'tab'
 
 /** One logical answer row backed by exactly one CcEditor state. */
 export class InlineAnswer {
@@ -38,6 +38,7 @@ export class InlineAnswer {
   /** The text handed to onSubmit before CcEditor cleared its buffer. */
   lastSubmittedText: string | undefined
   private pending: InlineKey | undefined
+  private disposed = false
 
   constructor(tui: TUI, keymap: CcKeymap) {
     this.keymap = keymap
@@ -50,7 +51,13 @@ export class InlineAnswer {
     }
     this.editor.onChange = text => this.onChange?.(text)
     this.editor.onAction = event => {
-      if (event.id === 'app.cancel' || event.id === 'app.interrupt') {
+      // Global turn cancellation and local dismissal are different answers for
+      // the dialog; keep them distinct instead of folding both into cancel.
+      if (event.id === 'app.interrupt') {
+        this.pending = 'interrupt'
+        return true
+      }
+      if (event.id === 'app.cancel') {
         this.pending = 'cancel'
         return true
       }
@@ -74,6 +81,25 @@ export class InlineAnswer {
     return this.editor.getText() === ''
   }
 
+  /** True once the shared-keymap listeners of this editor were released. */
+  get isDisposed(): boolean {
+    return this.disposed
+  }
+
+  /**
+   * Release the single editor state and any shared-keymap chord listener it
+   * owns. Idempotent: the parent calls it on settled closure, session reset or
+   * shutdown, never while a question is merely hidden and expected back.
+   */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.onChange = undefined
+    // CcEditor.dispose is ownership-aware for the shared keymap: it removes
+    // only this editor's listener and only cancels a chord this editor opened.
+    this.editor.dispose()
+  }
+
   set focused(value: boolean) {
     this.editor.focused = value
   }
@@ -86,6 +112,7 @@ export class InlineAnswer {
 
   /** Forward one raw terminal input to the single editor state. */
   handleKey(data: string): InlineKey {
+    if (this.disposed) return 'handled'
     this.pending = undefined
     this.lastSubmittedText = undefined
     const canNavigate = !this.editor.isPasting() && !this.keymap.isPendingChord() && !this.editor.capturesViewportInput
@@ -97,8 +124,14 @@ export class InlineAnswer {
     return result
   }
 
-  /** Render the row without editor borders; `width` is the available columns. */
-  render(width: number, focused: boolean, placeholder: string): string[] {
+  /**
+   * Render the row without editor borders; `width` is the available columns.
+   *
+   * `confirmed` is the answer the dialog already accepted (CcEditor clears its
+   * buffer on submit), so an unfocused row keeps showing the real value instead
+   * of an empty placeholder plus a check mark.
+   */
+  render(width: number, focused: boolean, placeholder: string, confirmed = ''): string[] {
     const raw = this.editor.getText()
     if (focused) {
       if (raw === '') {
@@ -108,8 +141,9 @@ export class InlineAnswer {
       // This plain Editor has one top and bottom border and no completion provider.
       return rendered.slice(1, -1).map(line => line.replace(/ +$/, ''))
     }
-    if (raw.trim() === '') return [cc.inactive(placeholder)]
-    return wrap(raw.replace(/\n+$/, ''), Math.max(4, width)).map(line => t.text(line))
+    const shown = raw.trim() === '' ? confirmed : raw
+    if (shown.trim() === '') return [cc.inactive(placeholder)]
+    return wrap(shown.replace(/\n+$/, ''), Math.max(4, width)).map(line => t.text(line))
   }
 
   invalidate(): void {

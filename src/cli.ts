@@ -1,85 +1,134 @@
-import { parseArgs } from 'node:util'
+import { spawnSync } from 'node:child_process'
 import { resolve } from 'node:path'
-import type { App } from './app.ts'
+import { fileURLToPath } from 'node:url'
+import { redactDiagnostic } from './backend/errors.ts'
+import { DEFAULT_PROFILE, optionsFromFlags, tuiCommand, type TuiFlags, type TuiOptions } from './plugin/options.ts'
 
-const HELP = `dsh-tui 0.1.0 — DSH TUI: CC-style terminal for DeepSeek Harness
+const ALIAS_FLAGS = new Set(['--profile', '--dsh', '--dsh-home'])
 
-Usage: dsh-tui [options] [prompt]
+/** Strip only alias flags; DSH receives every application argument verbatim. */
+export function nativeArguments(args: readonly string[], profile = DEFAULT_PROFILE): string[] {
+  const inner: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!
+    if (arg === '--') { inner.push(...args.slice(index)); break }
+    if (ALIAS_FLAGS.has(arg)) { index += 1; continue }
+    if ([...ALIAS_FLAGS].some(flag => arg.startsWith(flag + '='))) continue
+    inner.push(arg)
+  }
+  return ['--profile', profile, ...inner]
+}
 
-  --demo                  Deterministic offline demo, no model calls
-  --inline                Main screen / native terminal scrollback (default)
-  --fullscreen            Fullscreen renderer with app-owned scrolling
-  --cwd <directory>       Working directory
-  --profile <name>        Reuse a real DSH profile: its native providers, model
-                          defaults and credentials (dsh --profile <name>)
-  --model <provider/model> Override DSH route for this launch
-  --provider <name>       Provider (when model does not include a provider)
-  --dsh <executable>      DSH command/path (default: dsh on PATH)
-  --dsh-home <directory>  DSH native home; the generated profile stays private
-  -r, --resume <id>       Resume a DSH session
-  -c, --continue          Resume newest-created session in this working directory
-  --config-dir <directory> Independent TUI preferences / keybindings
-  -h, --help              Help
-  -v, --version           Version
-
-Model providers, default models and credentials come from DeepSeek Harness's own
-configuration: the selected profile's cordis.patch.yml, the home cordis.patch.yml
-and $DSH_HOME/.credentials.yaml. DSH TUI never reads Pi models.json/auth.json.
-Use --profile <name> (for example the profile you configured models in) instead of
-copying provider catalogs. Without --profile, DSH's default base composition plus
-home-level native configuration is used.
-
-Type /help inside the TUI. This checkout can be linked locally as dsh-tui.
-`
-
-const MODELS_FILE_HELP = `dsh-tui: --models-file was removed and no fallback is attempted.
-
-DSH TUI uses DeepSeek Harness native configuration only:
-  - configure providers, model defaults and credentials in DSH (a profile's
-    cordis.patch.yml, the home cordis.patch.yml, or the DSH settings UI);
-  - then select that profile with: dsh-tui --profile <name> [--model provider/model].
-
-Pi models.json/auth.json is never imported. Run dsh-tui --help for the current options.
-`
-
+/** Compatibility alias only. Production startup/composition belongs to the native dsh launcher. */
 export async function main(args: string[]): Promise<void> {
-  if (args.some(argument => argument === '--models-file' || argument.startsWith('--models-file='))) {
-    process.stderr.write(MODELS_FILE_HELP)
+  if (args.some(arg => arg === '--models-file' || arg.startsWith('--models-file='))) {
+    process.stderr.write('dsh-tui: --models-file was removed. Configure models and credentials through the native DSH profile; Pi models.json/auth.json are never imported.\n')
     process.exitCode = 2
     return
   }
-  let parsed: ReturnType<typeof parseArgs>
-  try {
-    parsed = parseArgs({ args, allowPositionals: true, options: {
-      demo: { type: 'boolean' }, inline: { type: 'boolean' }, fullscreen: { type: 'boolean' },
-      cwd: { type: 'string' }, model: { type: 'string' }, provider: { type: 'string' }, profile: { type: 'string' },
-      dsh: { type: 'string' }, 'dsh-home': { type: 'string' },
-      resume: { type: 'string', short: 'r' }, continue: { type: 'boolean', short: 'c' },
-      'config-dir': { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
-    } })
-  } catch (error) { process.stderr.write(String(error instanceof Error ? error.message : error) + '\nUse --help.\n'); process.exitCode = 2; return }
-  const values = parsed.values
-  if (values.help) { process.stdout.write(HELP); return }
-  if (values.version) { process.stdout.write('0.1.0\n'); return }
-  if (values.inline && values.fullscreen) { process.stderr.write('Choose --inline or --fullscreen, not both.\n'); process.exitCode = 2; return }
-  if (!process.stdin.isTTY || !process.stdout.isTTY) { process.stderr.write('dsh-tui requires an interactive terminal. Use --help for usage.\n'); process.exitCode = 2; return }
-  const string = (key: string) => typeof values[key] === 'string' ? values[key] as string : undefined
-  const cwd = resolve(string('cwd') ?? process.cwd())
-  let model = string('model')
-  let provider = string('provider')
-  if (model?.includes('/')) { const split = model.indexOf('/'); provider = model.slice(0, split); model = model.slice(split + 1) }
-  let app: App | undefined
-  try {
-    const { App } = await import('./app.ts')
-    const backend = values.demo
-      ? new (await import('./demo.ts')).DemoBackend({ cwd })
-      : new (await import('./backend/index.ts')).DshBackend({ cwd, dshPath: string('dsh'), home: string('dsh-home'), resume: string('resume'), provider, model, profile: string('profile') })
-    app = new App({ backend, cwd, demo: Boolean(values.demo), screen: values.fullscreen ? 'fullscreen' : values.inline ? 'inline' : undefined, configDir: string('config-dir'), initialPrompt: parsed.positionals.join(' ') || (values.demo ? 'tools' : undefined), continueLatest: Boolean(values.continue) })
-    await app.start()
-    process.exitCode = await app.exited
-  } catch (error) {
-    if (app) await app.shutdown(1).catch(() => {})
-    process.stderr.write('dsh-tui: ' + String(error instanceof Error ? error.message : error) + '\n')
-    process.exitCode = 1
+  const command = tuiCommand(true).exitOverride()
+  let options: TuiOptions | undefined
+  let flags: TuiFlags = {}
+  command.action((prompt: string[]) => {
+    flags = command.opts<TuiFlags>()
+    options = optionsFromFlags(flags, prompt, command)
+  })
+  try { command.parse(args, { from: 'user' }) }
+  catch (error: unknown) {
+    const exitCode = error !== null && typeof error === 'object' && 'exitCode' in error && typeof error.exitCode === 'number'
+      ? error.exitCode : 2
+    process.exitCode = exitCode
+    return
   }
+  if (options === undefined) return
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stderr.write('dsh-tui requires an interactive terminal. Use --help for usage.\n')
+    process.exitCode = 2
+    return
+  }
+  if (options.demo) {
+    // Fixture-only: the same terminal output boundary, without loading native DSH or a profile.
+    const [{ App }, { DemoBackend }, { ProcessTerminal }, { createTerminalOutputLease }, { createNativeDiagnosticProjection }, { configDirectory }] = await Promise.all([
+      import('./app.ts'), import('./demo.ts'), import('#pi-tui'), import('./backend/terminal-output.ts'),
+      import('./ui/native-diagnostics.ts'), import('./config.ts'),
+    ])
+    const cwd = resolve(options.cwd ?? process.cwd())
+    let app: InstanceType<typeof App> | undefined
+    let output: Awaited<ReturnType<typeof createTerminalOutputLease>> | undefined
+    const diagnostics = createNativeDiagnosticProjection((message, level) => app?.reportNativeDiagnostic(message, level))
+    const closeOutput = async () => {
+      diagnostics.dispose()
+      output?.restore()
+      await output?.close()
+    }
+    try {
+      output = await createTerminalOutputLease({
+        directory: resolve(options.configDir ?? configDirectory(), 'logs'),
+        onRecord: record => diagnostics.handle(record),
+        onFatal: () => { app?.restoreTerminal(); diagnostics.dispose(); output?.restore() },
+      })
+      output.install()
+      app = new App({
+        backend: new DemoBackend({ cwd }), cwd, screen: options.screen, configDir: options.configDir,
+        terminal: new ProcessTerminal({ write: output.terminalWrite }),
+        demo: true, initialPrompt: options.initialPrompt ?? 'tools',
+      })
+      await app.start()
+      process.exitCode = await app.exited
+      await closeOutput()
+    } catch (error: unknown) {
+      app?.restoreTerminal()
+      await app?.shutdown(1).catch(() => {})
+      await closeOutput().catch(() => {})
+      const message = redactDiagnostic(error instanceof Error ? error.message : 'Offline terminal startup failed.').replace(/[\u0000-\u001f\u007f]/g, ' ')
+      process.stderr.write(`dsh-tui: ${message}\n`)
+      process.exitCode = 1
+    }
+    return
+  }
+  const argv = nativeArguments(args, flags.profile ?? DEFAULT_PROFILE)
+  // Native composition, not a profile copy: assert activation even if both app rows were disabled.
+  argv.splice(2, 0, '--patch', fileURLToPath(new URL('../assets/launcher.patch.yml', import.meta.url)))
+  const executable = flags.dsh ?? 'dsh'
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  if (flags.dshHome !== undefined) env.DSH_HOME = resolve(flags.dshHome)
+  const startup = new AbortController()
+  let interruptedCode: number | undefined
+  const interrupt = () => { interruptedCode = 130; startup.abort() }
+  const terminate = () => { interruptedCode = 0; startup.abort() }
+  // Keep handlers registered until native package cancellation and cleanup have settled.
+  process.on('SIGINT', interrupt)
+  process.on('SIGTERM', terminate)
+  try {
+    if (options.cwd !== undefined) process.chdir(options.cwd)
+    const { ensureNativeAttachment } = await import('./plugin/attachment.ts')
+    await ensureNativeAttachment({
+      executable, profile: flags.profile ?? DEFAULT_PROFILE, cwd: process.cwd(), env, signal: startup.signal,
+      report: message => process.stderr.write(message + '\n'),
+    })
+  } catch (error: unknown) {
+    if (interruptedCode !== undefined) process.exitCode = interruptedCode
+    else {
+      const message = redactDiagnostic(error instanceof Error ? error.message : 'Native DSH application attachment failed.').replace(/[\u0000-\u001f\u007f]/g, ' ')
+      process.stderr.write(`dsh-tui: ${message}\n`)
+      process.exitCode = 1
+    }
+    return
+  } finally {
+    process.removeListener('SIGINT', interrupt)
+    process.removeListener('SIGTERM', terminate)
+  }
+  if (interruptedCode !== undefined) { process.exitCode = interruptedCode; return }
+  // POSIX replaces this alias with dsh: TUI and DSH live in one process, no IPC/supervisor.
+  if (process.platform !== 'win32' && typeof process.execve === 'function') {
+    const strings = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+    process.execve('/usr/bin/env', ['env', executable, ...argv], strings)
+    return
+  }
+  // Platforms without execve delegate the whole application; no TUI state remains in this shell.
+  const result = spawnSync(executable, argv, { env, stdio: 'inherit', shell: process.platform === 'win32' })
+  if (result.error !== undefined) {
+    process.stderr.write('Could not launch native DSH. Install DSH and mount dsh-tui in the selected profile.\n')
+    process.exitCode = 1
+  } else process.exitCode = result.status ?? (result.signal === 'SIGINT' ? 130 : 1)
 }

@@ -1,38 +1,146 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { watch, type FSWatcher } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import {
   CombinedAutocompleteProvider, Container, getNativeClipboard, isViewportTUI,
-  matchesKey, ProcessTerminal, ScrollView, Text, truncateToWidth, visibleWidth,
-  type Component, type Focusable, type KeyId, type Terminal, type TUI,
+  matchesKey, ProcessTerminal, ScrollView, Spacer, Text, truncateToWidth, visibleWidth,
+  type Component, type Focusable, type KeyId, type NativeClipboard, type Terminal, type TUI,
+  type TuiInputListenerResult,
   TuiAltScreen, TuiMainScreen, VStack,
-} from '@earendil-works/pi-tui'
-import type { Backend, BackendEvent, DecisionOption, DecisionRequest, SessionInfo, TranscriptCodec } from './backend/types.ts'
-import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore } from './config.ts'
+} from '#pi-tui'
+import type {
+  Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, StatsSnapshot, TranscriptCodec, UsageSnapshot,
+} from './backend/types.ts'
+import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore, type Settings } from './config.ts'
 import { HistorySearch } from './history-search.ts'
-import { CcEditor, createCcKeymap, type CcActionEvent, type CcDraftSnapshot, type CcKeymap, type CcKeymapConfig } from './input/index.ts'
+import { CcEditor, createCcKeymap, type CcActionEvent, type CcDraftSnapshot, type CcKeymap, type CcKeymapConfig, type CcSubmitPayload } from './input/index.ts'
 import { formatElapsed, formatOutputRate, formatOutputTokens, OutputTracker } from './state/output-stats.ts'
+import type { TodoItem } from './backend/types.ts'
+import { createGitStatsRefresher, readGitStats, type GitStats } from './state/git-stats.ts'
 import { TranscriptStore } from './state/transcript.ts'
 import { DecisionDialog, SelectDialog } from './ui/dialogs.ts'
+import { HelpPanel, type HelpCommand } from './ui/help.ts'
 import { KeybindingsDialog } from './ui/keybindings.ts'
-import { TranscriptView } from './ui/transcript.ts'
-import { editorTheme, t } from './ui/theme.ts'
+import { ModelPickerDialog, type ModelPickerItem } from './ui/model-picker.ts'
+import { SessionPickerDialog } from './ui/session-picker.ts'
+import { SettingsDialog } from './ui/settings.ts'
+import { HitboxRegistry } from './ui/mouse.ts'
+import { QueueList } from './ui/queue-list.ts'
+import { ToolDetailsDialog } from './ui/tool-details.ts'
+import { ImageDetailsDialog } from './ui/image-details.ts'
+import { getTranscriptImages } from './ui/image-data.ts'
+import { resetImageDisplayCache } from './ui/image-cache.ts'
+import type { ImageDetailsRequest, ImageViewItem } from './ui/image-view.ts'
+import { displayContentParts, imageAttachmentValue, imageMediaTypeFromBytes } from './attachments.ts'
+import { clearToolExpansion } from './ui/tool-expansion.ts'
+import { toolPreferences, type ToolDetailsRequest } from './ui/tool-view.ts'
+import { TranscriptView, transcriptHints, type TranscriptViewHints, type TranscriptViewOptionsShape } from './ui/transcript.ts'
+import { dim, editorTheme, t } from './ui/theme.ts'
+import { WelcomeHeader } from './ui/welcome.ts'
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
-// DSH mist-blue accent (not the previous CC orange).
-const accent = (text: string) => t.dshBlue(text)
-const dim = (text: string) => '\x1b[2m' + text + '\x1b[22m'
+
+const GIT_ICON = '\u{f418}'
+const CACHE_ICON = '\u{f01bc}'
+const CONTEXT_BAR_WIDTH = 10
+
+/** TTFT display: milliseconds under a second, one decimal above. */
+function formatTtft(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
+/**
+ * CC-style rainbow marker for the top effort level: three vivid theme hues,
+ * one per character, so `max` visibly cycles colors instead of wearing a
+ * single accent. Static (no timer/animation) and width-safe: every hue is a
+ * zero-width SGR wrapper around the same character.
+ */
+const EFFORT_RAINBOW = [t.pink, t.orange, t.cyan] as const
+
+/** Wrap each character in the next hue of `hues`, cycling through them. */
+function colorCycled(text: string, hues: readonly ((value: string) => string)[]): string {
+  let out = ''
+  let index = 0
+  for (const character of Array.from(text)) {
+    out += hues[index % hues.length](character)
+    index += 1
+  }
+  return out
+}
+
+/** git status symbols colored by role: conflict/behind red, modified yellow, untracked muted, ahead green. */
+function styledGitStatus(status: string): string {
+  let out = ''
+  for (const char of status) {
+    if (char === '=' || char === '\u21e3') out += t.red(char)
+    else if (char === '!') out += t.yellow(char)
+    else if (char === '?') out += t.muted(char)
+    else if (char === '\u21e1') out += t.green(char)
+    else out += t.subtle(char)
+  }
+  return out
+}
+const EXIT_ARM_MS = 1_000
+/** Bound on graceful DSH close after the terminal is already restored. */
+const SHUTDOWN_CLOSE_MS = 8_000
+/** Shared 品牌蓝 (brand blue) for the prompt, working status and chrome. */
+const accent = t.accent
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 
+function admittedUserMessageId(event: { data: unknown }): string | undefined {
+  const data = object(event.data)
+  const message = object(data?.message) ?? data
+  const source = object(message?.source)
+  if (source !== undefined && source.kind !== 'user') return undefined
+  return typeof message?.id === 'string' ? message.id : undefined
+}
+
+function readQueueEntries(value: unknown): QueueEntry[] {
+  if (!Array.isArray(value)) return []
+  const rows: QueueEntry[] = []
+  for (const item of value) {
+    const row = object(item)
+    if (row === undefined || typeof row.messageId !== 'string') continue
+    const images = typeof row.images === 'number' && Number.isFinite(row.images) ? row.images : 0
+    rows.push({
+      messageId: row.messageId,
+      text: typeof row.text === 'string' ? row.text : '',
+      target: row.target === 'next-step' ? 'next-step' : 'next-turn',
+      images,
+    })
+  }
+  return rows
+}
+
+function sameQueue(left: readonly QueueEntry[], right: readonly QueueEntry[]): boolean {
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index]
+    const b = right[index]
+    if (a === undefined || b === undefined) return false
+    if (a.messageId !== b.messageId || a.text !== b.text || a.target !== b.target || a.images !== b.images) return false
+  }
+  return true
+}
+/** Optional lifecycle hooks are called only when the owning component exposes them. */
+const disposeComponent = (value: unknown): void => {
+  if (value === null || value === undefined) return
+  const dispose = (value as { dispose?: () => void }).dispose
+  if (typeof dispose === 'function') dispose.call(value)
+}
+
+/** Native identity is retained only for display grouping, never command routing. */
+type CommandCatalogEntry = HelpCommand & { definitionId?: string }
+
 const UI_COMMANDS = [
-  { name: 'help', description: 'Commands and shortcuts' },
+  { name: 'help', description: 'Display commands and custom commands' },
   { name: 'settings', description: 'TUI preferences' },
   { name: 'model', description: 'Choose a DSH model' },
   { name: 'effort', description: 'Choose the model reasoning effort' },
   { name: 'preset', description: 'Choose a DSH agent preset' },
-  { name: 'resume', description: 'Resume a DSH session' },
+  { name: 'resume', description: 'Resume a DSH session (picker lists this directory)' },
   { name: 'new', description: 'New DSH session' },
   { name: 'reload', description: 'Reload TUI settings/keybindings and DSH configuration/plugins' },
   { name: 'exit', description: 'Exit' },
@@ -54,11 +162,14 @@ class PromptEditor extends CcEditor {
     const status = truncateToWidth(this.workingStatus, Math.max(1, width - 4), '')
     const statusWidth = visibleWidth(status)
     if (statusWidth === 0) return base
-    return this.borderColor('── ') + status + this.borderColor(' ' + '─'.repeat(Math.max(0, width - statusWidth - 4)))
+    // The status replaces the border's left edge so the spinner aligns with
+    // the `❯` prompt and the transcript markers, with no `── ` notch in front.
+    return status + this.borderColor(' ' + '─'.repeat(Math.max(0, width - statusWidth - 1)))
   }
 
   render(width: number): string[] {
     const lines = super.render(width)
+    // The prompt arrow is the 品牌蓝, like the editor frame it sits in.
     if (lines.length > 2 && lines[1]?.startsWith('  ')) lines[1] = accent('❯') + ' ' + lines[1].slice(2)
     return lines
   }
@@ -86,8 +197,50 @@ export interface AppOptions {
   terminal?: Terminal
   demo?: boolean
   initialPrompt?: string
-  continueLatest?: boolean
   registerSignals?: boolean
+  /** A native host owns shutdown signals, independently of Unix suspend/resume. */
+  allowSuspend?: boolean
+  /** User-triggered tool copy; offline acceptance injects this rather than touching a real clipboard. */
+  copyText?: (text: string) => Promise<void>
+  /** Native clipboard injection for offline image/text acceptance; never a credential/config subsystem. */
+  clipboard?: NativeClipboard
+  /**
+   * `--resume` without a session id: open the directory session picker at
+   * startup instead of resuming a known id. Esc keeps the fresh session.
+   */
+  resumePicker?: boolean
+}
+
+/**
+ * One UI operation's identity. DSH owns the session/attachment; the editor
+ * identity and epoch catch a same-session reattachment or replacement while
+ * an asynchronous palette catalog, clipboard read or send is in flight.
+ */
+interface UiContext {
+  sessionId: string | undefined
+  attachmentId: string | undefined
+  route: string
+  editor: CcEditor
+  epoch: number
+}
+
+interface PendingDecision {
+  sessionId: string
+  /** Attachment observed when the native request arrived. */
+  attachmentId?: string
+  request: DecisionRequest
+}
+
+interface DecisionDialogExtras {
+  /** Newer dialog surfaces expose a global-cancel hook separate from Esc. */
+  onInterrupt?: () => void
+}
+
+/** A native dequeue transfer receipt held only until explicit editing succeeds. Never an execution queue. */
+interface QueuedImageRecovery {
+  readonly text: string
+  readonly messageId?: string
+  readonly content: readonly DisplayContentPart[]
 }
 
 export class App {
@@ -101,12 +254,24 @@ export class App {
   private readonly keybindings: KeybindingsStore
   private readonly directory: string
   private readonly screen: 'inline' | 'fullscreen'
+  /** Fullscreen transcript scroll host; the click-anchor freezes/restores it. */
+  private scrollView: ScrollView | undefined
+  /** ScrollTop captured when a disclosure click disabled follow; null when idle. */
+  private anchoredScrollTop: number | null = null
+  private readonly followHitboxes = new HitboxRegistry()
+  private readonly queueList = new QueueList({
+    sendNow: id => { void this.sendQueued(id) },
+    edit: id => { this.editQueued(id) },
+    cancel: id => { void this.cancelQueued(id) },
+    changed: () => this.render(),
+  })
   private readonly modeBindings: CcKeymapConfig
   private history: PromptHistory
   private readonly histories = new Map<string, PromptHistory>()
-  private readonly viewOptions: { showThinking: boolean; expandTools: boolean }
+  private readonly viewOptions: TranscriptViewOptionsShape
   private readonly transcript: TranscriptView
   private readonly prompt: Prompt
+  private readonly welcome: WelcomeHeader
   private readonly slot = new Container()
   private readonly footer = new Text('', 0, 0)
   private readonly hint = new Text('', 0, 0)
@@ -116,21 +281,67 @@ export class App {
   private connected = false
   private fatal = false
   private closing = false
+  private started = false
   private terminalPaused = false
   private off?: () => void
   private dialog?: Component
+  private toolDetailsOverlay?: {
+    request: ToolDetailsRequest
+    dialog: ToolDetailsDialog
+    handle: ReturnType<TUI['showOverlay']>
+  }
+  private imageDetailsOverlay?: {
+    request: ImageDetailsRequest
+    dialog: ImageDetailsDialog
+    handle: ReturnType<TUI['showOverlay']>
+  }
+  private clipboardGeneration = 0
+  private clipboardPending = false
   private decisionId?: string
-  private readonly decisions: Array<{ sessionId: string; request: DecisionRequest }> = []
+  private readonly decisions: PendingDecision[] = []
   private readonly activeCommands = new Map<string, string>()
-  private nativeCommands: Array<{ name: string; description: string }> = []
-  private catalogRequest?: { sessionId: string; promise: Promise<void> }
+  private nativeCommands: CommandCatalogEntry[] = []
+  private catalogRequest?: { sessionId: string; attachmentId: string | undefined; promise: Promise<void> }
+  /** The startup connect() task; the resume overlay awaits it before listing. */
+  private connecting?: Promise<SessionInfo>
+  /** Confirmed per-session titles (null = no title) within this launch. */
+  private readonly sessionTitles = new Map<string, string | null>()
+  /** Ids waiting for the next coalesced `titles` request. */
+  private readonly sessionTitleIds = new Set<string>()
+  private titleTimer?: NodeJS.Timeout
+  /**
+   * Footer context/cache/total facts. Fed by the bridge's `metrics` frames
+   * during a turn and by the native `state` command at baselines.
+   */
+  private usage?: { used: number; size?: number; cachePct?: number; totalTokens?: number }
+  /** Native sessionStats fold (turns/steps, rate, TTFT): `metrics` frames plus `state` baselines. */
+  private stats?: { decodeTokens?: number; decodeMs?: number; ttftMs?: number; ttftSteps?: number; turns?: number; steps?: number }
+  /** Latest native todos snapshot of the current session (null = cleared). */
+  private todos: TodoItem[] | null = null
+  /** Last seen native plan-mode state; toggles surface as notices. */
+  private planActive: boolean | undefined
+  /** Read-only git observations for the footer's second line. */
+  private gitStats?: GitStats
+  private gitRefresher?: { refresh(): void; dispose(): void }
+  private gitTimer?: NodeJS.Timeout
   private codec?: TranscriptCodec
   private stashed?: CcDraftSnapshot
   private cleared?: CcDraftSnapshot
   private restored?: { text: string; before: CcDraftSnapshot }
   private updatingDraft = false
   private queueRecallPending = false
-  private nextSendMode?: 'followup' | 'steer'
+  private queueReadController?: AbortController
+  /** Ref-only retry receipts: bytes stay in DSH, and no message is automatically re-sent. */
+  private readonly queueImageRecoveries = new Map<string, readonly QueuedImageRecovery[]>()
+  private queued = 0
+  private queueRows: QueueEntry[] = []
+  private readonly queueRemovals = new Set<string>()
+  /** Inbox ids already written into the transcript. They are the current turn, not a queue. */
+  private readonly admittedUserMessageIds = new Set<string>()
+  /** Row whose text is in the composer. Enter writes it back; it is not sent. */
+  private editingQueueId?: string
+  private queueRequest?: { epoch: number; promise: Promise<void>; dirty: boolean }
+  private nextSendMode?: 'followup' | 'steer' | 'send-now'
   private nextPreset?: string
   private exitArm?: { at: number; id: string }
   private exitTimer?: NodeJS.Timeout
@@ -143,6 +354,15 @@ export class App {
   private chordHint?: string[]
   private readonly warnings: string[] = []
   private readonly signals: Array<[NodeJS.Signals, () => void]> = []
+  private offInput?: () => void
+  private epoch = 0
+  /** Increments on every applied SessionInfo; catches a ready event landing mid-command. */
+  private infoStamp = 0
+  /** Increments when a local dialog opens/closes; stale async pickers must not replace it. */
+  private surfaceGeneration = 0
+  private terminalRestored = false
+  private editorChild?: ChildProcess
+  private nativeAutoTitle?: { available: boolean; enabled?: boolean; effective?: string }
 
   constructor(options: AppOptions) {
     this.options = options
@@ -158,16 +378,29 @@ export class App {
       'historySearch.previous': ['ctrl+shift+r', 'up', 'ctrl+p'],
       'historySearch.accept': this.screen === 'inline' ? ['enter', 'tab', 'escape'] : ['enter', 'tab'],
       'historySearch.cancel': this.screen === 'inline' ? ['ctrl+c'] : ['escape', 'ctrl+c'],
-      'app.message.sendNow': ['ctrl+enter', 'ctrl+x ctrl+s'],
+      'app.message.sendNow': ['ctrl+enter'],
+      'app.message.steer': ['ctrl+x ctrl+s'],
       'app.message.followUp': ['ctrl+x enter'],
     }
     this.keymap = createCcKeymap({ bindings: this.modeBindings, chordTimeoutMs: 3000 })
-    this.viewOptions = { showThinking: settings.showThinking, expandTools: settings.expandTools }
+    this.viewOptions = {
+      ...toolPreferences(settings),
+      showThinking: settings.showThinking, hints: this.viewHints(),
+      thinkingPreviewLines: settings.thinkingPreviewLines,
+      screen: this.screen,
+      thinkingLiveTimerMs: settings.thinkingLiveTimerMs,
+      onRenderRequest: () => this.render(),
+      onViewportAnchor: expanding => this.anchorTranscriptViewport(expanding),
+      onToolDetails: request => this.openToolDetails(request),
+      onImageDetails: request => this.openImageDetails(request),
+      imageDetailsHint: this.keymap.getBindings('app.images.details')[0],
+    }
     const terminal = options.terminal ?? new ProcessTerminal()
     this.tui = this.screen === 'fullscreen'
-      ? new TuiAltScreen(terminal, false, undefined, { scrollToEndIndicator: () => accent(' ↓ new output · click to follow '), copyOnSelect: true })
+      ? new TuiAltScreen(terminal, false, undefined, { copyOnSelect: true })
       : new TuiMainScreen(terminal)
     this.prompt = new Prompt(this.tui, this.keymap)
+    this.welcome = new WelcomeHeader({ demo: options.demo })
     this.transcript = new TranscriptView(this.store, this.viewOptions)
     this.exited = new Promise(resolve => { this.resolveExit = resolve })
   }
@@ -176,43 +409,184 @@ export class App {
   get session(): SessionInfo | undefined { return this.info }
   get isBusy(): boolean { return this.busy || this.activeCommands.size > 0 }
   get pendingDecisionCount(): number { return this.decisions.length }
+  get queuedCount(): number { return this.queued }
+
+  /** Native diagnostic notices use the existing report plane, never the input draft. */
+  reportNativeDiagnostic(message: string, level: 'info' | 'error' = 'error'): void {
+    if (this.closing || this.terminalRestored) return
+    this.store.report(message, level)
+  }
+
+  private context(): UiContext {
+    return {
+      sessionId: this.info?.sessionId,
+      attachmentId: this.info?.attachmentId,
+      route: (this.info?.provider ?? '') + '/' + (this.info?.model ?? ''),
+      editor: this.editor,
+      epoch: this.epoch,
+    }
+  }
+
+  /** True while a captured UI operation still belongs to the live attachment. */
+  private sameContext(context: UiContext): boolean {
+    return this.sameAttachment(context) && (this.info?.provider ?? '') + '/' + (this.info?.model ?? '') === context.route
+  }
+
+  /**
+   * Attachment identity without the model route. Operations that intentionally
+   * change the route (/model, /effort, /preset, /new, /resume) use this so their
+   * own `ready` event is not mistaken for a stale result.
+   */
+  private sameAttachment(context: UiContext): boolean {
+    return !this.closing && this.epoch === context.epoch &&
+      this.info?.sessionId === context.sessionId &&
+      this.info?.attachmentId === context.attachmentId &&
+      this.editor === context.editor
+  }
+
+  /**
+   * Global routing for explicit Ctrl+C while a dialog, settings list or
+   * history search owns focus. It never clears or rewrites local state: the
+   * native cancel settles decisions and the backend reports the real outcome.
+   */
+  private globalInput(data: string): TuiInputListenerResult {
+    if (this.closing || this.terminalPaused || this.dialog === undefined) return undefined
+    if (this.editor.isPasting() || (this.dialog instanceof ModelPickerDialog && this.dialog.isPasting) || data.startsWith('\x1b[200~')) return undefined
+    if (!this.bound(data, 'app.interrupt')) return undefined
+    if (this.decisionId === undefined && !this.isBusy) return undefined
+    void this.interrupt()
+    return { consume: true }
+  }
+
+  /**
+   * Read-only queued human-input projection. Native inboxes also contain
+   * context-only notices (for example permission changes), which are not
+   * user messages waiting to send or recall. The adapter's queued count uses
+   * the same eligibility as dequeue; pending remains the raw inbox count.
+   * Cancellation retains input through DSH keepInbox, never a TUI scheduler.
+   */
+  private refreshQueue(): Promise<void> {
+    const context = this.context()
+    if (!this.connected || !this.info?.capabilities.includes('state')) {
+      if (this.queued !== 0 || this.queueRows.length !== 0) {
+        this.queued = 0
+        this.queueRows = []
+        this.editingQueueId = undefined
+        this.render()
+      }
+      return Promise.resolve()
+    }
+    // A status refresh can sample the inbox before the driver claims the
+    // message just sent. A later caller marks that read dirty so one more
+    // snapshot runs after it, instead of keeping the unclaimed copy on screen.
+    if (this.queueRequest?.epoch === context.epoch) {
+      this.queueRequest.dirty = true
+      return this.queueRequest.promise
+    }
+    const promise = (async () => {
+      try {
+        const state = object(await this.options.backend.command('state'))
+        if (!this.sameContext(context) || !state) return
+        const pending = object(state.pending)
+        const nextTurn = typeof pending?.nextTurn === 'number' ? pending.nextTurn : 0
+        const nextStep = typeof pending?.nextStep === 'number' ? pending.nextStep : 0
+        // An explicit zero is authoritative even if native context is pending.
+        const hasQueue = Array.isArray(state.queue)
+        const rows = readQueueEntries(state.queue).filter(row => !this.admittedUserMessageIds.has(row.messageId))
+        const queued = hasQueue
+          ? rows.length
+          : (typeof state.queued === 'number' ? state.queued : nextTurn + nextStep)
+        const sameRows = sameQueue(this.queueRows, rows)
+        const countChanged = queued !== this.queued
+        this.queued = Math.max(0, queued)
+        this.queueRows = rows
+        const editingGone = this.editingQueueId !== undefined && !rows.some(row => row.messageId === this.editingQueueId)
+        if (editingGone) this.editingQueueId = undefined
+        if (!sameRows || countChanged || editingGone) this.render()
+        this.applyUsage(object(state.usage))
+        this.applyStats(object(state.stats))
+      } catch { /* the queue is a read-only projection; a state failure is not a fatal backend error */ }
+    })()
+    this.queueRequest = { epoch: context.epoch, promise, dirty: false }
+    void promise.finally(() => {
+      if (this.queueRequest?.promise !== promise) return
+      const dirty = this.queueRequest.dirty
+      this.queueRequest = undefined
+      if (dirty && this.sameContext(context)) void this.refreshQueue()
+    })
+    return promise
+  }
 
   async start(): Promise<void> {
+    if (this.started || this.closing) return
+    this.started = true
     this.reloadKeys()
     this.configureEditor()
     this.slot.addChild(this.prompt)
-    for (const item of [this.slot, this.hint, this.footer]) this.bottom.addChild(item)
-    const header = new Text(accent('DeepSeek Harness') + dim(' · DSH TUI · v0.1 prototype' + (this.options.demo ? ' · DEMO / NO MODEL CALLS' : '')), 0, 1)
+    // Reuse the reserved separator row for the follow button. A renderer
+    // overlay on the last transcript row would cover a thinking summary/body
+    // and steal the next collapse click at the same pointer position.
+    this.bottom.addChild({
+      render: width => this.renderFollowIndicator(width),
+      handleMouse: event => this.followHitboxes.handleMouse(event),
+      invalidate: () => this.followHitboxes.clear(),
+    })
+    for (const item of [this.queueList, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
     const document = new Container()
-    document.addChild(header)
+    document.addChild(this.welcome)
+    // Keep the first conversation off the logo/identity block.
+    document.addChild(new Spacer(1))
     document.addChild(this.transcript)
     if (isViewportTUI(this.tui)) {
+      this.scrollView = new ScrollView(document, { follow: 'end', primary: true })
       this.tui.setLayoutRoot(new VStack([
-        { component: new ScrollView(document, { follow: 'end', primary: true }), basis: 0, grow: 1, minSize: 1 },
+        { component: this.scrollView, basis: 0, grow: 1, minSize: 1 },
         { component: this.bottom, basis: 'auto', shrink: 1, minSize: 4 },
       ]))
     } else { this.tui.addChild(document); this.tui.addChild(this.bottom) }
     this.store.onChange = () => this.render()
     this.off = this.options.backend.onEvent(event => this.onEvent(event))
+    this.offInput = this.tui.addInputListener(data => this.globalInput(data))
     this.tui.setFocus(this.prompt)
     this.tui.start()
     this.tui.terminal.setTitle('dsh-tui · ' + basename(this.options.cwd))
     if (this.options.registerSignals !== false) {
-      for (const signal of ['SIGTERM', 'SIGHUP'] as const) {
-        const handler = () => { void this.shutdown(0) }
+      const handlers: Array<[NodeJS.Signals, number]> = [['SIGINT', 130], ['SIGTERM', 0], ['SIGHUP', 0]]
+      for (const [signal, code] of handlers) {
+        const handler = () => { void this.shutdown(code) }
         process.on(signal, handler); this.signals.push([signal, handler])
       }
     }
     this.render()
     await this.watchKeys()
+    // Read-only git observations for the footer: async, debounced and
+    // refreshed periodically plus after each settled instruction.
+    this.gitRefresher = createGitStatsRefresher({
+      cwd: () => this.options.cwd,
+      query: (cwd, signal) => readGitStats(cwd, signal),
+      onChange: stats => {
+        this.gitStats = stats
+        this.render()
+      },
+    })
+    this.gitRefresher.refresh()
+    this.gitTimer = setInterval(() => this.gitRefresher?.refresh(), 10_000)
+    this.gitTimer.unref()
+    // The connect task starts before the overlay opens so the picker's async
+    // listing can await it; the DSH runtime boots behind a visible dialog.
+    this.connecting = this.options.backend.connect()
+    if (this.options.resumePicker) this.openStartupSessionPicker()
     try {
-      const info = await this.options.backend.connect()
+      const info = await this.connecting
       if (this.closing) return
       this.applyInfo(info)
-      await this.refreshCommands()
+      // The picker's listing must not queue behind the command roster.
+      if (this.options.resumePicker) void this.refreshCommands()
+      else await this.refreshCommands()
+      this.refreshQueue()
+      void this.syncAutoTitle()
       for (const warning of [...this.warnings, ...this.settings.warnings, ...this.history.warnings]) this.store.report(warning, 'error')
-      if (this.options.continueLatest) await this.continueLatest()
-      if (this.options.initialPrompt) await this.submit(this.options.initialPrompt)
+      if (!this.options.resumePicker && this.options.initialPrompt) await this.submit(this.options.initialPrompt)
     } catch (error) {
       this.connected = false; this.fatal = true
       this.store.report('Could not start DSH: ' + errorText(error), 'error')
@@ -220,8 +594,8 @@ export class App {
     this.render()
   }
 
-  private commands(): Array<{ name: string; description: string }> {
-    const commands = [...UI_COMMANDS]
+  private commands(): CommandCatalogEntry[] {
+    const commands: CommandCatalogEntry[] = [...UI_COMMANDS]
     const names = new Set(commands.map(command => command.name))
     for (const command of this.nativeCommands) if (!names.has(command.name)) { commands.push(command); names.add(command.name) }
     return commands
@@ -231,29 +605,299 @@ export class App {
     this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(this.commands(), this.info?.cwd ?? this.options.cwd))
   }
 
-  private refreshCommands(): Promise<void> {
-    const sessionId = this.info?.sessionId
+  private refreshCommands(force = false): Promise<void> {
+    const context = this.context()
+    const sessionId = context.sessionId
     if (!sessionId || !this.info?.capabilities.includes('commands')) {
       this.nativeCommands = []; this.updateAutocomplete(); return Promise.resolve()
     }
-    if (this.catalogRequest?.sessionId === sessionId) return this.catalogRequest.promise
-    const promise = (async () => {
+    if (!force && this.catalogRequest?.sessionId === sessionId && this.catalogRequest.attachmentId === context.attachmentId) return this.catalogRequest.promise
+    // Request identity also protects overlapping Help refreshes in the same
+    // attachment: an older listing must not replace the newer native roster.
+    const request = { sessionId, attachmentId: context.attachmentId, promise: Promise.resolve() }
+    this.catalogRequest = request
+    request.promise = (async () => {
       try {
         const result = await this.options.backend.command('commands')
-        if (this.closing || this.info?.sessionId !== sessionId) return
+        if (!this.sameContext(context) || this.catalogRequest !== request) return
         this.nativeCommands = Array.isArray(result) ? result.flatMap(value => {
           const command = object(value)
-          return typeof command?.name === 'string' && command.name
-            ? [{ name: command.name, description: typeof command.description === 'string' ? command.description : '' }] : []
+          if (typeof command?.name !== 'string' || !command.name) return []
+          const input = object(command.input)
+          return [{
+            name: command.name,
+            description: typeof command.description === 'string' ? command.description : '',
+            ...(typeof command.definitionId === 'string' ? { definitionId: command.definitionId } : {}),
+            ...(typeof input?.hint === 'string' ? { inputHint: input.hint } : {}),
+          }]
         }) : []
         this.updateAutocomplete()
       } catch (error) {
-        if (!this.closing && this.info?.sessionId === sessionId) this.store.report('Could not read DSH commands: ' + errorText(error), 'error')
+        if (this.sameContext(context) && this.catalogRequest === request) this.store.report('Could not read DSH commands: ' + errorText(error), 'error')
       }
     })()
-    this.catalogRequest = { sessionId, promise }
-    void promise.finally(() => { if (this.catalogRequest?.promise === promise) this.catalogRequest = undefined })
-    return promise
+    void request.promise.finally(() => { if (this.catalogRequest === request) this.catalogRequest = undefined })
+    return request.promise
+  }
+
+  /** Read-only command discovery; Help never changes the prompt or runs a command. */
+  private async openHelp(): Promise<void> {
+    const context = this.context()
+    const surface = this.surfaceGeneration
+    await this.refreshCommands(true)
+    if (!this.sameContext(context) || surface !== this.surfaceGeneration) return
+    const localNames = new Set(UI_COMMANDS.map(command => command.name))
+    const commands: HelpCommand[] = []
+    const customCommands: HelpCommand[] = []
+    for (const command of this.commands()) {
+      // DSH has no builtin/custom marker. This is a display convention based
+      // on native plugin-namespaced identity, not verified ownership. Missing
+      // identity is grouped with custom/other registrations; no names are guessed.
+      const group = localNames.has(command.name) || command.definitionId?.startsWith('@deepseek-ai/')
+        ? commands : customCommands
+      group.push(command)
+    }
+    this.showDialog(new HelpPanel(this.tui, {
+      commands, customCommands, keymap: this.keymap,
+      ...(customCommands.length ? { note: 'Custom commands includes plugin and unattributed native registrations.' } : {}),
+      onClose: () => this.dismissDialog(),
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else this.dismissDialog() },
+    }))
+  }
+
+  /** Display-only key labels for transcript hints; no fixed key name is invented. */
+  private viewHints(): TranscriptViewHints {
+    return transcriptHints(this.keymap)
+  }
+
+  /** One native call, one read-only interaction; it never executes or fills a prompt. */
+  private openToolDetails(request?: ToolDetailsRequest): void {
+    if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
+    const tool = request === undefined
+      ? [...this.store.items].reverse().find(item => item.kind === 'tool')
+      : this.store.items.find(item => item.kind === 'tool' && item.callId === request.callId)
+    if (tool?.kind !== 'tool') {
+      if (request === undefined) this.store.report('No tool calls to inspect.')
+      return
+    }
+    this.closeImageDetails()
+    this.closeToolDetails()
+    this.keymap.cancelChord()
+    this.chordHint = undefined
+    this.exitArm = undefined
+    this.surfaceGeneration += 1
+    const tui = this.tui
+    const selected: ToolDetailsRequest = request ?? { callId: tool.callId, section: 'output' }
+    const dialog = new ToolDetailsDialog(tui, {
+      tool, section: selected.section, keymap: this.keymap,
+      get maxHeight() { return Math.max(1, Math.floor(tui.terminal.rows * 0.8)) },
+      getToolNavigation: () => this.toolDetailsNavigation(selected.callId),
+      onPreviousTool: () => { this.navigateToolDetails(-1) },
+      onNextTool: () => { this.navigateToolDetails(1) },
+      onImageDetails: request => this.openImageDetails(request),
+      onClose: () => { if (this.toolDetailsOverlay?.dialog === dialog) this.closeToolDetails() },
+      onInterrupt: () => {
+        if (this.toolDetailsOverlay?.dialog !== dialog) return
+        this.closeToolDetails()
+        if (this.isBusy) void this.interrupt()
+      },
+      onCopy: async text => {
+        if (this.options.copyText !== undefined) { await this.options.copyText(text); return }
+        const clipboard = getNativeClipboard()
+        if (clipboard?.setText === undefined) throw new Error('Native clipboard unavailable in this terminal.')
+        await clipboard.setText(text)
+      },
+      onRenderRequest: () => { this.tui.requestRender() },
+    })
+    const handle = tui.showOverlay(dialog, { anchor: 'center', width: '80%', minWidth: 24, maxHeight: '80%', margin: 1 })
+    this.toolDetailsOverlay = { request: selected, dialog, handle }
+    this.viewOptions.mouseBlocked = true
+    this.render()
+  }
+
+  private closeToolDetails(): void {
+    const overlay = this.toolDetailsOverlay
+    if (overlay === undefined) return
+    this.toolDetailsOverlay = undefined
+    this.viewOptions.mouseBlocked = this.imageDetailsOverlay !== undefined
+    this.surfaceGeneration += 1
+    overlay.handle.hide()
+    overlay.dialog.dispose()
+    this.tui.requestRender()
+  }
+
+  private toolDetailsNavigation(fallbackCallId: string): { index: number; total: number } {
+    const tools = this.store.items.filter(item => item.kind === 'tool')
+    const callId = this.toolDetailsOverlay?.request.callId ?? fallbackCallId
+    return { index: Math.max(0, tools.findIndex(item => item.callId === callId)), total: tools.length }
+  }
+
+  /** Navigate declared calls, never completion order or a TUI-owned session policy. */
+  private navigateToolDetails(direction: -1 | 1): void {
+    const overlay = this.toolDetailsOverlay
+    if (overlay === undefined) return
+    const tools = this.store.items.filter(item => item.kind === 'tool')
+    const index = tools.findIndex(item => item.callId === overlay.request.callId)
+    if (index < 0) { this.closeToolDetails(); return }
+    const next = tools[index + direction]
+    if (next === undefined) return
+    overlay.request = { callId: next.callId, section: overlay.dialog.section }
+    overlay.dialog.setTool(next)
+    this.tui.requestRender()
+  }
+
+  /** Refresh the same panel, or remove it when its call/session disappears. */
+  private syncToolDetails(): void {
+    const overlay = this.toolDetailsOverlay
+    if (overlay === undefined) return
+    const tool = this.store.items.find(item => item.kind === 'tool' && item.callId === overlay.request.callId)
+    if (tool?.kind !== 'tool') this.closeToolDetails()
+    else overlay.dialog.setTool(tool)
+  }
+
+  /** Ordered image occurrences, not a newest-session policy or attachment-id deduplication. */
+  private imageDetailsItems(): ImageViewItem[] {
+    return [
+      ...getTranscriptImages(this.store.items),
+      ...(this.queueImageRecoveries.get(this.info?.sessionId ?? '') ?? []).flatMap((message, index) =>
+        message.content.flatMap((part, partIndex) => part.type === 'image' ? [{
+          key: `queued:${this.info?.sessionId}:${message.messageId ?? index}:image-${partIndex}`,
+          label: `Retrieved queued image ${index + 1}`,
+          attachment: part.attachment,
+        }] : [])),
+      ...this.editor.getImageAttachments().map(({ id, image }, index) => ({
+        key: `draft:${this.epoch}:image-${id}:${index}`,
+        label: `Draft image ${index + 1}`,
+        upload: image,
+      })),
+    ]
+  }
+
+  private openImageDetails(request?: ImageDetailsRequest): void {
+    if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
+    const images = this.imageDetailsItems()
+    const image = request === undefined ? images.at(-1) : images.find(item => item.key === request.key)
+    if (image === undefined) {
+      if (request === undefined) this.store.report('No images to inspect in this session.')
+      return
+    }
+    this.closeImageDetails()
+    this.keymap.cancelChord(); this.chordHint = undefined; this.exitArm = undefined
+    this.surfaceGeneration += 1
+    const selected: ImageDetailsRequest = { key: image.key }
+    const tui = this.tui
+    const dialog = new ImageDetailsDialog(tui, {
+      image, keymap: this.keymap,
+      readImage: async (attachment, signal) => {
+        const read = this.options.backend.readImage
+        if (read === undefined) throw new Error('Image attachments are unavailable in this backend.')
+        return imageAttachmentValue(await read.call(this.options.backend, attachment, signal), attachment)
+      },
+      get maxHeight() { return Math.max(1, tui.terminal.rows - 2) },
+      getImageNavigation: () => this.imageDetailsNavigation(selected.key),
+      onPreviousImage: () => { this.navigateImageDetails(-1) },
+      onNextImage: () => { this.navigateImageDetails(1) },
+      onClose: () => { if (this.imageDetailsOverlay?.dialog === dialog) this.closeImageDetails() },
+      onInterrupt: () => {
+        if (this.imageDetailsOverlay?.dialog !== dialog) return
+        this.closeImageDetails()
+        if (this.isBusy) void this.interrupt()
+      },
+      onRenderRequest: () => { if (!this.closing) this.tui.requestRender() },
+    })
+    // Native image lines must not be prefixed/cropped horizontally by a tool tree or a padded dialog.
+    const handle = tui.showOverlay(dialog, {
+      anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
+      margin: { top: 1, bottom: 1, left: 0, right: 0 },
+    })
+    this.imageDetailsOverlay = { request: selected, dialog, handle }
+    this.viewOptions.mouseBlocked = true
+    this.render()
+  }
+
+  private closeImageDetails(): void {
+    const overlay = this.imageDetailsOverlay
+    if (overlay === undefined) return
+    this.imageDetailsOverlay = undefined
+    this.viewOptions.mouseBlocked = this.toolDetailsOverlay !== undefined
+    this.surfaceGeneration += 1
+    overlay.handle.hide()
+    overlay.dialog.dispose()
+    this.tui.requestRender()
+  }
+
+  private imageDetailsNavigation(fallbackKey: string): { index: number; total: number } {
+    const images = this.imageDetailsItems()
+    const key = this.imageDetailsOverlay?.request.key ?? fallbackKey
+    return { index: Math.max(0, images.findIndex(image => image.key === key)), total: images.length }
+  }
+
+  private navigateImageDetails(direction: -1 | 1): void {
+    const overlay = this.imageDetailsOverlay
+    if (overlay === undefined) return
+    const images = this.imageDetailsItems()
+    const index = images.findIndex(image => image.key === overlay.request.key)
+    if (index < 0) { this.closeImageDetails(); return }
+    const image = images[index + direction]
+    if (image === undefined) return
+    overlay.request = { key: image.key }
+    overlay.dialog.setImage(image)
+    this.tui.requestRender()
+  }
+
+  private syncImageDetails(): void {
+    const overlay = this.imageDetailsOverlay
+    if (overlay === undefined) return
+    const image = this.imageDetailsItems().find(item => item.key === overlay.request.key)
+    if (image === undefined) this.closeImageDetails()
+    else overlay.dialog.setImage(image)
+  }
+
+  /**
+   * keepViewportOnExpand: a click that expands a thinking summary first
+   * freezes follow-end so content growth cannot drag the viewport to the
+   * bottom (the clicked row would jump away from under the pointer and the
+   * collapse click would miss the hitbox). The collapsing click restores
+   * follow only when the user has not scrolled away in the meantime.
+   */
+  private anchorTranscriptViewport(expanding: boolean): void {
+    const view = this.scrollView
+    if (view === undefined) return
+    if (expanding) {
+      if (!view.isFollowingEnd) return
+      this.anchoredScrollTop = view.scrollTop
+      view.scrollTo(view.scrollTop, { disableFollow: true })
+      return
+    }
+    // The callback runs before the state flip. Keep the original anchor while
+    // other thinking/tool disclosures remain open; count visible roots, not
+    // the individual children of an expanded group.
+    if (this.transcript.expandedDisclosureCount > 1) return
+    const frozenAt = this.anchoredScrollTop
+    this.anchoredScrollTop = null
+    if (frozenAt !== null && !view.isFollowingEnd && view.scrollTop === frozenAt) view.scrollToEnd()
+  }
+
+  /** One fixed row outside the scroll host: never obscures transcript text. */
+  private renderFollowIndicator(width: number): string[] {
+    const view = this.scrollView
+    if (view === undefined || view.isFollowingEnd) {
+      this.followHitboxes.sync([])
+      return ['']
+    }
+    const label = truncateToWidth(' ↓ Back to bottom · click to follow ', width, '')
+    const labelWidth = visibleWidth(label)
+    const startCol = Math.max(0, Math.floor((width - labelWidth) / 2))
+    this.followHitboxes.sync(labelWidth === 0 ? [] : [{
+      id: 'transcript-follow', startRow: 0, endRow: 0,
+      startCol, endCol: startCol + labelWidth - 1,
+      onClick: () => {
+        this.anchoredScrollTop = null
+        view.scrollToEnd()
+        this.render()
+      },
+    }])
+    return [' '.repeat(startCol) + accent(label)]
   }
 
   private configureEditor(): void {
@@ -265,6 +909,15 @@ export class App {
       this.render()
     }
     this.editor.onSubmit = text => { const mode = this.nextSendMode ?? 'followup'; this.nextSendMode = undefined; void this.submit(text, mode) }
+    this.editor.onSubmitContent = payload => {
+      const mode = this.nextSendMode ?? 'followup'; this.nextSendMode = undefined
+      void this.submit(payload.text, mode, payload)
+    }
+    this.editor.onSubmitBlocked = error => {
+      this.nextSendMode = undefined
+      this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+      this.render()
+    }
     this.editor.onAction = event => this.dispatchAction(event)
     this.editor.onChordChange = prefix => { this.chordHint = prefix ?? undefined; this.render() }
     this.prompt.onKey = data => this.beforeInput(data)
@@ -272,26 +925,87 @@ export class App {
   }
 
   private applyInfo(info: SessionInfo): void {
+    this.infoStamp += 1
     const codec = this.options.backend.transcriptCodec
     if (codec && codec !== this.codec) { this.store.setCodec(codec); this.codec = codec }
     const changed = this.info?.sessionId !== info.sessionId || this.info?.attachmentId !== info.attachmentId
+    // The first info lands while the startup resume overlay may already be
+    // open; there is no previous session to tear stale surfaces down from.
+    const replacedSession = this.info !== undefined
     this.info = info; this.connected = true
     if (changed) {
+      this.clipboardGeneration += 1; this.clipboardPending = false
+      this.queueReadController?.abort(); this.queueReadController = undefined
+      this.closeImageDetails()
+      this.closeToolDetails()
+      resetImageDisplayCache()
+      clearToolExpansion()
+      this.anchoredScrollTop = null
+      this.followHitboxes.clear()
+      // Invalidate every asynchronous UI operation bound to the old attachment.
+      this.epoch += 1
+      this.queueRequest = undefined
+      this.queued = 0
+      this.queueRows = []
+      this.queueRemovals.clear()
+      this.admittedUserMessageIds.clear()
+      this.editingQueueId = undefined
+      this.queueList.invalidate()
       this.nextPreset = undefined
       this.decisions.length = 0; this.activeCommands.clear(); this.nativeCommands = []
-      this.hideDialog()
-      this.busy = false; this.stopSpinner(); this.output.reset()
+      this.todos = null
+      this.planActive = undefined
+      if (replacedSession) {
+        const oldDialog = this.dialog
+        this.hideDialog()
+        disposeComponent(oldDialog)
+        this.busy = false; this.stopSpinner(); this.output.reset()
+        // Native projections belong to the session that produced them: never
+        // carry the previous session's chips into the resumed/pending one.
+        // (`applyUsage(undefined)` keeps the last value, so clear explicitly.)
+        this.usage = undefined; this.stats = undefined
+      }
       this.store.reset(info)
       if (info.truncated) this.store.report('Showing recent history only (' + (info.events?.length ?? 0) + '/' + (info.totalEvents ?? '?') + ' events); the full DSH log remains intact.')
       this.stashed = undefined; this.cleared = undefined; this.restored = undefined
       let history = this.histories.get(info.cwd)
       if (!history) { history = new PromptHistory(info.cwd, this.directory); this.histories.set(info.cwd, history) }
       this.history = history
+      const oldEditor = this.editor
       this.prompt.editor = new PromptEditor(this.tui, editorTheme, { paddingX: 2, keymap: this.keymap })
+      disposeComponent(oldEditor)
       this.configureEditor()
       void this.refreshCommands()
+      void this.refreshQueue()
+    } else {
+      // Same attachment, new native facts: a pending session just materialized
+      // (the roster gains preset-scoped commands) or DSH reconciled a reload.
+      // Re-read the native command roster without invalidating live UI work.
+      void this.refreshCommands(true)
     }
     this.render()
+  }
+
+  /**
+   * Surface native plan-mode transitions; the projection is the authority.
+   * The first snapshot also reports (a resumed plan-mode session announces
+   * its state); repeated identical snapshots stay quiet.
+   */
+  private applyPlanSnapshot(value: { active: boolean } | null): void {
+    const active = value?.active === true
+    if (this.planActive === active) return
+    this.planActive = active
+    this.store.report(active ? 'Plan mode is active.' : 'Plan mode is off.')
+  }
+
+  /** Ctrl+T: the current native todos checklist (projection-backed). */
+  private showTodos(): void {
+    if (this.todos === null || this.todos.length === 0) {
+      this.store.report('No todos in this session yet.')
+      return
+    }
+    this.store.report(this.todos.map((item, index) =>
+      `${index + 1}. [${item.status === 'completed' ? 'x' : item.status === 'in_progress' ? '~' : ' '}] ${item.content}`).join('\n'))
   }
 
   private onEvent(event: BackendEvent): void {
@@ -301,13 +1015,44 @@ export class App {
     if ('sessionId' in event && event.sessionId !== this.info?.sessionId) return
     if (event.type === 'status') {
       this.busy = event.status === 'running'
-      if (this.isBusy) this.startSpinner(); else this.stopSpinner()
+      if (this.isBusy) this.startSpinner()
+      else {
+        this.stopSpinner()
+        // A settled instruction may have changed git facts; the rate/TTFT
+        // chips now come from the native sessionStats fold via `state`.
+        this.gitRefresher?.refresh()
+      }
+      this.refreshQueue()
     } else if (event.type === 'stream_start') {
       this.output.start(event.turn, event.attemptId)
     } else if (event.type === 'stream_chunk') {
       this.output.chunk(event.attemptId, event.chunk)
     } else if (event.type === 'permissions' && this.info) {
       this.info.permissions = event.value
+    } else if (event.type === 'todos') {
+      // The native todos projection drives the live checklist block; the
+      // tracked snapshot backs the Ctrl+T summary.
+      this.todos = event.value
+    } else if (event.type === 'plan') {
+      this.applyPlanSnapshot(event.value)
+    } else if (event.type === 'metrics') {
+      // Bridge-pushed native projection frames (one per step / durable event,
+      // plus a baseline after attach) keep the footer live through a whole
+      // turn; the `state` command stays the baseline/fallback. An absent field
+      // means that projection is unavailable, so the current chips stay.
+      if (event.usage !== undefined) this.applyUsage(event.usage)
+      if (event.stats !== undefined) this.applyStats(event.stats)
+    } else if (event.type === 'session_event' && event.event.type === 'user/message') {
+      const id = admittedUserMessageId(event.event)
+      if (id !== undefined) {
+        this.admittedUserMessageIds.add(id)
+        if (this.queueRows.some(row => row.messageId === id)) {
+          this.queueRows = this.queueRows.filter(row => row.messageId !== id)
+          this.queued = this.queueRows.length
+          if (this.editingQueueId === id) this.editingQueueId = undefined
+          this.render()
+        }
+      }
     } else if (event.type === 'session_event' && event.event.type === 'turn/start') {
       const data = object(event.event.data)
       this.output.beginTurn(typeof data?.turn === 'number' ? data.turn : undefined, Date.now())
@@ -318,12 +1063,21 @@ export class App {
         else this.activeCommands.delete(data.commandId)
       }
       if (this.isBusy) this.startSpinner(); else this.stopSpinner()
+      this.refreshQueue()
     } else if (event.type === 'decision') {
-      if (!this.decisions.some(pending => pending.request.id === event.request.id)) this.decisions.push({ sessionId: event.sessionId, request: event.request })
+      const attachmentId = this.info?.attachmentId
+      if (!this.decisions.some(pending => pending.request.id === event.request.id)) this.decisions.push({ sessionId: event.sessionId, attachmentId, request: event.request })
       this.showNextDecision()
     } else if (event.type === 'decision_closed') this.closeDecision(event.id)
     else if (event.type === 'closed' || (event.type === 'error' && event.fatal)) {
-      this.connected = false; this.busy = false; this.decisions.length = 0; this.activeCommands.clear(); this.stopSpinner(); this.output.reset(); this.hideDialog()
+      this.clipboardGeneration += 1; this.clipboardPending = false
+      this.closeImageDetails()
+      this.closeToolDetails()
+      this.connected = false; this.busy = false; this.decisions.length = 0; this.activeCommands.clear(); this.stopSpinner(); this.output.reset()
+      const oldDialog = this.dialog
+      this.hideDialog()
+      disposeComponent(oldDialog)
+      this.queued = 0; this.queueRequest = undefined
       if (event.type === 'error' || (event.code !== null && event.code !== 0)) this.fatal = true
     }
     this.render()
@@ -333,13 +1087,15 @@ export class App {
   private workingStatus(spinner: string, command: string | undefined, now: number): string {
     const label = this.busy ? 'Working…' : '/' + (command ?? 'command') + '…'
     const details = this.workingDetails(this.busy, now)
-    return accent(spinner + ' ' + label) + (details === '' ? '' : dim(' (' + details + ')')) + dim(' · Esc interrupt')
+    return accent(spinner + ' ' + label) + (details === '' ? '' : dim(' (' + details + ')')) + dim(' · Esc sends queue')
   }
 
   /**
-   * `↓ 186 tokens · 9s · 21 tok/s` for a model turn. Native commands have no
-   * output-token stream, so they show only elapsed time after the same 3s
-   * threshold Pi uses.
+   * `↓ 186 tokens · 9s` for a model turn. The stream rate is deliberately
+   * absent: throughput lives in the footer's native sessionStats chip, so the
+   * Working border shows only the token count and elapsed time. Native
+   * commands have no output-token stream, so they show only elapsed time after
+   * the same 3s threshold Pi uses.
    */
   private workingDetails(modelTurn: boolean, now: number): string {
     const parts: string[] = []
@@ -351,11 +1107,64 @@ export class App {
       const formatted = formatElapsed(elapsed)
       parts.push(formatted === '' ? '0s' : formatted)
     }
-    if (tokens > 0) {
-      const rate = formatOutputRate(this.output.rate(now))
-      if (rate !== '') parts.push(rate)
-    }
     return parts.join(' · ')
+  }
+
+  /**
+   * Footer usage facts from the native projections — `metrics` frames during a
+   * turn, `state` at baselines: DSH's official context occupancy
+   * (`contextPressure`), the whole-log token total and the cache-hit percentage
+   * (`tokenUsage` billed-input denominator), all computed bridge-side with the
+   * web client's formulas. Missing fields omit their chips.
+   */
+  private applyUsage(usage: UsageSnapshot | Record<string, unknown> | undefined): void {
+    if (usage === undefined) return
+    const used = typeof usage.used === 'number' && Number.isFinite(usage.used) ? usage.used : undefined
+    const size = typeof usage.size === 'number' && Number.isFinite(usage.size) && usage.size > 0 ? usage.size : undefined
+    const cachePct = typeof usage.cachePct === 'number' && Number.isFinite(usage.cachePct) && usage.cachePct > 0
+      ? Math.min(100, usage.cachePct) : undefined
+    // `tokenUsage` whole-log total (billed input + output), shown as `1.2M tok`.
+    const totalTokens = typeof usage.totalTokens === 'number' && Number.isFinite(usage.totalTokens) && usage.totalTokens > 0
+      ? usage.totalTokens : undefined
+    const next = used === undefined && size === undefined && cachePct === undefined && totalTokens === undefined ? undefined
+      : {
+        used: used ?? 0,
+        ...(size !== undefined ? { size } : {}),
+        ...(cachePct !== undefined ? { cachePct } : {}),
+        ...(totalTokens !== undefined ? { totalTokens } : {}),
+      }
+    if (next?.used !== this.usage?.used || next?.size !== this.usage?.size ||
+      next?.cachePct !== this.usage?.cachePct || next?.totalTokens !== this.usage?.totalTokens) {
+      this.usage = next
+      this.render()
+    }
+  }
+
+  /**
+   * Native sessionStats fold: DSH's own turn/step counters, decode throughput
+   * and average TTFT. Absent fields (bundle not mounted, no steps yet) omit
+   * their chips; the footer never falls back to a local rate estimate. Like
+   * `applyUsage` it only touches the footer when a value actually changed and
+   * then repaints, so a stats-only projection frame still lands on screen.
+   */
+  private applyStats(stats: StatsSnapshot | Record<string, unknown> | undefined): void {
+    const next = stats === undefined ? undefined : {
+      ...(typeof stats.turns === 'number' && Number.isFinite(stats.turns) && stats.turns > 0 ? { turns: stats.turns } : {}),
+      ...(typeof stats.steps === 'number' && Number.isFinite(stats.steps) && stats.steps > 0 ? { steps: stats.steps } : {}),
+      ...(typeof stats.decodeTokens === 'number' && Number.isFinite(stats.decodeTokens) ? { decodeTokens: stats.decodeTokens } : {}),
+      ...(typeof stats.decodeMs === 'number' && Number.isFinite(stats.decodeMs) ? { decodeMs: stats.decodeMs } : {}),
+      ...(typeof stats.ttftMs === 'number' && Number.isFinite(stats.ttftMs) ? { ttftMs: stats.ttftMs } : {}),
+      ...(typeof stats.ttftSteps === 'number' && Number.isFinite(stats.ttftSteps) ? { ttftSteps: stats.ttftSteps } : {}),
+    }
+    const meaningful = next !== undefined &&
+      (next.turns !== undefined || next.steps !== undefined || next.decodeTokens !== undefined || next.ttftMs !== undefined)
+    const value = meaningful ? next : undefined
+    if (value?.turns !== this.stats?.turns || value?.steps !== this.stats?.steps ||
+      value?.decodeTokens !== this.stats?.decodeTokens || value?.decodeMs !== this.stats?.decodeMs ||
+      value?.ttftMs !== this.stats?.ttftMs || value?.ttftSteps !== this.stats?.ttftSteps) {
+      this.stats = value
+      this.render()
+    }
   }
 
   private startSpinner(): void {
@@ -368,13 +1177,19 @@ export class App {
 
   private render(): void {
     if (this.closing || this.terminalPaused) return
+    this.syncToolDetails()
+    this.syncImageDetails()
     const spinner = ['·', '✻', '✶', '✳'][this.spinnerStep % 4]
     const command = this.activeCommands.values().next().value
+    this.queueList.rows = this.queueRows
+    this.queueList.editingId = this.editingQueueId
     this.prompt.setWorkingStatus(this.isBusy ? this.workingStatus(spinner, command, Date.now()) : '')
     const hint = this.exitArm ? 'Press the same exit key again to exit'
+      : this.clipboardPending ? 'Pasting…'
       : this.chordHint ? this.chordHint.join(' ') + ' …'
-      : this.decisionId ? 'Decision 1/' + this.decisions.length + ' · Ctrl+P/N navigate · Enter choose · Esc cancel'
-      : this.dialog instanceof KeybindingsDialog ? ''
+      : this.decisionId ? 'Decision · Ctrl+P/N navigate · Enter choose · Esc ' + (this.decisions.find(decision => decision.request.id === this.decisionId)?.request.kind === 'question' ? 'cancel' : 'reject')
+      : this.editingQueueId ? 'Editing queued message · Enter saves · Esc leaves the edit'
+      : this.dialog instanceof KeybindingsDialog || this.dialog instanceof HelpPanel || this.dialog instanceof ModelPickerDialog ? ''
       : this.dialog ? 'Ctrl+P/N navigate · Enter choose · Esc cancel'
       : ''
     // An empty Text must stay truly empty: dim('') still emits ANSI escapes,
@@ -382,22 +1197,91 @@ export class App {
     this.hint.setText(hint ? dim(hint) : '')
     const model = this.info ? this.info.provider + '/' + this.info.model : 'starting DSH…'
     const status = this.isBusy ? 'working' : this.connected ? 'ready' : 'disconnected'
-    const preset = this.info?.preset ? ' · preset: ' + this.info.preset : ''
+    // Desktop status-line order (dsh web client): model+effort, status word,
+    // preset value (plus the transient queued/next-preset tail), then the
+    // native stat chips — context bar, whole-log token total, cache hit,
+    // turns/steps, decode rate, TTFT. Sources are the `state` projection's
+    // contextPressure / tokenUsage / sessionStats folds; the cwd line carries
+    // the git chip and the permission value.
+    const effort = this.info?.reasoningEffort
+    // Effort is text-only (no circle glyphs) and rides the model as one visual
+    // unit: every level except the top one uses the 品牌蓝 (the model's blue),
+    // so only `max` needs to stand out. The top level is a CC-style multi-hue
+    // marker — one vivid hue per character (pink/orange/cyan) — never a single
+    // flat color.
+    const effortChip = effort !== undefined && effort !== ''
+      ? ' ' + (effort === 'max' ? colorCycled(effort, EFFORT_RAINBOW) : t.accent(effort))
+      : ''
+    const chips = [t.accent(model) + effortChip, dim(status)]
+    if (this.info?.preset !== undefined && this.info.preset !== '') chips.push(dim(this.info.preset))
+    const usage = this.usage
+    // 1. 上下文 — DSH's official occupancy bar.
+    if (usage !== undefined && usage.size !== undefined && usage.size > 0) {
+      const pct = Math.min(100, Math.max(0, (usage.used / usage.size) * 100))
+      const filled = Math.round((pct / 100) * CONTEXT_BAR_WIDTH)
+      const barColor = pct >= 95 ? t.red : pct >= 80 ? t.yellow : t.accent
+      chips.push(
+        barColor('█'.repeat(filled)) + t.subtle('░'.repeat(CONTEXT_BAR_WIDTH - filled)) +
+        t.subtle(` ${Math.floor(pct)}%/${formatOutputTokens(usage.size)}`),
+      )
+    }
+    // 2. 总 tok — the whole-log tokenUsage total (`1.2M tok`).
+    if (usage?.totalTokens !== undefined && usage.totalTokens > 0) {
+      chips.push(t.subtle(`${formatOutputTokens(usage.totalTokens)} tok`))
+    }
+    // 3. 缓存 — the tokenUsage billed-input cache share.
+    if (usage?.cachePct !== undefined && usage.cachePct > 0) {
+      chips.push(t.subtle(`${CACHE_ICON} ${Math.floor(usage.cachePct)}%`))
+    }
+    // DSH's native sessionStats fold is the only rate/TTFT/turn source (the
+    // same numbers the DSH web client shows); no local fallback by design.
+    const stats = this.stats
+    // 4. 轮/步 — sessionStats turn/step counters (`10 turns 32 steps`).
+    if (stats?.turns !== undefined && stats?.steps !== undefined && stats.steps > 0) {
+      chips.push(t.subtle(`${stats.turns} turns ${stats.steps} steps`))
+    }
+    // 5. tok/s — sessionStats decode throughput; TTFT is its own chip now.
+    const rate = stats?.decodeTokens !== undefined && stats?.decodeMs !== undefined && stats.decodeMs > 0
+      ? (stats.decodeTokens * 1000) / stats.decodeMs : 0
+    if (rate > 0) chips.push(t.subtle(formatOutputRate(rate)))
+    // 6. ttft — sessionStats mean time to first token (`TTFT: 4.7s`).
+    const ttft = stats?.ttftMs !== undefined && stats?.ttftSteps !== undefined && stats.ttftSteps > 0
+      ? stats.ttftMs / stats.ttftSteps : 0
+    if (ttft > 0) chips.push(t.subtle(`TTFT: ${formatTtft(ttft)}`))
     const staged = this.nextPreset ? ' · next preset: ' + this.nextPreset : ''
-    const effort = this.info?.reasoningEffort ? ' · effort: ' + this.info.reasoningEffort : ''
-    this.footer.setText(dim(model + ' · ' + status + preset + staged + effort + (this.info?.permissions ? ' · permission: ' + this.info.permissions.currentValue : '') + '\n' + (this.info?.cwd ?? this.options.cwd)))
+    let place = t.accent(this.info?.cwd ?? this.options.cwd)
+    // The permission value rides directly behind the path; the git chip
+    // follows it (the user's requested order).
+    if (this.info?.permissions?.currentValue !== undefined && this.info.permissions.currentValue !== '') {
+      place += dim(' · ') + t.subtle(this.info.permissions.currentValue)
+    }
+    const git = this.gitStats
+    if (git?.branch !== undefined) {
+      let gitChip = t.accentBright(`${GIT_ICON} ${git.branch}`)
+      if (git.status !== undefined) gitChip += t.subtle(' [') + styledGitStatus(git.status) + t.subtle(']')
+      if (git.add > 0 || git.del > 0) {
+        gitChip += t.subtle('(') + t.green('+' + git.add) + ' ' + t.red('−' + git.del) + t.subtle(')')
+      }
+      place += dim(' · ') + gitChip
+    }
+    this.footer.setText(chips.join(dim(' · ')) + dim(staged) + '\n' + place)
     this.tui.terminal.setProgress(this.isBusy)
     this.tui.requestRender()
   }
 
   private showDialog(dialog: Component, decision = false): void {
     if (this.decisionId && !decision) { this.store.report('Resolve the pending DSH decision before opening another dialog.'); return }
+    this.closeImageDetails()
+    this.closeToolDetails()
+    this.surfaceGeneration += 1
+    if (this.dialog && this.dialog !== dialog) disposeComponent(this.dialog)
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialog = dialog
     this.slot.clear(); this.slot.addChild(dialog)
     this.tui.setFocus(dialog); this.render()
   }
   private hideDialog(): void {
+    this.surfaceGeneration += 1
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialog = undefined; this.decisionId = undefined
     this.slot.clear(); this.slot.addChild(this.prompt)
@@ -405,33 +1289,100 @@ export class App {
     this.showNextDecision(); this.render()
   }
 
+  /** Hide the current non-decision surface and release its editor resources. */
+  private dismissDialog(): void {
+    const dialog = this.dialog
+    this.hideDialog()
+    disposeComponent(dialog)
+  }
+
+  /** Current attachment owns decisions; stale requests from an old attachment stay ignored. */
+  private decisionBelongsToCurrentAttachment(decision: PendingDecision): boolean {
+    return decision.sessionId === this.info?.sessionId &&
+      (decision.attachmentId === undefined || this.info?.attachmentId === undefined || decision.attachmentId === this.info.attachmentId)
+  }
+
   private showNextDecision(): void {
     if (this.closing || this.decisionId || !this.connected) return
-    const pending = this.decisions.find(decision => decision.sessionId === this.info?.sessionId)
+    const pending = this.decisions.find(decision => this.decisionBelongsToCurrentAttachment(decision))
     if (!pending) return
     const request = pending.request
     this.decisionId = request.id
-    this.showDialog(new DecisionDialog(this.tui, {
+    const extras: DecisionDialogExtras = {
+      onInterrupt: () => { void this.interrupt() },
+    }
+    const options = {
       request,
-      onSubmit: value => { void this.answer(request.id, value) },
-      onCancel: () => { void this.answer(request.id, { cancelled: true }) },
+      onSubmit: (value: unknown) => { void this.answer(request.id, value) },
+      // Approval Esc uses DSH's native reject option; question Esc settles that
+      // one native request as cancelled. Ctrl+C still goes through the backend
+      // cancel path (a whole-turn abort) instead.
+      onCancel: () => {
+        if (request.kind === 'question') { this.cancelQuestion(request.id); return }
+        const rejection = this.rejectionValue(request)
+        void this.answer(request.id, rejection.value)
+      },
       keymap: this.keymap,
-    }), true)
+      ...extras,
+    } as ConstructorParameters<typeof DecisionDialog>[1] & DecisionDialogExtras
+    this.showDialog(new DecisionDialog(this.tui, options), true)
+  }
+
+  private rejectionValue(request: DecisionRequest): { value: unknown } {
+    const options = request.options ?? []
+    const match = options.find(option => {
+      if (typeof option.value === 'string' && /^(rejected|reject|deny|denied|decline)$/i.test(option.value)) return true
+      const value = object(option.value)
+      if (value) {
+        if (value.outcome === 'rejected' || value.outcome === 'deny' || value.outcome === 'denied') return true
+        if (value.allow === false || value.allowed === false || value.approved === false) return true
+      }
+      return /^(reject|deny|decline)\b/i.test(option.label.trim())
+    })
+    return { value: match?.value ?? { cancelled: true } }
+  }
+
+  /**
+   * Esc on a question cancels exactly that native request (CC/Pi semantics):
+   * the surface leaves at once, the request is settled through the existing
+   * respond channel with `{cancelled:true}`, and nothing stays pending behind
+   * a hidden dialog. The native `decision_closed` that follows is then a no-op.
+   */
+  private cancelQuestion(id: string): void {
+    const index = this.decisions.findIndex(decision => decision.request.id === id)
+    if (index < 0 || this.decisionId !== id) return
+    const context = this.context()
+    this.decisions.splice(index, 1)
+    const dialog = this.dialog
+    // Dismiss first so the next pending decision (if any) owns the surface
+    // while the native settlement is in flight.
+    this.hideDialog()
+    disposeComponent(dialog)
+    void this.options.backend.respond(id, { cancelled: true }).catch(error => {
+      if (!this.closing && this.sameContext(context)) this.store.report(errorText(error), 'error')
+    })
   }
 
   private closeDecision(id: string): void {
     const index = this.decisions.findIndex(decision => decision.request.id === id)
     if (index < 0) return
     this.decisions.splice(index, 1)
-    if (this.decisionId === id) this.hideDialog()
-    else this.render()
+    if (this.decisionId === id) {
+      const dialog = this.dialog
+      this.hideDialog()
+      disposeComponent(dialog)
+    } else this.render()
   }
 
   private async answer(id: string, value: unknown): Promise<void> {
-    const pending = this.decisions.find(decision => decision.request.id === id && decision.sessionId === this.info?.sessionId)
-    if (!pending || this.closing) return
-    try { await this.options.backend.respond(id, value); this.closeDecision(id) }
-    catch (error) { if (!this.closing) this.store.report(errorText(error), 'error') }
+    const context = this.context()
+    const pending = this.decisions.find(decision => decision.request.id === id && this.decisionBelongsToCurrentAttachment(decision))
+    if (!pending || !this.sameContext(context)) return
+    try {
+      await this.options.backend.respond(id, value)
+      if (!this.sameContext(context)) return
+      this.closeDecision(id)
+    } catch (error) { if (!this.closing && this.sameContext(context)) this.store.report(errorText(error), 'error') }
   }
 
   /** Non-mutating binding lookup: editor remains the sole key/chord dispatcher. */
@@ -443,7 +1394,8 @@ export class App {
     if (this.editor.isPasting() || data.startsWith('\x1b[200~') || this.keymap.isPendingChord() || this.editor.capturesViewportInput) return false
     const up = this.bound(data, 'editor.move.line-up') || this.bound(data, 'editor.history.previous')
     const down = this.bound(data, 'editor.move.line-down') || this.bound(data, 'editor.history.next')
-    if (up && this.busy && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
+    if (this.editingQueueId) return false
+    if (up && (this.busy || this.queued > 0 || this.queueImageRecoveries.has(this.info?.sessionId ?? '')) && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
       if (!this.queueRecallPending) void this.recallQueue(data)
       return true
     }
@@ -451,6 +1403,8 @@ export class App {
       const before = this.editor.captureDraft()
       this.updatingDraft = true; this.editor.restoreDraft(this.cleared); this.updatingDraft = false
       this.cleared = undefined
+      this.exitArm = undefined
+      if (this.exitTimer) clearTimeout(this.exitTimer)
       this.restored = { text: this.editor.getExpandedText(), before }
       return true
     }
@@ -463,69 +1417,172 @@ export class App {
 
   private async recallQueue(key: string): Promise<void> {
     this.queueRecallPending = true
-    const editor = this.editor
-    const sessionId = this.info?.sessionId
-    const before = editor.captureDraft()
-    const attachmentId = this.info?.attachmentId
-    const history = this.history
+    const context = this.context(), editor = context.editor, before = editor.captureDraft()
+    const sessionId = context.sessionId, attachmentId = context.attachmentId, history = this.history
+    const controller = new AbortController()
+    this.queueReadController = controller
     try {
-      const result = await this.options.backend.command('dequeue', { sessionId, attachmentId })
-      const texts = Array.isArray(result) ? result.flatMap(value => {
+      const recovery = sessionId === undefined ? undefined : this.queueImageRecoveries.get(sessionId)
+      if (recovery === undefined && this.queueImageRecoveries.size >= 8) {
+        throw new Error('Too many retrieved image drafts are waiting for editing. Restore one of those sessions first; the native queue was left untouched.')
+      }
+      const result = recovery ?? await this.options.backend.command('dequeue', { sessionId, attachmentId })
+      const messages: QueuedImageRecovery[] = Array.isArray(result) ? result.flatMap(value => {
+        if (typeof value === 'string') return [{ text: value, content: [] }]
         const message = object(value)
-        return typeof value === 'string' ? [value] : typeof message?.text === 'string' ? [message.text] : []
+        if (message === undefined) return []
+        const content = displayContentParts(message.content)
+        const text = typeof message.text === 'string' ? message.text : content.flatMap(part => part.type === 'text' ? [part.text] : []).join('\n')
+        return [{ text, content, ...(typeof message.messageId === 'string' ? { messageId: message.messageId } : {}) }]
       }) : []
-      if (this.closing || this.info?.sessionId !== sessionId || this.editor !== editor) {
-        for (const text of texts) void history.add(text).catch(() => {})
+      const texts = messages.map(message => message.text)
+      const hasImages = messages.some(message => message.content.some(part => part.type === 'image'))
+      // A dequeue already transferred these messages. Retain native refs on read
+      // failure, cancellation or a competing draft; never fall back to image-less text.
+      if (hasImages && sessionId !== undefined) this.queueImageRecoveries.set(sessionId, messages)
+      if (!this.sameContext(context)) {
+        if (!hasImages) for (const text of texts) void history.add(text).catch(() => {})
         return
       }
-      if (editor.getText() || editor.isPasting() || this.keymap.isPendingChord()) {
-        for (const text of texts) { editor.addToHistory(text); void history.add(text).catch(() => {}) }
-        if (texts.length) this.store.report('Retrieved queued inputs were kept in recall history; your new draft was not replaced.')
+      const draftChanged = () => editor.getText() !== before.lines.join('\n') || editor.isPasting() || this.keymap.isPendingChord()
+      if (draftChanged()) {
+        if (!hasImages) for (const text of texts) { editor.addToHistory(text); void history.add(text).catch(() => {}) }
+        if (messages.length) this.store.report(hasImages
+          ? 'Retrieved image inputs were kept for editing. Stash your new draft, then press Up on the empty prompt to retry.'
+          : 'Retrieved queued inputs were kept in recall history; your new draft was not replaced.')
         return
       }
-      if (!texts.length) { editor.handleInput(key); return }
-      this.updatingDraft = true
-      editor.replaceDraftText(texts.join('\n\n'))
-      this.updatingDraft = false
+      if (!messages.length) { editor.handleInput(key); return }
+      if (!hasImages) {
+        this.updatingDraft = true
+        try { editor.replaceDraftText(texts.join('\n\n')) } finally { this.updatingDraft = false }
+      } else {
+        const parts: PromptContentPart[] = []
+        for (const [index, message] of messages.entries()) {
+          if (index > 0) parts.push({ type: 'text', text: '\n\n' })
+          for (const part of message.content.length ? message.content : [{ type: 'text' as const, text: message.text }]) {
+            if (part.type === 'text') parts.push(part)
+            else {
+              const read = this.options.backend.readImage
+              if (read === undefined) throw new Error('Image reads are unavailable; the retrieved native references were kept. Press Up to retry after restoring the backend.')
+              const value = imageAttachmentValue(await read.call(this.options.backend, part.attachment, controller.signal), part.attachment)
+              if (controller.signal.aborted || !this.sameContext(context)) return
+              parts.push({ type: 'image', mediaType: value.attachment.mediaType, data: value.data,
+                ...(value.attachment.name === undefined ? {} : { name: value.attachment.name }) })
+            }
+          }
+        }
+        if (controller.signal.aborted || !this.sameContext(context) || draftChanged()) {
+          if (this.sameContext(context)) this.store.report('Retrieved image inputs were kept for editing; your newer draft was not replaced.')
+          return
+        }
+        this.updatingDraft = true
+        try {
+          editor.replaceDraftText('')
+          for (const part of parts) {
+            if (part.type === 'image') editor.insertImage(part)
+            else editor.insertTextAtCursor(part.text)
+          }
+        } catch (error) {
+          editor.restoreDraft(before)
+          throw error
+        } finally { this.updatingDraft = false }
+        if (sessionId !== undefined) this.queueImageRecoveries.delete(sessionId)
+      }
       this.restored = { text: editor.getExpandedText(), before }
-    } catch (error) { this.store.report('Could not retrieve queue: ' + errorText(error), 'error') }
-    finally { this.queueRecallPending = false; this.render() }
+    } catch (error) {
+      if (this.sameContext(context) && !controller.signal.aborted) this.store.report('Could not retrieve queue: ' + errorText(error), 'error')
+    } finally {
+      if (this.queueReadController === controller) this.queueReadController = undefined
+      this.queueRecallPending = false; this.refreshQueue(); this.render()
+    }
   }
 
   private dispatchAction(event: CcActionEvent): boolean {
     switch (event.id) {
       case 'app.interrupt':
+        if (this.queueRecallPending) {
+          this.queueReadController?.abort()
+          if (!this.isBusy && event.empty) break
+        }
+        if (this.clipboardPending) {
+          this.clipboardGeneration += 1; this.clipboardPending = false
+          if (!this.isBusy && event.empty) break
+        }
         if (this.isBusy) void this.interrupt()
-        else if (!event.empty) { this.cleared = this.editor.captureDraft(); this.editor.replaceDraftText('') }
+        else if (!event.empty) {
+          // CC: the first idle Ctrl+C clears the draft and arms the next press
+          // as exit. Typing or restoring the draft disarms it.
+          this.cleared = this.editor.captureDraft()
+          this.editor.replaceDraftText('')
+          this.armExit(event.id)
+        }
         else this.armExit(event.id)
         break
       case 'app.cancel':
-        if (this.isBusy) void this.interrupt()
+        if (this.editingQueueId && !this.isBusy) {
+          this.editingQueueId = undefined
+          this.updatingDraft = true
+          try { this.editor.replaceDraftText('') } finally { this.updatingDraft = false }
+          break
+        }
+        if (this.queueRecallPending) { this.queueReadController?.abort(); break }
+        if (this.clipboardPending) { this.clipboardGeneration += 1; this.clipboardPending = false; break }
+        if (this.isBusy) void this.interrupt({ drain: true })
+        else if (this.queueRows.length > 0) {
+          // CC: Esc does not send the draft. It releases the queue immediately.
+          void this.releaseQueue()
+          if (!event.empty) {
+            const now = Date.now()
+            if (now - this.escapeAt < 400) { this.cleared = this.editor.captureDraft(); this.editor.replaceDraftText(''); this.escapeAt = 0 }
+            else this.escapeAt = now
+          }
+        }
         else {
           const now = Date.now()
           if (!event.empty && now - this.escapeAt < 400) { this.cleared = this.editor.captureDraft(); this.editor.replaceDraftText(''); this.escapeAt = 0 }
           else this.escapeAt = now
         }
         break
-      case 'app.exit': this.armExit(event.id); break
+      case 'app.exit':
+        // Exit is empty-input only even if a user remaps Ctrl+D onto app.exit
+        // or disables the editor's forward-delete binding.
+        if (!event.empty) break
+        this.armExit(event.id)
+        break
       case 'app.redraw': this.tui.requestRender(true); break
       case 'app.history.search': this.searchHistory(); break
       case 'app.stash':
         if (!event.empty) { this.stashed = this.editor.captureDraft(); this.editor.replaceDraftText('') }
         else if (this.stashed) { this.editor.restoreDraft(this.stashed); this.stashed = undefined }
         break
-      case 'app.tools.expand': this.viewOptions.expandTools = !this.viewOptions.expandTools; this.transcript.invalidate(); break
-      case 'app.thinking.toggle': this.viewOptions.showThinking = !this.viewOptions.showThinking; this.transcript.invalidate(); break
+      case 'app.tools.expand': this.transcript.toggleToolsExpanded(); break
+      case 'app.tools.details': this.openToolDetails(); break
+      case 'app.images.details': this.openImageDetails(); break
+      case 'app.thinking.toggle': {
+        // CC-style cycle: hidden → collapsed summaries → expand/collapse the
+        // latest run. The master show/hide switch lives in /settings → Thinking.
+        if (!this.viewOptions.showThinking) this.viewOptions.showThinking = true
+        else this.transcript.toggleLatestThinking()
+        this.transcript.invalidate()
+        break
+      }
       case 'app.model.select': void this.pick('models'); break
       case 'app.mode.cycle': void this.cyclePermission(); break
       case 'app.editor.external': void this.externalEditor(); break
       case 'app.clipboard.pasteImage': void this.pasteClipboard(); break
       case 'app.message.sendNow':
+        if (event.empty) { void this.sendQueued(this.queueRows[0]?.messageId); break }
+        if (!this.editor.disableSubmit) { this.nextSendMode = 'send-now'; this.editor.ccSubmit() }
+        break
+      case 'app.message.steer':
+        if (!event.empty && !this.editor.disableSubmit) { this.nextSendMode = 'steer'; this.editor.ccSubmit() }
+        break
       case 'app.message.followUp':
-        if (!event.empty && !this.editor.disableSubmit) { this.nextSendMode = event.id === 'app.message.sendNow' ? 'steer' : 'followup'; this.editor.ccSubmit() }
+        if (!event.empty && !this.editor.disableSubmit) { this.nextSendMode = 'followup'; this.editor.ccSubmit() }
         break
       case 'app.suspend': this.suspend(); break
-      case 'app.todo': this.store.report('Todo/goal panels are not included in this prototype yet.'); break
+      case 'app.todo': this.showTodos(); break
       case 'app.help': void this.slash('/help'); break
       default: this.store.report('Action is not yet integrated: ' + event.id); break
     }
@@ -535,18 +1592,18 @@ export class App {
 
   private armExit(id: string): void {
     const now = Date.now()
-    if (this.exitArm?.id === id && now - this.exitArm.at < 800) { void this.shutdown(0); return }
+    if (this.exitArm?.id === id && now - this.exitArm.at < EXIT_ARM_MS) { void this.shutdown(0); return }
     this.exitArm = { id, at: now }
     this.render()
     if (this.exitTimer) clearTimeout(this.exitTimer)
-    this.exitTimer = setTimeout(() => { this.exitArm = undefined; this.render() }, 800)
+    this.exitTimer = setTimeout(() => { this.exitArm = undefined; this.render() }, EXIT_ARM_MS)
     this.exitTimer.unref()
   }
 
   private searchHistory(): void {
     const original = this.editor.captureDraft()
     this.showDialog(new HistorySearch(this.tui, this.history.entries(), this.keymap, this.screen, (text, execute) => {
-      this.hideDialog()
+      this.dismissDialog()
       this.editor.restoreDraft(original)
       if (text !== undefined) this.editor.replaceDraftText(text)
       if (execute && text?.trim()) { this.editor.replaceDraftText(''); void this.submit(text) }
@@ -554,27 +1611,170 @@ export class App {
     }))
   }
 
-  async submit(text: string, mode: 'followup' | 'steer' = 'followup'): Promise<void> {
-    if (!text.trim() || this.closing) return
-    if (text.startsWith('/')) { await this.slash(text); return }
-    if (!this.connected) { this.editor.replaceDraftText(text); this.store.report('DSH is disconnected. Check the error above, then restart.', 'error'); return }
-    const sessionId = this.info?.sessionId
-    const editor = this.editor
-    const history = this.history
+  async submit(text: string, mode: 'followup' | 'steer' | 'send-now' = 'followup', payload?: CcSubmitPayload): Promise<void> {
+    const hasImages = payload?.content.some(part => part.type === 'image') === true
+    if ((!text.trim() && !hasImages) || this.closing) return
+    const context = this.context(), editor = context.editor, history = this.history
     const draftBeforeSend = editor.getText()
-    try { await this.options.backend.send(text, mode) }
-    catch (error) {
-      if (!this.closing && this.info?.sessionId === sessionId && this.editor.getText() === draftBeforeSend) this.editor.replaceDraftText(text)
-      this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+    const restore = () => {
+      // A native failure never overwrites a newer draft or a replacement attachment/editor.
+      if (!this.sameContext(context) || editor.getText() !== draftBeforeSend) return
+      if (payload !== undefined) editor.restoreDraft(payload.snapshot)
+      else editor.replaceDraftText(text)
+    }
+    if (this.clipboardPending) {
+      restore(); this.store.report('Wait for the clipboard paste to finish; your draft was kept.'); return
+    }
+    const editingId = this.editingQueueId
+    if (editingId !== undefined && mode === 'followup' && !hasImages) {
+      try {
+        await this.options.backend.command('queue-replace', { messageId: editingId, text })
+        if (this.sameContext(context)) {
+          this.editingQueueId = undefined
+          editor.addToHistory(text)
+        }
+      } catch (error) {
+        restore()
+        if (this.sameContext(context)) this.store.report('Queued edit was not saved: ' + errorText(error), 'error')
+      }
+      this.refreshQueue()
+      this.render()
+      return
+    }
+    if (text.startsWith('/')) {
+      if (hasImages) {
+        restore(); this.store.report('Image attachments cannot be passed to a slash command. Remove them or send a normal prompt.', 'error'); return
+      }
+      await this.slash(text); return
+    }
+    if (mode === 'send-now') {
+      let accepted = false
+      try {
+        const args: Record<string, unknown> = hasImages ? { content: payload!.content } : { text }
+        if (editingId !== undefined) args.messageId = editingId
+        await this.options.backend.command('queue-send-now', args)
+        accepted = true
+        if (this.sameContext(context)) {
+          this.editingQueueId = undefined
+          editor.addToHistory(text)
+          this.restored = undefined
+        }
+      } catch (error) {
+        restore()
+        if (this.sameContext(context)) this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+      }
+      if (accepted && text.trim() !== '') {
+        void history.add(text).catch(error => { if (!this.closing) this.store.report('Prompt accepted, but recall history was not saved: ' + errorText(error), 'error') })
+      }
+      this.refreshQueue()
+      this.render()
+      return
+    }
+    if (!this.connected) { restore(); this.store.report('DSH is disconnected. Check the error above, then restart.', 'error'); return }
+    try {
+      if (hasImages) {
+        const sendContent = this.options.backend.sendContent
+        if (sendContent === undefined) throw new Error('This backend does not support native image prompt admission. Your image draft was kept.')
+        await sendContent.call(this.options.backend, payload!.content, mode)
+      } else await this.options.backend.send(text, mode)
+    } catch (error) {
+      restore()
+      if (this.sameContext(context)) this.store.report('Prompt not accepted: ' + errorText(error), 'error')
       this.render(); return
     }
-    if (!this.closing && this.info?.sessionId === sessionId && this.editor === editor) { editor.addToHistory(text); this.restored = undefined }
+    if (this.sameContext(context)) { editor.addToHistory(text); this.restored = undefined }
+    // Recall metadata remains text-only; image bytes belong to DSH and the editor's in-memory registry.
     void history.add(text).catch(error => { if (!this.closing) this.store.report('Prompt accepted, but recall history was not saved: ' + errorText(error), 'error') })
+    this.refreshQueue()
     this.render()
   }
 
-  async interrupt(): Promise<void> {
-    try { await this.options.backend.cancel() }
+  private editQueued(messageId: string): void {
+    const row = this.queueRows.find(item => item.messageId === messageId)
+    if (row === undefined) return
+    this.editingQueueId = messageId
+    this.updatingDraft = true
+    try { this.editor.replaceDraftText(row.text) } finally { this.updatingDraft = false }
+    this.tui.setFocus(this.prompt)
+    this.render()
+  }
+
+  private async sendQueued(messageId: string | undefined): Promise<void> {
+    if (messageId === undefined) return
+    if (this.editingQueueId === messageId && this.editor.getText().trim() !== '') {
+      this.nextSendMode = 'send-now'
+      this.editor.ccSubmit()
+      return
+    }
+    const context = this.context()
+    try {
+      await this.options.backend.command('queue-send-now', { messageId })
+    } catch (error) {
+      if (this.sameContext(context)) this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+    }
+    this.refreshQueue()
+    this.render()
+  }
+
+  private async cancelQueued(messageId: string): Promise<void> {
+    if (this.queueRemovals.has(messageId)) return
+    this.queueRemovals.add(messageId)
+    const context = this.context()
+    this.queueRows = this.queueRows.filter(row => row.messageId !== messageId)
+    if (this.editingQueueId === messageId) {
+      this.editingQueueId = undefined
+      this.updatingDraft = true
+      try { this.editor.replaceDraftText('') } finally { this.updatingDraft = false }
+    }
+    this.render()
+    try {
+      await this.options.backend.command('queue-remove', { messageId })
+    } catch (error) {
+      const text = errorText(error)
+      if (this.sameContext(context) && !text.includes('queued message is gone')) {
+        this.store.report(text, 'error')
+      }
+    } finally {
+      this.queueRemovals.delete(messageId)
+    }
+    this.refreshQueue()
+    this.render()
+  }
+
+  /** Release the first queued row. DSH then claims the rest one turn at a time. */
+  private async releaseQueue(): Promise<void> {
+    const messageId = this.queueRows[0]?.messageId
+    if (messageId === undefined) return
+    const context = this.context()
+    try {
+      await this.options.backend.command('queue-send-now', { messageId })
+      if (this.sameContext(context) && this.editingQueueId === messageId) this.editingQueueId = undefined
+    } catch (error) {
+      if (this.sameContext(context)) this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+    }
+    this.refreshQueue()
+    this.render()
+  }
+
+  async interrupt(options?: { drain?: boolean }): Promise<void> {
+    this.clipboardGeneration += 1; this.clipboardPending = false
+    this.queueReadController?.abort(); this.queueReadController = undefined
+    this.closeImageDetails()
+    this.closeToolDetails()
+    const context = this.context()
+    const before = this.queued
+    try {
+      await this.options.backend.cancel()
+      await this.refreshQueue()
+      if (!this.sameContext(context)) return
+      if (options?.drain && this.queueRows.length > 0) {
+        await this.releaseQueue()
+        return
+      }
+      if (before === 0 && this.queued > 0) {
+        this.store.report(this.queued + ' queued message(s) retained by DSH. They stay listed above the prompt. Up on an empty prompt edits them together. Ctrl+C does not send them.')
+      }
+    }
     catch (error) { this.store.report(errorText(error), 'error') }
   }
 
@@ -585,7 +1785,7 @@ export class App {
     const name = matched?.[1]?.toLowerCase() ?? ''
     const argument = matched?.[2]?.trim() ?? ''
     if (name === 'exit' || name === 'quit') { await this.shutdown(0); return }
-    if (name === 'help') { await this.refreshCommands(); this.store.report(this.commands().map(command => '/' + command.name + ' — ' + command.description).join('\n')); return }
+    if (name === 'help') { await this.openHelp(); return }
     if (name === 'reload') { await this.reloadRuntime(); return }
     if (name === 'settings' || name === 'config') { this.openSettings(); return }
     if (name === 'model') { if (argument) await this.runRemote('model', { id: argument }); else await this.pick('models'); return }
@@ -597,65 +1797,251 @@ export class App {
     }
     if (!this.connected) { this.store.report('DSH is disconnected.', 'error'); return }
     if (!this.info?.capabilities.includes('execute')) { this.store.report('Native DSH command execution is unavailable in this runtime.', 'error'); return }
-    await this.runRemote('execute', { line: text })
+    await this.runRemote('execute', { line: text }, name === 'permission' ? 'status-only' : 'normal')
   }
 
   private async cyclePermission(): Promise<void> {
-    const sessionId = this.info?.sessionId, attachmentId = this.info?.attachmentId
+    const context = this.context()
     try {
       if (!this.info?.capabilities.includes('permissions') || !this.info.capabilities.includes('execute')) {
         throw new Error('This backend does not expose native permission switching')
       }
       const current = object(await this.options.backend.command('permissions'))
-      if (this.closing || this.info?.sessionId !== sessionId || this.info?.attachmentId !== attachmentId) return
+      if (!this.sameContext(context)) return
       const options = Array.isArray(current?.options) ? current.options.map(object).filter(item => typeof item?.value === 'string') : []
       if (!options.length) throw new Error('This backend has no selectable permission presets')
       const index = options.findIndex(item => item?.value === current?.currentValue)
       const next = options[(index + 1) % options.length]
-      await this.runRemote('execute', { line: '/permission ' + next?.value })
+      await this.runRemote('execute', { line: '/permission ' + next?.value }, 'status-only')
     } catch (error) { this.store.report(errorText(error), 'error') }
   }
 
-  private async runRemote(name: string, args?: Record<string, unknown>): Promise<unknown> {
-    const sessionId = this.info?.sessionId
+  private async runRemote(name: string, args?: Record<string, unknown>, feedback: 'normal' | 'status-only' = 'normal'): Promise<unknown> {
+    const context = this.context()
+    const stamp = this.infoStamp
     try {
       const result = await this.options.backend.command(name, args)
-      if (this.closing || (!['resume', 'new'].includes(name) && this.info?.sessionId !== sessionId)) return result
+      const routeChanging = ['new', 'resume', 'model', 'effort', 'preset'].includes(name)
+      if (!(routeChanging ? this.sameAttachment(context) : this.sameContext(context))) return result
+      if (this.closing) return result
+      // A `ready` event that landed while this request was in flight is DSH's
+      // later native truth. Never overwrite it with the older command response.
+      // Legitimate own results still apply when no event was observed.
+      const eventApplied = this.infoStamp !== stamp
       const info = object(result)
-      if (info && typeof info.sessionId === 'string' && typeof info.cwd === 'string' && typeof info.provider === 'string' && typeof info.model === 'string' && Array.isArray(info.capabilities)) this.applyInfo(result as SessionInfo)
-      else if ((name === 'model' || name === 'effort') && this.info && info) {
-        if (typeof info.provider === 'string') this.info.provider = info.provider
-        if (typeof info.model === 'string') this.info.model = info.model
-        if (typeof info.reasoningEffort === 'string') this.info.reasoningEffort = info.reasoningEffort
-        else delete this.info.reasoningEffort
-        if (name === 'effort') this.store.report('Reasoning effort: ' + (typeof info.effectiveEffort === 'string' ? info.effectiveEffort : 'default'))
-      } else if (name === 'execute' || name === 'compact') {
+      if (info && typeof info.sessionId === 'string' && typeof info.cwd === 'string' && typeof info.provider === 'string' && typeof info.model === 'string' && Array.isArray(info.capabilities)) {
+        if (!eventApplied) this.applyInfo(result as SessionInfo)
+      } else if ((name === 'model' || name === 'effort') && this.info && info) {
+        if (!eventApplied) {
+          if (typeof info.provider === 'string') this.info.provider = info.provider
+          if (typeof info.model === 'string') this.info.model = info.model
+          if (typeof info.reasoningEffort === 'string') this.info.reasoningEffort = info.reasoningEffort
+          else delete this.info.reasoningEffort
+        }
+        if (!eventApplied) this.infoStamp += 1
+      } else if (name === 'execute') {
         const outcome = object(info?.result)
         if (outcome) {
-          if (typeof outcome.text === 'string' && outcome.text) this.store.report(outcome.text, outcome.kind === 'error' ? 'error' : 'info')
+          // Setting changes are already projected into the footer. Keep native
+          // execution/audit intact, and suppress only their successful echo.
+          if (!(feedback === 'status-only' && outcome.kind === 'success') && typeof outcome.text === 'string' && outcome.text) {
+            this.store.report(outcome.text, outcome.kind === 'error' ? 'error' : 'info')
+          }
         } else if (result !== undefined) this.store.report('Invalid native command outcome.', 'error')
-      } else if (result !== undefined && !['state', 'models', 'sessions', 'commands', 'presets', 'efforts'].includes(name)) this.store.report(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+      } else if (result !== undefined && !['state', 'models', 'sessions', 'titles', 'commands', 'presets', 'efforts', 'auto-title'].includes(name)) this.store.report(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+      if ((name === 'model' || name === 'effort') && !eventApplied) {
+        // Confirmed native setter acknowledgements are status metadata, not
+        // transcript output. Disk-flush uncertainty remains in the response;
+        // failed/unavailable/unclassified warnings and other notes stay visible.
+        const routineNativeSave = info?.defaultPersistence === 'native' &&
+          typeof info.defaultWarning === 'string' &&
+          info.defaultWarning.startsWith("Saved through DSH's native default-selection service.")
+        const persistence = typeof info?.defaultWarning === 'string' && info.defaultPersistence !== 'runtime' && !routineNativeSave
+          ? info.defaultWarning : typeof info?.note === 'string' ? info.note : undefined
+        if (persistence !== undefined && persistence !== '') this.store.report(persistence)
+      }
       this.render()
       return result
-    } catch (error) { this.store.report(errorText(error), 'error'); return undefined }
+    } catch (error) {
+      if (['new', 'resume'].includes(name) || this.sameContext(context)) this.store.report(errorText(error), 'error')
+      return undefined
+    }
   }
 
   private async pick(kind: 'models' | 'sessions' | 'presets' | 'efforts'): Promise<void> {
-    const sessionId = this.info?.sessionId
     if (kind === 'presets') { await this.pickPreset(); return }
     if (kind === 'efforts') { await this.pickEffort(); return }
-    const result = await this.runRemote(kind)
-    if (this.closing || this.info?.sessionId !== sessionId || !Array.isArray(result)) return
-    const items: DecisionOption[] = result.flatMap(value => {
-      const item = object(value)
-      const id = item?.id ?? item?.sessionId
-      if (!item || typeof id !== 'string') return []
-      return [{ label: String(item.label ?? item.title ?? item.name ?? id), description: typeof item.cwd === 'string' ? item.cwd : id, value: id }]
+    if (kind === 'models') { await this.pickModel(); return }
+    await this.pickSessions()
+  }
+
+  /**
+   * `--resume` without an id: the picker opens before the backend connects so
+   * the DSH runtime boots behind a visible loading overlay. A selection
+   * resumes that session; Esc keeps the new one, and a positional prompt is
+   * submitted once either path settles.
+   */
+  private openStartupSessionPicker(): void {
+    const submitInitial = () => {
+      if (this.closing || this.fatal || !this.connected || this.options.initialPrompt === undefined) return
+      void this.submit(this.options.initialPrompt)
+    }
+    this.pickSessions({
+      onSelect: id => {
+        void (async () => {
+          await this.runRemote('resume', { sessionId: id })
+          submitInitial()
+        })()
+      },
+      onCancel: submitInitial,
     })
-    if (!items.length) { this.store.report('No ' + kind + ' available'); return }
-    this.showDialog(new SelectDialog(this.tui, { title: kind === 'models' ? 'Choose model' : 'Resume session', items, keymap: this.keymap,
-      onSelect: value => { this.hideDialog(); void this.runRemote(kind === 'models' ? 'model' : 'resume', kind === 'models' ? { id: value } : { sessionId: value }) },
-      onCancel: () => this.hideDialog(),
+  }
+
+  /**
+   * CC/Pi-style resume picker over DSH's native `sessions` listing. The dialog
+   * opens immediately (loading state), the headers-only listing arrives when
+   * the backend is ready, and titles stream in only for the visible rows. The
+   * dialog owns scope/search/ordering/age; the app projects native DTOs and
+   * executes the resume.
+   */
+  private pickSessions(hooks?: { onSelect?: (id: string) => void; onCancel?: () => void }): void {
+    const dialog = new SessionPickerDialog(this.tui, {
+      directory: this.options.cwd, keymap: this.keymap, loading: true,
+      onSelect: value => {
+        if (this.dialog !== dialog) return
+        this.dismissDialog()
+        if (hooks?.onSelect !== undefined) hooks.onSelect(value)
+        else void this.runRemote('resume', { sessionId: value })
+      },
+      onCancel: () => {
+        if (this.dialog !== dialog) return
+        this.dismissDialog()
+        hooks?.onCancel?.()
+      },
+      onInterrupt: () => { void this.interrupt() },
+      onVisibleIds: ids => { this.fetchSessionTitles(dialog, ids) },
+    })
+    this.showDialog(dialog)
+    void this.loadSessionListing(dialog)
+  }
+
+  /** Phase 1: the headers-only listing (no per-session title decompression). */
+  private async loadSessionListing(dialog: SessionPickerDialog): Promise<void> {
+    try {
+      if (this.connecting !== undefined) await this.connecting
+      if (this.closing || this.dialog !== dialog) return
+      const result = await this.runRemote('sessions', { limit: 200, titles: false })
+      if (this.closing || this.dialog !== dialog || !Array.isArray(result)) {
+        dialog.setLoading(false)
+        this.render()
+        return
+      }
+      dialog.setSessions(result.flatMap(value => {
+        const item = object(value)
+        const id = item?.id ?? item?.sessionId
+        if (!item || typeof id !== 'string' || id === '') return []
+        const created = typeof item.activityAt === 'number' ? item.activityAt
+          : typeof item.createdAt === 'number' ? item.createdAt
+            : typeof item.updatedAt === 'number' ? item.updatedAt : undefined
+        return [{
+          id,
+          ...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
+          cwd: typeof item.cwd === 'string' ? item.cwd : '',
+          // The picker's age column shows the LAST CONVERSATION time: the
+          // bridge orders by the durable artifact's mtime (activityAt) and
+          // only falls back to creation/fixture stamps when absent.
+          ...(created !== undefined && Number.isFinite(created) ? { createdAt: created } : {}),
+          ...(item.live === true ? { live: true } : {}),
+        }]
+      }))
+      this.render()
+    } catch {
+      // Connect or listing failure: the transcript notice carries the detail;
+      // drop the overlay so the error is not hidden behind a stuck dialog.
+      if (this.dialog === dialog) this.dismissDialog()
+      this.render()
+    }
+  }
+
+  /**
+   * Phase 2: titles for the visible rows only. Coalesced and deduplicated;
+   * enrichment failures leave `(untitled)` rows usable and never surface as
+   * conversation errors.
+   */
+  private fetchSessionTitles(dialog: SessionPickerDialog, ids: string[]): void {
+    if (this.closing || this.dialog !== dialog) return
+    if (!this.info?.capabilities.includes('titles')) return
+    const cached = new Map<string, string | null>()
+    for (const id of ids) {
+      if (typeof id !== 'string' || id === '') continue
+      const known = this.sessionTitles.get(id)
+      if (known !== undefined) cached.set(id, known)
+      else if (!this.sessionTitleIds.has(id)) this.sessionTitleIds.add(id)
+    }
+    if (cached.size > 0) {
+      // Deferred past the component's synchronous refresh so a reopened
+      // picker immediately shows its already-known titles.
+      void Promise.resolve().then(() => {
+        if (this.closing || this.dialog !== dialog) return
+        dialog.setTitles(cached)
+        this.render()
+      })
+    }
+    if (this.sessionTitleIds.size === 0 || this.titleTimer !== undefined) return
+    this.titleTimer = setTimeout(() => {
+      this.titleTimer = undefined
+      void this.dispatchSessionTitles(dialog)
+    }, 25)
+    this.titleTimer.unref()
+  }
+
+  private async dispatchSessionTitles(dialog: SessionPickerDialog): Promise<void> {
+    const ids = [...this.sessionTitleIds].slice(0, 100)
+    for (const id of ids) this.sessionTitleIds.delete(id)
+    if (ids.length === 0 || this.closing || this.dialog !== dialog) return
+    try {
+      const result = await this.runRemote('titles', { ids })
+      if (this.closing || this.dialog !== dialog || !Array.isArray(result)) return
+      const update = new Map<string, string | null>()
+      for (const value of result) {
+        const item = object(value)
+        if (item === undefined || typeof item.sessionId !== 'string') continue
+        const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : null
+        this.sessionTitles.set(item.sessionId, title)
+        update.set(item.sessionId, title)
+      }
+      if (update.size > 0) { dialog.setTitles(update); this.render() }
+    } catch {
+      // Titles are optional enrichment; a failed batch stays invisible.
+    }
+  }
+
+  /** Provider grouping/search are UI projections of DSH's native model DTOs. */
+  private async pickModel(): Promise<void> {
+    const context = this.context()
+    const surface = this.surfaceGeneration
+    const result = await this.runRemote('models')
+    if (!this.sameContext(context) || surface !== this.surfaceGeneration || !Array.isArray(result)) return
+    const models: ModelPickerItem[] = result.flatMap(value => {
+      const item = object(value)
+      if (!item || typeof item.id !== 'string' || !item.id || typeof item.provider !== 'string' || !item.provider || typeof item.model !== 'string' || !item.model) return []
+      return [{
+        id: item.id, provider: item.provider, model: item.model,
+        label: typeof item.label === 'string' && item.label ? item.label : item.model,
+        ...(typeof item.description === 'string' ? { description: item.description } : {}),
+        ...(typeof item.isDefault === 'boolean' ? { isDefault: item.isDefault } : {}),
+      }]
+    })
+    if (!models.length) { this.store.report('No models available'); return }
+    this.showDialog(new ModelPickerDialog(this.tui, {
+      models, currentProvider: this.info?.provider, currentModel: this.info?.model, keymap: this.keymap,
+      onSelect: id => {
+        if (!this.sameContext(context)) return
+        this.dismissDialog()
+        void this.runRemote('model', { id })
+      },
+      onCancel: () => this.dismissDialog(),
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else this.dismissDialog() },
     }))
   }
 
@@ -669,26 +2055,13 @@ export class App {
     }
   }
 
-  private presetLabel(id: string, catalog: Record<string, unknown>): string {
-    const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object) : []
-    const entry = entries.find(item => item?.id === id)
-    return typeof entry?.name === 'string' && entry.name.length > 0 ? entry.name : id
-  }
-
   private async presetCommand(argument: string): Promise<void> {
+    const context = this.context()
+    const surface = this.surfaceGeneration
     const catalog = await this.presetCatalog()
-    if (!catalog) return
-    const current = typeof catalog.current === 'string' ? catalog.current : undefined
+    if (!catalog || !this.sameContext(context) || surface !== this.surfaceGeneration) return
+    if (argument === 'status') return
     const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object).filter(item => typeof item?.id === 'string') : []
-    if (argument === 'status') {
-      const healthy = entries.filter(item => typeof item?.broken !== 'string')
-      const lines = [
-        'Agent preset: ' + (current ?? 'none'),
-        'New sessions: ' + (this.nextPreset ?? (typeof catalog.default === 'string' ? catalog.default : 'roster default')),
-        'Available: ' + (healthy.map(item => String(item!.id)).join(', ') || 'none'),
-      ]
-      this.store.report(lines.join('\n')); return
-    }
     if (!argument) { await this.pickPreset(catalog); return }
     const entry = entries.find(item => item?.id === argument)
     if (!entry) {
@@ -696,35 +2069,37 @@ export class App {
       return
     }
     if (typeof entry.broken === 'string') { this.store.report('Agent preset ' + argument + ' is unavailable: ' + entry.broken, 'error'); return }
-    if (catalog.blank !== true) { this.stagePreset(argument, catalog); return }
-    await this.applyPreset(argument, catalog)
+    if (catalog.blank !== true) { this.stagePreset(argument); return }
+    await this.applyPreset(argument)
   }
 
-  private stagePreset(id: string, catalog: Record<string, unknown>): void {
+  private stagePreset(id: string): void {
     this.nextPreset = id
-    this.store.report('Agent preset ' + this.presetLabel(id, catalog) + ' will be used for the next /new session; this session keeps ' + (this.info?.preset ?? 'its current preset') + '.')
     this.render()
   }
 
-  private async applyPreset(id: string, catalog: Record<string, unknown>): Promise<void> {
-    const sessionId = this.info?.sessionId
+  private async applyPreset(id: string): Promise<void> {
+    const context = this.context()
+    const stamp = this.infoStamp
     try {
       const result = object(await this.options.backend.command('preset', { id }))
-      if (this.closing || this.info?.sessionId !== sessionId) return
-      if (result?.locked === true) { this.stagePreset(id, catalog); return }
+      if (!this.sameAttachment(context)) return
+      if (result?.locked === true) { this.stagePreset(id); return }
+      const applied = this.infoStamp !== stamp
       if (result && typeof result.sessionId === 'string' && typeof result.cwd === 'string' && typeof result.provider === 'string' && typeof result.model === 'string' && Array.isArray(result.capabilities)) {
-        this.applyInfo(result as unknown as SessionInfo)
+        if (!applied) this.applyInfo(result as unknown as SessionInfo)
         this.catalogRequest = undefined
         await this.refreshCommands()
-        this.store.report('Agent preset: ' + this.presetLabel(id, catalog))
       }
       this.render()
     } catch (error) { this.store.report(errorText(error), 'error') }
   }
 
   private async pickPreset(existing?: Record<string, unknown>): Promise<void> {
+    const context = this.context()
+    const surface = this.surfaceGeneration
     const catalog = existing ?? await this.presetCatalog()
-    if (!catalog) return
+    if (!catalog || !this.sameContext(context) || surface !== this.surfaceGeneration) return
     const current = typeof catalog.current === 'string' ? catalog.current : undefined
     const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object).filter(item => typeof item?.id === 'string') : []
     const items: DecisionOption[] = entries.filter(item => typeof item?.broken !== 'string').map(item => {
@@ -737,15 +2112,19 @@ export class App {
     const broken = entries.filter(item => typeof item?.broken === 'string')
     if (!items.length) { this.store.report('No usable agent presets are available' + (broken.length ? ' (' + broken.length + ' unavailable)' : ''), 'error'); return }
     if (broken.length) this.store.report('Skipped ' + broken.length + ' unavailable agent preset(s).')
-    this.showDialog(new SelectDialog(this.tui, { title: 'Choose agent preset', items, keymap: this.keymap,
-      onSelect: value => {
-        this.hideDialog()
+    const options = {
+      title: 'Choose agent preset', items, keymap: this.keymap,
+      onSelect: (value: unknown) => {
+        if (!this.sameContext(context)) return
+        this.dismissDialog()
         const id = String(value)
-        if (catalog.blank !== true) { this.stagePreset(id, catalog); return }
-        void this.applyPreset(id, catalog)
+        if (catalog.blank !== true) { this.stagePreset(id); return }
+        void this.applyPreset(id)
       },
-      onCancel: () => this.hideDialog(),
-    }))
+      onCancel: () => this.dismissDialog(),
+      onInterrupt: () => { void this.interrupt() },
+    } as ConstructorParameters<typeof SelectDialog>[1] & DecisionDialogExtras
+    this.showDialog(new SelectDialog(this.tui, options))
   }
 
   private async pickEffort(): Promise<void> {
@@ -757,15 +2136,14 @@ export class App {
       await this.runRemote('effort', { id: argument === 'default' ? null : argument })
       return
     }
+    const context = this.context()
+    const surface = this.surfaceGeneration
     const data = object(await this.runRemote('efforts'))
-    if (!data) return
+    if (!data || !this.sameContext(context) || surface !== this.surfaceGeneration) return
+    if (argument === 'status') return
     const levels = Array.isArray(data.efforts) ? data.efforts.map(object).filter(item => typeof item?.id === 'string') : []
     const selected = typeof data.reasoningEffort === 'string' ? data.reasoningEffort : undefined
     const effective = typeof data.effectiveEffort === 'string' ? data.effectiveEffort : undefined
-    if (argument === 'status') {
-      this.store.report('Reasoning effort: ' + (selected ?? (effective ? effective + ' (model default)' : 'provider default')) + '\nAvailable: ' + (levels.map(item => String(item!.id)).join(', ') || 'none'))
-      return
-    }
     if (data.available !== true || levels.length === 0) {
       this.store.report('This model exposes no reasoning levels.', 'error'); return
     }
@@ -777,43 +2155,141 @@ export class App {
         return { label: label + (id === selected ? ' · current' : id === effective ? ' · effective' : ''), description: typeof item!.description === 'string' ? item!.description : id, value: id }
       }),
     ]
-    this.showDialog(new SelectDialog(this.tui, { title: 'Choose reasoning effort', items, keymap: this.keymap,
-      onSelect: value => { this.hideDialog(); void this.runRemote('effort', { id: value === '' ? null : value }) },
-      onCancel: () => this.hideDialog(),
-    }))
+    const options = {
+      title: 'Choose reasoning effort', items, keymap: this.keymap,
+      onSelect: (value: unknown) => {
+        if (!this.sameContext(context)) return
+        this.dismissDialog()
+        void this.runRemote('effort', { id: value === '' ? null : value })
+      },
+      onCancel: () => this.dismissDialog(),
+      onInterrupt: () => { void this.interrupt() },
+    } as ConstructorParameters<typeof SelectDialog>[1] & DecisionDialogExtras
+    this.showDialog(new SelectDialog(this.tui, options))
   }
 
-  private async continueLatest(): Promise<void> {
-    const result = await this.options.backend.command('sessions')
-    if (!Array.isArray(result)) throw new Error('Session listing unavailable')
-    const latest = result.map(object).find(item => item && item.cwd === this.options.cwd && (item.id ?? item.sessionId) !== this.info?.sessionId && typeof (item.id ?? item.sessionId) === 'string')
-    if (!latest) { this.store.report('No previous session in this directory'); return }
-    await this.runRemote('resume', { sessionId: latest.id ?? latest.sessionId })
+  /** Query the native state, then apply only an explicit local boolean override. */
+  private async syncAutoTitle(): Promise<void> {
+    await this.queryAutoTitle()
+    await this.applyLocalAutoTitle()
+  }
+
+  /**
+   * A locally saved on/off preference is applied through the native command at
+   * startup and reload. `inherit` never forces false: the profile default owns
+   * the effective value.
+   */
+  private async applyLocalAutoTitle(): Promise<void> {
+    const preference = this.settings.get().autoTitle
+    if (preference === 'inherit') return
+    const context = this.context()
+    try {
+      const result = object(await this.options.backend.command('auto-title', { enabled: preference }))
+      if (!this.sameContext(context)) return
+      if (result?.available === false) throw new Error(typeof result?.limitation === 'string' ? result.limitation : typeof result?.reason === 'string' ? result.reason : 'this DSH runtime does not expose native auto-title configuration')
+      this.nativeAutoTitle = {
+        available: true,
+        ...(typeof result?.enabled === 'boolean' ? { enabled: result.enabled } : {}),
+        ...(typeof result?.effective === 'string' ? { effective: result.effective } : {}),
+      }
+      if (typeof result?.limitation === 'string' && result.limitation !== '') this.store.report(result.limitation)
+      this.render()
+    } catch (error) {
+      if (this.sameContext(context)) this.store.report('Local auto-title preference was not applied by DSH: ' + errorText(error), 'error')
+    }
+  }
+
+  /** Read the native auto-title state without blocking startup or reload. */
+  private async queryAutoTitle(): Promise<void> {
+    const context = this.context()
+    try {
+      const result = object(await this.options.backend.command('auto-title'))
+      if (!this.sameContext(context) || !result) return
+      if (result.available === false) { this.nativeAutoTitle = { available: false }; return }
+      this.nativeAutoTitle = {
+        available: true,
+        ...(typeof result.enabled === 'boolean' ? { enabled: result.enabled } : {}),
+        ...(typeof result.effective === 'string' ? { effective: result.effective } : {}),
+      }
+      this.render()
+    } catch { /* unsupported runtime: Settings shows the local preference and reports on change */ }
+  }
+
+  private autoTitleLabel(preference: Settings['autoTitle']): string {
+    const local = preference === 'inherit' ? 'inherit' : preference ? 'on' : 'off'
+    const native = this.nativeAutoTitle
+    if (native?.available && typeof native.enabled === 'boolean') {
+      return local + (preference === 'inherit' ? ' · native ' + (native.enabled ? 'on' : 'off') : '')
+    }
+    return local
+  }
+
+  /**
+   * Ask DSH's native auto-title capability; this TUI never runs a title LLM.
+   * The core owns inheritance, persistence and the effective value. Null means
+   * "inherit the native default".
+   */
+  private async toggleAutoTitle(): Promise<void> {
+    const context = this.context()
+    const current = this.settings.get().autoTitle
+    const next = current === 'inherit' ? true : current === true ? false : 'inherit'
+    this.dismissDialog()
+    try {
+      // Query first so an unsupported runtime is reported explicitly instead
+      // of looking like a successful local preference change.
+      const query = object(await this.options.backend.command('auto-title'))
+      if (!this.sameContext(context)) return
+      if (query?.available === false) throw new Error(typeof query.reason === 'string' ? query.reason : 'this DSH runtime does not expose native auto-title configuration')
+      const result = object(await this.options.backend.command('auto-title', { enabled: next === 'inherit' ? null : next }))
+      if (!this.sameContext(context)) return
+      if (result?.available === false) throw new Error(typeof result.reason === 'string' ? result.reason : 'this DSH runtime does not expose native auto-title configuration')
+      const enabled = typeof result?.enabled === 'boolean' ? result.enabled : undefined
+      this.nativeAutoTitle = { available: true, ...(enabled === undefined ? {} : { enabled }), ...(typeof result?.effective === 'string' ? { effective: result.effective } : {}) }
+      let localError: string | undefined
+      try { await this.settings.set({ autoTitle: next }) }
+      catch (error) { localError = errorText(error) }
+      const lines: string[] = []
+      if (enabled === undefined) lines.push('DSH did not report the effective auto-title value.')
+      if (typeof result?.note === 'string' && result.note !== '') lines.push(result.note)
+      else if (typeof result?.warning === 'string' && result.warning !== '') lines.push(result.warning)
+      if (typeof result?.limitation === 'string' && result.limitation !== '') lines.push(result.limitation)
+      if (localError !== undefined) lines.push('The local TUI preference was not saved: ' + localError)
+      if (lines.length) this.store.report(lines.join('\n'))
+    } catch (error) {
+      if (this.sameContext(context)) this.store.report('Auto title was not changed: ' + errorText(error), 'error')
+    } finally {
+      if (!this.closing && !this.dialog && this.sameContext(context)) this.openSettings()
+    }
   }
 
   private openSettings(): void {
-    const settings = this.settings.get()
-    const items: DecisionOption[] = [
-      { label: 'Tool details: ' + (this.viewOptions.expandTools ? 'on' : 'off'), value: 'tools' },
-      { label: 'Thinking: ' + (this.viewOptions.showThinking ? 'on' : 'off'), value: 'thinking' },
-      { label: 'Default screen: ' + settings.screen + ' (next launch)', value: 'screen' },
-      { label: 'Keyboard shortcuts', description: 'View or customize keybindings', value: 'keys' },
-    ]
-    this.showDialog(new SelectDialog(this.tui, { title: 'Settings · ' + this.settings.path, items, keymap: this.keymap,
-      onSelect: value => {
-        if (value === 'keys') { this.openKeybindings(); return }
-        this.hideDialog()
-        let patch: Parameters<SettingsStore['set']>[0] = {}
-        if (value === 'tools') patch = { expandTools: !this.viewOptions.expandTools }
-        if (value === 'thinking') patch = { showThinking: !this.viewOptions.showThinking }
-        if (value === 'screen') patch = { screen: settings.screen === 'inline' ? 'fullscreen' : 'inline' }
-        void this.settings.set(patch).then(() => {
-          if (patch.expandTools !== undefined) this.viewOptions.expandTools = patch.expandTools
-          if (patch.showThinking !== undefined) this.viewOptions.showThinking = patch.showThinking
+    const dialog = new SettingsDialog(this.tui, {
+      settings: this.settings.get(),
+      onChange: async patch => {
+        try {
+          await this.settings.set(patch)
+          const settings = this.settings.get()
+          if (patch.expandTools !== undefined) clearToolExpansion()
+          Object.assign(this.viewOptions, toolPreferences(settings))
+          this.viewOptions.showThinking = settings.showThinking
+          this.viewOptions.thinkingPreviewLines = settings.thinkingPreviewLines
+          this.viewOptions.thinkingLiveTimerMs = settings.thinkingLiveTimerMs
           this.transcript.invalidate(); this.render()
-        }).catch(error => this.store.report(errorText(error), 'error'))
-      }, onCancel: () => this.hideDialog(),
-    }))
+        } catch (error) {
+          this.store.report(errorText(error), 'error')
+          throw error
+        }
+      },
+      onAutoTitle: () => { void this.toggleAutoTitle() },
+      onKeybindings: () => { this.openKeybindings() },
+      autoTitleLabel: this.autoTitleLabel(this.settings.get().autoTitle),
+      keymap: this.keymap,
+      screen: this.screen,
+      path: this.settings.path,
+      onCancel: () => this.dismissDialog(),
+      onInterrupt: () => { void this.interrupt() },
+    })
+    this.showDialog(dialog)
   }
 
   private openKeybindings(): void {
@@ -821,6 +2297,7 @@ export class App {
       keymap: this.keymap, path: this.keybindings.path,
       onChange: (id, bindings) => this.saveKeybinding(id, bindings),
       onBack: () => { if (this.dialog === dialog) this.openSettings() },
+      onInterrupt: () => { void this.interrupt() },
     })
     this.showDialog(dialog)
   }
@@ -848,15 +2325,19 @@ export class App {
    * has the same boundary: resources/configuration, not core source code.
    */
   private async reloadRuntime(): Promise<void> {
-    if (this.isBusy || this.decisions.length > 0) {
+    if (this.isBusy || this.queued > 0 || this.decisions.length > 0) {
       this.store.report('Reload deferred: wait for the current turn/command/queued input or resolve the pending DSH decision first.')
       return
     }
+    const context = this.context()
     const beforeSettings = this.settings.get()
     const settingsWarnings = this.settings.reload()
     const settings = this.settings.get()
-    this.viewOptions.expandTools = settings.expandTools
+    if (this.viewOptions.expandTools !== settings.expandTools) clearToolExpansion()
+    Object.assign(this.viewOptions, toolPreferences(settings))
     this.viewOptions.showThinking = settings.showThinking
+    this.viewOptions.thinkingPreviewLines = settings.thinkingPreviewLines
+    this.viewOptions.thinkingLiveTimerMs = settings.thinkingLiveTimerMs
     this.transcript.invalidate()
     const keysApplied = this.reloadKeys()
     const lines: string[] = ['TUI reloaded: settings and keybindings.']
@@ -868,6 +2349,7 @@ export class App {
     try {
       const result = object(await this.options.backend.command('reload'))
       if (!result) throw new Error('the backend returned no reload result')
+      if (!this.sameContext(context)) return
       if (result.demo === true) {
         lines.push('Demo backend: DSH configuration reload is not applicable.')
       } else if (result.available !== true) {
@@ -875,15 +2357,23 @@ export class App {
       } else {
         const warnings = Array.isArray(result.warnings) ? result.warnings.filter((item): item is string => typeof item === 'string') : []
         const pending = Array.isArray(result.pending) ? result.pending : []
+        const restartReason = typeof result.restartReason === 'string' ? result.restartReason : ''
         for (const warning of warnings) lines.push(warning)
         if (pending.length > 0) lines.push('Changed plugin modules require a restart before their new code runs: ' + pending.length + '.')
-        if (typeof result.restartReason === 'string' && result.restartReason !== '') {
-          lines.push('Restart required: ' + result.restartReason + '.')
+        if (restartReason !== '') lines.push('Restart required: ' + restartReason + '.')
+        // Never claim every plugin/config module is live when the native HMR
+        // result still reports pending modules or another restart reason.
+        if (pending.length > 0 || restartReason !== '') {
+          lines.push('DSH configuration was reconciled, but not all native changes are running yet; restart to load the remaining plugins/configuration.')
+        } else if (keysApplied && settingsWarnings.length === 0) {
+          lines[0] = 'Reloaded settings, keybindings and DSH configuration.'
+        } else {
+          // Keep the partial outcome explicit if local resources were not applied.
+          lines.push('DSH configuration and plugins reconciled.')
         }
-        lines.push('DSH configuration and plugins reconciled; session, transcript and caches preserved.')
-        lines.push('The current session keeps its mounted model/preset; changed defaults apply through /model or /new.')
         this.catalogRequest = undefined
         await this.refreshCommands()
+        void this.syncAutoTitle()
       }
     } catch (error) {
       failed = true
@@ -897,6 +2387,9 @@ export class App {
     let applied = false
     try {
       this.keymap.setBindings({ ...this.modeBindings, ...this.keybindings.read() })
+      this.viewOptions.hints = this.viewHints()
+      this.viewOptions.imageDetailsHint = this.keymap.getBindings('app.images.details')[0]
+      this.transcript.invalidate()
       const diagnostics = this.keymap.getDiagnostics()
       applied = !diagnostics.some(diagnostic => diagnostic.severity === 'error')
       for (const diagnostic of diagnostics) {
@@ -921,66 +2414,156 @@ export class App {
   }
 
   private async pasteClipboard(): Promise<void> {
+    // A native read is already in flight; don't duplicate OS work on key repeat.
+    if (this.clipboardPending) return
+    const context = this.context()
+    const generation = this.clipboardGeneration
+    const current = () => generation === this.clipboardGeneration && this.sameContext(context)
+    this.clipboardPending = true
+    this.render()
     try {
-      const clipboard = getNativeClipboard()
+      const clipboard = this.options.clipboard ?? getNativeClipboard()
       if (!clipboard) { this.store.report('Native clipboard unavailable; use terminal paste.', 'error'); return }
+      const bytes = await clipboard.getImage()
+      if (!current()) return
+      if (bytes !== undefined && bytes !== null) {
+        const mediaType = imageMediaTypeFromBytes(bytes)
+        if (mediaType === undefined) {
+          this.store.report('Clipboard image format is not recognized. Use PNG, JPEG, GIF or WebP.', 'error')
+          return
+        }
+        // The single Editor enforces its memory budget; DSH owns image admission.
+        // There is no longer an IPC/base64-frame limit in the same-process path.
+        context.editor.insertImage({ type: 'image', mediaType, data: Buffer.from(bytes).toString('base64') })
+        return
+      }
       const text = await clipboard.getText()
-      if (!text) { this.store.report('No clipboard text. Image attachment sending is not yet available in this prototype.'); return }
-      this.editor.handleInput('\x1b[200~' + text + '\x1b[201~')
-      this.render()
-    } catch (error) { this.store.report('Clipboard: ' + errorText(error), 'error') }
+      if (!current()) return
+      if (!text) { this.store.report('No image or text in the clipboard.'); return }
+      context.editor.handleInput('\x1b[200~' + text + '\x1b[201~')
+    } catch (error) { if (current()) this.store.report('Clipboard: ' + errorText(error), 'error') }
+    finally {
+      if (generation === this.clipboardGeneration) { this.clipboardPending = false; this.render() }
+    }
   }
 
   private async externalEditor(): Promise<void> {
     if (this.terminalPaused || this.closing) return
+    const context = this.context()
     let directory: string | undefined
-    const previous = this.editor.captureDraftForExternalEditor()
+    const previous = context.editor.captureDraftForExternalEditor()
     try {
-      directory = await mkdtemp(join(tmpdir(), 'dsh-pi-tui-edit-'))
+      directory = await mkdtemp(join(tmpdir(), 'dsh-tui-edit-'))
       const file = join(directory, 'prompt.txt')
       await writeFile(file, previous.text, { mode: 0o600 })
+      if (this.closing) return
       this.terminalPaused = true
       this.tui.stop({ preserveScreen: true })
       const command = process.env.VISUAL || process.env.EDITOR || 'nano'
       const code = await new Promise<number>((resolve, reject) => {
         const child = spawn(process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', process.platform === 'win32' ? ['/c', command, file] : ['-c', command + ' "$1"', 'editor', file], { stdio: 'inherit' })
-        child.once('error', reject); child.once('exit', code => resolve(code ?? 1))
+        this.editorChild = child
+        child.once('error', reject)
+        child.once('exit', code => { if (this.editorChild === child) this.editorChild = undefined; resolve(code ?? 1) })
       })
-      if (code === 0) this.editor.applyExternalEdit(await readFile(file, 'utf8'), previous.snapshot)
-      else this.store.report('External editor exited with code ' + code, 'error')
-    } catch (error) { this.store.report('External editor: ' + errorText(error), 'error') }
+      if (code === 0 && !this.closing) {
+        const text = await readFile(file, 'utf8')
+        // Drop the edit when the editor/session/route changed while the child ran.
+        if (this.sameContext(context)) context.editor.applyExternalEdit(text, previous.snapshot)
+      } else if (code !== 0 && !this.closing) this.store.report('External editor exited with code ' + code, 'error')
+    } catch (error) { if (!this.closing && this.sameContext(context)) this.store.report('External editor: ' + errorText(error), 'error') }
     finally {
       if (directory) await rm(directory, { recursive: true, force: true })
       this.terminalPaused = false
-      if (!this.closing) { this.tui.start(); this.tui.setFocus(this.dialog ?? this.prompt); this.tui.requestRender(true) }
+      if (!this.closing && !this.terminalRestored) { this.tui.start(); this.tui.setFocus(this.dialog ?? this.prompt); this.tui.requestRender(true) }
     }
   }
 
   private suspend(): void {
-    if (process.platform === 'win32' || this.options.registerSignals === false) { this.store.report('Suspend is unavailable in this terminal'); return }
+    if (process.platform === 'win32' || (this.options.registerSignals === false && this.options.allowSuspend !== true)) { this.store.report('Suspend is unavailable in this terminal'); return }
     this.terminalPaused = true
     this.tui.stop({ preserveScreen: true })
-    const resume = () => { this.terminalPaused = false; if (!this.closing) { this.tui.start(); this.tui.requestRender(true) } }
+    const resume = () => { this.terminalPaused = false; if (!this.closing && !this.terminalRestored) { this.tui.start(); this.tui.requestRender(true) } }
     process.once('SIGCONT', resume); this.signals.push(['SIGCONT', resume])
     process.kill(process.pid, 'SIGTSTP')
   }
 
+  /** Native plugin disposal restores the terminal synchronously before slow cleanup. */
+  restoreTerminal(): void {
+    if (this.terminalRestored) return
+    this.terminalRestored = true
+    try { this.tui.terminal.setProgress(false) } catch { /* terminal may already be gone */ }
+    if (!this.terminalPaused) {
+      try { this.tui.stop() } catch { /* best effort; Pi also registers an exit restore hook */ }
+    }
+  }
+
+  /** Terminate a foreground external editor so shutdown cannot stay raw/hung. */
+  private async stopExternalEditor(): Promise<void> {
+    const child = this.editorChild
+    if (!child || child.exitCode !== null || child.signalCode !== null) return
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* already gone */ }
+        resolve()
+      }, 2_000)
+      timer.unref()
+      child.once('exit', () => { clearTimeout(timer); resolve() })
+      try { child.kill('SIGTERM') } catch { clearTimeout(timer); resolve() }
+    })
+  }
+
+  /** Bounded native close; the terminal is already restored when this runs. */
+  private async closeBackendBounded(): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined
+    const closed = Promise.resolve(this.options.backend.close()).then(() => true, () => false)
+    const timeout = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), SHUTDOWN_CLOSE_MS); timer.unref() })
+    const ok = await Promise.race([closed, timeout])
+    if (timer) clearTimeout(timer)
+    return ok
+  }
+
   async shutdown(code = 0): Promise<void> {
+    // Repeated SIGINT/SIGTERM while closing must not re-run teardown or re-enter
+    // a restored terminal; the first invocation owns the exit code.
     if (this.closing) return
     this.closing = true
+    // Detach input before disposing any editor/dialog or awaiting native work.
+    this.restoreTerminal()
+    this.clipboardGeneration += 1; this.clipboardPending = false
+    this.queueReadController?.abort(); this.queueReadController = undefined
+    this.queueImageRecoveries.clear()
+    this.closeImageDetails()
+    this.closeToolDetails()
+    resetImageDisplayCache()
+    this.transcript.dispose()
     this.stopSpinner()
     if (this.exitTimer) clearTimeout(this.exitTimer)
+    if (this.titleTimer !== undefined) { clearTimeout(this.titleTimer); this.titleTimer = undefined }
+    if (this.gitTimer !== undefined) { clearInterval(this.gitTimer); this.gitTimer = undefined }
+    this.gitRefresher?.dispose()
     this.editor.setKeymap(this.keymap)
-    this.watcher?.close(); this.off?.()
+    this.watcher?.close(); this.off?.(); this.offInput?.()
+    const dialog = this.dialog
+    this.hideDialog()
+    disposeComponent(dialog)
+    disposeComponent(this.editor)
+    // Terminal restore is synchronous and comes before the bounded native close.
+    this.restoreTerminal()
+    await this.stopExternalEditor()
+    let outcome = code !== 0 ? code : (this.fatal ? 1 : 0)
+    try {
+      if (!await this.closeBackendBounded() && outcome === 0) outcome = 1
+    } catch { if (outcome === 0) outcome = 1 }
+    await Promise.allSettled([
+      this.settings.flush(),
+      this.keybindings.flush(),
+      ...[...this.histories.values()].map(history => history.flush()),
+    ])
+    await this.tui.terminal.drainInput().catch(() => {})
+    // Keep signal handlers while the bounded close runs so a repeated SIGINT
+    // is an idempotent no-op rather than an uncontrolled second teardown.
     for (const [signal, handler] of this.signals) process.off(signal, handler)
-    let outcome = code || (this.fatal ? 1 : 0)
-    try { await this.options.backend.close() } catch { outcome = 1 }
-    finally {
-      await Promise.allSettled([this.keybindings.flush(), ...[...this.histories.values()].map(history => history.flush())])
-      this.tui.terminal.setProgress(false)
-      this.tui.stop()
-      await this.tui.terminal.drainInput().catch(() => {})
-      this.resolveExit(outcome)
-    }
+    this.resolveExit(outcome)
   }
 }

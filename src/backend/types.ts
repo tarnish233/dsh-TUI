@@ -1,6 +1,46 @@
 /** Neutral UI-facing contract. DSH owns the runtime and durable facts. */
 export type JsonRecord = Record<string, unknown>
 
+/** DSH's durable image vocabulary. The identifier is opaque, never a host path. */
+export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+
+export interface ImageAttachmentRef {
+  readonly attachmentId: string
+  readonly mediaType: ImageMediaType
+  readonly bytes: number
+  readonly width: number
+  readonly height: number
+  readonly name?: string
+  readonly originalDimensions?: { readonly width: number; readonly height: number }
+}
+
+/** One lazily read, DSH-verified image. Bytes never travel in transcript events. */
+export interface ImageAttachmentValue {
+  readonly attachment: ImageAttachmentRef
+  readonly data: string
+}
+
+/** Public Host-style prompt parts; DSH owns image admission and durable promotion. */
+export type PromptContentPart =
+  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'image'; readonly mediaType: ImageMediaType; readonly data: string; readonly name?: string }
+
+/** Ordered, already admitted content used only for display projection. */
+export type DisplayContentPart =
+  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'image'; readonly attachment: ImageAttachmentRef }
+
+/**
+ * One recallable human inbox row. `next-turn` waits for a turn boundary;
+ * `next-step` is delivered at the next step. Bytes stay in DSH.
+ */
+export interface QueueEntry {
+  readonly messageId: string
+  readonly text: string
+  readonly target: 'next-turn' | 'next-step'
+  readonly images: number
+}
+
 export type SurfaceOperation = 'append' | { op: 'replace'; startSeq: number; endSeq: number }
 
 export interface SessionEvent {
@@ -19,6 +59,9 @@ export interface StreamPresentation {
   text: string
   thinking: string
   toolNames: string[]
+  /** Optional for legacy/demo codecs; real image references are never reduced to counts. */
+  images?: readonly ImageAttachmentRef[]
+  content?: readonly DisplayContentPart[]
 }
 
 export interface DisplayStream {
@@ -55,6 +98,11 @@ export interface SessionInfo {
   events?: SessionEvent[]
   truncated?: boolean
   totalEvents?: number
+  /**
+   * DSH could not read the durable log for this session. The transcript is
+   * incomplete rather than empty; the UI must not present it as a new session.
+   */
+  snapshotUnavailable?: boolean
 }
 
 export interface DecisionOption {
@@ -69,8 +117,61 @@ export interface Question {
   intent?: string | JsonRecord
   question: string
   header?: string
+  /** Long-form supporting content (e.g. the full plan markdown of a plan review). */
+  detail?: string
   multiSelect?: boolean
   options: Array<{ label: string; description?: string; preview?: string }>
+}
+
+/**
+ * Native usage facts for the footer's stat chips, folded bridge-side from the
+ * `contextPressure` / `tokenUsage` projections with the web client's formulas
+ * (same source as the `state` command's `usage` field). Both occupancy fields
+ * travel together: a bar needs `used` and `size` as one atomic reading.
+ */
+export interface UsageSnapshot {
+  used?: number
+  size?: number
+  cachePct?: number
+  totalTokens?: number
+}
+
+/**
+ * DSH's native `sessionStats` fold, whitelisted to real non-negative numbers
+ * (same source as the `state` command's `stats` field). Absent fields omit
+ * their chips; the footer never falls back to a local rate estimate.
+ */
+export interface StatsSnapshot {
+  turns?: number
+  steps?: number
+  llmMs?: number
+  toolMs?: number
+  ttftMs?: number
+  ttftSteps?: number
+  decodeMs?: number
+  decodeTokens?: number
+}
+
+/** Native todo item of the `todos` projection. */
+export interface TodoItem {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+/**
+ * DSH's native `todos` projection: the whole list, or null before the first
+ * `todo/write` of a turn (the fold clears on `turn/start`).
+ */
+export type TodosSnapshot = TodoItem[] | null
+
+/**
+ * DSH's native `plan` projection, trimmed to presentation-relevant fields:
+ * plan mode is active / was requested and which command run toggled it.
+ */
+export interface PlanSnapshot {
+  active: boolean
+  wanted: boolean | null
+  running: { commandId: string; wanted: boolean } | null
 }
 
 export interface DecisionRequest {
@@ -91,8 +192,11 @@ export type BackendEvent =
   | { type: 'ready'; info: SessionInfo }
   | { type: 'status'; sessionId: string; status: 'running' | 'idle' }
   | { type: 'permissions'; sessionId: string; value: PermissionSelection }
+  | { type: 'todos'; sessionId: string; value: TodosSnapshot }
+  | { type: 'plan'; sessionId: string; value: PlanSnapshot }
+  | { type: 'metrics'; sessionId: string; usage?: UsageSnapshot; stats?: StatsSnapshot }
   | { type: 'stream_start'; sessionId: string; attemptId: string; revision: number; turn: number; step: number }
-  | { type: 'stream_chunk'; sessionId: string; attemptId: string; revision: number; index: number; chunk: JsonRecord }
+  | { type: 'stream_chunk'; sessionId: string; attemptId: string; revision: number; index: number; chunk: JsonRecord; /** DSH wall-clock timestamp (epoch ms) of the frame; optional on the wire. */ time?: number }
   | { type: 'stream_end'; sessionId: string; attemptId: string; revision: number; outcome: 'committed' | 'abandoned'; seq?: number }
   | { type: 'session_event'; sessionId: string; event: SessionEvent }
   | { type: 'decision'; sessionId: string; request: DecisionRequest }
@@ -107,25 +211,14 @@ export interface Backend {
   onEvent(listener: (event: BackendEvent) => void): () => void
   connect(): Promise<SessionInfo>
   send(text: string, mode?: 'followup' | 'steer'): Promise<void>
+  /** Native multimodal prompt admission; optional when a backend has no attachment capability. */
+  sendContent?(content: readonly PromptContentPart[], mode?: 'followup' | 'steer'): Promise<void>
+  /** Read-only attachment retrieval, independent from model vision and session creation. */
+  readImage?(attachment: ImageAttachmentRef, signal?: AbortSignal): Promise<ImageAttachmentValue>
   cancel(): Promise<void>
   /** Control methods plus commands (native descriptors) and execute ({line}, native CommandExecution). */
   command(name: string, args?: JsonRecord): Promise<unknown>
   /** Approval: option.value or {cancelled:true}. Questions: {answers:(string|string[])[],cancelled?:boolean}. */
   respond(id: string, value: unknown): Promise<void>
   close(): Promise<void>
-}
-
-export interface DshOptions {
-  cwd: string
-  dshPath?: string
-  home?: string
-  resume?: string
-  provider?: string
-  model?: string
-  /**
-   * Real DSH profile whose native configuration is reused (`dsh --profile`).
-   * Absent selects this application's base composition, composed by DSH from
-   * `DEFAULT_PROFILE_BUNDLES`; the home patch and credentials still apply.
-   */
-  profile?: string
 }

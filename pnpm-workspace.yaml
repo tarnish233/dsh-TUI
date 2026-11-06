@@ -1,2 +1,8 @@
-minimumReleaseAgeExclude:
-  - '@earendil-works/pi-tui@1.5.0'
+packages:
+  - 'vendor/pi-tui'
+
+# DSH supplies native peers in its own profile runtime. Do not install a second
+# Harness (or its browser/office stack) merely to consume the TUI plugin.
+autoInstallPeers: false
+allowBuilds:
+  koffi: set this to true or false

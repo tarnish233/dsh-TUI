@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '@earendil-works/pi-tui'
+import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '#pi-tui'
 import type { DecisionRequest } from '../src/backend/types.ts'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
@@ -352,4 +352,164 @@ test('long question tabs and options stay within narrow terminal widths', () => 
   })
   dialog.focused = true
   for (const width of [20, 30, 40, 60]) assertWidths(dialog.render(width), width)
+})
+
+// --- native plan review -----------------------------------------------------
+
+const PLAN_MARKDOWN = [
+  '# Plan: native sessionStats in the footer',
+  '',
+  'The footer must read DSH statistics instead of folding its own numbers.',
+  '',
+  '1. Read `sessionStats` from the native projection',
+  '2. Drop the local settle/TTFT fold',
+  '3. Keep the editor-border live rate',
+].join('\n')
+
+test('a plan-review question presents header, question, plan body and both options', () => {
+  const tui = fakeTui()
+  let result: unknown = 'unset'
+  const request: DecisionRequest = {
+    id: 'plan-review-1',
+    kind: 'question',
+    title: 'Decision from DSH',
+    questions: [{
+      id: 'plan-review',
+      intent: { kind: 'plan-review' },
+      header: 'Plan review',
+      question: 'Approve this plan and leave plan mode?',
+      detail: PLAN_MARKDOWN,
+      options: [
+        { label: 'Approve', description: 'Leave plan mode and run the plan.' },
+        { label: 'Keep planning', description: 'Stay in plan mode and keep refining.' },
+      ],
+    }],
+  }
+  const dialog = new DecisionDialog(tui, {
+    request,
+    onSubmit: value => { result = value },
+    onCancel: () => { result = 'cancelled' },
+  })
+  dialog.focused = true
+  for (const width of [24, 40, 72, 110]) assertWidths(dialog.render(width), width)
+
+  const rendered = stripTerminalSequences(dialog.render(72).join('\n'))
+  assert.match(rendered, /Plan review/, 'the native header is the dialog title')
+  assert.doesNotMatch(rendered, /Decision from DSH/, 'the generic request title is replaced')
+  assert.match(rendered, /Approve this plan and leave plan mode\?/, 'the question is the subtitle')
+  assert.match(rendered, /Plan: native sessionStats in the footer/, 'the plan markdown is the body')
+  assert.match(rendered, /Read `?sessionStats`? from the native projection/)
+  assert.match(rendered, /1\. Approve/, 'both options keep their existing rows')
+  assert.match(rendered, /2\. Keep planning/)
+  assert.doesNotMatch(rendered, /☐ Plan review/, 'the header does not repeat as a tab chip')
+
+  // Answer semantics are the unchanged question machinery.
+  dialog.handleInput('\r')
+  assert.deepEqual(result, { answers: ['Approve'] })
+
+  let kept: unknown = 'unset'
+  const keep = new DecisionDialog(tui, {
+    request,
+    onSubmit: value => { kept = value },
+    onCancel: () => { kept = 'cancelled' },
+  })
+  keep.handleInput('2')
+  assert.deepEqual(kept, { answers: ['Keep planning'] })
+
+  // The custom-answer path still carries plan feedback.
+  let feedback: unknown = 'unset'
+  const custom = new DecisionDialog(tui, {
+    request,
+    onSubmit: value => { feedback = value },
+    onCancel: () => { feedback = 'cancelled' },
+  })
+  custom.focused = true
+  custom.handleInput('3') // the custom row after the two options
+  custom.render(72)
+  for (const char of 'add the rollback step') custom.handleInput(char)
+  custom.handleInput('\r')
+  assert.deepEqual(feedback, { answers: ['add the rollback step'] })
+
+  // A multi-select detail question keeps its tabs and review step: only a
+  // self-presenting single question promotes its header to the dialog title.
+  const multi = new DecisionDialog(tui, {
+    request: {
+      id: 'plan-review-multi',
+      kind: 'question',
+      title: 'Pick many',
+      questions: [{
+        question: 'Choose the plan steps',
+        header: 'Many',
+        multiSelect: true,
+        detail: 'Supporting text for the choices.',
+        options: [{ label: 'A' }, { label: 'B' }],
+      }],
+    },
+    onSubmit: () => {},
+    onCancel: () => {},
+  })
+  const multiText = stripTerminalSequences(multi.render(72).join('\n'))
+  assert.match(multiText, /Pick many/, 'the request title stays for a multi-select question')
+  assert.match(multiText, /Supporting text for the choices/, 'the detail body still renders')
+  assert.match(multiText, /☐ Many/, 'and the tab chip is kept')
+})
+
+test('a long plan is capped with an honest marker and keeps the options reachable', () => {
+  const tui = fakeTui(18, 60) // rowBudget = max(4, 18 - 14) = 4
+  let result: unknown = 'unset'
+  const detail = ['# Plan', '', ...Array.from({ length: 40 }, (_, index) => `step ${index + 1}`)].join('\n')
+  const dialog = new DecisionDialog(tui, {
+    request: {
+      id: 'plan-review-2',
+      kind: 'question',
+      title: 'Decision from DSH',
+      questions: [{
+        header: 'Plan review',
+        question: 'Approve this plan and leave plan mode?',
+        detail,
+        options: [{ label: 'Approve' }, { label: 'Keep planning' }],
+      }],
+    },
+    onSubmit: value => { result = value },
+    onCancel: () => { result = 'cancelled' },
+  })
+  dialog.focused = true
+  for (const width of [20, 40, 60]) assertWidths(dialog.render(width), width)
+  const rendered = stripTerminalSequences(dialog.render(60).join('\n'))
+  assert.match(rendered, /… \+\d+ lines/, 'truncation is reported, never silent')
+  assert.match(rendered, /1\. Approve/, 'the answer rows survive a long plan')
+  assert.match(rendered, /2\. Keep planning/)
+  dialog.handleInput('\r')
+  assert.deepEqual(result, { answers: ['Approve'] })
+})
+
+test('a detail-less question renders as before', () => {
+  const tui = fakeTui()
+  let result: unknown = 'unset'
+  const request: DecisionRequest = {
+    id: 'q-no-detail',
+    kind: 'question',
+    title: 'Pick a delivery mode',
+    questions: [{
+      question: 'Which mode do you want?',
+      header: 'Mode',
+      options: [{ label: 'Compact' }, { label: 'Expanded' }],
+    }],
+  }
+  const dialog = new DecisionDialog(tui, {
+    request,
+    onSubmit: value => { result = value },
+    onCancel: () => { result = 'cancelled' },
+  })
+  dialog.focused = true
+  for (const width of [24, 40, 80]) assertWidths(dialog.render(width), width)
+  const rendered = stripTerminalSequences(dialog.render(80).join('\n'))
+  assert.match(rendered, /Pick a delivery mode/, 'the request title still heads the dialog')
+  assert.match(rendered, /☐ Mode/, 'a single question keeps its header chip')
+  assert.match(rendered, /Which mode do you want\?/)
+  assert.match(rendered, /1\. Compact/)
+  assert.match(rendered, /2\. Expanded/)
+  assert.doesNotMatch(rendered, /… \+/)
+  dialog.handleInput('2')
+  assert.deepEqual(result, { answers: ['Expanded'] })
 })

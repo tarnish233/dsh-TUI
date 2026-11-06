@@ -1,5 +1,7 @@
 # DSH TUI 方案：Pi 渲染底座 + CC 交互 + DSH 后端
 
+> **当前实施更新：原生插件化。** 用户已选择 DSH 原生应用 bundle + 同进程 Cordis TUI 插件；默认 profile 仍为 `dsh-tui`，模型选择采用直接消费 DSH `llm`/default-model 公开服务的轻投影。旧 IPC、独立后端进程、临时 home/profile 镜像及自动替换其他前端均已移除。应用身份现已统一为 `dsh-tui`；入口首启通过所选 DSH 的公开 package APIs 自动挂载本地应用，只升级同源旧别名、不重建配置或替换其他前端，再委托 native launcher 并断言终端激活。原生 preset 资源/类从宿主安装锚点解析。启动、资源释放和配置组合仍由 DSH 接管；入口与当前验收见 README / BACKEND / ACCEPTANCE。下文保留原始方案与历史版本调查，§5 的单 Editor/输入原则继续适用，历史隔离备选不代表当前架构。
+
 ## 结论
 
 推荐做一个独立的 TypeScript TUI：

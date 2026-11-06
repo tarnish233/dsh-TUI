@@ -1,223 +1,399 @@
-# DSH integration: native services plus a narrow TUI bridge
+# DSH integration: in-process native adapter
 
-Verified installation: `@deepseek-ai/dsh@0.2.1-rc.5`, Node 26/macOS.
-The version gate accepts that concrete release, not every `0.2.x` release;
-`DSH_PI_TUI_ALLOW_UNSUPPORTED=1` is an explicit experimental escape hatch.
+Verified installation: `@deepseek-ai/dsh@0.2.2-rc.1`, Cordis `~4.1.0`, Node 26/macOS.
+The parent plugin runs this adapter inside a DSH native application bundle; the
+user's default profile remains `dsh-tui`, owned by the parent's bundle
+composition.
 
 ## Ownership boundary
 
-Pi TUI supplies terminal rendering/input. It does not supply this application's
-AgentSession, models, tools, commands, permissions or conversation persistence.
-DSH remains the authority for all of those. The adapter is limited to process
-isolation, transport, display projection, request correlation and human answers.
+Pi TUI supplies terminal rendering/input. DSH owns Agents, model calls, tools,
+permissions, commands, sessions and persistence. The adapter
+(`src/backend/context.ts`) is a thin same-process seam:
 
-- `runtime/bridge.mjs`: native DSH services/events inside the actual launcher.
-- `src/backend/client.ts`, `protocol.ts`: isolated process and versioned wire.
-- `src/backend/native-codec.ts`: pure DSH helpers plus the installed public
-  profile/composition API, resolved from the selected installation's exports;
-  never a copied assembler/stream decoder or YAML merger.
-- `src/backend/native-profile.ts`: native profile selection and the documented
-  frontend-replacement policy (recognized `PROFILE_TEMPLATES` surfaces and the
-  supported legacy TUI); ordinary plugin utility binaries are preserved, and
-  configuration rows stay authoritative.
-- `runtime-home.ts`: scratch home, read-only profile mirror and the bridge
-  `--patch` overlay; the selected durable data home is only inherited.
+- the host Cordis context is passed in; `createDshBackend(ctx, options)` returns
+  the existing `Backend` contract (`src/backend/types.ts`) unchanged;
+- no loopback wire, JSON request dispatch, stdin/fd3, spawned second DSH,
+  scratch profile mirror, second persistence, scheduler, permission rule or
+  model transport exists;
+- `close()` releases only adapter-owned listeners, decisions, in-flight
+  command/image operations and the Agent handle it created. It never disposes
+  the host root, never calls `appExit`, and never exits the process. The parent
+  plugin owns application shutdown and `ctx.effect` lifecycle.
 
-The external SDK in this release does not expose raw `agent/assistant-stream`
-or per-session cancellation. ACP deliberately forwards committed semantic
-updates. These gaps justify a narrow wire to existing in-process APIs, not
-another Harness or synthetic streaming from completed messages.
+Public services used (all through `ctx.get(name)` with capability validation):
+`agents`, `commands`, `llm`, `attachments`, `sessionQuery`,
+`sessionProjections`, `agentDefaultModel`, `permissionPresets`, `agentPresets`,
+`sessions`, `hmr`, `tools`, `loader`, `sessionTitle`. Native pure helpers are
+`createUserMessage` and
+`BlockAssembler` / `expandAssistantStream` / `assembleAssistantStream` /
+surface predicates; `makeTranscriptCodec(llmModule, sessionModule)` is a pure
+factory and tests inject fakes. Production may pass `options.native` from the
+parent bundle or omit it and let the adapter resolve the installed public
+exports by their package names. There is no `packageJsonPath`, global
+discovery, private config/env or `loadNativeHelpers` production entry.
 
-## Launch and configuration
+## Host composition requirements (parent-owned)
 
-Discovery validates the installed manifest and uses its public `bin` field.
-Helpers are resolved with Node's package resolver seeded at that manifest;
-`lib/` layouts are not assumed. The real DSH launcher is spawned as
-`dsh --profile <name> --patch <bridge-overlay>` and owns `.env` layering,
-runtime/package resolution, bundle composition, the telemetry switch and
-failure reporting. Diagnostics use pipes, never the visible terminal.
+The parent bundle must mount the shared `dsh-base` rows (agent, agent-loop,
+commands, tools, llm, attachments, persistence/query, session-projection,
+permission presets, approval, user-questions, hmr/config-editor when
+profile-launched). For preset parity it must mount
+`@deepseek-ai/dsh-agent-preset-registry`. `session-stats` is optional: an absent
+service degrades explicitly instead of being faked. The parent adds the
+`0.2.2-rc.1` peer dependencies
+(`dsh-llm`, `dsh-session`, Cordis, agent services) and produces the publishable
+JS build.
 
-Profile selection (`DshOptions.profile` / `--profile <name>`):
+### Startup preset mount (`src/plugin/presets.ts`)
 
-- without a selection, DSH's `DEFAULT_PROFILE_BUNDLES` initialize this
-  application's profile (`initProfile`) in scratch — the same base composition
-  `dsh plugin --profile <new>` would create;
-- with a selection, native `resolveProfileDir`/`readProfileManifest` resolve the
-  real profile, and its configuration is reused: its `cordis.patch.yml` is
-  copied into the scratch profile and patch-relative assets are materialized
-  there (Node resolves symlinks to their real path, which would otherwise
-  anchor modules in the user's home); profile dependencies, `node_modules`
-  and `compatibility.json` remain readable through the mirror;
-- the profile's declared bundle list is filtered only for recognized
-  application surfaces the TUI must not start a second time: bundles named by
-  native `PROFILE_TEMPLATES` and the supported legacy TUI bundle. Ordinary
-  plugins that merely ship a utility `bin` are kept, because that heuristic
-  would drop valid bundles. Every replacement produces a startup warning; the
-  profile's own configuration rows stay in force (frontend-owned rows become
-  native "patch target not found" diagnostics). A patch or home patch that
-  *inserts* a recognized application frontend is disabled by exact row id in
-  the private highest-priority overlay, leaving the user patch untouched; if
-  that inserted row has no stable id, the profile fails rather than starting a
-  second terminal. A missing/invalid profile or one without the shared core
-  bundle fails with `INVALID_OPTIONS` / `PROFILE_UNSUPPORTED`.
+The TUI registers DSH's own `standard`/`ptc`/`minimal`/`cordis` declarations
+from the packaged `dsh-web-app/presets/*.patch.yml` assets and mounts the
+`@deepseek-ai/dsh-agent-preset` plugin class. Both are resolved through the
+host installation anchor, never from this package's module URL:
 
-The selected data home is resolved with native `resolveDshHome`; existing
-home-level config/auth, sessions and durable data are inherited through links.
-The profile's `cordis.yml` and regenerated manifest are written only into the
-scratch directory, so user profiles, patches and credentials are never edited.
-Legacy `settings.yaml` is copied (not linked) because the native settings
-import archives it. The bridge overlay mounts the agent-preset roster, disables
-HMR/model-backed title generation, and disables the host-plane tool rows that a
-per-Agent preset now owns; the native deterministic title service remains
-available.
+- `profileContext.installAnchor` (the launcher's own package manifest) is the
+  primary anchor;
+- `pluginPackages.packageOf('@deepseek-ai/dsh-web-app', import.meta.url)` is the
+  public fallback for an embedded host without the profile launcher.
 
-The TUI never imports Pi catalogs/auth: there is no `modelsFile` option,
-`--models-file` fails with native-configuration guidance, and the removed
-environment pointers are not read (an upgrading user gets one warning). A
-`DshOptions.profile` warning can name replaced frontends; model routes come
-only from DSH's mounted catalog (`ctx.llm.listProviders/listModels`,
-`resolveModelInfo`, native `agent-default-model`). See [PROVIDERS.md](PROVIDERS.md).
+A globally installed or linked TUI package sits outside the profile's runtime
+resolution scope, so the same bare import from `import.meta.url` fails with
+`Cannot find package '@deepseek-ai/dsh-web-app'`. Resolving from the installation
+anchor also guarantees the mounted plugin class is DSH's own copy. A missing
+anchor or missing exported asset fails loudly; no YAML, tool inventory, fake
+preset or web frontend is substituted. `test/backend-presets.test.ts` proves the
+contract against a temporary local installation (exported preset assets plus one
+fake plugin class), so an accidental peer/root resolution fails the test.
 
-## Wire and lifecycle
+## Interface
 
-- Parent requests: NDJSON on stdin, `{t:'req',id,method,params}`.
-- Runtime events/responses: NDJSON on fd 3.
-- stdout/stderr: bounded, redacted diagnostics; optional debug log is private.
-- Hello carries `protocolVersion: 2`; incompatible/missing versions fail the
-  handshake rather than being assumed compatible.
-- `SessionInfo.attachmentId` is an ephemeral Agent-attachment epoch. It is not
-  another durable session id and is not stored in DSH. Reattaching the same
-  session produces a new epoch so the UI clears stale tentative streams even
-  though the native frame revision counter restarts at 1.
+```ts
+interface DshHostContext {
+  get(name: string): unknown
+  on(name: string, listener: unknown): unknown
+  logger?: { warn?(message: string): void }
+}
 
-Creation/resume uses `ctx.agents.create/resume` and their public setup hook.
-Sending uses native `createUserMessage`, then `Agent.followup/steer`; its
-promise means inbox acceptance, not model success. Optional session/attachment
-correlation prevents a delayed send/recall from applying to a different Agent.
-Native Agent object identity filters root streams; child streams are not mixed.
+interface DshContextBackendOptions {
+  cwd: string
+  resume?: string
+  provider?: string
+  model?: string
+  native?: { createUserMessage(input): unknown; transcriptCodec: TranscriptCodec }
+  warn?(message: string): void
+}
 
-Close cancels pending decisions and native operations, drains the Agent,
-flushes through `ctx.sessions`, and disposes the native handle. The bridge
-releases its input channel and requests native `appExit`. It does not install
-another `uncaughtException`/`unhandledRejection` policy or force an early exit
-on top of the launcher's fail-loud/disposal behavior. The client retains bounded
-transport shutdown/escalation for an unresponsive child.
+class DshContextBackend implements Backend
+function createDshBackend(ctx: DshHostContext, options): DshContextBackend
+```
 
-## Events, original history and pure codecs
+`transcriptCodec` is available before the first `ready`; a missing native codec
+fails `connect()` loudly rather than substituting a mirror.
 
-`agent/assistant-stream` produces start/chunk/end frames. `attemptId` identifies
-an attempt; `revision` increases on EVERY frame inside an attachment, and
-`index` is the attempt's dense chunk position. Durable settlement precedes the
-committed end naming its exact `seq`. These native semantics are not changed.
+## Lifecycle and attachments
 
-`session/event` and query snapshots preserve the complete JSON event envelope,
-including `surfaceOp` and `sourceEventSeqs`. The original append-origin message
-is human transcript material. A model-only replacement (e.g. result pruning)
-may change model context but must never overwrite the user's original output.
-Non-surface tool-call, attempt, command and lifecycle records remain available.
+A plain launch (and `/new`) creates no Agent: `connect` enters a pending session
+with adapter-minted `sessionId`/`attachmentId`. The first `send`, image prompt
+or command needing live Agent state materializes it through
+`ctx.agents.create` with those exact ids and the staged route/preset; a `ready`
+event follows. A launch that never sends leaves no durable session.
+`connect({resume})` and `/resume` use `ctx.agents.resume` and return the durable
+snapshot from `sessionQuery.readSession`; a failed read reports
+`snapshotUnavailable` (with a warning) instead of an empty conversation.
 
-Before ready, `DshBackend.transcriptCodec` supplies public native:
+An explicit resume of the session this adapter is **already attached to** is a
+no-op reattachment: the current attachment is reported (same `attachmentId`,
+same durable snapshot) and no native resume is attempted. Installed native
+contracts allow no alternative: `AgentRegistry.enter` is the authoritative
+collision boundary and rejects a second live entry for one id
+(`agent "<id>" is already registered`), and `SessionPersistence.open(id,'write')`
+claims single-writer ownership and rejects an existing owner with
+`SessionAlreadyOwnedError`. A prepared same-id candidate can therefore never
+coexist with the live one, so closing first and resuming after would have no
+rollback: one native resume/setup failure would leave the process attached to
+nothing. Native `session-controller.resolve()` resolves the same situation the
+same way, by returning the live Agent. Consequences, all deliberate: the
+attachment epoch, native queues, pending decisions and the owned handle survive
+a reattachment; a running turn is not cancelled; the transcript is not rebuilt
+from the log. A resume of a *different* id still prepares and commits the
+candidate first and retires the previous Agent only afterwards, so its failure
+keeps the current attachment (see `test/backend-reattach.test.ts`).
 
-- `BlockAssembler` for incremental chunks and interrupted safe prefixes;
-- `expandAssistantStream` for validating durable packed records;
-- `assembleAssistantStream` for canonical assembly;
-- `isAppendSurfaceEvent` / `isReplacementSurfaceEvent` for placement semantics.
+The attachment epoch (`attachmentId`) is process-local and not a second durable
+identity. Native `agent/assistant-stream`, `session/event`, `agent/status` and
+`agent/error` payloads are forwarded only while their Agent/session object is
+the exact one this adapter owns, so a late frame after `/new` or resume cannot
+reach the UI. `/new` validates the requested preset first and retires the old
+Agent only after the new pending session exists.
 
-The UI installs this codec before resetting history. Missing native helpers
-fail startup; the explicit offline Demo codec is never a production fallback.
-Attempt identity, render state and live/durable deduplication remain in the UI.
-Active text uses the same layout as settled replies with no attempt/debug header;
-only incomplete or unconfirmed responses get an explicit warning.
+`closeAgent` settles decisions, calls native
+`agent.cancel({kind:'user'},{keepInbox:true})`, waits boundedly for
+`whenIdle`, skips the explicit `sessions.flush` only when the native
+turn-boundary projection proves no turn started (an explicit flush would
+materialize an empty session), then disposes the owned handle. Errors during
+disposal are contained.
 
-Snapshots use `sessionQuery.readSession`, not deprecated `snapshotEvents`.
-The newest fitting suffix is limited to 8000 events and 4 MiB measured in UTF-8
-bytes. Omitted history is marked `truncated/totalEvents`; durable content is
-not cut or rewritten to fit the wire. Full DSH history remains authoritative.
+## Streaming and durable facts
 
-## Native commands and controls
+- `stream_start/chunk/end` mirror native `attemptId`, `revision`, `turn`,
+  `step`, chunk `index`/`time` and the committed/abandoned outcome with its
+  committed `seq`. `revision` increases on every frame; it is not constant per
+  attempt.
+- `session_event` preserves the complete JSON event envelope including
+  `surfaceOp` and `sourceEventSeqs`; a model-only replacement never overwrites
+  the original user output.
+- `toolPresentation` is ephemeral: `ctx.tools.get(name, agent)` plus only the
+  definition's pure `presentCall`/`presentResult`; no tool is re-executed and
+  nothing is written back to DSH's log.
+- Snapshots keep the newest suffix within 8000 events and 4 MiB UTF-8; omissions
+  are reported as `truncated`/`totalEvents`, durable text is never rewritten.
 
-| Control | Native authority / response |
-| --- | --- |
-| `commands` | `ctx.commands.list(agent)` descriptors for help/autocomplete |
-| `execute {line}` | `ctx.commands.execute(agent,line,[],signal)` -> native `{commandId,result}` |
-| `compact` | Compatibility alias to native `/compact`, including its argument checks; no local compaction implementation |
-| `model` | Native catalog/model validation and public `installModelSelection` slot; effort is preserved when the target supports it, otherwise the target default applies |
-| `presets` | Read-only native `agentPresets.list()` roster plus current/default/blank state |
-| `preset` | Native `agentPresets.select` on a blank session; a started session returns `locked` and keeps its composition |
-| `efforts` | Native `llm.resolveModelInfo(provider, model).reasoning` levels, default and effective effort |
-| `effort {id}` | Apply an adapter-owned effort to the current `ModelSelection`; `null`/`default` clears the explicit level |
-| `permissions` | Read-only native `permissionPresets.catalog/current`; native option DTOs are preserved |
-| `new/resume` | Native Agent registry and durable query snapshot, followed by ready |
-| `sessions` | Native session query and title observations; `createdAt`, not invented activity time |
-| `state` | Native session, model selection, status, inbox counts and token meter |
-| `dequeue` | Native Inbox.remove for recalled human text; no scheduler, no deletion of injected context or attachments |
-| `reload` | Backend syncs real profile/home config into scratch, then `ctx.hmr.runExclusive(reconcileProfile)`; returns warnings/pending/restartReason plus refreshed session info |
+## Decisions and cancellation
 
-Native execution owns `command/run`, `command/done`, pairing IDs, parameter
-validation, error classification and compaction source-event links. UI commands
-(help/preferences/pickers) are handled locally; other business command
-lines are forwarded without collapsing whitespace or multiline arguments.
+Approval and user-question answerers are registered on the public
+`approval/request` and `user-questions/request` waterfalls and answer only their
+exact Agent; every other request calls `next()` and keeps DSH's fail-closed
+behavior. Human answers are normalized to native outcomes
+(`allowed-once`/`rejected`/`cancelled`) and native answer batches. A question
+cancel settles the exact native request as `ASK_CANCELLED`; a signal/turn abort
+settles it as `ASK_ABORTED`, so Esc and Ctrl+C stay distinguishable. Every path
+emits `decision_closed` once before settling.
 
-There is no local `/mode` command or mode setter. `/permission` and the
-Shift+Tab shortcut both execute the mounted native command, retaining command
-audit and the approval service's Agent-aware setter. `SessionInfo.permissions`
-and `permissions` events carry the native `{currentValue}` selection; updates
-come directly from `sessionProjections.onChanged`, not a second permission fold.
-Native `/plan` is independent: the tested base composition mounts
-`dsh-plan-mode`, whose command/guidance/review semantics remain in DSH.
+Foreground interruption is native `Agent.cancel({kind:'user'},{keepInbox:true})`.
+It also aborts the exact AbortController of in-flight native commands and
+settles pending decisions; queued inbox input survives, no TUI scheduler is
+introduced. `state.pending` reports raw inbox lengths, while `state.queued` and
+`dequeue` share one predicate (`source.kind === 'user'` and only text/image
+blocks), so native context notices are neither counted nor recalled.
 
-Keyboard configuration lives in `/settings` → Keyboard shortcuts, not a
-standalone `/hotkeys` command. The grouped list/inline field and atomic binding
-overrides are UI-only and never invoke DSH business commands or change the
-main draft. Existing keymap validation/diagnostics are reused, without a second
-key dispatch engine or configuration hierarchy. `/reload` re-reads the TUI
-settings/binding files, syncs the selected real profile/home patch into the
-private scratch tree, then asks native HMR to reconcile. It keeps the Agent,
-transcript, draft and caches; a running turn, native command, or pending
-decision refuses the operation. Bundle/package moves, credential-file changes
-and TUI source changes still require a restart.
+## Commands, models, presets, permissions
 
-The client uses advertised capabilities instead of a second command-name
-whitelist. Execution has a 200s caller deadline, catalogs 180s, ordinary requests
-30s (test overrides exist). A timed-out execution sends `abort {id}` to cancel
-the exact native command signal. `cancel` also aborts current-session native
-commands and delegates Agent interruption. A timeout is not presented as proof
-that an operation rolled back; native command audit/outcomes remain authoritative.
+`command()` keeps the UI-facing names. Session-less commands (`state`,
+`commands`, `sessions`, `titles`, `models`, `presets`, `permissions`, `new`,
+`resume`, `auto-title`, `dequeue`, `cancel`) never materialize a pending
+session. `model`/`preset`/`effort` stage on a pending session; they apply through
+DSH's own owners when live:
 
-## Tool cards and human decisions
+- live route: `agent.model.select({provider,model,reasoningEffort?})`, the only
+  native write; the footer reads `agent.model.current()` plus the creation
+  fallback;
+- default save: `agentDefaultModel.saveSelection()` followed by a getter match.
+  Metadata says `defaultPersistence:'native'` and `defaultsPersisted:false`
+  because persistence is owned by the host's mounted ConfigEditor and this
+  adapter cannot confirm a profile flush. No scratch/runtime wording is
+  hardcoded;
+- presets: read-only native roster plus `blank`/`current`; a started session
+  returns `locked`; a pending session stages the preset;
+- permissions: `permissionPresets.catalog()/current(session)` passthrough;
+  switching executes the mounted native `/permission` command, and native
+  `/plan` remains independent;
+- commands: `ctx.commands.list(agent)` descriptors and
+  `ctx.commands.execute(agent, line, [], signal)`; DSH mints
+  `command/run`/`command/done` and owns validation/audit;
+- model catalog: the mounted native `ctx.llm.listProviders()` /
+  `listModels(provider)` / `resolveModelInfo(provider, model)` plus
+  `agentDefaultModel.currentSelection()`. `src/backend/model-view.ts` is a
+  small pure projection that only renames fields into UI rows
+  (`id/provider/model/label/description/reasoning/isDefault`); the `id` is a UI
+  correlation key and native provider/model values pass through unchanged.
+  Provider failures keep their native message (redacted) and never hide the
+  successful rows. There is no external/Pi catalog import, credential policy,
+  router or second default policy; `models` is advertised only when
+  `listProviders` and `listModels` are really mounted.
+- reasoning metadata: DSH 0.2.2 list DTOs may omit `reasoning`. When a model is
+  selected, the adapter resolves that **target only** through
+  `llm.resolveModelInfo(provider, model)` and carries an existing explicit
+  level only if the target still advertises it; otherwise the route omits
+  effort and DSH's own adapter default applies (a target default is never
+  promoted to an explicit level). The metadata await is followed by a fresh
+  pending/live route and attachment-identity check, so a late answer cannot
+  overwrite a switch. A missing resolver means no level can be carried; model
+  selection itself still works and `efforts` retains its existing capability
+  semantics.
 
-The bridge uses `tools.get(name,agent)` and pure `presentCall/presentResult`.
-It adds ephemeral `{call?,result?}` `toolPresentation` to wire events, never to
-DSH's log. Replay uses logged arguments/content/meta; it never re-executes tools
-or reads files to guess a diff. The UI renders card intent, with generic fallback,
-CC layout, width-safe coloring and real native read line numbers. A model
-proposal is not execution, and absence of a result is not success/failure.
+## Auto-title
 
-Approval and question answerers use the public waterfalls. DSH performs policy
-and audit; the bridge only forwards human choices. Native question IDs/intent
-survive projection; unknown intent can use the generic dialog. The App keeps
-multiple requests in a FIFO and closes by exact ID; a late acknowledgement
-cannot dismiss a newer dialog. Child decisions fall through to DSH fail-closed.
+No new title service or persistence rule. The adapter toggles the existing
+native Loader entries (`@deepseek-ai/dsh-session-title-*-llm`) through
+`entry.update({disabled})`. The `inherit` baseline is the first native state the
+adapter observed at runtime (the host composition is original, so there is no
+scratch-profile comparison). `enabled:null` restores that baseline; title
+generation remains DSH-owned and may issue model requests only when a native
+provider is enabled.
 
-## Known limits and acceptance
+## Projections and footer metrics
 
-- Single-root home isolation still needs link glue in this DSH release. Settings
-  written to the private profile are not a permanent user-profile editor.
-- Frontend replacement covers recognized DSH shipped application bundles and
-  the supported legacy TUI. A profile whose patch inserts one of those
-  frontends is refused instead of starting a second stdio consumer; ordinary
-  plugin utility binaries are not treated as applications.
-- A selected profile's non-application bundles are mounted; bundle-owned
-  frontend rows from replaced bundles have no target and are reported by the
-  native launcher, not silently rewritten.
-- Configured gateway headers are native `llm-pi-ai` provider fields; the TUI
-  owns no request-header shim, credential migration, or provider catalog.
-- Queue recall is a text-only UI convenience, not a full edit/steer queue UI.
-- Child panels, timed-question follow-up UI, images, fork/rewind and full native
-  configuration UI are not implemented. Thinking display and reasoning effort
-  are separate: the display toggle is UI-only; `/effort` owns the model level.
-- Preset choices are not persisted as a TUI preference. A started Session keeps
-  its composition; the staged preset applies to the next `/new` in this process.
-- Native lifecycle/command/pruning/presenter regressions, strong pre-finish
-  loopback SSE paint checks, CLI PTY and representative real providers are tested.
-  See [ACCEPTANCE.md](ACCEPTANCE.md) for the current results and exclusions.
+`sessionProjections.onChanged` is only a hint. `permissions` is forwarded as
+the native `{currentValue}`; `todos` is trimmed to `{content,status}`; `plan`
+re-reads the full host state and publishes only when the trimmed
+`{active,wanted,running}` fact changes, publishing an unengaged init view never.
+Footer `usage`/`stats` read the official wire views
+(`snapshot(session,keys)` with a `stateOf` fallback), re-read all contributing
+keys, and publish only on value change. The occupancy pair is atomic; cache
+share and whole-log total use the native token buckets; `sessionStats` fields
+are whitelisted non-negative numbers. One attach snapshot per new attachment
+replays the current facts.
+
+## Images
+
+`readImage(ref, signal)` is read-only and session-independent: no Agent is
+created, no tool re-runs, no path/URL is derived. It calls
+`ctx.attachments.readImage`, verifies the returned identity, MIME and byte
+length, and returns verified base64 bytes. There is no IPC frame cap; the image
+is bounded only by DSH's own storage/admission limits and the UI's display
+budget. Cancellation only aborts that read, never a turn.
+
+`sendContent` text-only delegates to `send`. Content with an image uses exactly
+the documented public sequence `attachments.admitPromptContent(content)` →
+native `createUserMessage` → the current Agent's `followup/steer`. The TUI is
+not a Remote caller: it mounts no SessionController, calls no
+`prompt`/`resolveAgent`, and adds no vision/permission gate. DSH owns canonical
+base64, media/count/pixel limits, model-vision projection, admission and durable
+promotion; refusals happen before materializing a pending session and keep the
+draft retryable.
+
+## Diagnostics privacy
+
+Adapter-origin diagnostics (warnings, thrown `BackendError` text, `warn()` logs,
+native-failure strings, default-save warnings, title-toggle errors) pass through
+`redactDiagnostic()`: `Authorization` values, bearer tokens, `api_key` /
+`token` / `secret` / `password` assignments — quoted JSON keys and escaped
+quoted values included — and common `sk-…` key shapes become `[redacted]`.
+`asBackendError()` never serializes an arbitrary thrown object: only its scalar
+`message`/`name`/`detail` fields become (redacted) diagnostics, so enumerable
+`stack`, `cause` or credential-shaped properties cannot reach the UI; an object
+without a usable message becomes one generic sentence. This is textual
+diagnostics hygiene only. Native session events,
+tool calls/results, `toolPresentation` and decision payloads are never rewritten,
+and image bytes/base64 never enter diagnostics.
+
+## Terminal diagnostic isolation
+
+Native DSH plugins can write diagnostics the Cordis logger never sees: the shared
+provider listing cache (`createModelListingCache` in the installed
+`dsh-llm-deepseek`) hardcodes `console.error(tag, …)` / `console.warn(tag, …)`, so
+a periodic successful catalog refresh lands on fd 2 — the same terminal the
+renderer owns — and overwrites the focused editor row while leaving
+`ctx.logger.exporter` empty. `src/backend/terminal-output.ts` owns the narrow
+application-lifecycle lease for that path; the backend adapter, provider catalogs,
+credentials, refresh cadence and the DSH Agent are untouched.
+
+`createTerminalOutputLease({directory, onRecord, onFatal})` opens one private log
+and returns `{logPath, terminalWrite, install, restore, flush, close}`. While
+`install()` is active it patches the two JavaScript writers
+`process.stdout.write` and `process.stderr.write`; nothing is forwarded to the
+terminal. The renderer therefore writes through `lease.terminalWrite` (the parent
+supplies it to `ProcessTerminal`), so renderer bytes never enter the diagnostic
+path and the lease never inspects, special-cases or pattern-matches screen text or
+escape prefixes. `Buffer`/`Uint8Array` chunks are reassembled by a per-channel
+`StringDecoder` (a UTF-8 sequence split across writes stays intact and a chunk's
+encoding argument never reinterprets its bytes); `string` chunks flush held bytes
+first; an unknown string encoding is rejected exactly as Node's `write()` does
+(`ERR_UNKNOWN_ENCODING`) and is never captured; write callbacks settle once and
+captured writes report no backpressure. `terminalWrite` always resolves the real
+pre-capture stdout writer (this lease's, an active lease's, or the current one) and
+lets terminal errors propagate: a dead terminal must surface, not be masked.
+
+Classification is deliberately text-based and small: the native fail-loud labels
+(`<bin>: fatal load failure:` / `<bin>: fatal uncaught exception:`) are `fatal`;
+the exact periodic model-listing success line
+(`model listing from <url> loaded <n> model(s), skipped <m> row(s)`) is `routine`
+(log-only, never a transcript line); every other stderr line is `warning`, so
+native errors are never silently swallowed; unknown stdout stays `routine`
+log-only unless it plainly reads as a warning/failure (`error`, `failed`,
+`exception`, `denied`, `refused`, …), which keeps generic `console.log` chatter
+out of the transcript. Lines are stripped of ANSI/CSI/OSC sequences and C0/C1
+control characters (tabs become spaces) and passed through `redactDiagnostic()`:
+credential values never reach the UI or the log, and a credential line split
+across writes is still redacted as one complete line.
+
+A `fatal` line releases the capture first and then invokes `onFatal(text)`
+synchronously, **before** anything is forwarded to the original stderr writer.
+The hook therefore sees an unpatched terminal and can write terminal-restore
+sequences directly. Native fail-loud writes one multiline `util.inspect`
+diagnostic, so the rest of that same write (code/cause/context/stack lines) is
+recorded as `fatal` continuation records and forwarded, sanitized and in order,
+after the hook: nothing of the fatal report is lost, and the native exit policy
+stays intact.
+
+Bounds: the log lives in an application-private directory (created `0700`, an
+existing directory that is group/other-writable is refused) with mode `0600`; one
+generation is capped at 1 MiB, then a single `.1` rotation, then in-place
+truncation. An existing log that is a symlink, a non-regular file or not
+owner-only is refused rather than chmodded or appended to, and a symlinked or
+special rotation target is never replaced. The in-memory queue is bounded (512
+lines / 256 KiB, with a drop note) and `flush()`/`close()` wait at most 1 s. A
+line longer than 64 KiB is discarded from the point of overflow through its
+terminating newline — across later writes, with exactly one marker per complete
+line — so the continuation of an over-long line is never mistaken for a fresh
+diagnostic and a credential split across those writes cannot be stored as a
+tail. A sink failure stops persistence without recursing into another log write
+(a sink that writes synchronously is dropped rather than re-captured), emits
+exactly one sanitized `warning` record stating that storage failed and that
+further diagnostics may not be persisted, and keeps capture safe; a log that
+cannot be opened fails the lease before any stream is patched.
+
+Lifecycle: `install()` is idempotent (double install/HMR cannot stack a second
+capture) and refuses to install while *any* lease in the process is capturing —
+the marker lives on a `Symbol.for` key, so a second module instance (HMR,
+duplicated bundle) cannot stack a capture whose writer would hijack the other
+lease's patch. `restore()` is synchronous and idempotent, records any partial or
+discarded line instead of losing it, releases that process-wide marker only if
+it is still ours, and never clobbers a writer another component installed on top.
+The application keeps the capture installed while it pauses for an external
+editor — child-UI output is *not* claimed captured — and calls `restore()` then
+`close()` on final UI detach. `close()` re-refuses `install()`.
+
+Limits, stated in the module: this is JavaScript-write interception, not
+descriptor isolation. Writes from a native addon, from a child process that
+inherited fd 1/fd 2, or from an independently opened `/dev/tty` bypass the lease;
+while it is installed, all same-process JS stdout/stderr text (including
+`console.*`) is treated as diagnostics. `test/backend-terminal-output.test.ts`
+covers classification, sanitization, split-UTF-8 and split-credential lines,
+discard-until-newline for over-long lines, log bounds and rotation, storage
+failure reporting, symlink/mode refusals, multiline fatal ordering and its
+continuation, cross-lease refusal, encoding rejection, renderer error
+propagation, install/restore idempotency, and one child process whose real fd
+1/fd 2 are inspected; all fixtures are synthetic and offline.
+
+## Reload
+
+`/reload` is a single-step native operation: the adapter's own idle gate (agent
+status, active commands, pending decisions, native inbox except
+`user-approval` notices) runs first, then
+`hmr.runExclusive(() => hmr.reconcileProfile())`. `reconcileProfile` requires
+that exclusive context; there is no nested acquisition, no prepare/commit
+reservation and no scratch sync. The result is DSH's own
+warnings/pending/restartReason plus refreshed `info`. `close()` never awaits an
+in-flight reload, so a recomposition that unloads this plugin cannot deadlock on
+its own disposal; an absent HMR service returns `available:false`.
+
+## Removed architecture
+
+Deleted in this pass: `runtime/bridge.mjs`, `runtime/bridge.d.mts`,
+`src/backend/client.ts`, `discover.ts`, `protocol.ts`, `runtime-home.ts`,
+`native-profile.ts`, and the wire/discovery/mirror-specific backend tests. The
+semantic coverage (native streaming, images, decisions, queue, models,
+permissions, commands, resume, lazy creation, metrics, titles) was migrated to
+`test/backend-context.test.ts`, `test/backend-context-native.test.ts`,
+`test/backend-native-codec.test.ts` and `test/backend-privacy.test.ts`, which run
+against an offline fake Cordis host (`src/backend/testing.ts`). No tests read a real profile, credential,
+session log or provider.
+
+## Known limits
+
+- The TUI is not a Remote caller: image prompts always use public attachment
+  admission + native message/inbox delivery. No SessionController is mounted,
+  called or required.
+- ConfigEditor flush is not provable from the public default-model service;
+  `defaultsPersisted` therefore stays `false` with `defaultPersistence:'native'`.
+- Model rows are a presentation projection of the mounted native LLM registry;
+  the adapter owns no provider catalog, credential validity, routing or default
+  policy. Native service failures remain visible and redacted.
+- The parent bundle owns `dsh-tui` profile assembly, `session-stats`, JS build
+  output and `package.json` peer dependencies. The startup preset mount reads
+  the official preset assets/plugin from the host installation; it adds no web
+  frontend, copied preset or second preset implementation.
+- Parent-owned files still referencing the deleted modules must be migrated by
+  their owners (see the delegation report); this adapter does not edit them.

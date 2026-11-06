@@ -139,6 +139,20 @@ export interface Terminal {
 	setProgramStatus(status: ProgramStatus): void;
 }
 
+/** Options for {@link ProcessTerminal}. */
+export interface ProcessTerminalOptions {
+	/**
+	 * Sink for every terminal write: rendered frames, cursor/clear/title/progress
+	 * sequences, protocol negotiation and capability queries.
+	 *
+	 * Defaults to `process.stdout.write`. Pass the original terminal writer when
+	 * the host temporarily routes JS `process.stdout`/`process.stderr` elsewhere;
+	 * TUI output keeps reaching the real terminal without a second terminal
+	 * abstraction.
+	 */
+	write?: (data: string) => void;
+}
+
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const DEFAULT_SSH_ESCAPE_TIMEOUT_MS = 100;
 
@@ -181,6 +195,7 @@ export class ProcessTerminal implements Terminal {
 	private programStatusSupported = false;
 	/** The support query was sent and its DA1 sentinel has not arrived yet. */
 	private programStatusQueryPending = false;
+	private readonly writeOutput: (data: string) => void;
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -196,6 +211,10 @@ export class ProcessTerminal implements Terminal {
 		return env;
 	})();
 
+	constructor(options: ProcessTerminalOptions = {}) {
+		this.writeOutput = options.write ?? ((data) => process.stdout.write(data));
+	}
+
 	get kittyProtocolActive(): boolean {
 		return this._kittyProtocolActive;
 	}
@@ -205,6 +224,12 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
+		// Idempotent attach: a second start() without an intervening stop() must not add a
+		// second stdin/stdout wiring. Overwriting stdinBuffer/stdinDataHandler used to leak the
+		// previous 'data' listener (every key dispatched twice) and re-capture wasRaw while the
+		// terminal was already raw, so the following stop() left raw mode on. A different owner
+		// must stop() this terminal before starting it, so the input path stays single-owner.
+		if (this.stdinDataHandler) return;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
@@ -217,7 +242,7 @@ export class ProcessTerminal implements Terminal {
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
-		process.stdout.write("\x1b[?2004h");
+		this.writeOutput("\x1b[?2004h");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.resizeHandler);
@@ -309,7 +334,7 @@ export class ProcessTerminal implements Terminal {
 		this.programStatusSupported = programStatusOverride === "1";
 		this.programStatusQueryPending = programStatusOverride !== "1" && programStatusOverride !== "0";
 		const programStatusQuery = this.programStatusQueryPending ? PROGRAM_STATUS_QUERY : "";
-		process.stdout.write(`${KITTY_KEYBOARD_PROTOCOL_QUERY}${programStatusQuery}${DEVICE_ATTRIBUTES_QUERY}`);
+		this.writeOutput(`${KITTY_KEYBOARD_PROTOCOL_QUERY}${programStatusQuery}${DEVICE_ATTRIBUTES_QUERY}`);
 		this.writeProgramStatus();
 	}
 
@@ -415,13 +440,13 @@ export class ProcessTerminal implements Terminal {
 
 	private enableModifyOtherKeys(): void {
 		if (this._kittyProtocolActive || this._modifyOtherKeysActive) return;
-		process.stdout.write("\x1b[>4;2m");
+		this.writeOutput("\x1b[>4;2m");
 		this._modifyOtherKeysActive = true;
 	}
 
 	private disableModifyOtherKeys(): void {
 		if (!this._modifyOtherKeysActive) return;
-		process.stdout.write("\x1b[>4;0m");
+		this.writeOutput("\x1b[>4;0m");
 		this._modifyOtherKeysActive = false;
 	}
 
@@ -446,7 +471,7 @@ export class ProcessTerminal implements Terminal {
 		if (shouldDisableKittyProtocol) {
 			// Disable Kitty keyboard protocol first so any late key releases
 			// do not generate new Kitty escape sequences.
-			process.stdout.write("\x1b[<u");
+			this.writeOutput("\x1b[<u");
 			this.keyboardProtocolPushed = false;
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
@@ -479,25 +504,29 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
+		// Idempotent detach: nothing to restore when start() never attached. Writing mode resets
+		// in that case would toggle protocol state (bracketed paste, keyboard protocol, progress)
+		// on a terminal this instance does not own, including after an earlier stop().
+		if (!this.stdinDataHandler) return;
 		if (this.clearProgressInterval()) {
-			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+			this.writeOutput(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 		// Remove the status while stopped, for example after exit or while suspended. start() reports it again.
 		if (this.programStatusSupported && this.programStatus) {
-			process.stdout.write(formatProgramStatus({ state: "clear" }));
+			this.writeOutput(formatProgramStatus({ state: "clear" }));
 		}
 		this.programStatusSupported = false;
 		this.programStatusQueryPending = false;
 
 		// Disable bracketed paste mode
-		process.stdout.write("\x1b[?2004l");
+		this.writeOutput("\x1b[?2004l");
 
 		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
 		this.clearKeyboardProtocolNegotiationBuffer();
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (shouldDisableKittyProtocol) {
-			process.stdout.write("\x1b[<u");
+			this.writeOutput("\x1b[<u");
 			this.keyboardProtocolPushed = false;
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
@@ -540,7 +569,9 @@ export class ProcessTerminal implements Terminal {
 		if (this._modifyOtherKeysActive) sequence += "\x1b[>4;0m";
 		sequence += after;
 		try {
-			// process.stdout.write() may be asynchronous (e.g. Windows TTYs) and would not flush during exit.
+			// The injected writer may be asynchronous (e.g. Windows TTYs) and would not flush during exit.
+			// This emergency renderer-owned exit output intentionally bypasses it and writes the real fd
+			// synchronously so terminal modes are restored even when JS stdout/stderr are intercepted.
 			fs.writeSync(process.stdout.fd, sequence);
 		} catch {
 			// The terminal may already be gone.
@@ -548,7 +579,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	write(data: string): void {
-		process.stdout.write(data);
+		this.writeOutput(data);
 		if (this.writeLogPath) {
 			try {
 				fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });
@@ -569,64 +600,64 @@ export class ProcessTerminal implements Terminal {
 	moveBy(lines: number): void {
 		if (lines > 0) {
 			// Move down
-			process.stdout.write(`\x1b[${lines}B`);
+			this.writeOutput(`\x1b[${lines}B`);
 		} else if (lines < 0) {
 			// Move up
-			process.stdout.write(`\x1b[${-lines}A`);
+			this.writeOutput(`\x1b[${-lines}A`);
 		}
 		// lines === 0: no movement
 	}
 
 	hideCursor(): void {
-		process.stdout.write("\x1b[?25l");
+		this.writeOutput("\x1b[?25l");
 	}
 
 	showCursor(): void {
-		process.stdout.write("\x1b[?25h");
+		this.writeOutput("\x1b[?25h");
 	}
 
 	clearLine(): void {
-		process.stdout.write("\x1b[K");
+		this.writeOutput("\x1b[K");
 	}
 
 	clearFromCursor(): void {
-		process.stdout.write("\x1b[J");
+		this.writeOutput("\x1b[J");
 	}
 
 	clearScreen(): void {
-		process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
+		this.writeOutput("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
 	}
 
 	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title. A BEL or ESC in the title would end the sequence early and
 		// send the rest to the terminal as escape sequences (session names come from session files).
-		process.stdout.write(`\x1b]0;${replaceControlCharacters(title)}\x07`);
+		this.writeOutput(`\x1b]0;${replaceControlCharacters(title)}\x07`);
 	}
 
 	setProgramStatus(status: ProgramStatus): void {
 		this.programStatus = status.state === "clear" ? undefined : status;
-		if (this.programStatusSupported) process.stdout.write(formatProgramStatus(status));
+		if (this.programStatusSupported) this.writeOutput(formatProgramStatus(status));
 	}
 
 	private writeProgramStatus(): void {
 		if (this.programStatusSupported && this.programStatus) {
-			process.stdout.write(formatProgramStatus(this.programStatus));
+			this.writeOutput(formatProgramStatus(this.programStatus));
 		}
 	}
 
 	setProgress(active: boolean): void {
 		if (active) {
 			// OSC 9;4;3 - indeterminate progress
-			process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+			this.writeOutput(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 			if (!this.progressInterval) {
 				this.progressInterval = setInterval(() => {
-					process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+					this.writeOutput(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 				}, TERMINAL_PROGRESS_KEEPALIVE_MS);
 			}
 		} else {
 			this.clearProgressInterval();
 			// OSC 9;4;0 - clear progress
-			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+			this.writeOutput(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 	}
 

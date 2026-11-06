@@ -12,14 +12,21 @@
 
 export {
   CcEditor,
+  CcImageBudgetError,
+  CcUnresolvedImageMarkerError,
+  printableInput,
   type CcActionEvent,
   type CcEditorOptions,
+  type CcImageBudgets,
   type CcExternalEditorRequest,
+  type CcImageAttachment,
+  type CcSubmitPayload,
 } from "./cc-editor.ts"
 
 export {
   CcKeymap,
   createCcKeymap,
+  detectKeybindingPlatform,
   formatBinding,
   isValidKeyId,
   parseBindingSpec,
@@ -43,6 +50,7 @@ export {
   type CcActionImplementor,
   type CcCompatibilityStatus,
   type CcContext,
+  type CcKeybindingPlatform,
 } from "./actions.ts"
 
 export {

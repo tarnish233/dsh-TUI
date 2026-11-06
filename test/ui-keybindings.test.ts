@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { stripTerminalSequences, visibleWidth } from '@earendil-works/pi-tui'
+import { stripTerminalSequences, visibleWidth } from '#pi-tui'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
 const input = await loadInputModule()
@@ -129,4 +129,40 @@ test('a failed save leaves the binding text editable and does not change effecti
   assert.match(text(f.dialog), /Shortcut conflict/)
   f.dialog.handleInput('\x03')
   assert.equal(f.dialog.isEditing, false, 'the configured cancel shortcut also cancels an edit')
+})
+
+test('global interrupt stays separate from the inline editor cancel', async () => {
+  const keymap = input.createCcKeymap()
+  const events: string[] = []
+  const make = (onInterrupt?: () => void) => new KeybindingsDialog(asTui(createFakeTui(30, 80)), {
+    keymap,
+    path: '/temporary/config/keybindings.json',
+    onChange: async () => {},
+    onBack: () => { events.push('back') },
+    ...(onInterrupt === undefined ? {} : { onInterrupt: () => { events.push('interrupt') } }),
+  })
+
+  // With the hook, the configured interrupt key is global: it does not save or
+  // close the pane, and it does not silently cancel the edit either.
+  const hooked = make(() => { events.push('interrupt') })
+  hooked.focused = true
+  hooked.handleInput('\r')
+  assert.equal(hooked.isEditing, true)
+  hooked.handleInput('\x03')
+  assert.deepEqual(events, ['interrupt'])
+  assert.equal(hooked.isEditing, true, 'global interrupt leaves the binding editor open')
+  hooked.handleInput('\x1b')
+  assert.equal(hooked.isEditing, false)
+
+  // Without the hook, Ctrl+C keeps this pane's recovery behaviour.
+  events.length = 0
+  const plain = make()
+  plain.focused = true
+  plain.handleInput('\r')
+  assert.equal(plain.isEditing, true)
+  plain.handleInput('\x03')
+  assert.deepEqual(events, [])
+  assert.equal(plain.isEditing, false, 'the configured cancel shortcut still cancels an edit')
+  plain.handleInput('\x03')
+  assert.deepEqual(events, ['back'])
 })

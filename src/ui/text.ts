@@ -1,20 +1,16 @@
 /**
  * Display-width helpers shared by frontend components.
  *
- * Ported from agent_tui (MIT) src/ui/text.ts, itself built on Pi TUI's public
- * width functions. The CJK line-breaking rules keep closing punctuation with
- * the preceding character; emoji and ANSI are measured by Pi TUI.
+ * Ported from agent_tui (MIT) src/ui/text.ts, rebuilt on Pi TUI's public width
+ * functions only. Emoji, ANSI and CJK widths are measured by Pi TUI; earlier
+ * local wrap/format helpers with no callers were deleted rather than kept as
+ * untested dead surface.
  */
 import { homedir } from 'node:os'
 import { isAbsolute, relative } from 'node:path'
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from '#pi-tui'
 
-export { truncateToWidth, visibleWidth, wrapTextWithAnsi }
-
-/** Wrap and prefix: the first line gets `first`, continuation lines `rest`. */
-export function prefixLines(lines: readonly string[], first: string, rest: string): string[] {
-  return lines.map((line, index) => `${index === 0 ? first : rest}${line}`)
-}
+export { truncateToWidth, visibleWidth }
 
 /** Wrap plain or styled text into lines no wider than `width`. */
 export function wrap(text: string, width: number): string[] {
@@ -25,64 +21,6 @@ export function wrap(text: string, width: number): string[] {
       continue
     }
     out.push(...wrapTextWithAnsi(paragraph, Math.max(1, width)))
-  }
-  return out
-}
-
-const NO_LINE_START = new Set('，。、；：！？）」』】》〉’”…,.;:!?)]}%')
-const NO_LINE_END = new Set('（「『【《〈‘“([{')
-const TOKEN = /[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]|[^\s\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]+|\s+/gu
-
-/**
- * Wrap plain (unstyled) text that mixes Chinese and English: break between CJK
- * characters or at spaces, never inside a word unless it alone is too wide.
- */
-export function wrapText(text: string, width: number): string[] {
-  const max = Math.max(4, width)
-  const out: string[] = []
-  for (const paragraph of text.split('\n')) {
-    const lines: string[][] = [[]]
-    let used = 0
-    for (const token of paragraph.match(TOKEN) ?? []) {
-      let line = lines[lines.length - 1]!
-      const size = visibleWidth(token)
-      if (/^\s+$/.test(token)) {
-        if (line.length > 0 && used + size <= max) {
-          line.push(token)
-          used += size
-        }
-        continue
-      }
-      if (used + size > max && line.length > 0) {
-        const carry: string[] = []
-        const trim = (): void => {
-          while (line.length > 0 && line[line.length - 1]!.trim() === '') line.pop()
-        }
-        trim()
-        while (line.length > 1 && (NO_LINE_START.has((carry[0] ?? token)[0]!) || NO_LINE_END.has(line[line.length - 1]!.slice(-1)))) {
-          carry.unshift(line.pop()!)
-          trim()
-        }
-        line = carry
-        lines.push(line)
-        used = carry.reduce((sum, part) => sum + visibleWidth(part), 0)
-      }
-      if (size > max) {
-        for (const piece of wrapTextWithAnsi(token, max)) {
-          if (used > 0) {
-            line = []
-            lines.push(line)
-            used = 0
-          }
-          line.push(piece)
-          used = visibleWidth(piece)
-        }
-        continue
-      }
-      line.push(token)
-      used += size
-    }
-    out.push(...lines.map(line => line.join('').trimEnd()))
   }
   return out
 }
@@ -98,22 +36,6 @@ export function oneLine(value: unknown, max = 200): string {
 
 export function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? '' : 's'}`
-}
-
-export function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '0s'
-  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`
-  const seconds = ms / 1000
-  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = Math.round(seconds % 60)
-  return minutes < 60 ? `${minutes}m ${rest}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
-}
-
-export function formatTokens(count: number): string {
-  if (count < 1000) return String(count)
-  if (count < 1_000_000) return `${(count / 1000).toFixed(count < 10_000 ? 1 : 0)}k`
-  return `${(count / 1_000_000).toFixed(1)}M`
 }
 
 /** cwd-relative when inside cwd, `~`-prefixed when inside home. */

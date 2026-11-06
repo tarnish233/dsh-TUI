@@ -80,8 +80,13 @@ test('native command discovery drives help and /compact forwards raw input, not 
   try {
     await f.app.submit('/help')
     await paint(f.terminal)
-    assert.match(f.terminal.document(), /\/custom — Native custom command/)
-    assert.match(f.terminal.document(), /\/compact — Native compact command/)
+    assert.match(f.terminal.screen(), /Custom commands/)
+    assert.match(f.terminal.screen(), /\/custom\b/)
+    assert.match(f.terminal.screen(), /Native custom command/)
+    assert.match(f.terminal.screen(), /\/compact\b/)
+    assert.match(f.terminal.screen(), /Native compact command/)
+    assert.deepEqual(f.app.store.items.filter(item => item.kind === 'notice'), [])
+    f.terminal.type('\x1b'); await paint(f.terminal)
     const line = '/compact \t exact  whitespace\nand second line  '
     await f.app.submit(line)
     const calls = f.backend.commands.filter(command => command.name === 'execute')
@@ -152,6 +157,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       assert.doesNotMatch(f.terminal.screen(), /Streaming attempt|◌/)
       const workingBorder = f.terminal.screen().split('\n').find(line => line.includes('Working…')) ?? ''
       assert.match(workingBorder, /──/, 'working status is embedded in the editor top border')
+      assert.doesNotMatch(workingBorder, /^──/, 'the spinner aligns with the prompt marker, not a border notch')
       f.backend.emit({ type: 'stream_chunk', sessionId, attemptId: 'plain-stream', revision: 2, index: 0, chunk: { type: 'text-delta', index: 0, text: 'Visible incremental response' } })
       await paint(f.terminal)
       assert.match(f.terminal.screen(), /Visible incremental response/)

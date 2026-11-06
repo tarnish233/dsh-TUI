@@ -1,19 +1,27 @@
-# Prototype integration contract
+# DSH TUI integration contract
 
-Entry is `dsh-pi-tui`; `--demo` uses an offline mock, normal startup must use real DSH. Read AGENTS.md and docs/PROPOSAL.zh-CN.md.
+Application/package/entry identity is `dsh-tui`. Read `AGENTS.md` and `docs/PROPOSAL.zh-CN.md`, especially section 5. The upstream vendored package remains Pi TUI and every app import goes through `#pi-tui`.
 
-## Input (delegated)
+## Native application
 
-Own src/input/, vendor/pi-tui/, test/input*.test.ts. Export CcEditor (same constructor as Pi Editor, inherited onSubmit/onChange) and keymap configuration from src/input/index.ts. Parent routes app actions/dialogs; agree on a semantic contextual action lookup API in your report. Provide lossless draft capture/restore if needed. Do not bypass editor state with string rewrites losing undo/pastes. Use the vendored TUI source and the app-owned seam installer only; never modify global Pi. Do not edit package.json; tell parent new dependencies required. The vendored TUI is built with pnpm build:pi-tui.
+Production is an ordered DSH application bundle plus same-process Cordis startup/terminal plugins. The native DSH launcher composes the profile and owns the root lifecycle. The compatibility entry may attach this local application through the selected DSH installation's public package APIs before delegating to native `dsh`; it must not write a private profile engine, copy profiles/credentials, or replace unrelated frontends. The explicit `--demo` is fixture-only and never a fallback for failed native startup.
 
-## Backend (delegated)
+DSH owns Agent/model/tools/permissions/presets/commands/sessions/persistence and attachment admission. Do not use Pi AgentSession, implement another Agent loop/model transport, or restore a private backend process/IPC bridge. Preset resources and the preset plugin class resolve from the host's public installation anchor, not the TUI package's peer lookup.
 
-Own src/backend/ except shared types.ts, runtime/, test/backend*.test.ts. Export DshBackend implementing Backend (constructor DshOptions) from src/backend/index.ts. Contract is src/backend/types.ts. Stream events carry real process-local agent/assistant-stream; session_event carries authoritative v2 settlements. Do not fake realtime tokens from SDK/ACP committed records. Reuse installed DSH launcher/profile via a private overlay/bridge if practical. Scratch overlays/config are project/temp-local; never mutate global dsh/profiles. Inherit existing DSH credentials safely; never print them. Do not read arbitrary user session content.
+## Input owner
 
-connect returns SessionInfo and emits ready. resume/new returns or emits fresh info with durable snapshot. Handle bad path/version, rejected requests, disconnect, shutdown, fatal errors and cancellation. No real remote model prompts: parent owns live smoke. Offline control-plane startup in a throwaway workspace is allowed.
+Own `src/input/`, `vendor/pi-tui/`, `test/input*.test.ts` and input docs. Reuse one Editor state, kill ring, undo, history and paste/image atoms. Parent routes app actions and dialogs through semantic contextual actions. Keep the app-owned seam; never edit installed Pi or bypass the private `#pi-tui` import seam. The vendor is built before the app.
 
-Approval options use opaque values; ordered strings/string arrays for question answers. Models/sessions commands return normalized JSON arrays; model/permissions/compact reject clearly if unavailable. Permissions is read-only catalog/selection data; switches execute native `/permission`, while native `/plan` stays independent. `presets`/`efforts` are read-only native roster/model metadata; `preset`/`effort` update only the native Agent composition/model-selection slot. Claim only exercised capabilities.
+## Backend owner
 
-## Parent
+Own `src/backend/` except shared `types.ts`, `test/backend*.test.ts` and backend docs. Adapt the supplied host Context to `Backend` in `src/backend/types.ts`. Preserve genuine process-local native streams, authoritative settlements, attachment epochs and explicit recovery. Reuse native cancellation/queues/decisions/model/permission services; never replace them with local policy or a fake production implementation. Only stable, sanitized scalar diagnostics may leave the adapter; raw canonical events/tools/images stay faithful.
 
-Own manifest/lock, Backend types, CLI/app/state/UI/demo, shared test harness, terminal replay, live acceptance, README. Node >=22.19 strips TS: use erasable syntax. Gates are pnpm typecheck and pnpm test. Consult ownership before touching shared files.
+## Frontend owner
+
+Own `src/ui/`, `src/state/`, `src/demo.ts` and `test/ui*.test.ts`. Render from backend facts with cached/stable components and one input state. Only the renderer writes while a TUI is active. Normal success updates the footer; internal settlement/attempt diagnostics do not enter the transcript. Native `/permission` and `/plan` are separate.
+
+## Parent / integration
+
+Own manifests/lock, shared backend types/helpers, `src/plugin/`, app/CLI/config, independent PTY/rendering tests and final integration. Delegate another owner's file explicitly before editing it. Node-compatible strict TypeScript uses erasable syntax and relative `.ts` imports; shipped entrypoints run compiled JS. Keep version identity in `src/version.ts` and preserve every terminal lifecycle path.
+
+Tests use temporary homes/workspaces and mock or native offline fixtures. No real profile patches/credential values, remote model calls, global installation changes, commits, publication or pushes. Existing unrelated dirty-tree work must remain intact. Final gates are build, strict typecheck, complete tests and native/compiled-entry acceptance; inspect actual delegated changes before reporting completion.

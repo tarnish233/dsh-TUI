@@ -7,12 +7,13 @@
  * Kitty CSI-u and xterm modifyOtherKeys).
  */
 
-import { matchesKey, type KeyId } from "@earendil-works/pi-tui"
+import { matchesKey, type KeyId } from "#pi-tui"
 import {
   CC_ACTIONS,
   type CcActionDefinition,
   type CcCompatibilityStatus,
   type CcContext,
+  type CcKeybindingPlatform,
   CC_CONTEXTS,
 } from "./actions.ts"
 
@@ -35,6 +36,11 @@ export interface CcKeymapOptions {
   chordTimeoutMs?: number
   /** Replace the built-in registry (tests, experimental extensions). */
   definitions?: readonly CcActionDefinition[]
+  /**
+   * Platform bucket for platform-specific default bindings (Windows/WSL Alt+V).
+   * Defaults to the current process; inject it in tests.
+   */
+  platform?: CcKeybindingPlatform
 }
 
 export interface CcResolvedKey {
@@ -72,6 +78,44 @@ interface CompiledBinding {
 }
 
 const MODIFIER_NAMES = ["ctrl", "shift", "alt", "super"] as const
+
+/**
+ * Context fallback chains (first match wins).
+ *
+ * `modelPickerList` is the /model picker browse list: picker-local provider
+ * keys first, then the shared list keys (j/k/arrows/digits) and finally the
+ * editor editing fallback. `modelPickerSearch` is its query field: picker
+ * provider keys, then Enter/Esc as list actions, then the editor text layer.
+ *
+ * `toolDetails` and `imageDetails` are read-only modals: shared list
+ * navigation, dialog and app keys, but **no editor fallback**, so
+ * movement/kill/undo bindings cannot edit or type into those surfaces.
+ */
+const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>> = {
+  editor: ["editor", "global"],
+  autocomplete: ["autocomplete", "editor", "global"],
+  historySearch: ["historySearch", "editor", "global"],
+  dialog: ["dialog", "editor", "global"],
+  list: ["list", "global"],
+  modelPickerList: ["modelPickerList", "list", "editor", "global"],
+  modelPickerSearch: ["modelPickerSearch", "editor", "global"],
+  toolDetails: ["toolDetails", "list", "dialog", "global"],
+  imageDetails: ["imageDetails", "list", "dialog", "global"],
+  global: ["global"],
+}
+
+/**
+ * Contexts where the configured simple `app.interrupt` key always wins over
+ * a local binding (list.cancel also binds Ctrl+C) *and* over a pending chord.
+ * That makes Ctrl+C an unconditional escape hatch from a read-only details
+ * modal or /model picker without changing `list`/`dialog` semantics.
+ */
+const INTERRUPT_PRIORITY_CONTEXTS: ReadonlySet<CcContext> = new Set<CcContext>([
+  "modelPickerList",
+  "modelPickerSearch",
+  "toolDetails",
+  "imageDetails",
+])
 
 const SPECIAL_KEYS = new Set([
   "escape",
@@ -196,8 +240,23 @@ export function formatBinding(keys: readonly string[]): string {
     .join(" ")
 }
 
+/**
+ * Resolve the platform bucket used for platform-specific default bindings.
+ * WSL is detected first because it reports `process.platform === "linux"` but
+ * follows Windows clipboard conventions.
+ */
+export function detectKeybindingPlatform(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): CcKeybindingPlatform {
+  if (platform === "win32") return "windows"
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP || env.WSLENV) return "wsl"
+  return "posix"
+}
+
 export class CcKeymap {
   readonly definitions: readonly CcActionDefinition[]
+  readonly platform: CcKeybindingPlatform
 
   private readonly definitionsById: Map<string, CcActionDefinition>
   private readonly chordTimeout: number
@@ -205,10 +264,14 @@ export class CcKeymap {
   private bindingsByAction = new Map<string, CompiledBinding[]>()
   private index = new Map<CcContext, CompiledBinding[]>()
   private diagnostics: CcKeymapDiagnostic[] = []
-  private pending: { since: number; prefix: string[]; candidates: CompiledBinding[] } | null = null
+  private pending: { since: number; prefix: string[]; candidates: CompiledBinding[]; generation: number } | null = null
+  /** Monotonic id for each new pending chord (ownership for shared keymaps). */
+  private chordGeneration = 0
+  private readonly chordListeners = new Set<(prefix: readonly string[] | null) => void>()
 
   constructor(options: CcKeymapOptions = {}) {
     this.definitions = options.definitions ?? CC_ACTIONS
+    this.platform = options.platform ?? detectKeybindingPlatform()
     this.definitionsById = new Map(this.definitions.map((action) => [action.id, action]))
     const timeout = options.chordTimeoutMs ?? 3000
     this.chordTimeout = Number.isFinite(timeout) && timeout > 0 ? timeout : 3000
@@ -229,41 +292,17 @@ export class CcKeymap {
 
   /**
    * Bindings that apply in a context: the context's own bindings first, then
-   * the `global` app bindings. Local bindings win, so e.g. Ctrl+D stays
-   * forward-delete in the editor and only reaches `app.exit` when the editor
-   * action itself forwards it.
+   * its fallback chain (see `CONTEXT_FALLBACK_CHAINS`). Local bindings win, so
+   * e.g. Ctrl+D stays forward-delete in the editor and only reaches
+   * `app.exit` when the editor action itself forwards it.
    */
   private bindingsForContext(context: CcContext): CompiledBinding[] {
-    const chain: CcContext[] =
-      context === "editor"
-        ? ["editor", "global"]
-        : context === "autocomplete"
-          ? ["autocomplete", "editor", "global"]
-          : context === "historySearch"
-            ? ["historySearch", "editor", "global"]
-            : context === "dialog"
-              ? ["dialog", "editor", "global"]
-              : context === "list"
-                ? ["list", "global"]
-                : ["global"]
-    return chain.flatMap((entry) => this.index.get(entry) ?? [])
+    return CONTEXT_FALLBACK_CHAINS[context].flatMap((entry) => this.index.get(entry) ?? [])
   }
 
   /** Context fallback chain, exposed for diagnostics and help UIs. */
   getFallbackChain(context: CcContext): CcContext[] {
-    const chain: CcContext[] =
-      context === "editor"
-        ? ["editor", "global"]
-        : context === "autocomplete"
-          ? ["autocomplete", "editor", "global"]
-          : context === "historySearch"
-            ? ["historySearch", "editor", "global"]
-            : context === "dialog"
-              ? ["dialog", "editor", "global"]
-              : context === "list"
-                ? ["list", "global"]
-                : ["global"]
-    return chain
+    return [...CONTEXT_FALLBACK_CHAINS[context]]
   }
 
   /** Effective bindings for one action (empty when disabled). */
@@ -296,9 +335,31 @@ export class CcKeymap {
 
   /** Hot-update the user configuration; diagnostics are recomputed. */
   setBindings(config: CcKeymapConfig): void {
+    const hadPending = this.pending !== null
     this.userConfig = config ?? {}
     this.pending = null
     this.rebuild()
+    if (hadPending) this.notifyChord(null)
+  }
+
+  /**
+   * Observe pending-chord transitions: `prefix` when a chord starts, `null`
+   * when it completes, is cancelled, mismatches or times out.
+   *
+   * The keymap owns the pending state, so every cancellation path (including
+   * dialogs calling `cancelChord()`) reaches one listener and the hint UI
+   * cannot go stale. Returns an unsubscribe function.
+   */
+  onChordChange(listener: (prefix: readonly string[] | null) => void): () => void {
+    this.chordListeners.add(listener)
+    return () => {
+      this.chordListeners.delete(listener)
+    }
+  }
+
+  private notifyChord(prefix: readonly string[] | null): void {
+    const value = prefix ? [...prefix] : null
+    for (const listener of this.chordListeners) listener(value)
   }
 
   isPendingChord(): boolean {
@@ -309,10 +370,16 @@ export class CcKeymap {
     return this.pending ? [...this.pending.prefix] : null
   }
 
+  /** Identity of the current pending chord, or null when idle. */
+  getPendingChordGeneration(): number | null {
+    return this.pending?.generation ?? null
+  }
+
   /** Drop a pending chord, returning the consumed prefix. */
   cancelChord(): string[] | null {
     const prefix = this.pending?.prefix ?? null
     this.pending = null
+    if (prefix) this.notifyChord(null)
     return prefix ? [...prefix] : null
   }
 
@@ -325,6 +392,7 @@ export class CcKeymap {
     if (now - this.pending.since < this.chordTimeout) return null
     const prefix = [...this.pending.prefix]
     this.pending = null
+    this.notifyChord(null)
     return prefix
   }
 
@@ -336,10 +404,27 @@ export class CcKeymap {
    * `passthrough` again as fresh input.
    */
   resolve(data: string, context: CcContext = "editor", now: number = Date.now()): CcKeyResolution {
+    // An unconditional interrupt escape hatch comes before pending chords:
+    // a read-only modal must never swallow the configured interrupt key just
+    // because a chord prefix was already typed. Cancelling the chord here keeps
+    // the hint state truthful, then the interrupt action is dispatched fresh.
+    if (INTERRUPT_PRIORITY_CONTEXTS.has(context)) {
+      const interrupt = (this.bindingsByAction.get("app.interrupt") ?? []).find(
+        (binding) => binding.keys.length === 1 && keyMatches(data, binding.keys[0]),
+      )
+      if (interrupt) {
+        if (this.pending) {
+          this.pending = null
+          this.notifyChord(null)
+        }
+        return { kind: "action", action: interrupt.action, keys: [...interrupt.keys], context }
+      }
+    }
     if (this.pending) {
       if (now - this.pending.since >= this.chordTimeout) {
         const prefix = [...this.pending.prefix]
         this.pending = null
+        this.notifyChord(null)
         return { kind: "cancelled-chord", reason: "timeout", prefix, passthrough: data }
       }
       const { prefix, candidates } = this.pending
@@ -350,19 +435,28 @@ export class CcKeymap {
       })
       if (matches.length === 0) {
         this.pending = null
+        this.notifyChord(null)
         return { kind: "cancelled-chord", reason: "mismatch", prefix: [...prefix], passthrough: data }
       }
       const completed = matches.find((binding) => binding.keys.length === depth + 1)
       if (completed) {
         this.pending = null
+        this.notifyChord(null)
         return { kind: "action", action: completed.action, keys: [...completed.keys], context }
       }
       const deeper = matches.filter((binding) => binding.keys.length > depth + 1)
       if (deeper.length > 0) {
-        this.pending = { since: now, prefix: [...prefix, deeper[0].keys[depth]], candidates: deeper }
+        this.pending = {
+          since: now,
+          prefix: [...prefix, deeper[0].keys[depth]],
+          candidates: deeper,
+          generation: this.pending.generation,
+        }
+        this.notifyChord(this.pending.prefix)
         return { kind: "pending", prefix: [...prefix, deeper[0].keys[depth]] }
       }
       this.pending = null
+      this.notifyChord(null)
       return { kind: "cancelled-chord", reason: "mismatch", prefix: [...prefix], passthrough: data }
     }
 
@@ -379,7 +473,13 @@ export class CcKeymap {
     }
     if (chordCandidates.length > 0) {
       const first = chordCandidates[0]
-      this.pending = { since: now, prefix: [first.keys[0]], candidates: chordCandidates }
+      this.pending = {
+        since: now,
+        prefix: [first.keys[0]],
+        candidates: chordCandidates,
+        generation: ++this.chordGeneration,
+      }
+      this.notifyChord(this.pending.prefix)
       return { kind: "pending", prefix: [first.keys[0]] }
     }
     if (simple) {
@@ -432,7 +532,8 @@ export class CcKeymap {
       const hasOverride = Object.prototype.hasOwnProperty.call(this.userConfig, action.id)
       const compiled: CompiledBinding[] = []
       if (!hasOverride) {
-        for (const spec of action.defaultBindings) {
+        const specs = [...action.defaultBindings, ...(action.platformBindings?.[this.platform] ?? [])]
+        for (const spec of specs) {
           const keys = parseBindingSpec(spec)
           if (!keys) {
             diagnostics.push({

@@ -10,7 +10,7 @@ import {
   typeText,
 } from "../src/input/testing/harness.ts"
 import type { CcActionEvent, CcEditorOptions } from "../src/input/index.ts"
-import type { AutocompleteProvider } from "@earendil-works/pi-tui"
+import type { AutocompleteProvider } from "#pi-tui"
 
 const mod = await loadInputModule()
 type TestEditor = InstanceType<typeof mod.CcEditor>

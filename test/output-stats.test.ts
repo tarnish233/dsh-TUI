@@ -7,6 +7,12 @@ import {
   OutputTracker,
 } from '../src/state/output-stats.ts'
 
+/**
+ * The live working-indicator projection only: the footer's settled rate/TTFT
+ * now come from DSH's native `sessionStats`, so there is no local settle/TTFT
+ * machinery to test here.
+ */
+
 test('output tracker estimates deltas, accepts provider usage and sums attempts within a turn', () => {
   const tracker = new OutputTracker()
   tracker.beginTurn(1, 1_000)
@@ -35,7 +41,40 @@ test('output tracker counts CJK as one token and handles a chunk before stream_s
   assert.equal(tracker.total(), 2)
 })
 
-test('working status formatters stay compact', () => {
+test('live rate follows the turn wall clock and stays honest below the floor', () => {
+  const tracker = new OutputTracker()
+  // Nothing streamed yet: no invented numbers.
+  tracker.beginTurn(1, 10_000)
+  assert.equal(tracker.rate(10_400), 0)
+
+  tracker.start(1, 'attempt-a', 10_000)
+  // A usage-only frame carries no content but is still recorded output.
+  tracker.chunk('attempt-a', { type: 'usage', usage: { outputTokens: 4 } }, 10_200)
+  assert.equal(tracker.total(), 4)
+  assert.equal(tracker.rate(10_200), 0, 'below the 250ms floor a rate would be misleading')
+
+  // A tool wait inflates the denominator, not the token count.
+  tracker.chunk('attempt-a', { type: 'usage', usage: { outputTokens: 99 } }, 12_000)
+  assert.equal(tracker.total(), 99)
+  assert.equal(tracker.rate(14_000), 24.75, 'live average includes tool waits')
+
+  // The next turn starts from zero again; nothing is frozen for an idle footer.
+  tracker.beginTurn(2, 20_000)
+  assert.equal(tracker.total(), 0)
+  assert.equal(tracker.rate(20_400), 0)
+  tracker.start(2, 'c', 20_000)
+  tracker.chunk('c', { type: 'text-delta', text: '中文' }, 20_900)
+  assert.equal(tracker.total(), 2, 'CJK still counts as one token per character')
+  assert.equal(tracker.rate(21_000), 2, '2 tokens over 1s')
+
+  // reset clears the live projection (new attachment / session switch).
+  tracker.reset()
+  assert.equal(tracker.total(), 0)
+  assert.equal(tracker.rate(22_000), 0)
+  assert.equal(tracker.startTime, 0)
+})
+
+test('formatters stay compact', () => {
   assert.equal(formatOutputTokens(999), '999')
   assert.equal(formatOutputTokens(1_500), '1.5k')
   assert.equal(formatOutputTokens(12_000), '12k')

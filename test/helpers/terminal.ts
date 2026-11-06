@@ -1,5 +1,5 @@
 import xterm from '@xterm/headless'
-import type { ProgramStatus, Terminal } from '@earendil-works/pi-tui'
+import type { ProgramStatus, Terminal } from '#pi-tui'
 import { setTimeout as delay } from 'node:timers/promises'
 
 /** Independent ANSI emulator for integration tests, not a substitute for PTY tests. */

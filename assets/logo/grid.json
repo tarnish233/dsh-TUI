@@ -1,0 +1,19 @@
+{
+  "source": "Directly sampled DeepSeek logo reference; enclosed negative spaces filled white; crown arc gently rounded",
+  "columns": 32,
+  "pixelRows": 12,
+  "rows": [
+    "........BBBB...B......B.........",
+    "....BBBBBBBBBBBB.....BBBB.....BB",
+    "..BBBBBBBBBBBBBBBB....BBBBBBBBB.",
+    ".BBBBBBBBBBBBBBBBBBB...BBBBBBB..",
+    "BBBBBBBBBBBBBBBBBBBBBBBBBBB.....",
+    "BBBWWWWWWWBBBBBBBBWWBBBBBB......",
+    "BBBWWWWWWWWWBBBBBBBWWBBBBB......",
+    ".BBBWWWWWWWWWWBBBBBBBBBBB.......",
+    "..BBBWWWWWWWWWWWBBBBBBBB........",
+    "...BBBBWWWWBBBWWWBBBBBB.........",
+    ".....BBBBBBBBBBBBBBBBBBBB.......",
+    "........BBBBBBBBB..............."
+  ]
+}

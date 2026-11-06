@@ -1,5 +1,6 @@
 # Dependencies and generated output
 node_modules/
+lib/
 vendor/pi-tui/dist/
 .cache/
 artifacts/
