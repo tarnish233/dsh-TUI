@@ -71,6 +71,7 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
 | Tool details | Ctrl+X Ctrl+O, `[`/`]`, Alt+Left/Right, Tab/Right, Shift+Tab/Left, c | `app.tools.details` opens the tools inspector on the **latest tool** (TUI extension, not a CC default; plain Ctrl+O keeps expand/collapse). The read-only modal context `toolDetails → list → dialog → global` adds previous/next tool (`[` + Alt+Left, `]` + Alt+Right; Pi's legacy ESC-b/ESC-f reads alias Alt+Left/Right in this context), next/previous section, copy, shared list scrolling (`Up/Down`, `Ctrl+P/N`, `j/k`, PageUp/Down, Home/End), `Esc`/`list.cancel` close. `c` and brackets exist only in `toolDetails`, so they are ordinary text in the editor; unbound printable bytes are inert in the modal. |
+| Native Agents overlay | Ctrl+X Ctrl+A; `r` reply, `s` stop, shared list keys, Enter/Esc, Ctrl+C | `app.subagents.details` opens the native Agents overlay (TUI extension, not a CC default) through the read-only `subagentList → list → dialog → global` and `subagentSession → list → dialog → global` contexts. The agent list and one agent's session view reuse `list.previous/next/pageUp/pageDown/first/last/select/cancel/select-digit` and global `app.interrupt`, and add exactly two overlay-local actions: `subagent.reply` (`r`; the App owns the reply target and `app.cancel` leaves it, no second editor target/mode action) and `subagent.interrupt` (`s`; stops the focused child inside the overlay without rebinding Ctrl+C). Both are ordinary rows in the same grouped Settings list and `keybindings.json` map (remap/disable/reset); plain `r`/`s` stay text in the prompt and every other context. Unbound printable bytes, editing bytes, pasted content and an abandoned character jump are inert (or cancelled) instead of reaching the hidden root editor; root-only editor commands and root-draft app actions (stash, paste, history search, external editor, send/steer/follow-up) fail closed, while global `app.exit` is not swallowed (the App keeps its empty-input policy). `Esc` closes via `list.cancel`, `Ctrl+C` keeps global interrupt priority. |
 | Chords | Ctrl+X Ctrl+E + user chords | prefix wait, **3000 ms** default timeout (expires at the deadline), cancel on mismatch and redispatch, paste/focus/config changes cancel; the keymap owns pending state and hint notification (`onChordChange`), the editor only owns the timeout timer. match (timeout value per CC docs) |
 | Cancel | Esc, Ctrl+C | Esc is contextual: close completion, restore the history-browsing draft, and only then forward `app.cancel`; a consumed local action never also reaches the app. Ctrl+C always resolves `app.interrupt` through the keymap (completion, jump mode, pending chord and dialogs do not swallow it); paste bytes are not keys. match |
 | Character jump | Ctrl+] / Ctrl+Alt+] | Pi extension: only an actual target character (one grapheme) is consumed; DEL/Backspace, control keys and escape sequences cancel the jump and are re-dispatched through `CcKeymap`, so CC whitespace Ctrl+W, CC deletion, remaps and disabled actions still apply. No Pi default fallback. match |
@@ -83,8 +84,12 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 Open `/settings` → **Keyboard shortcuts**. One grouped list shows current
 keys and action descriptions, including unbound actions; there is no standalone
 `/hotkeys` command, debug/compatibility columns, profile hierarchy or conflict
-resolution wizard. Select a row to edit it; `d` disables it and `r` removes just
-that override to restore the effective app default.
+resolution wizard. TUI extensions such as `app.tools.details`,
+`app.images.details`, `app.subagents.details`, `subagent.reply` and
+`subagent.interrupt` are ordinary rows in that same list, so opening the native
+Agents overlay, setting a reply target and stopping a child are
+remappable/disableable and reset by deleting their one override. Select a row to edit it; `d` disables it
+and `r` removes just that override to restore the effective app default.
 
 The inline CC editor takes one alternative per line (Shift+Enter adds a line);
 spaces retain native chord syntax, e.g. `ctrl+x ctrl+e`. Option is an alias of
@@ -125,18 +130,26 @@ cannot split a large-paste marker; it stays one undoable edit.
 - `toolDetails → list → dialog → global` (no editor fallback: editor
   movement/kill/undo bindings never reach a read-only details surface; an
   unbound printable byte is inert even if the modal is hosted by `CcEditor`)
+- `imageDetails → list → dialog → global` (same read-only shape as
+  `toolDetails`)
+- `subagentList → list → dialog → global` (native Agents overlay list)
+- `subagentSession → list → dialog → global` (one agent's read-only session
+  view). Both subagent contexts add only `subagent.reply` (`r`) and
+  `subagent.interrupt` (`s`) on top of list, dialog and global app keys; there
+  is no editor layer and no root-editor target/mode action.
 
 Local actions win; global app bindings are a fallback. This is why Ctrl+W,
 Ctrl+A, Alt+B etc. still edit while completion or history search is open, and
 why Ctrl+C/Esc still reach the app in dialogs.
 
-In `modelPickerList`, `modelPickerSearch` and `toolDetails`, the configured
-**simple** `app.interrupt` binding (Ctrl+C by default) is checked before a
-pending chord and before the context chain. A typed chord prefix therefore
-cannot swallow the interrupt: the pending chord is cancelled (the key hint
-clears once) and `app.interrupt` is dispatched. Disabling/remapping the action
-moves or removes this priority; Ctrl+C then falls back to `list.cancel`.
-Existing `list`/`dialog` behaviour is unchanged.
+In `modelPickerList`, `modelPickerSearch`, `toolDetails`, `imageDetails`,
+`subagentList` and `subagentSession`, the configured **simple**
+`app.interrupt` binding (Ctrl+C by default) is checked before a pending chord
+and before the context chain. A typed chord prefix therefore cannot swallow
+the interrupt: the pending chord is cancelled (the key hint clears once) and
+`app.interrupt` is dispatched. Disabling/remapping the action moves or removes
+this priority; Ctrl+C then falls back to `list.cancel`. Existing
+`list`/`dialog` behaviour is unchanged.
 
 Picker specifics (details: `docs/MODEL-INPUT-API.md`):
 
@@ -308,6 +321,17 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   motion; remap/disable of every new binding with old keys inert; Ctrl+C
   priority through a pending chord and local list.cancel; and the return to the
   editor where `c` is text again and readline edits still work.
+- `test/input-subagents.test.ts` — native Agents overlay: `subagentList` and
+  `subagentSession` contexts/chains, the two overlay-local actions
+  (`subagent.reply`/`subagent.interrupt`) and their grouped Settings rows,
+  `app.subagents.details` contract, chord uniqueness against prompt-mode
+  chords, draft preservation, shared list/dialog/global fallback, read-only
+  printable/editing/paste/jump inertness with `r`/`s` emitted as actions only,
+  no callback and no editor/global leakage, root-only editor/app-draft commands
+  failing closed while global `app.exit`, `app.interrupt` and `list.cancel`
+  keep working, list/overlay/opening-chord remap/disable/reset, conflicts,
+  Ctrl+C priority through pending chords, mouse input staying outside the
+  keymap, and context-switch/paste/timeout/dispose chord ownership.
 - `test/input-lifecycle.test.ts` — terminal start/stop ownership: one exit
   hook, one stdin/resize wiring, suspend/resume cycles without accumulation,
   a stopped renderer ignoring stale key/resize callbacks, stop-before-start and

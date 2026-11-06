@@ -16,6 +16,7 @@ export type {
   Backend,
   BackendEvent,
   DecisionOption,
+  DecisionOrigin,
   DecisionRequest,
   DisplayContentPart,
   ImageAttachmentRef,
@@ -26,4 +27,9 @@ export type {
   Question,
   SessionEvent,
   SessionInfo,
+  SubagentEntry,
+  SubagentMode,
+  SubagentSnapshot,
+  SubagentStatus,
+  SubagentTiming,
 } from './types.ts'

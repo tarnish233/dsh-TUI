@@ -1,6 +1,53 @@
-# v0.1.1 原生 DSH 边界与交互语义验收
+# v0.1.2 原生 DSH 边界与交互语义验收
 
-## 当前：v0.1.1 原生 compaction reasoning 修复
+## 当前：v0.1.2 发布验收
+
+按用户授权，本轮完整 Subagent 功能以 `0.1.2/private` 形成 release commit，并推送 GitHub `main` 与 `v0.1.2` tag；不发布 registry、不改装全局程序。版本号统一来自 `package.json` 与 `src/version.ts`，CLI／welcome 使用同一个值。
+
+- **发布源码完整 `pnpm check`：1228/1228**，101 个测试文件，build／strict TypeScript 通过，0 fail/skip/cancel/todo，tests 阶段约 206 秒；`.cache/release-v0.1.2/full-check.log`。
+- **CLI 与编译版本**：`node bin/dsh-tui.mjs --version` 返回 `0.1.2`；包 metadata、`lib/version.js`、解压后的 CLI 与 welcome 都为 `0.1.2`，`private:true` 保持。
+- **Subagent CLI/PTY 6/6**：名字链接、上方进度、Stop/Reply 三组 × inline/fullscreen，全部 exit 0 与终端恢复；name-only 点击、原生拖选复制、草稿与键位路径不变，图片草稿由完整 App 回归覆盖。工程验收未调用真实 provider／模型、未触及真实剪贴板。
+- **启动身份 CLI/PTY 6/6**：两 renderer × kitty/none 静态 logo＋外部 SIGINT；静态 logo 场景验证 `v0.1.2`，正常退出／SIGINT 130、resize、草稿和终端恢复通过。全部为离线 fixture 与临时配置。
+- **编译归档 296 entries**：`dsh-tui-0.1.2.tgz` 解压后 App/backend/Progress/Agents/Child/actions 导入通过，CLI／welcome 版本与名字-only internal-link smoke 成功；仅链接已有本地 dependencies，不冒充 clean install。
+- **Git/数据边界**：只提交源码／测试／文档／manifest，不提交 `lib/`、vendor dist、缓存、运行状态或凭据。发布前远程 main 与本地基线一致，`v0.1.2` 不存在；不 force、不替换旧 tag，分支和 tag 原子推送。
+
+证据集中在 `.cache/release-v0.1.2/`；发布前的功能阶段验收保留如下。
+
+## 发布前：Subagent 名字限定内部导航链接（基于 v0.1.1）
+
+- **完整 `pnpm check`：1228/1228**，101 个测试文件，build＋strict TypeScript 通过，0 fail/skip/cancel/todo；tests 阶段约 210 秒。证据：`.cache/subagent-links/full-check.log`。
+- **仅名字进入 child**：进度区可打开的 agent 名字为加粗、品牌蓝、下划线，hover 提亮；命中区来自最终 paint／clip 后的实际显示列。图标、导线、间隔、状态、时间、tokens、route、活动次行和空白不触发跳转。仅 `Agents`／`+N more` 文字进入完整树，计数和 chord 不可点。External／不可打开／无 callback 名字不显示伪链接。不使用 OSC8、浏览器或自定义 URL 协议。
+- **选字／复制与手势**：所有 move/drag 与非链接 press 不抢占；原生拖选和 copy-on-select 保留，包括从 hovered link 离开后第一次 drag，以及跨名字链接的拖选。名字 press 以 child id 锁定；非名字 press 的 tombstone 经 reflow／同 id reattachment／temporary blocking 保留，之后移到该坐标的名字不能接受旧 click。drag 不变成跳转。Esc 返回同一个 Editor，草稿／图片保留；R/S、queue/steer 和原始 transcript／Agents 列表行为不变。
+- **进度／链接专项 68/68**：组件 50、父级 App 18（本次比上一轮新增 19 条回归），覆盖真实 VT underline／bold、精确 first/last/end-exclusive 边界、CJK／ZWJ 显示列、external、header／overflow 文字命中区、native selection/copy、outside-press reflow/reattach、blocked gesture、图标／指标／活动不可点；`.cache/subagent-links/app-ui.log`。
+- **Subagent 全链 195/195**：backend 22＋14、frontend 55＋50、input 23、App 9＋18、真实 DSH 4；`.cache/subagent-links/targeted.log`。真实 DSH 回归仍为临时 home/workspace＋hermetic model stream，没有真实 provider 请求。
+- **真实 CLI/PTY 6/6**：新名字链接两 renderer 2/2（fullscreen 实际点击名字、16 个非链接坐标不跳转、hover 后原生 drag/copy、header／overflow 文字边界、external 非链接、18 行 resize、Esc／草稿／exit 0／恢复）；原有进度 2/2 和 Stop/Reply 2/2 均回归通过。inline 保持相同样式和原 keyboard path。copy packet 只留在私有 PTY／headless VT，不写真实剪贴板。证据：`pty-links.log`、`pty-progress.log`、`pty-controls.log`。
+- **产物**：296 entries 的本地编译归档，App/backend/Progress/Overlay/actions 解压导入与名字-only internal-link smoke 通过；只链接已有本地 dependencies，不冒充 clean install。`git diff --check` 通过。详细报告与归档：`.cache/subagent-links/`。
+- **范围**：只改变编辑框上方进度区的链接外观／命中区和相关回归。仍为 DSH 原生同进程插件，业务／数据／Agent／模型／权限／持久化归 DSH；没有新 Editor、listener、timer、scheduler、credential subsystem 或模型调用。版本仍 **0.1.1/private**，HEAD `18f9440`，未 commit/push/tag/publish，未修改真实配置／凭据／会话／全局安装。
+
+## 前次：Pi 风格编辑框上方 Subagent 进度（未发布）
+
+- **完整 `pnpm check`：1209 tests / 1209 pass / 0 fail**，0 skip/cancel/todo，vendor/src 构建、strict TypeScript 与 **101 个测试文件**通过；tests 阶段约 **203 秒**。证据：`.cache/subagent-progress/full-check.log`。
+- **样式按用户的 Pi 截图**：蓝色 `● Agents` 标题、dim 树形导线、cyan live marker、bold agent 标签、原生状态／可用 session 累计指标，以及下一行原生当前活动。以本机 `@tintinweb/pi-subagents` 的 aboveEditor widget 为只读视觉参考，不导入其 Agent/runtime、timer、turn/tool/context/cost 计数。
+- **交互按 Grok**：fullscreen 点击进度行直接进入对应 child；Esc 回到同一个主 Editor，保留草稿／图片。标题和 `+N more` 打开完整 Agents 树；inline 保持同一布局并使用原键位。关闭浮层后 mouse owner 用 live getter 立即解锁，不等下一次输入或 native frame；审批、details／Agents／child 浮层阻断底层 hitbox。原有 transcript 状态行仍可点击，Reply/Stop 控制不变。
+- **进度不挤占编辑框**：回复目标、活跃 child＋活动次行优先；总预算最多八行，并在每次 renderer paint 按实际 Editor/dialog/queue/hint/footer 高度重算。窄／矮屏降级摘要、标题或隐藏，空 catalog 不占行且不进行额外 sibling 高度测量。多行 native label/route 在 paint 前折成单行，不改变原生事实；CJK／emoji／ANSI 宽度安全。无新的 Editor、input listener、child read、polling 或 timer。
+- **新增进度专项 49/49**：纯组件 **37**、父级 App **12**，覆盖默认／remap／disable、active detail priority、overflow、原始 transcript 点击、两 renderer、scroll pinning、真实 press/release、图片草稿、Esc 后立即再点、decision blocking、removed／reappeared／same-id-new-attachment 失效手势及多行／高度／宽度预算。
+- **完整 Subagent 专项 176/176**：backend 只读 **22**、原生控制 **14**、frontend **55＋37**、input **23**、App **9＋12**、真实 DSH **4**；`.cache/subagent-progress/targeted.log`。原生场景继续使用真实 DSH 和 hermetic model stream，未调用真实 provider。
+- **真实 CLI/PTY 4/4**：新增进度两模式 **2/2** 验证可见位置、Pi 树形样式、fullscreen 实际进度行点击、Esc／草稿返回、标题列表点击、resize、exit 0 和终端恢复；原有 Stop → Reply → follow-up → target exit 两模式 **2/2** 回归通过，fullscreen 实际点击 R/S chips。证据：`.cache/subagent-progress/pty-progress.log`、`pty-controls.log`。
+- **编译归档 296 entries**：解压后的 App/backend/Progress/Overlay/actions 导入成功，新增 compiled progress 的空／活跃／dispose 与单行安全 smoke 通过。只链接已有本地 dependencies，不冒充 clean install。证据：`.cache/subagent-progress/package/entries.txt`、`import-smoke.log`。
+- **边界**：版本仍 **0.1.1/private**，HEAD 仍 `18f9440`，未 commit/push/tag/publish／改装全局程序。生产仍是 native DSH 同进程插件与唯一主 Editor；没有 sidebar、第二任务系统／scheduler／persistence、per-run usage、child `/resume` 或自动 retry。所有工程验收使用临时 home/workspace／离线 fixture，不读取真实凭据／会话，不发起真实 DSH 模型请求。操作文档见 `docs/SUBAGENTS.md`，完整报告见 `.cache/subagent-progress/REPORT.md`。
+
+## 前次：基于 v0.1.1 的原生 Subagent TUI（未发布）
+
+- **完整 `pnpm check`：1160 tests / 1160 pass / 0 fail**，0 skip/cancel/todo，vendor/src 构建、strict TypeScript 与 **99 个测试文件**通过，约 **197 秒**。证据：`.cache/subagent-controls/full-check.log`。
+- **三层只读事实面**：主对话每个 direct child 一条不可展开状态行；`Ctrl+X Ctrl+A` 打开原生 Agents 树；Enter/点击进入全屏只读子 transcript。continuable、one-shot、external、failed/stopped/max-tokens/refusal/unknown 分开；token/timing 为 child session 累计值。`subagent-settled` 与 `agent-message` 以 durable seq 投影；子审批／问题带精确来源，follow＋1024 帧有界缓冲和独立 child store 保持父子隔离。
+- **第二阶段原生干预已落地**：`subagent-interrupt` 经当前 root tree 证明后调用 core `ctx.subagents.interrupt`，使用真实 direct parent，支持 one-shot/continuable；`subagent-prompt` 仅接受 local continuable，原生 queue/steer、文本／图片和 request/message receipt 均保留。out-of-tree/root/不合法目标 fail closed；nested 不误用 root，读取时不 create/resume child，只有用户明确 prompt 才让 DSH 决定冷恢复。
+- **主 Editor 目标与输入**：R 只回复 continuable，S 只停止 running/initializing local row，均有可配置键和真实鼠标 chips；窄屏不保留不可见 hitbox。Reply 关闭浮层并复用唯一主 Editor，保留草稿/图片，Enter=queue、Ctrl+X Ctrl+S=steer；child 目标下 `/...` 不当根命令，send-now 不冒充 steer，Esc 只退出目标。活动目标 Ctrl+C 只中断 child。accepted 不伪造 stopped/completed，失败恢复草稿，continuable 完成后回到 idle＋原生 stop reason。
+- **第三阶段加固**：能力按真实 method 分别探测；延迟出现的 native 控制服务只补发同 session/attachment 的 capabilities ready，不重放 transcript。prompt carrier 纳入 active-command abort/close/reload 生命周期；Receipt 接受后的 abort 不错误改判未接受。frontend/App 共用 mode/local/status gating，session/attachment/target 失效 fail closed。
+- **专项 127/127**：backend 只读桥 22、控制 14、frontend 55、input 23、App 9、真实 DSH 4，全部通过（`.cache/subagent-controls/targeted.log`）。真实 DSH 两模式各验证并行 child、原生审批、冷读/follow live chunk、durable continuable reply，以及 running child interrupt；子消息不进入根 user/assistant/attempt，delayed answer 在中断后不提交。
+- **真实 CLI/PTY 2/2**：inline 键盘与 fullscreen 实际鼠标 chips 完成 Stop → Reply → 子会话 follow-up → Esc 返回目标，resize、草稿保留、exit 0 和终端恢复通过（`.cache/subagent-controls/pty.log`）。编译归档 **294 entries**，App/backend/Overlay/actions 解压导入成功，控制标记存在；只链接已有本地 dependencies，不冒充 clean install。
+- **边界**：子 transcript 仍只读，但表面提供原生控制；没有 per-run usage、常驻侧栏、第二 scheduler/persistence、child `/resume` 或 UI 自动 retry。所有原生验收使用临时 home/workspace 与 hermetic model stream，没有真实 provider 调用。版本仍 **0.1.1/private**，本轮没有 commit/push/tag/publish。
+
+## 此前：v0.1.1 原生 compaction reasoning 修复
 
 - **完整 `pnpm check`：1033 tests / 1033 pass / 0 fail**，0 skip/cancel/todo，vendor/src 构建、strict TypeScript 与 **93 个测试文件**通过，测试约 **188 秒**。证据为 `.cache/compaction-fix/full-check.log`；版本号调整为 v0.1.1 后对发布源码再次完整执行仍为 **1033/1033**，见 `.cache/compaction-fix/release-v0.1.1-check.log`。
 - **真实失败原因已核验**：用户指定当前目录最新会话后，只提取 compaction 生命周期和安全路由字段。两次 `compaction/start → compaction/end` 分别为 1698/1605ms，均为 provider `400 InvalidParameter: enable_thinking restricted to True`，没有 `compaction/summary`；正常最近路由为 `cloudagent/glm-5.3`、`reasoningEffort:max`。未读取对话正文或凭据。

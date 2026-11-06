@@ -22,9 +22,11 @@ import { backendError, backendErrorCodeOf, asBackendError, redactDiagnostic } fr
 import type { BackendError } from './errors.ts'
 import { makeTranscriptCodec } from './native-codec.ts'
 import { carriedEffort, modelRow, reasoningView, selectModelRow, type ModelReasoningView, type ModelRow } from './model-view.ts'
+import { SubagentBridge } from './subagents.ts'
 import type {
   Backend,
   BackendEvent,
+  DecisionOrigin,
   DecisionRequest,
   DisplayContentPart,
   ImageAttachmentRef,
@@ -36,6 +38,7 @@ import type {
   SessionEvent,
   SessionInfo,
   StatsSnapshot,
+  SubagentSnapshot,
   TodosSnapshot,
   TranscriptCodec,
   UsageSnapshot,
@@ -119,6 +122,7 @@ interface AgentHandleLike {
 interface AgentRegistryLike {
   create(options: unknown): Promise<AgentHandleLike>
   resume(options: unknown): Promise<AgentHandleLike>
+  get?(id: string): AgentLike | undefined
 }
 
 interface CommandsLike {
@@ -137,10 +141,41 @@ interface AttachmentsLike {
   admitPromptContent?(content: readonly PromptContentPart[]): Promise<readonly unknown[]>
 }
 
+/**
+ * Structural view of the public `ctx.subagents` mutation surface.
+ *
+ * DSH owns admission and authorization: this adapter only validates current
+ * tree membership, presents the exact durable direct-parent address and
+ * forwards the native call. Optional methods keep an older/smaller composition
+ * loadable; capability detection reads them live.
+ */
+interface SubagentsLike {
+  /** Fire-and-return cancel-signal admission; a no-op is still `accepted`. */
+  interrupt?(targetSessionId: string, authority: { readonly kind: 'user'; readonly parentSessionId: string }): void
+  /** Continuable child prompt whose receipt names the accepted inbox message. */
+  prompt?(request: {
+    readonly requestId: string
+    readonly parentSessionId: string
+    readonly childSessionId: string
+    readonly mode: 'continuable'
+    readonly delivery: 'queue' | 'steer'
+    readonly content: readonly PromptContentPart[]
+  }, signal: AbortSignal): Promise<unknown>
+}
+
+interface ObservationLike {
+  readonly header?: unknown
+  readonly inheritedEventCount?: unknown
+  readonly events?: unknown
+  readonly projections?: { readonly values?: unknown }
+  [Symbol.dispose]?(): void
+}
+
 interface SessionQueryLike {
   readSession(id: string): Promise<unknown>
   listSessions(signal?: AbortSignal): Promise<readonly unknown[]>
   readTitleSnapshots(ids: readonly string[], signal?: AbortSignal): Promise<readonly unknown[]>
+  observeSession?(id: string, options?: { readonly signal?: AbortSignal; readonly projectionMode?: 'all' | 'none' }): Promise<ObservationLike>
 }
 
 interface ProjectionsLike {
@@ -194,6 +229,7 @@ interface SessionTitleLike {
 
 interface SessionsLike {
   flush?(session: SessionLike): Promise<unknown>
+  get?(id: string): SessionLike | undefined
 }
 
 interface SessionPersistenceLike {
@@ -240,6 +276,7 @@ const COMMAND_NAMES = new Set([
   'models', 'sessions', 'titles', 'commands', 'execute', 'cancel', 'new', 'resume', 'model',
   'presets', 'preset', 'efforts', 'effort', 'permissions', 'auto-title', 'state',
   'reload', 'dequeue', 'queue-remove', 'queue-replace', 'queue-send-now',
+  'subagent-session', 'subagent-follow', 'subagent-interrupt', 'subagent-prompt',
 ])
 const TITLE_PROVIDER_NAMES = [
   '@deepseek-ai/dsh-session-title-first-prompt-llm',
@@ -268,6 +305,10 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined
+}
+
+function textOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function jsonSafe(value: unknown): unknown {
@@ -635,6 +676,8 @@ export class DshContextBackend implements Backend {
   private readonly metricsStates = new Map<string, { usage?: UsageSnapshot; stats?: StatsSnapshot }>()
   private readonly titleBaselines = new Map<string, boolean>()
   private readonly compactionCauses = new Map<string, string>()
+  private readonly subagentBridge: SubagentBridge
+  private readonly childPresenters = new Map<string, { readonly agent: AgentLike; readonly presenter: ToolPresenter }>()
   private bound = false
   private native: DshNativeHelpers | undefined
   private live: LiveAgent | undefined
@@ -648,10 +691,20 @@ export class DshContextBackend implements Backend {
   private toolPresenter: ToolPresenter | undefined
   private reloading: Promise<unknown> | undefined
   private codec: TranscriptCodec | undefined
+  /** Native subagent services may activate after the first pending/root ready. */
+  private subagentControlCapabilities = ''
+  private refreshingSubagentCapabilities: Promise<void> | undefined
 
   constructor(host: DshHostContext, options: DshContextBackendOptions) {
     this.host = host
     this.options = { ...options }
+    this.subagentBridge = new SubagentBridge({
+      host: {
+        get: (name: string): unknown => this.service(name),
+      },
+      emit: event => this.emit(event),
+      warn: (message: string) => this.warn(message),
+    })
     if (options.native !== undefined) {
       this.native = options.native
       this.codec = options.native.transcriptCodec
@@ -731,10 +784,11 @@ export class DshContextBackend implements Backend {
     const on = this.host.on.bind(this.host) as (
       event: string,
       listener: (...args: unknown[]) => unknown,
+      options?: { global?: boolean },
     ) => (() => void) | undefined
-    const keep = (event: string, listener: (...args: unknown[]) => unknown): void => {
+    const keep = (event: string, listener: (...args: unknown[]) => unknown, options?: { global?: boolean }): void => {
       try {
-        const dispose = on(event, listener)
+        const dispose = on(event, listener, options)
         if (typeof dispose === 'function') this.disposers.push(dispose)
       } catch (error) {
         this.warn(`DSH capability listener ${event} is unavailable: ${errorMessage(error)}`)
@@ -742,31 +796,86 @@ export class DshContextBackend implements Backend {
     }
     keep('agent/assistant-stream', payload => {
       const item = record(payload)
-      if (this.live === undefined || item?.agent !== this.live.agent) return
-      this.onStreamFrame(record(item.frame))
-    })
+      if (this.live !== undefined && item?.agent === this.live.agent) {
+        this.onStreamFrame(this.live.agent.session.id, record(item?.frame))
+        return
+      }
+      // A child stream reaches the main UI only while its exact session is followed.
+      const childId = textOf(record(item?.agent)?.id)
+      if (childId === undefined || !this.subagentBridge.isFollowed(childId)) return
+      this.onStreamFrame(childId, record(item?.frame))
+    }, { global: true })
     keep('session/event', (session, event) => {
-      if (this.live === undefined || session !== this.live.agent.session) return
-      this.rememberCompactionCause(event)
-      const wire = sessionEventWire(event, this.toolPresenter?.of(event as SessionEvent))
-      this.emit({ type: 'session_event', sessionId: this.live.agent.session.id, event: wire })
-    })
+      const sessionId = textOf(record(session)?.id)
+      if (this.live !== undefined && session === this.live.agent.session) {
+        this.rememberCompactionCause(event)
+        this.subagentBridge.noteRootEvent(this.live.agent.session.id, event)
+        const wire = sessionEventWire(event, this.toolPresenter?.of(event as SessionEvent))
+        this.emit({ type: 'session_event', sessionId: this.live.agent.session.id, event: wire })
+        return
+      }
+      if (sessionId === undefined) return
+      // Child activity stays a bounded label; only a followed child's own
+      // transcript frames are forwarded, under its own session id.
+      this.subagentBridge.noteChildEvent(sessionId, event)
+      if (!this.subagentBridge.isFollowed(sessionId)) return
+      const agent = this.liveAgentOf(sessionId)
+      const presenter = agent === undefined ? undefined : this.childPresenter(sessionId, agent)
+      const wire = sessionEventWire(event, presenter?.of(event as SessionEvent))
+      this.emit({ type: 'session_event', sessionId, event: wire })
+    }, { global: true })
     keep('agent/status', payload => {
       const item = record(payload)
-      if (this.live === undefined || item?.agent !== this.live.agent) return
-      const status = item.status
+      if (this.live !== undefined && item?.agent === this.live.agent) {
+        const status = item.status
+        if (status !== 'running' && status !== 'idle') return
+        this.emit({ type: 'status', sessionId: this.live.agent.session.id, status })
+        return
+      }
+      const childId = textOf(record(item?.agent)?.id)
+      if (childId === undefined) return
+      this.subagentBridge.noteAgentStatus(childId)
+      if (!this.subagentBridge.isFollowed(childId)) return
+      const status = item?.status
       if (status !== 'running' && status !== 'idle') return
-      this.emit({ type: 'status', sessionId: this.live.agent.session.id, status })
-    })
+      this.emit({ type: 'status', sessionId: childId, status })
+    }, { global: true })
     keep('agent/error', payload => {
       const item = record(payload)
-      if (this.live === undefined || item?.agent !== this.live.agent) return
-      this.emit({ type: 'error', message: `agent error: ${errorMessage(item.error)}` })
-    })
+      if (this.live !== undefined && item?.agent === this.live.agent) {
+        this.emit({ type: 'error', message: `agent error: ${errorMessage(item.error)}` })
+        return
+      }
+      const childId = textOf(record(item?.agent)?.id)
+      if (childId === undefined) return
+      // A child failure is never surfaced as a main-session warning: it stays a
+      // bounded activity label plus the native stop reason when the run ends.
+      this.subagentBridge.noteAgentError(childId)
+    }, { global: true })
+    keep('agent/created', payload => {
+      const childId = textOf(record(record(payload)?.agent)?.id)
+      if (childId !== undefined) this.subagentBridge.noteAgentPresent(childId)
+    }, { global: true })
+    keep('agent/disposed', payload => {
+      const childId = textOf(record(record(payload)?.agent)?.id)
+      if (childId === undefined) return
+      const cached = this.childPresenters.get(childId)
+      if (cached === undefined || cached.agent === record(payload)?.agent) this.childPresenters.delete(childId)
+      this.subagentBridge.noteAgentDisposed(childId)
+    }, { global: true })
+    keep('subagent/start', info => {
+      this.refreshSubagentControlCapabilities()
+      this.subagentBridge.noteStart(record(info) ?? {})
+    }, { global: true })
+    keep('subagent/end', info => {
+      this.refreshSubagentControlCapabilities()
+      this.subagentBridge.noteEnd(record(info) ?? {})
+    }, { global: true })
     const projections = this.service<ProjectionsLike>('sessionProjections')
     if (typeof projections?.onChanged === 'function') {
       try {
         const dispose = projections.onChanged((session, key, value) => {
+          this.subagentBridge.noteProjection(session, key, value)
           if (this.live === undefined || session !== this.live.agent.session) return
           const sessionId = this.live.agent.session.id
           if (key === 'permissions') {
@@ -791,22 +900,25 @@ export class DshContextBackend implements Backend {
         this.warn(`DSH projection change feed is unavailable: ${errorMessage(error)}`)
       }
     }
-    // Human decisions are answered only for the exact Agent this adapter owns;
-    // every other request keeps falling through to DSH's own answerers.
+    // Human decisions are answered only for the exact Agent this adapter owns
+    // or for a child proven to be in the current root tree. Every other request
+    // keeps falling through to DSH's own answerers (fail closed).
     keep('approval/request', (request, next) => {
       const item = record(request)
-      if (this.live === undefined || item?.agent !== this.live.agent) {
+      if (this.live === undefined || item === undefined) {
         return typeof next === 'function' ? next() : Promise.resolve('unavailable')
       }
-      return this.askApproval(item)
-    })
+      if (item.agent === this.live.agent) return this.askApproval(item)
+      return this.childDecision(item, next, origin => this.askApproval(item, origin), 'unavailable')
+    }, { global: true })
     keep('user-questions/request', (request, next) => {
       const item = record(request)
-      if (this.live === undefined || item?.agent !== this.live.agent) {
+      if (this.live === undefined || item === undefined) {
         return typeof next === 'function' ? next() : Promise.resolve({ answers: [] })
       }
-      return this.askQuestions(item)
-    })
+      if (item.agent === this.live.agent) return this.askQuestions(item)
+      return this.childDecision(item, next, origin => this.askQuestions(item, origin), { answers: [] })
+    }, { global: true })
   }
 
   // ------------------------------------------------------------- lifecycle
@@ -860,6 +972,13 @@ export class DshContextBackend implements Backend {
     if (has('commands', 'list')) caps.push('commands')
     if (has('commands', 'execute')) caps.push('execute')
     if (has('agents', 'create')) caps.push('model')
+    if (this.subagentBridge.available()) {
+      caps.push('subagents', 'subagent-session', 'subagent-follow')
+      // Capabilities follow the exact mounted native methods, so an older or
+      // partial composition never advertises a mutation it cannot perform.
+      if (has('subagents', 'interrupt')) caps.push('subagent-interrupt')
+      if (has('subagents', 'prompt')) caps.push('subagent-prompt')
+    }
     if (this.titleProviderEntries().length > 0) caps.push('auto-title')
     return caps
   }
@@ -874,6 +993,7 @@ export class DshContextBackend implements Backend {
     }
     this.live = undefined
     this.toolPresenter = undefined
+    this.subagentBridge.setRoot(undefined)
     return this.pending
   }
 
@@ -944,6 +1064,10 @@ export class DshContextBackend implements Backend {
     this.toolPresenter = this.makeToolPresenter(prepared.agent)
     this.planStates.delete(prepared.agent.session.id)
     this.metricsStates.delete(prepared.agent.session.id)
+    // A new top-level session is a new tree: process-local run identity,
+    // follow state and cached child rows all belong to the previous root.
+    this.subagentBridge.setRoot(prepared.agent.session.id)
+    this.childPresenters.clear()
     setImmediate(() => {
       try {
         this.emitProjectionSnapshots()
@@ -1245,6 +1369,8 @@ export class DshContextBackend implements Backend {
       if (previous !== undefined) {
         this.live = undefined
         this.toolPresenter = undefined
+        this.subagentBridge.setRoot(undefined)
+        this.childPresenters.clear()
       }
       this.pending = {
         sessionId: randomUUID(),
@@ -1273,13 +1399,49 @@ export class DshContextBackend implements Backend {
   }
 
   private emitAnnouncement(info: SessionInfo): void {
+    this.subagentControlCapabilities = this.subagentControlCapabilitySignature()
     this.emit({ type: 'ready', info })
+    // The ready payload is the authoritative first snapshot; `announce` only
+    // records it so later publishes stay idempotent.
+    if (info.subagents !== undefined) this.subagentBridge.announce(info.sessionId, info.subagents)
     if (info.snapshotUnavailable === true) {
       this.emit({
         type: 'warning',
         message: 'DSH could not read this session\'s durable history; the transcript is incomplete, not a new conversation.',
       })
     }
+  }
+
+  private subagentControlCapabilitySignature(): string {
+    return this.capabilities().filter(capability =>
+      capability === 'subagent-interrupt' || capability === 'subagent-prompt',
+    ).join(' ')
+  }
+
+  /**
+   * Re-publish a same-attachment ready when DSH activates the native mutation
+   * service after the initial pending/root announcement. No snapshot, Editor,
+   * session id or attachment id is replaced; without a real change this is inert.
+   */
+  private refreshSubagentControlCapabilities(): void {
+    if (this.closed || this.refreshingSubagentCapabilities !== undefined) return
+    const signature = this.subagentControlCapabilitySignature()
+    if (signature === this.subagentControlCapabilities) return
+    const live = this.live
+    const pending = this.pending
+    if (live === undefined && pending === undefined) return
+    this.subagentControlCapabilities = signature
+    const task = (async () => {
+      const info = live !== undefined ? await this.sessionInfo(false) : this.pendingInfo()
+      if (this.closed || (live !== undefined && this.live !== live) || (pending !== undefined && this.pending !== pending)) return
+      this.emitAnnouncement(info)
+    })()
+    this.refreshingSubagentCapabilities = task
+    void task.catch(error => {
+      if (!this.closed) this.warn('Could not refresh native subagent capabilities: ' + errorMessage(error))
+    }).finally(() => {
+      if (this.refreshingSubagentCapabilities === task) this.refreshingSubagentCapabilities = undefined
+    })
   }
 
   private permissionsOf(session: SessionLike): { currentValue: string } | undefined {
@@ -1321,7 +1483,22 @@ export class DshContextBackend implements Backend {
         info.totalEvents = snapshot.totalEvents
       }
     }
+    const subagents = await this.subagentSnapshot(session.id)
+    if (subagents !== undefined) info.subagents = subagents
     return info
+  }
+
+  /**
+   * The current root's native child tree. Reads the mounted projections only;
+   * a failure never fails `connect()` or invents an empty catalog.
+   */
+  private async subagentSnapshot(sessionId: string): Promise<SubagentSnapshot | undefined> {
+    try {
+      return await this.subagentBridge.snapshotForRoot(sessionId)
+    } catch (error) {
+      this.warn(`the native subagent catalog could not be read: ${errorMessage(error)}`)
+      return undefined
+    }
   }
 
   private async snapshotOf(sessionId: string): Promise<{
@@ -1340,7 +1517,25 @@ export class DshContextBackend implements Backend {
     }
     const log = record(rawLog)
     const raw = Array.isArray(log?.events) ? log.events : []
-    const presenter = this.toolPresenter
+    const header = record(log?.session)
+    const inheritedEventCount = typeof log?.inheritedEventCount === 'number' ? log.inheritedEventCount : 0
+    // Preserve the parent catalog event seq used to anchor child rows to the
+    // ordered transcript; inherited fork facts are excluded by the projection.
+    if (typeof header?.id === 'string') {
+      try {
+        this.subagentBridge.noteCatalogEvents(header.id, raw, inheritedEventCount)
+      } catch {
+        /* anchoring is an enhancement, not a transcript failure */
+      }
+    }
+    return this.durableSnapshot(raw, this.toolPresenter)
+  }
+
+  /** Newest bounded suffix of one durable log, shared by root and child reads. */
+  private durableSnapshot(
+    raw: readonly unknown[],
+    presenter: ToolPresenter | undefined,
+  ): { events: SessionEvent[]; truncated: boolean; totalEvents: number } {
     const wire = raw.map(event => sessionEventWire(event, presenter?.of(event as SessionEvent)))
     const kept: SessionEvent[] = []
     let bytes = 0
@@ -1363,7 +1558,28 @@ export class DshContextBackend implements Backend {
     return `${kind}-${process.pid}-${this.decisionSeq}`
   }
 
-  private askApproval(request: Record<string, unknown>): Promise<unknown> {
+  /**
+   * Route one waterfall request to a child only when native tree/lineage
+   * proves it belongs to the current root; anything else falls through.
+   */
+  private childDecision(
+    request: Record<string, unknown> | undefined,
+    next: unknown,
+    ask: (origin: DecisionOrigin) => unknown,
+    fallback: unknown,
+  ): unknown {
+    const childId = textOf(record(request?.agent)?.id)
+    if (childId === undefined) return typeof next === 'function' ? (next as () => unknown)() : fallback
+    return this.subagentBridge.originFor(childId).then(
+      (origin: DecisionOrigin | undefined) => {
+        if (origin === undefined) return typeof next === 'function' ? (next as () => unknown)() : fallback
+        return ask(origin)
+      },
+      () => typeof next === 'function' ? (next as () => unknown)() : fallback,
+    )
+  }
+
+  private askApproval(request: Record<string, unknown>, origin?: DecisionOrigin): Promise<unknown> {
     const id = this.nextDecisionId('approval')
     const title = typeof request.toolName === 'string' ? `Approve ${request.toolName}` : 'Approve tool'
     const display = record(request.displayReason)
@@ -1372,7 +1588,7 @@ export class DshContextBackend implements Backend {
       : typeof display?.en === 'string' ? display.en : undefined
     this.emit({
       type: 'decision',
-      sessionId: this.live?.agent.session.id ?? '',
+      sessionId: origin?.rootSessionId ?? this.live?.agent.session.id ?? '',
       request: {
         id,
         kind: 'approval',
@@ -1382,6 +1598,7 @@ export class DshContextBackend implements Backend {
           { label: 'Allow once', description: 'Permit exactly this action.', value: 'allowed-once' },
           { label: 'Reject', description: 'Decline the action.', value: 'rejected' },
         ],
+        ...(origin === undefined ? {} : { origin }),
       },
     })
     const signal = request.signal instanceof AbortSignal ? request.signal : undefined
@@ -1391,7 +1608,7 @@ export class DshContextBackend implements Backend {
     )
   }
 
-  private askQuestions(request: Record<string, unknown>): Promise<unknown> {
+  private askQuestions(request: Record<string, unknown>, origin?: DecisionOrigin): Promise<unknown> {
     const id = this.nextDecisionId('question')
     const questions = Array.isArray(request.questions)
       ? request.questions.map(question => record(question)).filter((question): question is Record<string, unknown> => question !== undefined)
@@ -1410,6 +1627,7 @@ export class DshContextBackend implements Backend {
       id,
       kind: 'question',
       title: typeof questions[0]?.header === 'string' ? questions[0].header : 'Question',
+      ...(origin === undefined ? {} : { origin }),
       questions: questions.map(question => ({
         ...(typeof question.id === 'string' ? { id: question.id } : {}),
         ...(question.intent === undefined ? {} : { intent: jsonSafe(question.intent) as string | JsonRecord }),
@@ -1420,7 +1638,11 @@ export class DshContextBackend implements Backend {
         options: options(question),
       })),
     }
-    this.emit({ type: 'decision', sessionId: this.live?.agent.session.id ?? '', request: requestWire })
+    this.emit({
+      type: 'decision',
+      sessionId: origin?.rootSessionId ?? this.live?.agent.session.id ?? '',
+      request: requestWire,
+    })
     const signal = request.signal instanceof AbortSignal ? request.signal : undefined
     return this.awaitDecision(id, 'question', signal).then(
       value => normalizeAskAnswer(questions, value),
@@ -1506,12 +1728,40 @@ export class DshContextBackend implements Backend {
     } else this.settleDecision(id, value)
   }
 
+  // -------------------------------------------------------------- subagents
+
+  /** The exact live Agent of one child id, never created or resumed here. */
+  private liveAgentOf(sessionId: string): AgentLike | undefined {
+    const agents = this.service<AgentRegistryLike>('agents')
+    if (typeof agents?.get !== 'function') return undefined
+    try {
+      return agents.get(sessionId)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Reuse one ephemeral tool-card presenter per followed child Agent. A new
+   * activation of the same durable child reuses the session id, so the cached
+   * entry is keyed by the exact Agent object as well.
+   */
+  private childPresenter(sessionId: string, agent: AgentLike): ToolPresenter | undefined {
+    const existing = this.childPresenters.get(sessionId)
+    if (existing !== undefined && existing.agent === agent) return existing.presenter
+    const presenter = this.makeToolPresenter(agent)
+    if (presenter === undefined) {
+      this.childPresenters.delete(sessionId)
+      return undefined
+    }
+    this.childPresenters.set(sessionId, { agent, presenter })
+    return presenter
+  }
+
   // ----------------------------------------------------------------- stream
 
-  private onStreamFrame(frame: Record<string, unknown> | undefined): void {
-    const live = this.live
-    if (frame === undefined || live === undefined) return
-    const sessionId = live.agent.session.id
+  private onStreamFrame(sessionId: string, frame: Record<string, unknown> | undefined): void {
+    if (frame === undefined) return
     const attemptId = String(frame.attemptId)
     if (frame.type === 'start') {
       if (typeof frame.revision !== 'number' || typeof frame.turn !== 'number' || typeof frame.step !== 'number') return
@@ -1850,6 +2100,10 @@ export class DshContextBackend implements Backend {
       case 'queue-remove': return this.queueRemove(params)
       case 'queue-replace': return await this.queueReplace(params)
       case 'queue-send-now': return await this.queueSendNow(params)
+      case 'subagent-session': return await this.subagentSession(params)
+      case 'subagent-follow': return await this.subagentFollow(params)
+      case 'subagent-interrupt': return await this.subagentInterrupt(params)
+      case 'subagent-prompt': return await this.subagentPrompt(params)
       default: throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
     }
   }
@@ -2437,6 +2691,281 @@ export class DshContextBackend implements Backend {
     return ids.map(sessionId => ({ sessionId, title: titles.get(sessionId) ?? null }))
   }
 
+  // ------------------------------------------------------------- subagents
+
+  /**
+   * Read one child Session durably without creating or resuming an Agent.
+   *
+   * Membership is validated against the current root tree (catalog or native
+   * header lineage) before any read; the returned events are the unmodified
+   * native durable log, so the UI's installed transcript codec assembles them
+   * exactly like a root snapshot. This command never emits subagent events for
+   * the child tree: the wire contract roots those at the top-level session.
+   */
+  private async subagentSession(params: Record<string, unknown>): Promise<SessionInfo> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
+    if (sessionId === '') throw codedError('INVALID_ARGUMENT', 'subagent-session requires a non-empty sessionId')
+    const root = this.live?.agent.session.id
+    if (root === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    if (sessionId === root) {
+      throw codedError('INVALID_ARGUMENT', 'subagent-session reads a child session; the root session is already attached')
+    }
+    if (!this.subagentBridge.available()) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounts no readable native subagent catalog')
+    }
+    const membership = await this.subagentBridge.membership(sessionId)
+    if (membership === undefined) {
+      throw codedError(
+        'INVALID_ARGUMENT',
+        `session ${JSON.stringify(sessionId)} is not a child in the current session's native subagent tree`,
+      )
+    }
+    if (membership.mode === 'external') {
+      throw codedError('INVALID_ARGUMENT', `external subagent ${JSON.stringify(sessionId)} has no local session transcript`)
+    }
+    const read = await this.subagentBridge.readSession(sessionId)
+    const header = read?.header ?? await this.subagentBridge.headerOf(sessionId)
+    const route = this.childRoute(sessionId, read?.values)
+    const info: SessionInfo = {
+      sessionId,
+      cwd: header?.cwd ?? this.options.cwd,
+      provider: route?.provider ?? '',
+      model: route?.model ?? '',
+      ...(typeof route?.reasoningEffort === 'string' ? { reasoningEffort: route.reasoningEffort } : {}),
+      ...(header?.agentPreset === undefined ? {} : { preset: header.agentPreset }),
+      capabilities: this.capabilities(),
+    }
+    if (read === undefined) {
+      info.snapshotUnavailable = true
+    } else {
+      const childAgent = this.liveAgentOf(sessionId)
+      const presenter = childAgent === undefined ? undefined : this.childPresenter(sessionId, childAgent)
+      const snapshot = this.durableSnapshot(read.events, presenter)
+      info.events = snapshot.events
+      info.truncated = snapshot.truncated
+      info.totalEvents = snapshot.totalEvents
+    }
+    const subagents = await this.subagentBridge.snapshotAt(sessionId, read === undefined
+      ? undefined
+      : { events: read.events, inheritedEventCount: read.inheritedEventCount })
+    if (subagents !== undefined) info.subagents = subagents
+    return info
+  }
+
+  /** Route one child's native LLM route from the live Agent or the durable projection. */
+  private childRoute(sessionId: string, values: Record<string, unknown> | undefined): Route | undefined {
+    const agent = this.liveAgentOf(sessionId)
+    if (agent !== undefined && typeof agent.model?.current === 'function') {
+      try {
+        const current = routeOf(agent.model.current())
+        if (current !== undefined) return current
+      } catch {
+        /* fall through to the durable selection */
+      }
+    }
+    const selection = record(values?.modelSelection)
+    return routeOf(selection?.lastUsed) ?? routeOf(selection?.next)
+  }
+
+  /**
+   * Follow or unfollow one child's own frames. Only followed children emit
+   * `session_event` and stream frames, always under their own session id, so
+   * the App can maintain a separate store without mixing parent/child data.
+   * Follow state is process-local and clears on root switch and close.
+   */
+  private async subagentFollow(params: Record<string, unknown>): Promise<{ sessionId: string; follow: boolean }> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
+    if (sessionId === '') throw codedError('INVALID_ARGUMENT', 'subagent-follow requires a non-empty sessionId')
+    if (typeof params.follow !== 'boolean') throw codedError('INVALID_ARGUMENT', 'subagent-follow requires a boolean follow')
+    if (!this.subagentBridge.available()) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounts no readable native subagent catalog')
+    }
+    if (params.follow) {
+      const membership = await this.subagentBridge.membership(sessionId)
+      if (membership === undefined) {
+        throw codedError(
+          'INVALID_ARGUMENT',
+          `session ${JSON.stringify(sessionId)} is not a child in the current session's native subagent tree`,
+        )
+      }
+      this.subagentBridge.follow(sessionId)
+    } else {
+      this.subagentBridge.unfollow(sessionId)
+    }
+    return { sessionId, follow: params.follow }
+  }
+
+  /**
+   * Interrupt one child's current execution under its exact durable direct
+   * parent.
+   *
+   * Membership is proven against the *current root* tree and the authority is
+   * the direct parent the bridge resolved — for a nested child that is its own
+   * parent session, never the root. The native call is the public
+   * `ctx.subagents.interrupt(target, {kind:'user', parentSessionId})`
+   * fire-and-return primitive, so both one-shot and continuable children use
+   * the same path; `interruptByParent` is deliberately not used because it
+   * only addresses continuable children.
+   *
+   * `accepted` means the native cancel signal was admitted: the target may be
+   * idle (a native no-op) or may keep running until it observes the signal.
+   * This adapter never cancels the root, drains/disposes the child, emits a
+   * fabricated `stopped` row or waits for quiescence.
+   *
+   * @param params - `{sessionId}` of a child in the current root tree.
+   * @returns `{sessionId, parentSessionId, accepted:true}` (admission only).
+   */
+  private async subagentInterrupt(params: Record<string, unknown>): Promise<unknown> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
+    if (sessionId === '') throw codedError('INVALID_ARGUMENT', 'subagent-interrupt requires a non-empty sessionId')
+    const root = this.live?.agent.session.id
+    if (root === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    if (sessionId === root) {
+      throw codedError('INVALID_ARGUMENT', 'subagent-interrupt targets a child session; the root session is not a subagent')
+    }
+    if (!this.subagentBridge.available()) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounts no readable native subagent catalog')
+    }
+    const subagents = this.service<SubagentsLike>('subagents')
+    if (typeof subagents?.interrupt !== 'function') {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'this runtime mounts no native subagent interrupt (ctx.subagents.interrupt)')
+    }
+    const membership = await this.subagentBridge.membership(sessionId)
+    if (membership === undefined) {
+      throw codedError(
+        'INVALID_ARGUMENT',
+        `session ${JSON.stringify(sessionId)} is not a child in the current session's native subagent tree`,
+      )
+    }
+    if (this.closed) throw codedError('CLOSED', 'the backend closed before the subagent interrupt was submitted')
+    if (this.live?.agent.session.id !== root) {
+      throw codedError('STALE_SESSION', 'the DSH session changed while resolving the subagent; nothing was interrupted')
+    }
+    try {
+      subagents.interrupt(sessionId, { kind: 'user', parentSessionId: membership.parentSessionId })
+    } catch (error) {
+      throw nativeAgentFailure(`the native subagent interrupt for ${JSON.stringify(sessionId)} was refused`, error)
+    }
+    return { sessionId, parentSessionId: membership.parentSessionId, accepted: true }
+  }
+
+  /**
+   * Deliver one human message to a local continuable child through its exact
+   * durable direct parent.
+   *
+   * Only the native `ctx.subagents.prompt` call admits the message; this
+   * adapter validates membership/mode, normalizes the public prompt content
+   * and forwards the caller-minted request identity. Image parts are admitted
+   * by DSH itself, so no attachment/model capability rule is duplicated here.
+   * The returned `messageId` only proves inbox acceptance; later execution is
+   * independent of this call and no optimistic transcript/status is written.
+   * A caller-supplied `requestId` is used verbatim (one identity per command
+   * invocation, no automatic retry).
+   *
+   * @param params - `{sessionId, delivery?, text?|content?, requestId?}`.
+   * @returns native `{messageId}` plus the addressed session facts.
+   */
+  private async subagentPrompt(params: Record<string, unknown>): Promise<unknown> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
+    if (sessionId === '') throw codedError('INVALID_ARGUMENT', 'subagent-prompt requires a non-empty sessionId')
+    const root = this.live?.agent.session.id
+    if (root === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    if (sessionId === root) {
+      throw codedError('INVALID_ARGUMENT', 'subagent-prompt targets a child session; the root session is not a subagent')
+    }
+    const delivery = params.delivery === undefined ? 'queue' : params.delivery
+    if (delivery !== 'queue' && delivery !== 'steer') {
+      throw codedError('INVALID_ARGUMENT', 'subagent-prompt delivery must be "queue" or "steer"')
+    }
+    const text = params.text
+    const contentValue = params.content
+    let content: PromptContentPart[]
+    if (text !== undefined) {
+      if (contentValue !== undefined) {
+        throw codedError('INVALID_ARGUMENT', 'subagent-prompt accepts either text or content, not both')
+      }
+      if (typeof text !== 'string' || text.trim().length === 0) {
+        throw codedError('INVALID_ARGUMENT', 'subagent-prompt text must be a non-empty string')
+      }
+      content = [{ type: 'text', text }]
+    } else {
+      if (contentValue === undefined) {
+        throw codedError('INVALID_ARGUMENT', 'subagent-prompt requires text or content')
+      }
+      content = normalizePromptContent(contentValue as readonly PromptContentPart[], 'subagent-prompt')
+      if (!content.some(part => part.type === 'image' || part.text.trim().length > 0)) {
+        throw codedError('INVALID_ARGUMENT', 'subagent-prompt content requires non-whitespace text or an image')
+      }
+    }
+    const requestIdValue = params.requestId
+    if (requestIdValue !== undefined && (typeof requestIdValue !== 'string' || requestIdValue.length === 0)) {
+      throw codedError('INVALID_ARGUMENT', 'subagent-prompt requestId must be a non-empty string when present')
+    }
+    const requestId = requestIdValue ?? randomUUID()
+    if (!this.subagentBridge.available()) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounts no readable native subagent catalog')
+    }
+    const subagents = this.service<SubagentsLike>('subagents')
+    if (typeof subagents?.prompt !== 'function') {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'this runtime mounts no native continuable subagent prompt (ctx.subagents.prompt)')
+    }
+    const membership = await this.subagentBridge.membership(sessionId)
+    if (membership === undefined) {
+      throw codedError(
+        'INVALID_ARGUMENT',
+        `session ${JSON.stringify(sessionId)} is not a child in the current session's native subagent tree`,
+      )
+    }
+    if (membership.mode !== 'continuable' || membership.local !== true) {
+      throw codedError(
+        'INVALID_ARGUMENT',
+        `subagent ${JSON.stringify(sessionId)} is not a local continuable child (mode: ${membership.mode}); prompt delivery is unavailable`,
+      )
+    }
+    if (this.closed) throw codedError('CLOSED', 'the backend closed before the subagent prompt was submitted')
+    if (this.live?.agent.session.id !== root) {
+      throw codedError('STALE_SESSION', 'the DSH session changed while resolving the subagent; the prompt was not sent')
+    }
+    // The native call owns its AbortSignal until inbox acceptance. Registering
+    // it in the existing active-command table is what lets `cancel()`,
+    // `/reload` idleness checks and `close()` observe exactly this call.
+    const commandId = randomUUID()
+    const controller = new AbortController()
+    let settle: () => void = () => {}
+    const settled = new Promise<void>(resolve => { settle = resolve })
+    this.activeCommands.set(commandId, { requestId: commandId, controller, sessionId: root, settled, settle })
+    try {
+      if (controller.signal.aborted) throw codedError('ABORTED', 'the subagent prompt was cancelled')
+      let receipt: Record<string, unknown> | undefined
+      try {
+        receipt = record(await subagents.prompt({
+          requestId,
+          parentSessionId: membership.parentSessionId,
+          childSessionId: sessionId,
+          mode: 'continuable',
+          delivery,
+          content,
+        }, controller.signal))
+      } catch (error) {
+        if (controller.signal.aborted) throw codedError('ABORTED', 'the subagent prompt was cancelled')
+        throw nativeAgentFailure(`the native subagent prompt for ${JSON.stringify(sessionId)} was refused`, error)
+      }
+      // A resolved native call proves inbox acceptance; a carrier abort that
+      // lands afterwards cannot un-accept the message, so the receipt stands.
+      const messageId = receipt?.messageId
+      if (typeof messageId !== 'string' || messageId.length === 0) {
+        throw codedError(
+          'RUNTIME_REQUEST_FAILED',
+          `the native subagent prompt for ${JSON.stringify(sessionId)} returned no accepted message id`,
+        )
+      }
+      return { messageId, sessionId, parentSessionId: membership.parentSessionId, delivery, requestId }
+    } finally {
+      this.activeCommands.delete(commandId)
+      settle()
+    }
+  }
+
   // ------------------------------------------------------------- auto-title
 
   private titleProviderEntries(): LoaderEntryLike[] {
@@ -2822,10 +3351,17 @@ export class DshContextBackend implements Backend {
           RELOAD_TIMEOUT_MS,
           'native HMR reconciliation',
         ))
+        // Recomposition can replace the projection registrations this bridge
+        // reads; drop cached rows and re-resolve services on the next read.
+        this.subagentBridge.invalidate()
+        const info = this.live === undefined ? undefined : await this.sessionInfo(false)
+        // `/reload` does not emit `ready`; re-announce so subsequent child
+        // changes are published against the refreshed attachment again.
+        if (info !== undefined) this.subagentBridge.announce(info.sessionId, info.subagents)
         return {
           ...(record(result) ?? {}),
           available: true,
-          info: this.live === undefined ? undefined : await this.sessionInfo(false),
+          info,
         }
       } finally {
         this.reloading = undefined
@@ -2843,6 +3379,8 @@ export class DshContextBackend implements Backend {
       return
     }
     this.closed = true
+    this.subagentBridge.close()
+    this.childPresenters.clear()
     for (const dispose of this.disposers.splice(0)) {
       try {
         dispose()
@@ -2907,9 +3445,9 @@ function oneLineDiagnostic(text: string): string | undefined {
     : stripped
 }
 
-function normalizePromptContent(value: readonly PromptContentPart[]): PromptContentPart[] {
+function normalizePromptContent(value: readonly PromptContentPart[], label = 'sendContent'): PromptContentPart[] {
   if (!Array.isArray(value) || value.length === 0) {
-    throw backendError('INVALID_ARGUMENT', 'sendContent requires a non-empty ordered content list')
+    throw backendError('INVALID_ARGUMENT', `${label} requires a non-empty ordered content list`)
   }
   const parts: PromptContentPart[] = []
   for (const entry of value) {

@@ -43,6 +43,8 @@ import type {
   SessionEvent,
   SessionInfo,
   StreamPresentation,
+  SubagentEntry,
+  SubagentSnapshot,
   TranscriptCodec,
 } from './backend/types.ts'
 
@@ -62,9 +64,10 @@ export const DEMO_HINTS = [
   'question → 多选 + 单选 AskUserQuestion 问卷',
   'approval → 审批选项（opaque value）；Esc 返回原生拒绝值',
   'Esc/Ctrl+C → 问卷隐藏可重开；Ctrl+C 中断但保留排队输入',
-  'abort    → 流式尝试被放弃',
+  'abort    → 流式尝试被放弃（aborted attempt）',
   'fail     → assistant/attempt 结算 + 非致命错误',
   'pending  → 已受理但没有结果的工具调用（显示 unknown）',
+  'subagent → 原生子 Agent 目录（并行运行/空闲/失败/外部）+ 结算与触发消息',
 ] as const
 
 /** Mirrors DSH's public `CommandDescriptor`; the demo never invents capabilities. */
@@ -133,6 +136,25 @@ export interface DemoCommandExecution {
 
 const CANCELLED = Symbol('demo-cancelled')
 const DEMO_BASE_TIME = 1_750_000_000_000
+
+/**
+ * Deterministic child identities of the offline subagent fixture. These are
+ * fixture-only durable ids; `subagent-session` returns a synthetic child
+ * SessionInfo for the local ones, while the external id deliberately has no
+ * local transcript at all.
+ */
+const DEMO_CHILD_EXPLORE = 'demo-child-explore'
+const DEMO_CHILD_REVIEW = 'demo-child-review'
+const DEMO_CHILD_VERIFY = 'demo-child-verify'
+const DEMO_CHILD_TEST = 'demo-child-test'
+const DEMO_CHILD_EXTERNAL = 'demo-child-external'
+
+const DEMO_CHILD_SESSIONS: Readonly<Record<string, string>> = {
+  [DEMO_CHILD_EXPLORE]: 'I mapped the transcript projection, the live settlement path and the keys that will open the Agents overlay.',
+  [DEMO_CHILD_REVIEW]: 'I reviewed the frontend diff. No blocking issues; two width-safe edge cases are covered by the new tests.',
+  [DEMO_CHILD_VERIFY]: 'The demo verification fixture stopped before it could run the full suite.',
+  [DEMO_CHILD_TEST]: 'Focused UI tests passed against the fixture codec; no model or network call was made.',
+}
 const DEMO_CWD_FALLBACK = process.cwd()
 
 /**
@@ -307,6 +329,61 @@ function asDemoAttachment(value: unknown): ImageAttachmentRef | undefined {
   }
 }
 
+/**
+ * Fixture-only follow-up prompt payload: text and/or ordered content blocks.
+ *
+ * This validates the wire shape and nothing else. Image blocks keep their
+ * canonical attachment ref (an unfetchable placeholder is counted but not
+ * painted, exactly like the durable projection), so a demo reply never loses
+ * an image the caller included. It is never a production admission path.
+ */
+function demoPromptBlocks(args: JsonRecord): unknown[] {
+  const contentValue = args.content
+  if (contentValue !== undefined) {
+    if (args.text !== undefined) {
+      throw new Error('DemoBackend subagent-prompt accepts either text or content, not both')
+    }
+    if (!Array.isArray(contentValue)) {
+      throw new Error('DemoBackend subagent-prompt content must be an array of prompt parts')
+    }
+    const blocks: unknown[] = []
+    let usable = false
+    for (const value of contentValue) {
+      if (!isRecord(value)) continue
+      if (value.type === 'text' && typeof value.text === 'string') {
+        blocks.push({ type: 'text', text: value.text })
+        if (value.text.trim() !== '') usable = true
+        continue
+      }
+      if (value.type === 'image') {
+        // Keep the caller's ordered image part (bytes/mediaType included) and
+        // add the canonical display ref when one is already known.
+        const attachment = asDemoAttachment(value.attachment)
+        blocks.push(attachment === undefined ? { ...value } : { ...value, attachment })
+        usable = true
+      }
+    }
+    if (!usable) {
+      throw new Error('DemoBackend subagent-prompt content requires non-whitespace text or an image')
+    }
+    return blocks
+  }
+  const text = args.text
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new Error('DemoBackend command "subagent-prompt" needs a non-empty { text } or { content }')
+  }
+  return [{ type: 'text', text }]
+}
+
+/** Delivery mode of a fixture follow-up: `queue` (next turn) or `steer` (next step). */
+function demoPromptDelivery(args: JsonRecord): 'queue' | 'steer' {
+  const raw = typeof args.delivery === 'string' ? args.delivery : typeof args.mode === 'string' ? args.mode : 'queue'
+  if (raw !== 'queue' && raw !== 'steer') {
+    throw new Error(`DemoBackend subagent-prompt delivery must be "queue" or "steer", got "${raw}"`)
+  }
+  return raw
+}
+
 /** Expand the demo's compact `AssistantStreamRecord[]` fixture records. */
 export function expandDemoStream(records: unknown): JsonRecord[] {
   const out: JsonRecord[] = []
@@ -445,6 +522,15 @@ export class DemoBackend implements Backend {
   private abortFlag = false
   /** Native `keepInbox:true`: a cancelled turn pauses the queue instead of dropping it. */
   private paused = false
+  /**
+   * Fixture child catalog. The native rows this file projects are the same rows
+   * `subagent-prompt` / `subagent-interrupt` mutate; nothing here is a second
+   * catalog — it is the offline stand-in for DSH's durable child state.
+   */
+  private readonly demoSubagents = new Map<string, SubagentEntry>()
+  /** Deterministic durable event log per local child Session (fixture only). */
+  private readonly demoChildEvents = new Map<string, SessionEvent[]>()
+  private subagentMessageCounter = 0
 
   constructor(options: DemoBackendOptions = {}) {
     const delay = options.delayMs ?? 24
@@ -457,7 +543,7 @@ export class DemoBackend implements Backend {
       permissions: { currentValue: 'workspace-write' },
       preset: 'standard',
       reasoningEffort: DEMO_DEFAULT_EFFORT,
-      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'demo'],
+      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'subagents', 'subagent-session', 'subagent-follow', 'subagent-prompt', 'subagent-interrupt', 'demo'],
       events: [],
     }
   }
@@ -545,6 +631,9 @@ export class DemoBackend implements Backend {
       case 'resume': {
         const sessionId = typeof args.sessionId === 'string' && args.sessionId !== '' ? args.sessionId : `demo-session-${++this.sessionCounter}`
         this.infoValue = { ...this.infoValue, sessionId, events: [] }
+        delete this.infoValue.subagents
+        this.demoSubagents.clear()
+        this.demoChildEvents.clear()
         this.events.length = 0
         this.seq = 0
         this.queue.length = 0
@@ -645,6 +734,35 @@ export class DemoBackend implements Backend {
           })),
           usage: null,
         }
+      case 'subagent-session': {
+        // Fixture-only child snapshot: no child backend is attached, so the
+        // demo serves deterministic durable events for the local children it
+        // advertises. An external child genuinely has no local Session.
+        const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
+        if (sessionId === '') throw new Error('DemoBackend command "subagent-session" needs { sessionId }')
+        const event = DEMO_CHILD_SESSIONS[sessionId]
+        if (event === undefined) {
+          throw new Error(`No demo child session "${sessionId}" (external tasks have no local transcript)`)
+        }
+        return this.childSessionInfo(sessionId, event)
+      }
+      case 'subagent-follow': {
+        // Fixture no-op with a truthful shape: the offline demo never streams a
+        // child Agent, so it cannot actually follow one.
+        const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
+        if (sessionId === '') throw new Error('DemoBackend command "subagent-follow" needs { sessionId }')
+        return {
+          sessionId,
+          follow: args.follow !== false,
+          following: false,
+          supported: false,
+          demo: true,
+        }
+      }
+      case 'subagent-prompt':
+        return await this.subagentPromptCommand(args)
+      case 'subagent-interrupt':
+        return this.subagentInterruptCommand(args)
       case 'compact':
         // Compatibility alias for the native command path; never its own
         // compactNow wrapper.
@@ -738,6 +856,11 @@ export class DemoBackend implements Backend {
       preset,
       events: [],
     }
+    // A fresh root Session has its own direct-child catalog; the previous one
+    // must not leak into a fixture that reports native state.
+    delete this.infoValue.subagents
+    this.demoSubagents.clear()
+    this.demoChildEvents.clear()
     this.events.length = 0
     this.seq = 0
     // A fresh Agent attachment has its own inbox: the old queued input is not
@@ -925,6 +1048,8 @@ export class DemoBackend implements Backend {
     let reason: unknown = { kind: 'completed' }
     if (imageRequest) {
       reason = await this.imagesFlow(turn, step)
+    } else if (lower.includes('subagent') || lower.includes('agents') || text.includes('子代理') || text.includes('子任务')) {
+      reason = await this.subagentFlow(turn, step)
     } else if (lower.includes('question') || text.includes('问题') || text.includes('问卷')) {
       reason = await this.questionFlow(turn, step)
     } else if (lower.includes('approval') || lower.includes('permission') || text.includes('审批')) {
@@ -1170,6 +1295,442 @@ export class DemoBackend implements Backend {
     if (second === undefined) return { kind: 'aborted' }
     this.commitMessage(second, turn, step, [{ type: 'text', text: finalText }])
     return { kind: 'completed' }
+  }
+
+  /**
+   * Native subagent showcase: parallel direct children (running / completed /
+   * failed), one nested child, one external task with no local Session, the
+   * durable settlement + adjacent-Agent trigger messages, and a live
+   * continuable reactivation (idle snapshot -> running upsert).
+   *
+   * Catalog seqs are real parent log seqs, so the transcript anchors one row
+   * per direct child exactly where DSH recorded it. The external and nested
+   * rows have no root transcript anchor; they remain in progress/Agents views.
+   */
+  private async subagentFlow(turn: number, step: number): Promise<unknown> {
+    const sessionId = this.infoValue.sessionId
+    const at = this.now()
+    const exploreSeq = this.append('subagent/catalog', {
+      version: 0,
+      childId: DEMO_CHILD_EXPLORE,
+      childCreatedAt: at - 3_000,
+      mode: 'continuable',
+      label: 'Explore repository',
+    }).seq
+    const reviewSeq = this.append('subagent/catalog', {
+      version: 0,
+      childId: DEMO_CHILD_REVIEW,
+      childCreatedAt: at - 2_000,
+      mode: 'one-shot',
+      label: 'Review changes',
+    }).seq
+    const verifySeq = this.append('subagent/catalog', {
+      version: 0,
+      childId: DEMO_CHILD_VERIFY,
+      childCreatedAt: at - 1_000,
+      mode: 'one-shot',
+      label: 'Verify build',
+    }).seq
+
+    const exploreIdle: SubagentEntry = {
+      id: DEMO_CHILD_EXPLORE,
+      parentSessionId: sessionId,
+      catalogSeq: exploreSeq,
+      createdAt: at - 3_000,
+      mode: 'continuable',
+      label: 'Explore repository',
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      reasoningEffort: this.infoValue.reasoningEffort ?? DEMO_DEFAULT_EFFORT,
+      local: true,
+      status: 'idle',
+      lastRunId: 'demo-run-2',
+      lastStopReason: 'completed',
+      totalTokens: 18_420,
+      timing: { settledMs: 42_000, lastTurnCompleted: true },
+    }
+    const review: SubagentEntry = {
+      id: DEMO_CHILD_REVIEW,
+      parentSessionId: sessionId,
+      catalogSeq: reviewSeq,
+      createdAt: at - 2_000,
+      mode: 'one-shot',
+      label: 'Review changes',
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      local: true,
+      status: 'completed',
+      lastStopReason: 'completed',
+      totalTokens: 9_310,
+      timing: { settledMs: 63_000, lastTurnCompleted: true },
+    }
+    const verify: SubagentEntry = {
+      id: DEMO_CHILD_VERIFY,
+      parentSessionId: sessionId,
+      catalogSeq: verifySeq,
+      createdAt: at - 1_000,
+      mode: 'one-shot',
+      label: 'Verify build',
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      local: true,
+      status: 'failed',
+      lastStopReason: 'error',
+      totalTokens: 5_120,
+      timing: { settledMs: 18_000, lastTurnCompleted: false },
+    }
+    const nested: SubagentEntry = {
+      id: DEMO_CHILD_TEST,
+      parentSessionId: DEMO_CHILD_EXPLORE,
+      createdAt: at - 1_500,
+      mode: 'one-shot',
+      label: 'Run focused tests',
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      local: true,
+      status: 'idle',
+      lastRunId: 'demo-run-2',
+      lastStopReason: 'completed',
+      totalTokens: 2_210,
+      timing: { settledMs: 9_000, lastTurnCompleted: true },
+    }
+    const external: SubagentEntry = {
+      id: DEMO_CHILD_EXTERNAL,
+      parentSessionId: sessionId,
+      createdAt: at - 500,
+      mode: 'external',
+      label: 'External research',
+      status: 'external',
+      local: false,
+    }
+
+    const summary = `Background subagent ${DEMO_CHILD_REVIEW} finished. It cannot receive follow-up messages.`
+    this.append('user/message', {
+      id: 'demo-subagent-settlement',
+      role: 'user',
+      content: [
+        { type: 'text', text: summary },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: 'Reviewed the frontend diff; no blocking issues.' },
+      ],
+      source: {
+        kind: 'subagent-settled',
+        form: 'notice',
+        summary,
+        senderSessionId: DEMO_CHILD_REVIEW,
+      },
+    })
+    this.append('user/message', {
+      id: 'demo-subagent-agent-message',
+      role: 'user',
+      content: [
+        { type: 'text', text: `Agent ${DEMO_CHILD_EXPLORE} sent a message: ` },
+        { type: 'text', text: 'The transcript projection is in src/state/transcript.ts; the overlay list is in src/ui/agents-overlay.ts.' },
+      ],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: DEMO_CHILD_EXPLORE },
+    })
+
+    const idleSnapshot: SubagentSnapshot = { entries: [exploreIdle, review, verify, nested, external] }
+    this.infoValue = { ...this.infoValue, subagents: idleSnapshot }
+    this.emit({ type: 'subagents', sessionId, value: idleSnapshot })
+    this.registerDemoChildren(idleSnapshot.entries)
+
+    const exploreRunning: SubagentEntry = {
+      id: DEMO_CHILD_EXPLORE,
+      parentSessionId: sessionId,
+      catalogSeq: exploreSeq,
+      createdAt: at - 3_000,
+      mode: 'continuable',
+      label: 'Explore repository',
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      reasoningEffort: this.infoValue.reasoningEffort ?? DEMO_DEFAULT_EFFORT,
+      local: true,
+      status: 'running',
+      lastActivity: 'reading src/state/transcript.ts',
+      lastRunId: 'demo-run-3',
+      totalTokens: 18_420,
+      timing: { settledMs: 42_000, activeSince: at, activeThrough: at + 2_000 },
+    }
+    this.emit({ type: 'subagent', sessionId, value: exploreRunning })
+    this.demoSubagents.set(DEMO_CHILD_EXPLORE, exploreRunning)
+    const finalSnapshot: SubagentSnapshot = {
+      entries: [exploreRunning, review, verify, nested, external],
+    }
+    this.infoValue = { ...this.infoValue, subagents: finalSnapshot }
+
+    const text = [
+      '已载入原生 **子 Agent** 目录（fixture）。',
+      '',
+      '- Explore repository：continuable，当前运行中，可点击编辑框上方的 agent 名字链接查看子会话。',
+      '- Review changes：one-shot 已完成，并写入原生结算消息。',
+      '- Verify build：one-shot 失败，不伪装成成功。',
+      '- External research：外部任务，进度区／Agents 树可见，没有本地会话。',
+      '',
+      '仅点击带下划线的 agent 名字进入子会话，Esc 返回原编辑框；状态／指标／活动可选字复制但不跳转。`app.subagents.details` 打开完整 Agents 树。`subagent.reply` / `subagent.interrupt` 分别请求继续对话与停止（仅对适用的子 Agent）。以上全部为离线确定性 fixture，不调用模型。',
+    ].join('\n')
+    const chunks = [...this.textChunks(0, text, 'text'), ...this.terminalChunks()]
+    const meta = await this.liveStream(turn, step, chunks)
+    if (meta === undefined) return { kind: 'aborted' }
+    this.commitMessage(meta, turn, step, [{ type: 'text', text }])
+    // Keep the fixture snapshot replayable: the demo's `info.events` is the
+    // durable log a resume/ready snapshot would carry.
+    this.infoValue = {
+      ...this.infoValue,
+      subagents: finalSnapshot,
+      events: [...this.events],
+    }
+    return { kind: 'completed' }
+  }
+
+  /** Deterministic durable child transcript served by `subagent-session`. */
+  private childSessionInfo(sessionId: string, answer: string): SessionInfo {
+    const cached = this.demoChildEvents.get(sessionId)
+    const events = cached ?? this.createChildEvents(sessionId, answer)
+    this.demoChildEvents.set(sessionId, events)
+    return {
+      sessionId,
+      cwd: this.infoValue.cwd,
+      provider: DEMO_PROVIDER,
+      model: DEMO_MODEL,
+      capabilities: [],
+      // A copy: the caller folds its own projection and must not mutate the log.
+      events: [...events],
+    }
+  }
+
+  /** Baseline durable child log: one completed fixture turn, no model call. */
+  private createChildEvents(sessionId: string, answer: string): SessionEvent[] {
+    const time = DEMO_BASE_TIME + 10_000
+    return [
+      { type: 'turn/start', seq: 1, time, data: { turn: 1 }, surfaceOp: 'append' },
+      {
+        type: 'user/message',
+        seq: 2,
+        time: time + 1,
+        data: {
+          id: `demo-child-user-${sessionId}`,
+          role: 'user',
+          content: [{ type: 'text', text: `Fixture task for ${sessionId}.` }],
+          source: { kind: 'user' },
+        },
+        surfaceOp: 'append',
+      },
+      { type: 'step/start', seq: 3, time: time + 2, data: { turn: 1, step: 1 } },
+      {
+        type: 'assistant/message',
+        seq: 4,
+        time: time + 3,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            id: `demo-child-assistant-${sessionId}`,
+            role: 'assistant',
+            content: [
+              { type: 'reasoning', text: 'Deterministic demo reasoning; no model call is made.' },
+              { type: 'text', text: answer },
+            ],
+            source: { kind: 'model', provider: DEMO_PROVIDER, model: DEMO_MODEL },
+          },
+          stream: [],
+        },
+        surfaceOp: 'append',
+      },
+      { type: 'turn/end', seq: 5, time: time + 4, data: { turn: 1, reason: { kind: 'completed' } }, surfaceOp: 'append' },
+    ]
+  }
+
+  /**
+   * Remember the fixture catalog rows so the intervention commands can resolve
+   * a child exactly like the native catalog does (and refuse anything else).
+   */
+  private registerDemoChildren(entries: readonly SubagentEntry[]): void {
+    for (const entry of entries) this.demoSubagents.set(entry.id, entry)
+  }
+
+  /** Store one mutated fixture row and emit the native upsert a surface folds. */
+  private projectDemoChild(entry: SubagentEntry): void {
+    this.demoSubagents.set(entry.id, entry)
+    const snapshot = this.infoValue.subagents
+    if (snapshot !== undefined) {
+      this.infoValue = {
+        ...this.infoValue,
+        subagents: {
+          entries: snapshot.entries.map(row => row.id === entry.id ? entry : row),
+          ...(snapshot.truncated === true ? { truncated: true } : {}),
+        },
+      }
+    }
+    this.emit({ type: 'subagent', sessionId: this.infoValue.sessionId, value: entry })
+  }
+
+  /** Append one durable child event and emit it for an already-open child view. */
+  private appendChildEvent(sessionId: string, events: SessionEvent[], type: string, data: unknown): SessionEvent {
+    const previous = events[events.length - 1]
+    const seq = (previous?.seq ?? 0) + 1
+    const event: SessionEvent = {
+      type,
+      seq,
+      time: this.now(),
+      data,
+      ...(DEMO_SURFACE_TYPES.has(type) ? { surfaceOp: 'append' as const } : {}),
+    }
+    events.push(event)
+    this.emit({ type: 'session_event', sessionId, event })
+    return event
+  }
+
+  /** Resolve a fixture child that really has a local Session to mutate. */
+  private demoLocalChild(sessionId: string, verb: string): SubagentEntry {
+    const entry = this.demoSubagents.get(sessionId)
+    if (entry === undefined) {
+      if (sessionId === DEMO_CHILD_EXTERNAL) {
+        throw new Error(`No demo child session "${sessionId}" (external tasks have no local transcript)`)
+      }
+      throw new Error(`No demo child session "${sessionId}"`)
+    }
+    if (entry.mode === 'external' || entry.status === 'external' || entry.local === false) {
+      throw new Error(`Demo child "${sessionId}" is an external task and cannot ${verb}`)
+    }
+    return entry
+  }
+
+  /**
+   * Fixture-only native interrupt: the addressed child becomes `stopped` when
+   * the native lifecycle says it is running/initializing.
+   *
+   * No Agent is cancelled and no model call exists here; this is the demo's
+   * explicit state transition so the Stop affordance can be exercised offline.
+   * The response mirrors the adapter's `{sessionId, parentSessionId, accepted}`
+   * shape and adds the fixture marker plus what actually changed.
+   */
+  private subagentInterruptCommand(args: JsonRecord): unknown {
+    const sessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
+    if (sessionId === '') throw new Error('DemoBackend command "subagent-interrupt" needs { sessionId }')
+    const entry = this.demoLocalChild(sessionId, 'be interrupted')
+    const stoppable = entry.status === 'running' || entry.status === 'initializing'
+    if (stoppable) this.projectDemoChild(this.stoppedChild(entry))
+    const projected = this.demoSubagents.get(sessionId) ?? entry
+    return {
+      accepted: true,
+      demo: true,
+      sessionId,
+      parentSessionId: entry.parentSessionId,
+      stopped: stoppable,
+      status: projected.status,
+    }
+  }
+
+  /** Project one running child as stopped, folding the open turn into settled time. */
+  private stoppedChild(entry: SubagentEntry): SubagentEntry {
+    const at = this.now()
+    const timing = entry.timing
+    const open = timing?.activeSince === undefined ? 0 : Math.max(0, at - timing.activeSince)
+    const next: SubagentEntry = {
+      ...entry,
+      status: 'stopped',
+      lastStopReason: 'aborted',
+      timing: {
+        settledMs: (timing?.settledMs ?? 0) + open,
+        activeThrough: at,
+        lastTurnCompleted: false,
+      },
+    }
+    delete next.lastActivity
+    return next
+  }
+
+  /**
+   * Fixture-only follow-up prompt: append the durable user message (keeping
+   * image blocks intact), reactivate the continuable child and schedule one
+   * deterministic assistant reply. No model, network or filesystem is used.
+   */
+  private async subagentPromptCommand(args: JsonRecord): Promise<unknown> {
+    const sessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
+    if (sessionId === '') throw new Error('DemoBackend command "subagent-prompt" needs { sessionId }')
+    const child = this.demoLocalChild(sessionId, 'receive a follow-up prompt')
+    if (child.mode !== 'continuable') {
+      throw new Error(`Demo child "${sessionId}" is ${child.mode} and cannot receive follow-up messages`)
+    }
+    const content = demoPromptBlocks(args)
+    const delivery = demoPromptDelivery(args)
+    const requestedId = args.requestId
+    if (requestedId !== undefined && (typeof requestedId !== 'string' || requestedId === '')) {
+      throw new Error('DemoBackend subagent-prompt requestId must be a non-empty string when present')
+    }
+    const events = this.demoChildEvents.get(sessionId) ?? this.createChildEvents(sessionId, DEMO_CHILD_SESSIONS[sessionId] ?? '')
+    this.demoChildEvents.set(sessionId, events)
+    const counter = ++this.subagentMessageCounter
+    const messageId = `demo-child-user-prompt-${counter}`
+    const requestId = typeof requestedId === 'string' ? requestedId : `demo-child-request-${counter}`
+    const turn = events.reduce((count, event) => count + (event.type === 'turn/start' ? 1 : 0), 0) + 1
+    this.appendChildEvent(sessionId, events, 'turn/start', { turn })
+    this.appendChildEvent(sessionId, events, 'user/message', {
+      id: messageId,
+      role: 'user',
+      content,
+      source: { kind: 'user' },
+    })
+    this.appendChildEvent(sessionId, events, 'step/start', { turn, step: 1 })
+    const runId = `demo-run-child-${counter}`
+    this.projectDemoChild({
+      ...child,
+      status: 'running',
+      lastActivity: delivery === 'steer' ? 'applying the steered prompt' : 'reading the follow-up prompt',
+      lastRunId: runId,
+      timing: { settledMs: child.timing?.settledMs ?? 0, activeSince: this.now() },
+    })
+    void this.completeDemoChildPrompt(sessionId, runId, delivery)
+    return {
+      messageId,
+      requestId,
+      sessionId,
+      parentSessionId: child.parentSessionId,
+      delivery,
+      runId,
+      demo: true,
+    }
+  }
+
+  /**
+   * Deterministic follow-up completion. Aborts silently when the fixture was
+   * interrupted/replaced (the run id no longer matches) or the backend closed.
+   */
+  private async completeDemoChildPrompt(sessionId: string, runId: string, delivery: 'queue' | 'steer'): Promise<void> {
+    await this.pause()
+    if (this.closed) return
+    const current = this.demoSubagents.get(sessionId)
+    if (current === undefined || current.lastRunId !== runId) return
+    const events = this.demoChildEvents.get(sessionId)
+    if (events === undefined) return
+    const turn = events.reduce((count, event) => count + (event.type === 'turn/start' ? 1 : 0), 0)
+    const text = delivery === 'steer'
+      ? 'Acknowledged the steered prompt at the next step boundary (offline fixture).'
+      : 'Follow-up received (offline fixture). The continuable child completed another deterministic run; no model call was made.'
+    this.appendChildEvent(sessionId, events, 'assistant/message', {
+      turn,
+      step: 1,
+      message: {
+        id: `demo-child-assistant-${runId}`,
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        source: { kind: 'model', provider: DEMO_PROVIDER, model: DEMO_MODEL },
+      },
+      stream: [],
+    })
+    this.appendChildEvent(sessionId, events, 'turn/end', { turn, reason: { kind: 'completed' } })
+    const at = this.now()
+    const timing = current.timing
+    const open = timing?.activeSince === undefined ? 0 : Math.max(0, at - timing.activeSince)
+    const next: SubagentEntry = {
+      ...current,
+      status: 'idle',
+      lastStopReason: 'completed',
+      timing: { settledMs: (timing?.settledMs ?? 0) + open, activeThrough: at, lastTurnCompleted: true },
+    }
+    delete next.lastActivity
+    this.projectDemoChild(next)
   }
 
   private async normalFlow(turn: number, step: number): Promise<unknown> {

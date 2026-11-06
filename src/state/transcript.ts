@@ -35,10 +35,21 @@ import type {
   SessionEvent,
   SessionInfo,
   StreamPresentation,
+  SubagentEntry,
+  SubagentSnapshot,
   TodoItem,
   TodosSnapshot,
   TranscriptCodec,
 } from '../backend/types.ts'
+import {
+  composeSubagentRows,
+  readSubagentMessage,
+  SubagentProjection,
+  type SubagentMessageTranscriptItem,
+  type SubagentTranscriptItem,
+} from './subagents.ts'
+
+export type { SubagentMessageTranscriptItem, SubagentTranscriptItem }
 
 export type TranscriptItem =
   | UserTranscriptItem
@@ -47,6 +58,8 @@ export type TranscriptItem =
   | AttemptTranscriptItem
   | NoticeTranscriptItem
   | TodosTranscriptItem
+  | SubagentTranscriptItem
+  | SubagentMessageTranscriptItem
 
 export interface UserTranscriptItem {
   readonly kind: 'user'
@@ -437,6 +450,7 @@ export class TranscriptStore {
    */
   private stepStartedAt: number | undefined
   private readonly processedSeqs = new Set<number>()
+  private readonly subagentProjection = new SubagentProjection()
   private noticeCounter = 0
   private versionCounter = 0
   /** Called after every observable mutation. Parent assigns this to request a render. */
@@ -469,7 +483,29 @@ export class TranscriptStore {
 
   /** Read-only view of the projected entries, in session order. */
   get items(): readonly TranscriptItem[] {
-    return this.list
+    return composeSubagentRows(this.list, this.subagentProjection, this.sessionIdValue)
+  }
+
+  /**
+   * Current native child catalog (direct and nested), in catalog order. The
+   * overlay reads this, including cold rows that carry no parent catalog seq.
+   */
+  get subagentEntries(): readonly SubagentEntry[] {
+    return this.subagentProjection.entries
+  }
+
+  /** The current serializable catalog snapshot; absent before a native read. */
+  get subagentSnapshot(): SubagentSnapshot | undefined {
+    return this.subagentProjection.snapshot
+  }
+
+  get subagentsTruncated(): boolean {
+    return this.subagentProjection.truncated
+  }
+
+  /** One known child by durable session id, for detail-surface wiring. */
+  subagentEntry(id: string): SubagentEntry | undefined {
+    return this.subagentProjection.get(id)
   }
 
   get info(): SessionInfo | undefined {
@@ -494,6 +530,11 @@ export class TranscriptStore {
     this.liveAttempt = undefined
     this.stepStartedAt = undefined
     this.processedSeqs.clear()
+    // An absent catalog is not an empty native read: keep `subagentSnapshot`
+    // undefined until DSH actually reports one. An explicit empty snapshot is
+    // still recorded as a known-empty catalog.
+    if (info.subagents === undefined) this.subagentProjection.clear()
+    else this.subagentProjection.applySnapshot(info.subagents)
     this.infoValue = info
     this.sessionIdValue = info.sessionId
     this.statusValue = 'idle'
@@ -509,6 +550,7 @@ export class TranscriptStore {
     this.list = []
     this.liveAttempt = undefined
     this.stepStartedAt = undefined
+    this.subagentProjection.clear()
     this.notify()
   }
 
@@ -534,6 +576,17 @@ export class TranscriptStore {
       case 'todos':
         if (!this.isCurrent(event.sessionId)) return
         this.applyTodos(event.value)
+        return
+      case 'subagents':
+        // Native full catalog snapshot: authoritative membership, idempotent
+        // when replayed with no changes (no re-render, no re-key).
+        if (!this.isCurrent(event.sessionId)) return
+        if (this.subagentProjection.applySnapshot(event.value)) this.notify()
+        return
+      case 'subagent':
+        // Native live upsert of one child; keeps a cold snapshot's anchor.
+        if (!this.isCurrent(event.sessionId)) return
+        if (this.subagentProjection.applyEntry(event.value)) this.notify()
         return
       case 'session_event':
         if (!this.isCurrent(event.sessionId)) return
@@ -920,9 +973,14 @@ export class TranscriptStore {
 
   private projectUserMessage(seq: number, data: Record<string, unknown>): void {
     const source = isRecord(data.source) ? data.source : undefined
+    const sourceKind = source === undefined ? 'user' : asString(source.kind)
+    if (sourceKind === 'subagent-settled' || sourceKind === 'agent-message') {
+      this.projectSubagentMessage(seq, data)
+      return
+    }
     // Synthetic context (agent.inject, instructions, notices) is model-visible
     // but not a human prompt. Keep the transcript to real user turns.
-    if (source !== undefined && asString(source.kind) !== 'user') return
+    if (source !== undefined && sourceKind !== 'user') return
     const blocks = projectBlocks(data.content)
     if (blocks.text.trim() === '' && blocks.images === 0) return
     this.list.push({
@@ -932,6 +990,27 @@ export class TranscriptStore {
       text: blocks.text,
       imageCount: blocks.images,
       ...(blocks.images > 0 ? { content: blocks.content } : {}),
+      version: ++this.versionCounter,
+    })
+  }
+
+  /**
+   * DSH's durable settlement/trigger messages are user-role facts, never human
+   * prompts. They keep their native seq, sender, summary and exact text; the
+   * UI renders them as attributed trigger rows rather than notices.
+   */
+  private projectSubagentMessage(seq: number, data: Record<string, unknown>): void {
+    const fields = readSubagentMessage(data)
+    if (fields === undefined) return
+    this.list.push({
+      kind: 'subagent-message',
+      id: `subagent-message:${seq}`,
+      seq,
+      sourceKind: fields.sourceKind,
+      senderSessionId: fields.senderSessionId,
+      ...(fields.summary === undefined ? {} : { summary: fields.summary }),
+      ...(fields.form === undefined ? {} : { form: fields.form }),
+      text: fields.text,
       version: ++this.versionCounter,
     })
   }

@@ -90,6 +90,13 @@ const MODIFIER_NAMES = ["ctrl", "shift", "alt", "super"] as const
  * `toolDetails` and `imageDetails` are read-only modals: shared list
  * navigation, dialog and app keys, but **no editor fallback**, so
  * movement/kill/undo bindings cannot edit or type into those surfaces.
+ *
+ * `subagentList` and `subagentSession` are the read-only native Agents overlay
+ * (agent list and one agent's session view). They follow the same read-only
+ * shape: shared list navigation, dialog and app keys, never the editor layer.
+ * The only context-local actions are `subagent.reply` (`r`) and
+ * `subagent.interrupt` (`s`); both come from this one registry, so they are
+ * remappable/disableable and plain `r`/`s` stay text in the prompt.
  */
 const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>> = {
   editor: ["editor", "global"],
@@ -101,6 +108,8 @@ const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>>
   modelPickerSearch: ["modelPickerSearch", "editor", "global"],
   toolDetails: ["toolDetails", "list", "dialog", "global"],
   imageDetails: ["imageDetails", "list", "dialog", "global"],
+  subagentList: ["subagentList", "list", "dialog", "global"],
+  subagentSession: ["subagentSession", "list", "dialog", "global"],
   global: ["global"],
 }
 
@@ -108,13 +117,16 @@ const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>>
  * Contexts where the configured simple `app.interrupt` key always wins over
  * a local binding (list.cancel also binds Ctrl+C) *and* over a pending chord.
  * That makes Ctrl+C an unconditional escape hatch from a read-only details
- * modal or /model picker without changing `list`/`dialog` semantics.
+ * modal, a read-only Agents surface or /model picker without changing
+ * `list`/`dialog` semantics.
  */
 const INTERRUPT_PRIORITY_CONTEXTS: ReadonlySet<CcContext> = new Set<CcContext>([
   "modelPickerList",
   "modelPickerSearch",
   "toolDetails",
   "imageDetails",
+  "subagentList",
+  "subagentSession",
 ])
 
 const SPECIAL_KEYS = new Set([

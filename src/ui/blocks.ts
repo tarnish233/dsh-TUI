@@ -24,7 +24,7 @@ import {
   type TuiMouseEvent,
   type TuiMouseEventResult,
 } from '#pi-tui'
-import type { TodoItem } from '../backend/types.ts'
+import type { SubagentEntry, TodoItem } from '../backend/types.ts'
 import type {
   AssistantTranscriptItem,
   AttemptTranscriptItem,
@@ -35,16 +35,27 @@ import type {
   TranscriptThinkingRun,
   UserTranscriptItem,
 } from '../state/transcript.ts'
+import type { SubagentMessageTranscriptItem, SubagentTranscriptItem } from '../state/subagents.ts'
 import { ImageContentBody, type ContentRenderOptions } from './image-content.ts'
 import { imageMarkerLine } from './image-marker.ts'
 import { toolImageOccurrences } from './image-data.ts'
 import type { ImageDetailsRequest } from './image-view.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import { bold, cc, dim, italic, markdownTheme, t } from './theme.ts'
-import { fit, plural, sanitize, visibleWidth, wrap } from './text.ts'
+import { fit, plural, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { ThinkingBlock, type ThinkingRun, type ThinkingScreen } from './thinking-block.ts'
 import type { ToolGroupContext, ToolViewOptions } from './tool-view.ts'
 import { ToolBlock } from './tool-block.ts'
+import {
+  subagentActivity,
+  subagentLabel,
+  subagentModeLabel,
+  subagentOpenable,
+  subagentSenderLabel,
+  subagentStatusLabel,
+  subagentTone,
+  type SubagentTone,
+} from './subagent-format.ts'
 
 export { toolDisplayName } from './tool-io.ts'
 
@@ -82,6 +93,14 @@ export interface TranscriptViewOptions extends ToolViewOptions {
   onImageDetails?: (request: ImageDetailsRequest) => void
   /** Real `app.images.details` key label for the inline marker hint. */
   imageDetailsHint?: string
+  /**
+   * Open the read-only details surface for one identified child Session. Used
+   * by the inline subagent row and by the sender of a durable trigger message.
+   * Without it those rows stay inert (no fake affordance).
+   */
+  onSubagentDetails?: (sessionId: string) => void
+  /** Optional `app.subagents.details` key label advertised on wide rows. */
+  subagentDetailsHint?: string
 }
 
 /** Cache key for the display-only hint labels. */
@@ -172,6 +191,8 @@ export function createItemBlock(item: TranscriptItem, options: TranscriptViewOpt
     case 'attempt': return new AttemptBlock(item, options)
     case 'notice': return new NoticeBlock(item, options)
     case 'todos': return new TodosBlock(item, options)
+    case 'subagent': return new SubagentBlock(item, options)
+    case 'subagent-message': return new SubagentMessageBlock(item, options)
   }
 }
 
@@ -677,3 +698,226 @@ class TodosBlock extends CachedBlock {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Native subagent rows
+
+const SUBAGENT_GLYPHS: Readonly<Record<SubagentTone, string>> = {
+  running: DOT,
+  done: '●',
+  idle: HOLLOW,
+  failed: '●',
+  stopped: HOLLOW,
+  external: HOLLOW,
+  unknown: HOLLOW,
+}
+
+function subagentGlyph(tone: SubagentTone): string {
+  const glyph = SUBAGENT_GLYPHS[tone]
+  switch (tone) {
+    case 'running': return t.accent(glyph)
+    case 'done': return t.green(glyph)
+    case 'failed': return t.redSoft(glyph)
+    case 'stopped': return t.yellow(glyph)
+    case 'idle': return t.muted(glyph)
+    case 'external': return t.subtle(glyph)
+    case 'unknown': return t.subtle(glyph)
+  }
+}
+
+function subagentStatusStyle(tone: SubagentTone, text: string): string {
+  switch (tone) {
+    case 'running': return t.accent(text)
+    case 'done': return t.green(text)
+    case 'failed': return t.redSoft(text)
+    case 'stopped': return t.yellow(text)
+    case 'idle': return t.muted(text)
+    case 'external': return t.subtle(text)
+    case 'unknown': return t.subtle(text)
+  }
+}
+
+/** Append one low-priority segment only when the finished row still fits. */
+function appendIfFits(line: string, segment: string, width: number): string {
+  const next = `${line}${dim(' · ')}${segment}`
+  return visibleWidth(next) <= width ? next : line
+}
+
+/**
+ * ONE single-line row per direct child.
+ *
+ * There is no accordion and no per-run metric: the row carries the native
+ * label, mode, status and (only while running) the one current activity. Mode
+ * and activity disappear before the name/status when the width shrinks; the
+ * final `fit` guarantees no line ever exceeds the terminal width.
+ */
+class SubagentBlock extends CachedBlock {
+  private entry: SubagentEntry
+  private readonly registry = new HitboxRegistry()
+
+  constructor(item: SubagentTranscriptItem, flags: TranscriptViewOptions) {
+    super(item.id, item.kind, item.version, flags)
+    this.entry = item.entry
+  }
+
+  protected assign(item: TranscriptItem): void {
+    if (item.kind !== 'subagent') return
+    this.entry = item.entry
+  }
+
+  protected viewKey(): string {
+    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}|${this.flags.subagentDetailsHint ?? ''}`
+  }
+
+  protected syncMouse(): void {
+    const handler = this.flags.onSubagentDetails
+    // External tasks have no local child Session: the row must not advertise a
+    // details surface the parent cannot open.
+    if (handler === undefined || !subagentOpenable(this.entry)) {
+      this.registry.clear()
+      return
+    }
+    const sessionId = this.entry.id
+    this.registry.sync([{
+      id: `${this.itemId}:open`,
+      startRow: 0,
+      endRow: 0,
+      claimPress: true,
+      onClick: () => handler(sessionId),
+    }])
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    return this.registry.handleMouse(event)
+  }
+
+  clearMouse(): void {
+    this.registry.clear()
+  }
+
+  protected build(width: number): string[] {
+    const entry = this.entry
+    const tone = subagentTone(entry)
+    const glyph = subagentGlyph(tone)
+    const status = subagentStatusLabel(entry)
+    const mode = subagentModeLabel(entry.mode)
+    const separator = dim(' · ')
+    const glyphWidth = visibleWidth(glyph) + 1
+    const separatorWidth = visibleWidth(separator)
+    const statusWidth = visibleWidth(status)
+    // Mode is a secondary detail: keep it only when the row can also keep a
+    // readable name plus the full status. Narrow rows degrade to name · status.
+    // External is already the leaf status, so repeating "external · external"
+    // would just noise the row.
+    const external = entry.mode === 'external' || entry.status === 'external'
+    const keepMode = !external &&
+      width >= glyphWidth + separatorWidth + statusWidth + separatorWidth + visibleWidth(mode) + 8
+    const reserved = glyphWidth + separatorWidth + statusWidth +
+      (keepMode ? separatorWidth + visibleWidth(mode) : 0)
+    const name = truncateToWidth(subagentLabel(entry), Math.max(1, width - reserved))
+    let line = `${glyph} ${bold(t.text(name))}`
+    if (keepMode) line += separator + dim(mode)
+    line += separator + subagentStatusStyle(tone, status)
+    const activity = subagentActivity(entry)
+    if (activity !== undefined && width >= 48) line = appendIfFits(line, t.muted(activity), width)
+    const hint = this.flags.onSubagentDetails === undefined ? '' : this.flags.subagentDetailsHint?.trim() ?? ''
+    if (hint !== '' && width >= 72) line = appendIfFits(line, t.subtle(hint), width)
+    return [fit(line, width)]
+  }
+}
+
+/**
+ * Durable settlement/trigger row (native `user/message` with an attributed
+ * source). It is not a human prompt (`> ` band) and not an ephemeral notice:
+ * the header states the native attribution, the body is the exact message text.
+ */
+class SubagentMessageBlock extends CachedBlock {
+  private item: SubagentMessageTranscriptItem | undefined
+  private readonly registry = new HitboxRegistry()
+
+  constructor(item: SubagentMessageTranscriptItem, flags: TranscriptViewOptions) {
+    super(item.id, item.kind, item.version, flags)
+    this.assign(item)
+  }
+
+  protected assign(item: TranscriptItem): void {
+    if (item.kind !== 'subagent-message') return
+    this.item = item
+  }
+
+  protected viewKey(): string {
+    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}`
+  }
+
+  protected syncMouse(): void {
+    const handler = this.flags.onSubagentDetails
+    const item = this.item
+    if (handler === undefined || item === undefined) {
+      this.registry.clear()
+      return
+    }
+    const sessionId = item.senderSessionId
+    this.registry.sync([{
+      id: `${this.itemId}:sender`,
+      startRow: 0,
+      endRow: 0,
+      claimPress: true,
+      onClick: () => handler(sessionId),
+    }])
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    return this.registry.handleMouse(event)
+  }
+
+  clearMouse(): void {
+    this.registry.clear()
+  }
+
+  private title(): string {
+    return this.item?.sourceKind === 'agent-message' ? 'Task message received' : 'Subtask status updated'
+  }
+
+  /**
+   * Body paragraphs without repeating the header. The stored `text` stays
+   * exact; only an exact native prefix that the header already states is
+   * removed from the paint (never a guessed summary or a relabeled message).
+   */
+  private paragraphs(): string[] {
+    const item = this.item
+    if (item === undefined) return []
+    const summary = item.summary ?? ''
+    let body = item.text
+    if (item.sourceKind === 'agent-message') {
+      const prefix = `Agent ${item.senderSessionId} sent a message: `
+      if (body.startsWith(prefix)) body = body.slice(prefix.length)
+    } else if (summary !== '' && body.startsWith(summary)) {
+      body = body.slice(summary.length)
+    }
+    body = body.replace(/^\n+/, '')
+    return [summary, body].map(part => sanitize(part).trim()).filter(part => part !== '')
+  }
+
+  protected build(width: number): string[] {
+    const item = this.item
+    if (item === undefined) return []
+    const sender = subagentSenderLabel(item.senderSessionId)
+    const title = this.title()
+    let header = `${t.muted(DOT)} ${bold(t.text(title))}`
+    // The sender is the clickable identity; keep it whole when possible and let
+    // `fit` truncate only at the terminal edge, never in the stored item.
+    const senderSegment = dim(' · ') + t.accentBright(sender)
+    if (visibleWidth(header + senderSegment) <= width) header += senderSegment
+    const out: string[] = [fit(header, width)]
+    const paragraphs = this.paragraphs()
+    const room = Math.max(1, width - visibleWidth(ELBOW))
+    paragraphs.forEach((paragraph, paragraphIndex) => {
+      if (paragraphIndex > 0) out.push('')
+      const lines = wrap(paragraph, room)
+      lines.forEach((line, index) => {
+        out.push(index === 0 ? ELBOW + t.text(line) : INDENT + t.text(line))
+      })
+    })
+    return out.map(line => fit(line, width))
+  }
+}

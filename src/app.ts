@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { watch, type FSWatcher } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -11,7 +12,7 @@ import {
   TuiAltScreen, TuiMainScreen, VStack,
 } from '#pi-tui'
 import type {
-  Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, StatsSnapshot, TranscriptCodec, UsageSnapshot,
+  Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, StatsSnapshot, SubagentEntry, TranscriptCodec, UsageSnapshot,
 } from './backend/types.ts'
 import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore, type Settings } from './config.ts'
 import { HistorySearch } from './history-search.ts'
@@ -30,6 +31,10 @@ import { HitboxRegistry } from './ui/mouse.ts'
 import { QueueList } from './ui/queue-list.ts'
 import { ToolDetailsDialog } from './ui/tool-details.ts'
 import { ImageDetailsDialog } from './ui/image-details.ts'
+import { AgentsOverlay } from './ui/agents-overlay.ts'
+import { ChildSessionView } from './ui/child-session-view.ts'
+import { SubagentProgress } from './ui/subagent-progress.ts'
+import { subagentCanReply, subagentCanStop, subagentLabel } from './ui/subagent-format.ts'
 import { getTranscriptImages } from './ui/image-data.ts'
 import { resetImageDisplayCache } from './ui/image-cache.ts'
 import type { ImageDetailsRequest, ImageViewItem } from './ui/image-view.ts'
@@ -231,6 +236,14 @@ interface PendingDecision {
   request: DecisionRequest
 }
 
+/** One explicit main-Editor destination; DSH still owns delivery and execution. */
+interface SubagentReplyTarget {
+  rootSessionId: string
+  childId: string
+  parentSessionId: string
+  label: string
+}
+
 interface DecisionDialogExtras {
   /** Newer dialog surfaces expose a global-cancel hook separate from Esc. */
   onInterrupt?: () => void
@@ -270,6 +283,7 @@ export class App {
   private readonly histories = new Map<string, PromptHistory>()
   private readonly viewOptions: TranscriptViewOptionsShape
   private readonly transcript: TranscriptView
+  private readonly subagentProgress: SubagentProgress
   private readonly prompt: Prompt
   private readonly welcome: WelcomeHeader
   private readonly slot = new Container()
@@ -295,6 +309,28 @@ export class App {
     dialog: ImageDetailsDialog
     handle: ReturnType<TUI['showOverlay']>
   }
+  private agentsOverlay?: {
+    dialog: AgentsOverlay
+    handle: ReturnType<TUI['showOverlay']>
+  }
+  private childSessionOverlay?: {
+    childId: string
+    info: SessionInfo
+    store: TranscriptStore
+    dialog: ChildSessionView
+    handle: ReturnType<TUI['showOverlay']>
+    returnToList: boolean
+  }
+  /** Frames admitted after follow acknowledgement and before the child store reset. */
+  private pendingChildFollow?: {
+    childId: string
+    surface: number
+    events: BackendEvent[]
+    overflow: boolean
+  }
+  /** The single root Editor can address one native continuable child at a time. */
+  private subagentReplyTarget?: SubagentReplyTarget
+  private readonly pendingSubagentStops = new Set<string>()
   private clipboardGeneration = 0
   private clipboardPending = false
   private decisionId?: string
@@ -394,6 +430,8 @@ export class App {
       onToolDetails: request => this.openToolDetails(request),
       onImageDetails: request => this.openImageDetails(request),
       imageDetailsHint: this.keymap.getBindings('app.images.details')[0],
+      onSubagentDetails: sessionId => { void this.openSubagentSession(sessionId) },
+      subagentDetailsHint: this.keymap.getBindings('app.subagents.details')[0],
     }
     const terminal = options.terminal ?? new ProcessTerminal()
     this.tui = this.screen === 'fullscreen'
@@ -402,6 +440,17 @@ export class App {
     this.prompt = new Prompt(this.tui, this.keymap)
     this.welcome = new WelcomeHeader({ demo: options.demo })
     this.transcript = new TranscriptView(this.store, this.viewOptions)
+    const app = this
+    this.subagentProgress = new SubagentProgress({
+      keymap: this.keymap,
+      get maxRows() { return app.subagentProgressRowBudget() },
+      // Overlay close only asks Pi to repaint; sample the current owner rather
+      // than keeping the last App.render() value blocked until another key.
+      get mouseBlocked() { return app.closing || app.terminalPaused || app.dialog !== undefined || app.viewOptions.mouseBlocked === true },
+      onOpenAgents: () => this.openAgentsOverlay(),
+      onOpenChild: entry => { void this.openSubagentSession(entry.id) },
+      onRenderRequest: () => this.render(),
+    })
     this.exited = new Promise(resolve => { this.resolveExit = resolve })
   }
 
@@ -410,6 +459,7 @@ export class App {
   get isBusy(): boolean { return this.busy || this.activeCommands.size > 0 }
   get pendingDecisionCount(): number { return this.decisions.length }
   get queuedCount(): number { return this.queued }
+  get replyTargetSessionId(): string | undefined { return this.subagentReplyTarget?.childId }
 
   /** Native diagnostic notices use the existing report plane, never the input draft. */
   reportNativeDiagnostic(message: string, level: 'info' | 'error' = 'error'): void {
@@ -531,7 +581,7 @@ export class App {
       handleMouse: event => this.followHitboxes.handleMouse(event),
       invalidate: () => this.followHitboxes.clear(),
     })
-    for (const item of [this.queueList, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
+    for (const item of [this.queueList, this.subagentProgress, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
     const document = new Container()
     document.addChild(this.welcome)
     // Keep the first conversation off the logo/identity block.
@@ -682,6 +732,7 @@ export class App {
     }
     this.closeImageDetails()
     this.closeToolDetails()
+    this.closeSubagentSurfaces()
     this.keymap.cancelChord()
     this.chordHint = undefined
     this.exitArm = undefined
@@ -719,7 +770,7 @@ export class App {
     const overlay = this.toolDetailsOverlay
     if (overlay === undefined) return
     this.toolDetailsOverlay = undefined
-    this.viewOptions.mouseBlocked = this.imageDetailsOverlay !== undefined
+    this.syncOverlayMouse()
     this.surfaceGeneration += 1
     overlay.handle.hide()
     overlay.dialog.dispose()
@@ -782,6 +833,7 @@ export class App {
       return
     }
     this.closeImageDetails()
+    this.closeSubagentSurfaces()
     this.keymap.cancelChord(); this.chordHint = undefined; this.exitArm = undefined
     this.surfaceGeneration += 1
     const selected: ImageDetailsRequest = { key: image.key }
@@ -819,7 +871,7 @@ export class App {
     const overlay = this.imageDetailsOverlay
     if (overlay === undefined) return
     this.imageDetailsOverlay = undefined
-    this.viewOptions.mouseBlocked = this.toolDetailsOverlay !== undefined
+    this.syncOverlayMouse()
     this.surfaceGeneration += 1
     overlay.handle.hide()
     overlay.dialog.dispose()
@@ -851,6 +903,279 @@ export class App {
     const image = this.imageDetailsItems().find(item => item.key === overlay.request.key)
     if (image === undefined) this.closeImageDetails()
     else overlay.dialog.setImage(image)
+  }
+
+  // ------------------------------------------------------------- subagents
+
+  private syncOverlayMouse(): void {
+    this.viewOptions.mouseBlocked = this.toolDetailsOverlay !== undefined ||
+      this.imageDetailsOverlay !== undefined || this.agentsOverlay !== undefined ||
+      this.childSessionOverlay !== undefined
+  }
+
+  private openAgentsOverlay(): void {
+    if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
+    if (this.store.subagentEntries.length === 0) {
+      this.store.report('No native subagents in this session.')
+      return
+    }
+    this.closeImageDetails()
+    this.closeToolDetails()
+    this.closeSubagentSurfaces()
+    this.keymap.cancelChord(); this.chordHint = undefined; this.exitArm = undefined
+    this.surfaceGeneration += 1
+    const dialog = new AgentsOverlay(this.tui, {
+      entries: this.store.subagentEntries,
+      ...(this.store.subagentsTruncated ? { truncated: true } : {}),
+      keymap: this.keymap,
+      maxHeight: Math.max(6, Math.floor(this.tui.terminal.rows * 0.8)),
+      onClose: () => this.closeAgentsOverlay(),
+      onOpen: entry => { void this.openSubagentSession(entry.id, true) },
+      ...(this.info?.capabilities.includes('subagent-prompt') === true
+        ? { onReply: (entry: SubagentEntry) => this.beginSubagentReply(entry) } : {}),
+      ...(this.info?.capabilities.includes('subagent-interrupt') === true
+        ? { onStop: (entry: SubagentEntry) => { void this.interruptSubagent(entry) } } : {}),
+      onInterrupt: () => this.closeAgentsOverlay(),
+      onGlobalAction: id => this.handleSubagentGlobalAction(id),
+      onRenderRequest: () => this.render(),
+    })
+    const handle = this.tui.showOverlay(dialog, { anchor: 'center', width: '85%', minWidth: 24, maxHeight: '80%', margin: 1 })
+    this.agentsOverlay = { dialog, handle }
+    this.syncOverlayMouse()
+    this.render()
+  }
+
+  private closeAgentsOverlay(): void {
+    const overlay = this.agentsOverlay
+    if (overlay === undefined) return
+    this.agentsOverlay = undefined
+    this.surfaceGeneration += 1
+    overlay.handle.hide()
+    overlay.dialog.dispose()
+    this.syncOverlayMouse()
+    this.tui.requestRender()
+  }
+
+  private async openSubagentSession(childId: string, returnToList = false): Promise<void> {
+    if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
+    const entry = this.store.subagentEntry(childId)
+    if (entry === undefined) {
+      this.store.report('The native subagent is not present in this session.', 'error')
+      return
+    }
+    if (entry.mode === 'external' || entry.local === false) {
+      this.store.report('External subagents have no local transcript to display.')
+      return
+    }
+    const rootSessionId = this.info?.sessionId
+    if (rootSessionId === undefined) return
+    this.closeImageDetails()
+    this.closeToolDetails()
+    this.closeSubagentSurfaces()
+    this.keymap.cancelChord(); this.chordHint = undefined; this.exitArm = undefined
+    this.surfaceGeneration += 1
+    const surface = this.surfaceGeneration
+    const pending: NonNullable<App['pendingChildFollow']> = { childId, surface, events: [], overflow: false }
+    this.pendingChildFollow = pending
+    try {
+      await this.options.backend.command('subagent-follow', { sessionId: childId, follow: true })
+      const raw = await this.options.backend.command('subagent-session', { sessionId: childId })
+      if (this.pendingChildFollow !== pending || surface !== this.surfaceGeneration || this.info?.sessionId !== rootSessionId) return
+      if (pending.overflow) throw new Error('the live child event buffer was exceeded; reopen the child session')
+      const info = object(raw)
+      if (info?.sessionId !== childId) throw new Error('DSH returned an invalid child session snapshot')
+      const childInfo = info as unknown as SessionInfo
+      const childStore = new TranscriptStore()
+      const codec = this.options.backend.transcriptCodec
+      if (codec !== undefined) childStore.setCodec(codec)
+      childStore.reset(childInfo)
+      const view = new TranscriptView(childStore, {
+        ...this.viewOptions,
+        mouseBlocked: false,
+        onToolDetails: undefined,
+        onImageDetails: undefined,
+        onViewportAnchor: undefined,
+        onSubagentDetails: id => { void this.openSubagentSession(id) },
+      })
+      const dialog = new ChildSessionView(this.tui, {
+        entry: this.store.subagentEntry(childId) ?? entry,
+        info: childInfo,
+        store: childStore,
+        view,
+        keymap: this.keymap,
+        breadcrumb: [rootSessionId, this.store.subagentEntry(childId)?.label ?? entry.label ?? childId],
+        onClose: () => this.closeChildSession(),
+        ...(this.info?.capabilities.includes('subagent-prompt') === true
+          ? { onReply: (current: SubagentEntry) => this.beginSubagentReply(current) } : {}),
+        ...(this.info?.capabilities.includes('subagent-interrupt') === true
+          ? { onStop: (current: SubagentEntry) => { void this.interruptSubagent(current) } } : {}),
+        onInterrupt: () => this.closeChildSession(),
+        onGlobalAction: id => this.handleSubagentGlobalAction(id),
+        onRenderRequest: () => this.render(),
+      })
+      childStore.onChange = () => { dialog.invalidate(); this.render() }
+      const handle = this.tui.showOverlay(dialog, {
+        anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
+        margin: { top: 1, bottom: 1, left: 0, right: 0 },
+      })
+      this.childSessionOverlay = { childId, info: childInfo, store: childStore, dialog, handle, returnToList }
+      this.pendingChildFollow = undefined
+      for (const event of pending.events) this.routeChildEvent(event)
+      this.syncOverlayMouse()
+      this.render()
+    } catch (error) {
+      if (this.pendingChildFollow === pending) {
+        this.pendingChildFollow = undefined
+        void this.options.backend.command('subagent-follow', { sessionId: childId, follow: false }).catch(() => {})
+      }
+      if (surface === this.surfaceGeneration && !this.closing) {
+        if (returnToList) this.openAgentsOverlay()
+        this.store.report('Could not open the child session: ' + errorText(error), 'error')
+        this.render()
+      }
+    }
+  }
+
+  private beginSubagentReply(entry: SubagentEntry): void {
+    const rootSessionId = this.info?.sessionId
+    if (this.closing || rootSessionId === undefined) return
+    if (this.editingQueueId !== undefined) {
+      this.store.report('Finish or leave the queued-message edit before replying to a subagent.')
+      this.render()
+      return
+    }
+    if (this.info?.capabilities.includes('subagent-prompt') !== true || !subagentCanReply(entry)) {
+      this.store.report('This native subagent cannot receive a continuable reply.', 'error')
+      this.render()
+      return
+    }
+    const current = this.store.subagentEntry(entry.id)
+    if (current === undefined || current.parentSessionId !== entry.parentSessionId || !subagentCanReply(current)) {
+      this.store.report('The native subagent is no longer present in this session.', 'error')
+      this.render()
+      return
+    }
+    // Keep the exact draft and its image registry. Only the submit destination
+    // changes; no second Editor or overlay composer is created.
+    this.closeSubagentSurfaces()
+    this.subagentReplyTarget = {
+      rootSessionId,
+      childId: current.id,
+      parentSessionId: current.parentSessionId,
+      label: subagentLabel(current),
+    }
+    this.nextSendMode = undefined
+    this.tui.setFocus(this.prompt)
+    this.render()
+  }
+
+  private clearSubagentReplyTarget(): void {
+    this.subagentReplyTarget = undefined
+    this.nextSendMode = undefined
+  }
+
+  private syncSubagentReplyTarget(): void {
+    const target = this.subagentReplyTarget
+    if (target === undefined) return
+    const entry = this.store.subagentEntry(target.childId)
+    if (this.info?.sessionId !== target.rootSessionId ||
+      this.info.capabilities.includes('subagent-prompt') !== true ||
+      entry === undefined || entry.parentSessionId !== target.parentSessionId || !subagentCanReply(entry)) {
+      this.clearSubagentReplyTarget()
+    }
+  }
+
+  private canStopSubagent(entry: SubagentEntry | undefined): entry is SubagentEntry {
+    return entry !== undefined && subagentCanStop(entry) &&
+      this.info?.capabilities.includes('subagent-interrupt') === true
+  }
+
+  private async interruptSubagent(entry: SubagentEntry): Promise<void> {
+    const current = this.store.subagentEntry(entry.id)
+    if (!this.canStopSubagent(current)) return
+    const rootSessionId = this.info?.sessionId
+    if (rootSessionId === undefined) return
+    const key = rootSessionId + ':' + current.id
+    if (this.pendingSubagentStops.has(key)) return
+    const context = this.context()
+    const label = subagentLabel(current)
+    this.pendingSubagentStops.add(key)
+    try {
+      const receipt = object(await this.options.backend.command('subagent-interrupt', { sessionId: current.id }))
+      if (receipt?.accepted !== true) throw new Error('DSH returned an invalid subagent interrupt receipt')
+      if (this.sameAttachment(context)) {
+        this.store.report('Interrupt admitted for ' + label + '; waiting for the native status to settle.')
+      }
+    } catch (error) {
+      if (this.sameAttachment(context)) this.store.report('Could not interrupt ' + label + ': ' + errorText(error), 'error')
+    } finally {
+      this.pendingSubagentStops.delete(key)
+      if (this.sameAttachment(context)) this.render()
+    }
+  }
+
+  private closeChildSession(returnToList = true): void {
+    const overlay = this.childSessionOverlay
+    if (overlay === undefined) return
+    this.childSessionOverlay = undefined
+    this.surfaceGeneration += 1
+    overlay.handle.hide()
+    overlay.dialog.dispose()
+    void this.options.backend.command('subagent-follow', { sessionId: overlay.childId, follow: false }).catch(() => {})
+    this.syncOverlayMouse()
+    if (returnToList && overlay.returnToList && !this.closing) this.openAgentsOverlay()
+    else this.tui.requestRender()
+  }
+
+  private closeSubagentSurfaces(): void {
+    const pending = this.pendingChildFollow
+    this.pendingChildFollow = undefined
+    if (pending !== undefined) {
+      void this.options.backend.command('subagent-follow', { sessionId: pending.childId, follow: false }).catch(() => {})
+    }
+    // Bulk teardown must not transiently reopen Agents between the two hides.
+    this.closeChildSession(false)
+    this.closeAgentsOverlay()
+    this.syncOverlayMouse()
+  }
+
+  private syncSubagentSurfaces(): void {
+    const agents = this.agentsOverlay
+    if (agents !== undefined) {
+      agents.dialog.setSnapshot({
+        entries: this.store.subagentEntries,
+        ...(this.store.subagentsTruncated ? { truncated: true } : {}),
+      })
+    }
+    const child = this.childSessionOverlay
+    if (child !== undefined) {
+      const entry = this.store.subagentEntry(child.childId)
+      // ChildSessionView.setEntry invalidates synchronously. Only call it for
+      // a real projection replacement, not on every App.render recursion.
+      if (entry !== undefined && entry !== child.dialog.entry) child.dialog.setEntry(entry)
+    }
+  }
+
+  private routeChildEvent(event: BackendEvent): void {
+    if (!('sessionId' in event)) return
+    if (event.type !== 'session_event' && event.type !== 'status' &&
+      event.type !== 'stream_start' && event.type !== 'stream_chunk' && event.type !== 'stream_end') return
+    const pending = this.pendingChildFollow
+    if (pending !== undefined && event.sessionId === pending.childId) {
+      if (pending.events.length >= 1024) pending.overflow = true
+      else pending.events.push(event)
+      return
+    }
+    const overlay = this.childSessionOverlay
+    if (overlay !== undefined && event.sessionId === overlay.childId) overlay.store.handle(event)
+  }
+
+  private handleSubagentGlobalAction(id: string): void {
+    if (id !== 'app.exit') return
+    // Keep the root editor's normal empty-draft/double-press exit policy.
+    if (this.editor.getExpandedText().length > 0) return
+    this.armExit(id)
+    this.render()
   }
 
   /**
@@ -938,10 +1263,13 @@ export class App {
       this.queueReadController?.abort(); this.queueReadController = undefined
       this.closeImageDetails()
       this.closeToolDetails()
+      this.closeSubagentSurfaces()
+      this.clearSubagentReplyTarget()
       resetImageDisplayCache()
       clearToolExpansion()
       this.anchoredScrollTop = null
       this.followHitboxes.clear()
+      this.subagentProgress.invalidate()
       // Invalidate every asynchronous UI operation bound to the old attachment.
       this.epoch += 1
       this.queueRequest = undefined
@@ -1011,6 +1339,7 @@ export class App {
   private onEvent(event: BackendEvent): void {
     if (this.closing) return
     if (event.type === 'ready') { this.applyInfo(event.info); return }
+    this.routeChildEvent(event)
     this.store.handle(event)
     if ('sessionId' in event && event.sessionId !== this.info?.sessionId) return
     if (event.type === 'status') {
@@ -1073,6 +1402,8 @@ export class App {
       this.clipboardGeneration += 1; this.clipboardPending = false
       this.closeImageDetails()
       this.closeToolDetails()
+      this.closeSubagentSurfaces()
+      this.clearSubagentReplyTarget()
       this.connected = false; this.busy = false; this.decisions.length = 0; this.activeCommands.clear(); this.stopSpinner(); this.output.reset()
       const oldDialog = this.dialog
       this.hideDialog()
@@ -1175,15 +1506,38 @@ export class App {
   }
   private stopSpinner(): void { if (this.spinner) clearInterval(this.spinner); this.spinner = undefined }
 
+  /**
+   * Keep the progress widget above the one Editor, never in the transcript's
+   * scroll host. The getter is sampled by the component on every paint, so a
+   * resize or a growing multiline draft cannot leave an old height budget.
+   * Reserve the actual sibling heights and four visible transcript lines;
+   * a short terminal falls back to a header or hides the widget altogether.
+   */
+  private subagentProgressRowBudget(): number {
+    const width = Math.max(1, this.tui.terminal.columns)
+    const siblings = 1 + this.queueList.render(width).length + this.slot.render(width).length +
+      this.hint.render(width).length + this.footer.render(width).length
+    return Math.max(0, Math.min(8, Math.floor(this.tui.terminal.rows / 3), this.tui.terminal.rows - siblings - 4))
+  }
+
   private render(): void {
     if (this.closing || this.terminalPaused) return
     this.syncToolDetails()
     this.syncImageDetails()
+    this.syncSubagentSurfaces()
+    this.syncSubagentReplyTarget()
     const spinner = ['·', '✻', '✶', '✳'][this.spinnerStep % 4]
     const command = this.activeCommands.values().next().value
     this.queueList.rows = this.queueRows
     this.queueList.editingId = this.editingQueueId
-    this.prompt.setWorkingStatus(this.isBusy ? this.workingStatus(spinner, command, Date.now()) : '')
+    const replyTarget = this.subagentReplyTarget
+    this.subagentProgress.entries = this.store.subagentEntries
+    this.subagentProgress.truncated = this.store.subagentsTruncated
+    this.subagentProgress.replyTargetId = replyTarget?.childId
+    const rootWorking = this.isBusy ? this.workingStatus(spinner, command, Date.now()) : ''
+    this.prompt.setWorkingStatus(replyTarget === undefined ? rootWorking
+      : accent('Replying to ' + replyTarget.label) + dim(' · Esc to return') +
+        (rootWorking === '' ? '' : dim(' · root ') + rootWorking))
     const hint = this.exitArm ? 'Press the same exit key again to exit'
       : this.clipboardPending ? 'Pasting…'
       : this.chordHint ? this.chordHint.join(' ') + ' …'
@@ -1273,6 +1627,7 @@ export class App {
     if (this.decisionId && !decision) { this.store.report('Resolve the pending DSH decision before opening another dialog.'); return }
     this.closeImageDetails()
     this.closeToolDetails()
+    this.closeSubagentSurfaces()
     this.surfaceGeneration += 1
     if (this.dialog && this.dialog !== dialog) disposeComponent(this.dialog)
     this.keymap.cancelChord(); this.chordHint = undefined
@@ -1307,12 +1662,16 @@ export class App {
     const pending = this.decisions.find(decision => this.decisionBelongsToCurrentAttachment(decision))
     if (!pending) return
     const request = pending.request
+    const displayRequest: DecisionRequest = request.origin === undefined ? request : {
+      ...request,
+      title: `${request.origin.label ?? (request.origin.untracked === true ? 'Child session (untracked)' : request.origin.childSessionId)} › ${request.title}`,
+    }
     this.decisionId = request.id
     const extras: DecisionDialogExtras = {
       onInterrupt: () => { void this.interrupt() },
     }
     const options = {
-      request,
+      request: displayRequest,
       onSubmit: (value: unknown) => { void this.answer(request.id, value) },
       // Approval Esc uses DSH's native reject option; question Esc settles that
       // one native request as cancelled. Ctrl+C still goes through the backend
@@ -1500,7 +1859,18 @@ export class App {
 
   private dispatchAction(event: CcActionEvent): boolean {
     switch (event.id) {
-      case 'app.interrupt':
+      case 'app.interrupt': {
+        const replyTarget = this.subagentReplyTarget
+        if (replyTarget !== undefined) {
+          const entry = this.store.subagentEntry(replyTarget.childId)
+          if (this.canStopSubagent(entry)) void this.interruptSubagent(entry)
+          else if (!event.empty) {
+            this.cleared = this.editor.captureDraft()
+            this.editor.replaceDraftText('')
+            this.armExit(event.id)
+          } else this.armExit(event.id)
+          break
+        }
         if (this.queueRecallPending) {
           this.queueReadController?.abort()
           if (!this.isBusy && event.empty) break
@@ -1519,7 +1889,14 @@ export class App {
         }
         else this.armExit(event.id)
         break
+      }
       case 'app.cancel':
+        // Esc changes only the Editor destination; it never interrupts the
+        // root Agent or the addressed child and never discards the draft.
+        if (this.subagentReplyTarget !== undefined) {
+          this.clearSubagentReplyTarget()
+          break
+        }
         if (this.editingQueueId && !this.isBusy) {
           this.editingQueueId = undefined
           this.updatingDraft = true
@@ -1559,6 +1936,7 @@ export class App {
       case 'app.tools.expand': this.transcript.toggleToolsExpanded(); break
       case 'app.tools.details': this.openToolDetails(); break
       case 'app.images.details': this.openImageDetails(); break
+      case 'app.subagents.details': this.openAgentsOverlay(); break
       case 'app.thinking.toggle': {
         // CC-style cycle: hidden → collapsed summaries → expand/collapse the
         // latest run. The master show/hide switch lives in /settings → Thinking.
@@ -1624,6 +2002,53 @@ export class App {
     }
     if (this.clipboardPending) {
       restore(); this.store.report('Wait for the clipboard paste to finish; your draft was kept.'); return
+    }
+    const replyTarget = this.subagentReplyTarget
+    if (replyTarget !== undefined) {
+      if (mode === 'send-now') {
+        restore()
+        this.store.report('Send-now is unavailable for a subagent reply. Use ordinary queue delivery or native steer; your draft was kept.', 'error')
+        this.render()
+        return
+      }
+      const current = this.store.subagentEntry(replyTarget.childId)
+      if (!this.connected || this.info?.sessionId !== replyTarget.rootSessionId ||
+        this.info.capabilities.includes('subagent-prompt') !== true ||
+        current === undefined || current.parentSessionId !== replyTarget.parentSessionId || !subagentCanReply(current)) {
+        restore()
+        this.store.report('The addressed native subagent is unavailable. Your draft was kept; press Esc to return to the root session.', 'error')
+        this.render()
+        return
+      }
+      const requestId = randomUUID()
+      const delivery = mode === 'steer' ? 'steer' : 'queue'
+      const content: readonly PromptContentPart[] = hasImages
+        ? payload!.content
+        : [{ type: 'text', text }]
+      try {
+        const receipt = object(await this.options.backend.command('subagent-prompt', {
+          sessionId: replyTarget.childId,
+          requestId,
+          delivery,
+          content,
+        }))
+        if (typeof receipt?.messageId !== 'string' || receipt.messageId === '') {
+          throw new Error('DSH returned an invalid subagent prompt receipt')
+        }
+      } catch (error) {
+        restore()
+        if (this.sameContext(context)) this.store.report('Subagent reply not accepted: ' + errorText(error), 'error')
+        this.render()
+        return
+      }
+      if (this.sameContext(context)) {
+        editor.addToHistory(text)
+        this.restored = undefined
+        this.store.report('Reply accepted for ' + replyTarget.label + ' (' + delivery + '); DSH owns execution.')
+      }
+      void history.add(text).catch(error => { if (!this.closing) this.store.report('Reply accepted, but recall history was not saved: ' + errorText(error), 'error') })
+      this.render()
+      return
     }
     const editingId = this.editingQueueId
     if (editingId !== undefined && mode === 'followup' && !hasImages) {
@@ -2535,8 +2960,11 @@ export class App {
     this.queueImageRecoveries.clear()
     this.closeImageDetails()
     this.closeToolDetails()
+    this.closeSubagentSurfaces()
+    this.clearSubagentReplyTarget()
     resetImageDisplayCache()
     this.transcript.dispose()
+    this.subagentProgress.dispose()
     this.stopSpinner()
     if (this.exitTimer) clearTimeout(this.exitTimer)
     if (this.titleTimer !== undefined) { clearTimeout(this.titleTimer); this.titleTimer = undefined }

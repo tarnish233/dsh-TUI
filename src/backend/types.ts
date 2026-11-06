@@ -82,6 +82,8 @@ export interface PermissionSelection {
 }
 
 export interface SessionInfo {
+  /** Current root's native child catalog; child Sessions are not independently resumable. */
+  subagents?: SubagentSnapshot
   /** Process-local Agent attachment epoch, not a second durable session identity. */
   attachmentId?: string
   sessionId: string
@@ -174,6 +176,70 @@ export interface PlanSnapshot {
   running: { commandId: string; wanted: boolean } | null
 }
 
+export type SubagentMode = 'one-shot' | 'continuable' | 'external' | 'unknown'
+
+/** UI vocabulary mapped from native lifecycle/status facts, never inferred from prose. */
+export type SubagentStatus =
+  | 'initializing'
+  | 'running'
+  | 'idle'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'max-tokens'
+  | 'refusal'
+  | 'unknown'
+  | 'external'
+
+/** Native per-child-session totals. These are not per-activation measurements. */
+export interface SubagentTiming {
+  settledMs?: number
+  activeSince?: number
+  activeThrough?: number
+  lastTurnCompleted?: boolean
+}
+
+/** Lightweight direct/nested child row. Full child transcripts use a separate read path. */
+export interface SubagentEntry {
+  /** Durable child session identity. */
+  id: string
+  /** Durable direct-parent session identity. */
+  parentSessionId: string
+  /** Parent catalog event seq when available; unsequenced rows stay out of the ordered transcript. */
+  catalogSeq?: number
+  createdAt?: number
+  mode: SubagentMode
+  label?: string
+  provider?: string
+  model?: string
+  reasoningEffort?: string
+  local?: boolean
+  status: SubagentStatus
+  /** One bounded native activity label, never the child's full stream. */
+  lastActivity?: string
+  /** Process-local activation identity; absent from cold catalog reads. */
+  lastRunId?: string
+  /** Native stop reason for the latest observed activation. */
+  lastStopReason?: string
+  /** Sum of native tokenUsage buckets for the whole child session. */
+  totalTokens?: number
+  timing?: SubagentTiming
+}
+
+export interface SubagentSnapshot {
+  entries: readonly SubagentEntry[]
+  /** True only when native data is known to be incomplete; never a guess from an empty list. */
+  truncated?: boolean
+}
+
+export interface DecisionOrigin {
+  rootSessionId: string
+  childSessionId: string
+  parentSessionId?: string
+  label?: string
+  untracked?: boolean
+}
+
 export interface DecisionRequest {
   id: string
   kind: 'approval' | 'question'
@@ -181,6 +247,8 @@ export interface DecisionRequest {
   message?: string
   options?: DecisionOption[]
   questions?: Question[]
+  /** Present when DSH attributes this exact decision to a child in the current tree. */
+  origin?: DecisionOrigin
 }
 
 /**
@@ -195,6 +263,8 @@ export type BackendEvent =
   | { type: 'todos'; sessionId: string; value: TodosSnapshot }
   | { type: 'plan'; sessionId: string; value: PlanSnapshot }
   | { type: 'metrics'; sessionId: string; usage?: UsageSnapshot; stats?: StatsSnapshot }
+  | { type: 'subagents'; sessionId: string; value: SubagentSnapshot }
+  | { type: 'subagent'; sessionId: string; value: SubagentEntry }
   | { type: 'stream_start'; sessionId: string; attemptId: string; revision: number; turn: number; step: number }
   | { type: 'stream_chunk'; sessionId: string; attemptId: string; revision: number; index: number; chunk: JsonRecord; /** DSH wall-clock timestamp (epoch ms) of the frame; optional on the wire. */ time?: number }
   | { type: 'stream_end'; sessionId: string; attemptId: string; revision: number; outcome: 'committed' | 'abandoned'; seq?: number }

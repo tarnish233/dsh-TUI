@@ -104,6 +104,9 @@ const APP_FALLBACK_ACTIONS = new Set([
   "app.editor.external",
   "app.tools.expand",
   "app.tools.details",
+  "app.subagents.details",
+  "subagent.reply",
+  "subagent.interrupt",
   "app.todo",
   "app.thinking.toggle",
   "app.model.select",
@@ -134,6 +137,31 @@ const APP_FALLBACK_ACTIONS = new Set([
   "historySearch.previous",
   "historySearch.accept",
   "historySearch.cancel",
+])
+
+/**
+ * App actions that only make sense for the focused root prompt editor: they
+ * stash/clear, paste into, submit, externally edit or search the single root
+ * draft. A read-only surface has no editable draft behind it, so these fail
+ * closed there instead of acting on hidden root state.
+ *
+ * Deliberately excluded: app.cancel/list.cancel/dialog.* keep their documented
+ * local close behavior, app.interrupt keeps global priority, app.exit remains
+ * global (the App still applies its empty-input exit policy), and app-level
+ * surfaces (redraw, help, todo, model picker, detail overlays, suspend) remain
+ * available as global fallbacks. The Agents surface actions
+ * `subagent.reply`/`subagent.interrupt` also remain available to the overlay:
+ * they are app-implemented, the input layer only emits the action, and the App
+ * owns the reply target and the native child interrupt.
+ */
+const ROOT_EDITOR_APP_ACTIONS = new Set([
+  "app.stash",
+  "app.history.search",
+  "app.editor.external",
+  "app.clipboard.pasteImage",
+  "app.message.sendNow",
+  "app.message.steer",
+  "app.message.followUp",
 ])
 
 /** Same normalization Pi applies in `setText` (used for a true no-op check). */
@@ -824,8 +852,9 @@ export class CcEditor extends Editor {
     for (const token of tokens) {
       if (token.kind === "paste") {
         this.cancelChord()
-        // Read-only surfaces (tool/image details): pasted content is not inserted.
-        if (this.isReadOnlyContext()) continue
+        // Read-only surfaces (tool/image details, Agents overlay): pasted
+        // content is never inserted.
+        if (this.isReadOnlySurface()) continue
         if (token.text.length > 0) {
           this.ccPaste(token.text)
           this.requestRender()
@@ -838,7 +867,15 @@ export class CcEditor extends Editor {
 
   private dispatchKeys(data: string): void {
     if (!data) return
-    const jumpMode = this.ccGetJumpMode()
+    let jumpMode = this.ccGetJumpMode()
+    if (jumpMode !== null && this.isReadOnlySurface()) {
+      // A read-only surface has no editable draft behind it. A jump left over
+      // from the prompt must not let a printable byte move the hidden cursor:
+      // cancel it, then route the key through the read-only keymap below.
+      this.ccCancelJump()
+      this.requestRender()
+      jumpMode = null
+    }
     if (jumpMode !== null) {
       const target = splitJumpTarget(data)
       if (target.target !== undefined) {
@@ -912,16 +949,33 @@ export class CcEditor extends Editor {
     }
   }
 
-  /** Modals with no editable draft behind them (tool and image details). */
+  /** Modals with no editable draft behind them (tool/image details, Agents overlay). */
   private isReadOnlyContext(context: CcContext = this.actionContext): boolean {
-    return context === "toolDetails" || context === "imageDetails"
+    return (
+      context === "toolDetails" ||
+      context === "imageDetails" ||
+      context === "subagentList" ||
+      context === "subagentSession"
+    )
+  }
+
+  /**
+   * True when this editor is hosted by a read-only surface. Anchored on the
+   * configured surface context (not the effective completion overlay), so a
+   * completion menu cannot turn a read-only Agents/details surface into an
+   * editable one.
+   */
+  private isReadOnlySurface(): boolean {
+    return this.isReadOnlyContext(this.actionContext)
   }
 
   private dispatchUnbound(data: string, context: CcContext): void {
-    // Read-only modal contexts (toolDetails, imageDetails): an unbound byte,
-    // including a printable character, is inert here. It must never fall through
-    // to Pi's text insertion or depend on the app having switched contexts.
-    if (this.isReadOnlyContext(context)) return
+    // Read-only surfaces (tool/image details, Agents overlay): an unbound byte,
+    // including a printable character, is inert here. It must never fall
+    // through to Pi's text insertion or depend on the app having switched
+    // contexts. This is anchored on the surface context so a stale completion
+    // overlay cannot reopen the hidden editor's text path.
+    if (this.isReadOnlySurface()) return
     const printable = decodeKittyPrintable(data)
     if (printable !== undefined) {
       this.ccInsertCharacter(printable)
@@ -940,6 +994,19 @@ export class CcEditor extends Editor {
   // --- action dispatch ---------------------------------------------------
 
   private runAction(action: CcActionDefinition, data: string, context: CcContext): void {
+    // Root-only editor commands (movement, kill, undo, submit, completion, ...)
+    // act on the single root prompt state. A read-only surface has no editable
+    // draft, so these fail closed even if a custom registry, a completion
+    // overlay or a fallback layer makes them resolvable there: the key is
+    // consumed instead of mutating the hidden root editor. App actions
+    // (app.cancel, list.cancel, app.interrupt, subagent.reply/interrupt, ...)
+    // still flow below.
+    if (this.isReadOnlySurface() && action.implementor === "editor") return
+    // Same boundary for app actions that would act on the hidden root draft
+    // (stash, paste, external editor, submit/steer/follow-up, history search,
+    // exit). They remain resolvable in the keymap for diagnostics/Settings,
+    // but a read-only surface consumes the key instead of emitting them.
+    if (this.isReadOnlySurface() && ROOT_EDITOR_APP_ACTIONS.has(action.id)) return
     switch (action.id) {
       case "editor.move.char-left":
         this.ccMoveCursor(0, -1)

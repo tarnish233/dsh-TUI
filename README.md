@@ -1,8 +1,8 @@
-# DSH TUI · v0.1.1
+# DSH TUI · v0.1.2
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前发布版本为 **v0.1.1**（`private: true`），收录原生 DSH 插件化、运行诊断隔离与 compaction 修复。用户明确确认版本号从 v0.2.0 回退为 v0.1.1；本次 release commit 推送到 GitHub `main` 并标记 `v0.1.1`，不发布 registry。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
+当前发布版本为 **v0.1.2**（`private: true`），新增原生 Subagent 目录／子会话／Stop/Reply，以及编辑框上方的 Pi 风格进度和名字限定内部链接；保留 v0.1.1 的原生插件化、诊断隔离与 compaction 修复。本次按用户授权通过 GitHub `main` 与 `v0.1.2` tag 发布，不发布 registry。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
 
 ## 安装与启动（当前本机边界）
 
@@ -35,6 +35,7 @@ dsh-tui
 dsh-tui --demo                 # 默认 fullscreen + tools 场景
 dsh-tui --demo tools-group     # 连续工具分组、I/O 详情与独立 Diff
 dsh-tui --demo images          # 用户/assistant/工具图片与重复附件
+dsh-tui --demo subagent        # 编辑框上方进度、子会话与原生 Reply/Stop 的离线 fixture
 ```
 
 demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型、不执行真实工具。它不会在真实连接失败时自动启用。
@@ -60,6 +61,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 - 真实模型流式上屏与结算、排队/steering、取消、权限预设、审批与问题；`/model` 模型选择器（搜索、provider 分组、effort 保留）。
 - 原生 preset 选择、原生命令透传、会话新建/恢复与启动会话选择器；`/reload` 走 native HMR 配置重组合。
 - 图片：`[Image #N]` 原子附件输入、显式只读查看器、用户/assistant/工具/历史图片保序投影；`history.json` 只存文字，不写 base64；队列图片 refs 需要显式 Up 取回重试，不新增调度器。
+- Subagents：编辑框上方的 Pi 风格紧凑进度树；点击 agent 直接查看子会话，另有完整 Agents 树、原生 Stop/Reply 与子审批来源。
 - 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、cwd 与 git 只读状态。
 - 品牌蓝主题与静态字符块 DeepSeek logo；无启动动画、无原生图片 logo。
 
@@ -87,14 +89,17 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | Ctrl+X Ctrl+O | 工具 Inspector；`[` / `]` 或 Alt+Left/Right 浏览调用，Tab 切 Input/Output，c 复制 |
 | Alt+P | 模型选择 |
 | Shift+Tab | 循环 DSH 暴露的权限预设（执行原生 `/permission`，不切换 plan） |
-| Ctrl+Enter | 取消当前回合，立刻发送草稿；输入框为空时发送队列第一条。其余排队消息留在 inbox |
+| Ctrl+Enter | 根会话：取消当前回合并立刻发送草稿；空输入发送队列第一条。其余排队消息留在 inbox；child reply 中明确拒绝该根语义 |
 | Ctrl+X Ctrl+S | 把草稿插进当前回合的下一步（DSH steer） |
 | Ctrl+X Enter | 明确排到下一回合 |
 | Ctrl+Z | Unix 挂起，`fg` 恢复 |
 | Ctrl+V | 原生剪贴板图片附件；无图片时回退为文本（Windows/WSL 另有 Alt+V） |
 | Ctrl+X Ctrl+I | 查看当前草稿或会话图片；`[`/`]` 或 Alt+Left/Right 切换，Esc 关闭 |
+| Ctrl+X Ctrl+A | 打开 Agents 树；Enter 查看子会话，R 回复 continuable child，S 停止活动 child |
 
 回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
+
+Subagent 进度紧贴编辑框上方：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。fullscreen 仅点击蓝色、加粗、带下划线的 agent 名字进入对应子会话，Esc 返回原编辑框并保留草稿／图片；`Agents`／`+N more` 文字打开完整树。状态、指标、模型、活动和空白不触发跳转，保留正常拖选／复制；External 不显示伪链接。这些是 TUI 内部导航，不生成外部 URL。inline 保留相同进度样式，通过 `Ctrl+X Ctrl+A` 查看。活跃 child 与回复目标优先显示，终端变矮或输入变高时缩减为摘要／标题；没有 child 时不占行。
 
 macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节会标记诊断，不伪造支持。完整动作与兼容说明见 [输入说明](docs/INPUT.md)。
 
@@ -103,6 +108,7 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 `/help`、`/settings`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
 
 - **`/compact`**：摘要目标仍是最近一次实际路由时，原生插件接缝继承该请求的显式 reasoning effort；不同摘要模型不串用 effort，没有历史 effort 时保留 DSH 默认。消息、工具和输出预算不变。若压缩失败，界面在原生提示的下一行显示按 command/session 关联、脱敏且限长的 `Native cause`，不再只剩笼统错误。
+- **Subagents**：编辑框上方默认显示 Pi 风格进度树，使用原生状态、当前活动与可用的 child session 累计指标，不照搬 Pi 的 turn/tool/context 计数。fullscreen 仅点击进度中的 agent 名字链接直接查看子会话，Esc 返回原 Editor；仅 `Agents`／`+N more` 文字打开完整树。其余进度文本可选字复制但不跳转，External 名字不是链接。主对话仍保留每个 direct child 一条不可展开的原生事实行；`Ctrl+X Ctrl+A` 打开 Agents 树，Enter/点击查看子会话，Esc 返回。R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips；Ctrl+C 在活动 child/回复目标上只中断该 child。回复支持原生 queue/steer 与文本/图片，accepted receipt 不冒充执行完成；失败保留草稿。子审批／问题带来源标签，子 transcript 使用独立 store，不会混入父会话。token/timing 是 child session 累计值，不冒充 per-run 统计。快捷键可在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。可运行 `dsh-tui --demo subagent` 查看离线示例。
 
 - **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
 - **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。

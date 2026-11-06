@@ -109,6 +109,14 @@ export interface TranscriptViewOptionsShape extends ToolViewOptions {
    */
   onRenderRequest?: () => void
   /**
+   * Open the read-only details surface for one identified child Session. The
+   * inline subagent row and a durable trigger row's sender both use it; without
+   * it those rows stay inert instead of advertising a dead click.
+   */
+  onSubagentDetails?: (sessionId: string) => void
+  /** Real `app.subagents.details` key label for wide row hints. */
+  subagentDetailsHint?: string
+  /**
    * Click-driven viewport anchor for thinking expansion: the parent freezes
    * follow-end before an expanding click so the clicked row stays visible,
    * and restores follow on the collapsing click.
@@ -201,6 +209,8 @@ export class TranscriptView implements Component {
     this.flags.onViewportAnchor = this.options.onViewportAnchor
     this.flags.onImageDetails = this.options.onImageDetails
     this.flags.imageDetailsHint = this.options.imageDetailsHint
+    this.flags.onSubagentDetails = this.options.onSubagentDetails
+    this.flags.subagentDetailsHint = this.options.subagentDetailsHint
     Object.assign(this.flags, toolPreferences(this.options))
     this.flags.onToolDetails = this.options.onToolDetails
     this.flags.onImageDetails = this.options.onImageDetails

@@ -1,5 +1,21 @@
 # 版本记录
 
+## v0.1.2
+
+按用户授权，将本轮 Subagent 只读闭环、原生干预、编辑框上方进度与名字限定内部链接发布为 **v0.1.2**。包仍为 `private:true`；发布范围为 release commit、GitHub `main` 与 `v0.1.2` tag，不发布 registry，不修改真实配置／凭据／会话或全局安装。
+
+- 发布源码完整检查 **1228/1228**，CLI／编译后 welcome／package metadata 统一为 `0.1.2`；Subagent **6/6** 与启动身份 **6/6** CLI/PTY 全通过，正常退出和 SIGINT 均恢复终端。编译归档 **296 entries** 导入、版本和 name-link smoke 通过；源码／测试／文档提交，不提交构建／缓存／运行数据。发布验收证据：`.cache/release-v0.1.2/`。
+
+- 第一阶段：主对话单行 child 状态、Agents 树 Overlay、全屏只读子 transcript、durable settlement/trigger 与带来源的子审批／问题。原生 catalog/lifecycle/projections 与 child session 为唯一事实源；显式 follow＋有界缓冲隔离父子 transcript，不新建 Agent/scheduler/persistence，token/timing 不冒充 per-run。
+- 第二／第三阶段：新增 `subagent-interrupt` 与 `subagent-prompt` 原生 adapter commands，严格使用当前树与真实 direct parent；支持 one-shot/continuable 中断、continuable 的 queue/steer 文本／图片回复、精确 capabilities、延迟服务能力刷新与 in-flight abort。Reply 复用唯一主 Editor 并保留草稿，Stop/Reply 支持可配置键和鼠标 chips；accepted 不伪造 stopped/completed，失败恢复草稿，根 slash/send-now 不误路由到 child。
+- 编辑框上方进度：按用户的 Pi 截图采用蓝色 Agents 标题、树形摘要与原生活动次行；fullscreen 点击 agent 按 Grok 式交互直接进入子会话，Esc 返回同一 Editor／草稿。标题／溢出行进入完整树；活跃 child 与回复目标优先、有界高度和窄屏降级，空 catalog 不占行。只用已有原生投影，不增加 child read／轮询、计时器、编辑器或假造 Pi turn/tool/context 指标；临时浮层阻断底层 mouse hits，失效手势不能串到新 attachment。
+- 名字限定内部链接：仅蓝色、加粗、下划线的 agent 名字打开 child；仅 `Agents`／`+N more` 文字打开完整树。图标、状态／指标／活动／空白保留选字复制，不跳转；external 无伪链接，不发出 OSC8／浏览器 URL。可见列命中区支持 CJK／emoji／clip，hover 只提亮；outside press、drag、reattach／blocking 不得串成旧 click。原始子会话、Editor、R/S 与 queue/steer 不变。
+- 保持排除：无常驻 sidebar、第二任务系统、per-run usage、child `/resume` 或私有 persistence；真实验收使用临时 home/workspace 与 hermetic model stream，不调用真实 provider。
+- 上一轮原生干预父级验收：完整 `pnpm check` **1160/1160**（99 个测试文件）、Subagent 专项 **127/127**、真实 DSH **4/4**、真实 CLI/PTY **2/2** 通过；fullscreen 实际点击控制 chips。编译归档 294 entries 且解压导入成功。详细证据见 `docs/ACCEPTANCE.md` 与 `.cache/subagent-controls/`。
+- 进度阶段父级验收：完整 `pnpm check` **1209/1209**（101 个测试文件）、新增进度 **49/49**（组件 37＋App 12）、Subagent 全链 **176/176**、真实 DSH **4/4**、真实 CLI/PTY **4/4**，编译归档 **296 entries** 且解压导入／Progress smoke 成功。Esc 后立即再点、图片草稿、原始 transcript 点击、overflow、decision blocking、失效手势与多行单行化均有回归；未修改原生业务或真实配置／凭据／全局程序。当前证据见 `docs/ACCEPTANCE.md` 与 `.cache/subagent-progress/`。
+
+- 本次名字链接父级验收：完整 **1228/1228**、进度／链接 **68/68**（组件 50＋App 18）、Subagent 全链 **195/195**、真实 DSH **4/4**、CLI/PTY **6/6**、编译归档 **296 entries** 导入与内部 name-link smoke 通过。fullscreen 实际 16 个非链接位置点击均不跳转，并验证 native drag/copy 与短屏 overflow；所有 copy packet 留在测试终端，未触及真实剪贴板／模型。证据：`.cache/subagent-links/`。
+
 ## v0.1.1
 
 按用户明确确认，将当前原生 DSH 插件化与累计修复发布为 **v0.1.1**，版本号从此前的 v0.2.0 回退。包仍为 `private:true`；本次创建 release commit，推送 GitHub `main` 与 `v0.1.1` tag，不发布 registry。未修改真实 profile、凭据或全局安装。

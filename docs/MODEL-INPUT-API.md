@@ -27,9 +27,13 @@ returns the authoritative list):
 All existing chains are unchanged:
 `editor → global`, `autocomplete → editor → global`,
 `historySearch → editor → global`, `dialog → editor → global`,
-`list → global`, `global`. The tool-details modal adds a separate
-`toolDetails → list → dialog → global` chain with no editor layer; it does not
-alter the picker chains.
+`list → global`, `global`. The read-only `toolDetails`, `imageDetails`,
+`subagentList` and `subagentSession` surfaces add their own
+`context → list → dialog → global` chains with no editor layer; they do not
+alter the picker chains. The two Agents contexts additionally register the
+overlay-local `subagent.reply` (`r`) and `subagent.interrupt` (`s`) actions;
+those are ordinary `CcKeymap` rows and never become editor/global fallbacks, so
+the picker text-first routing below is unaffected.
 
 Consequences:
 
@@ -232,13 +236,15 @@ picker contexts instead of falling through to `editor.submit`: it never calls
 Without a rule, the local list binding would shadow the global
 `app.interrupt` in the picker. `CcKeymap.resolve()` therefore gives the
 configured **simple** `app.interrupt` binding priority in `modelPickerList`,
-`modelPickerSearch` and `toolDetails`, **before** pending-chord resolution and
+`modelPickerSearch`, `toolDetails`, `imageDetails`, `subagentList` and
+`subagentSession`, **before** pending-chord resolution and
 before the context chain.
 
 Result:
 
 - Default `Ctrl+C` → `app.interrupt` in both picker contexts (and the
-tool-details modal), including while a chord is pending: the chord is
+read-only details/Agents surfaces), including while a chord is pending: the
+chord is
 cancelled, its hint clears once, and the interrupt is dispatched directly
 instead of being re-dispatched after a mismatch. Pasted Ctrl+C bytes are text.
 - If `app.interrupt` is disabled or remapped, the configured binding is

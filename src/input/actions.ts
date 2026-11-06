@@ -22,6 +22,8 @@ export type CcContext =
   | "modelPickerSearch"
   | "toolDetails"
   | "imageDetails"
+  | "subagentList"
+  | "subagentSession"
   | "global"
 
 export const CC_CONTEXTS: readonly CcContext[] = [
@@ -34,6 +36,8 @@ export const CC_CONTEXTS: readonly CcContext[] = [
   "modelPickerSearch",
   "toolDetails",
   "imageDetails",
+  "subagentList",
+  "subagentSession",
   "global",
 ]
 
@@ -99,6 +103,13 @@ const toolDetailsContext = ["toolDetails"] as const
  * fallback, so printable input can never reach a hidden text field.
  */
 const imageDetailsContext = ["imageDetails"] as const
+/**
+ * Native Agents overlay (agent list and one child's session view). Same
+ * read-only shape as `toolDetails`/`imageDetails`: list/dialog/global fallback,
+ * never the editor layer. The two overlay-local actions below are the only
+ * additions, so plain `r`/`s` stay ordinary text everywhere else.
+ */
+const subagentContexts = ["subagentList", "subagentSession"] as const
 /** Browse mode of the provider-grouped /model picker (list + provider keys). */
 const modelPickerListContext = ["modelPickerList"] as const
 const modelPickerBothContexts = ["modelPickerList", "modelPickerSearch"] as const
@@ -112,6 +123,17 @@ const listAndModelPickerSearchContexts = ["list", "modelPickerSearch"] as const
 /**
  * Default CC keymap. Keys are Pi key identifiers; a binding with several keys
  * is a chord (e.g. `"ctrl+x ctrl+e"`).
+ *
+ * `subagentList` / `subagentSession` are the read-only native Agents overlay:
+ * the agent list and one agent's session view. They share the read-only shape
+ * of `toolDetails`/`imageDetails` (list navigation, dialog and global app keys,
+ * no `editor` fallback) and add exactly two app-implemented, overlay-local
+ * actions: `subagent.reply` (default `r`, set the App-owned reply target) and
+ * `subagent.interrupt` (default `s`, stop the focused child inside the
+ * overlay). Both are ordinary registry rows (remap/disable/reset in the one
+ * grouped Settings list); the input layer only emits/returns the action, the
+ * App performs the backend operation. There is no second target/mode action in
+ * the root editor: leaving a reply target stays `app.cancel`.
  *
  * Ordering matters when one byte matches several identifiers (^M = enter,
  * ^J = ctrl+j): the first matching definition in this array wins.
@@ -567,6 +589,37 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     note: "DSH TUI capability, not a verified CC default. Shown only when the surface has an image; the chord keeps Ctrl+I available for tab completion.",
   },
   {
+    id: "app.subagents.details",
+    family: "app",
+    contexts: appContext,
+    defaultBindings: ["ctrl+x ctrl+a"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Open the native Agents overlay",
+    note: "DSH TUI capability, not a verified CC default. Opens the read-only native Agents overlay (agent list and one agent's session view); the chord keeps plain Ctrl+A available for line start in the prompt.",
+  },
+  // --- native Agents overlay (read-only) -------------------------------
+  {
+    id: "subagent.reply",
+    family: "dialog",
+    contexts: subagentContexts,
+    defaultBindings: ["r"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Reply to the focused native subagent",
+    note: "Agents overlay only (subagentList/subagentSession), so plain `r` stays text in the prompt and is not a global fallback. The App owns the reply target and leaves it through app.cancel; this adds no second editor target/mode action. DSH TUI capability, not a verified CC default.",
+  },
+  {
+    id: "subagent.interrupt",
+    family: "dialog",
+    contexts: subagentContexts,
+    defaultBindings: ["s"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Interrupt (stop) the focused native subagent",
+    note: "Agents overlay only (subagentList/subagentSession), so plain `s` stays text in the prompt. Stops the focused child inside the overlay; the global Ctrl+C app.interrupt priority is unchanged. DSH TUI capability, not a verified CC default.",
+  },
+  {
     id: "app.todo",
     family: "app",
     contexts: appContext,
@@ -738,7 +791,7 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     implementor: "app",
     status: "cc-app-override",
     description: "Close the list without selecting",
-    note: "Also applies in modelPickerSearch (Esc dismisses). In picker and toolDetails contexts the configured app.interrupt key keeps priority over ctrl+c.",
+    note: "Also applies in modelPickerSearch (Esc dismisses). In picker, toolDetails, imageDetails and subagent contexts the configured app.interrupt key keeps priority over ctrl+c.",
   },
   {
     id: "list.select-digit",

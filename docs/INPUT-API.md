@@ -171,6 +171,9 @@ restores `payload.snapshot` with `restoreDraft()` when native admission fails.
 | `image.details.previous-image` | `[`, `alt+left` | `imageDetails` only; stays plain text/word motion in the editor |
 | `image.details.next-image` | `]`, `alt+right` | `imageDetails` only; stays plain text/word motion in the editor |
 | `image.details.close` | `escape` | `imageDetails` only; wins over `list.cancel` for Esc |
+| `app.subagents.details` | `ctrl+x ctrl+a` | TUI extension; opens the native Agents overlay (`subagentList` / `subagentSession`). Plain Ctrl+A stays line start in the prompt |
+| `subagent.reply` | `r` | TUI extension; `subagentList`/`subagentSession` only. Sets the App-owned reply target; leave it with `app.cancel`. Plain `r` stays text in the prompt and every other context |
+| `subagent.interrupt` | `s` | TUI extension; `subagentList`/`subagentSession` only. Stops the focused child inside the overlay. Ctrl+C remains the global `app.interrupt` |
 | `app.suspend` | `ctrl+z` | parent must restore terminal state; see `docs/INPUT-LIFECYCLE.md` |
 | `app.message.sendNow` | (unbound) | app-state dependent |
 | `app.message.followUp` | (unbound) | app-state dependent |
@@ -179,7 +182,8 @@ restores `payload.snapshot` with `restoreDraft()` when native admission fails.
 Also available for non-editor surfaces (same keymap instance):
 `list.previous/next/pageUp/pageDown/first/last/select/cancel/select-digit`,
 `dialog.confirm/cancel`, `historySearch.next/previous/accept/cancel`,
-`autocomplete.*`, `model.provider.previous/next/previousArrow/nextArrow`.
+`autocomplete.*`, `model.provider.previous/next/previousArrow/nextArrow`, and
+the overlay-local `subagent.reply`/`subagent.interrupt` (Agents contexts only).
 The /model picker contract (contexts, text-first query routing, provider
 navigation) is documented in `docs/MODEL-INPUT-API.md`.
 
@@ -205,6 +209,40 @@ The image-details viewer uses the `imageDetails` context
 discards printable input, editing bytes and bracketed paste instead of inserting
 them. All three viewer actions appear in the same grouped Settings list and use
 the same single override map.
+
+The native Agents overlay uses two read-only contexts, `subagentList` (agent
+list) and `subagentSession` (one agent's session view):
+`subagentList → list → dialog → global` and
+`subagentSession → list → dialog → global`, both **without** an editor layer.
+`app.subagents.details` (`ctrl+x ctrl+a`, TUI extension) opens it and is
+forwarded through the same `APP_FALLBACK_ACTIONS` path as the other overlay
+openers. The surface reuses `list.previous/next/pageUp/pageDown/first/last/
+select/cancel/select-digit`, `dialog.*` and global `app.interrupt`, and adds
+exactly two overlay-local, app-implemented actions:
+
+- `subagent.reply` (default `r`): the App sets the focused child as the reply
+  target. Leaving the target stays `app.cancel`; there is no second
+  target/mode action on the root editor.
+- `subagent.interrupt` (default `s`): stops the focused child inside the
+  overlay. It does not rebind Ctrl+C; global `app.interrupt` keeps its priority
+  and the root Ctrl+C semantics.
+
+Both actions are ordinary rows in the one grouped Settings shortcut list and
+the one `keybindings.json` override map (remap, disable, or reset by deleting
+the override); there is no subagent-specific config or standalone hotkeys
+panel. Plain `r`/`s` remain ordinary text in the root prompt and in every other
+context, because the actions are registered only for
+`subagentList`/`subagentSession`. In `CcEditor`, printable bytes, editing bytes,
+bracketed paste and an abandoned character jump never reach the hidden root
+editor; editor-implemented (root-only) commands and root-draft app actions
+(stash, paste image, history search, external editor, send/steer/follow-up)
+fail closed, while `subagent.reply`/`subagent.interrupt` are emitted to
+`onAction` and the App performs the operation. The input layer only resolves or
+emits the action; it never calls the backend, and without an `onAction` handler
+the key has no effect. `app.cancel`, `list.cancel` and global `app.interrupt`
+keep their documented behavior. Global `app.exit` is **not** swallowed: Ctrl+D
+still reaches the App, which keeps its existing empty-input policy. Esc resolves
+to `list.cancel` and Ctrl+C keeps interrupt priority over a pending chord.
 
 Plain keys: the frontend can keep using Pi's `getKeybindings().matches` for
 non-chord app keys, but then the YAML/JSON override in `CcKeymap` is not in
@@ -237,16 +275,20 @@ keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
 ```
 
 - Contexts: `editor`, `autocomplete`, `list`, `dialog`, `historySearch`,
-  `modelPickerList`, `modelPickerSearch`, `toolDetails`, `global`. Fallback
+  `modelPickerList`, `modelPickerSearch`, `toolDetails`, `imageDetails`,
+  `subagentList`, `subagentSession`, `global`. Fallback
   chains (first match wins): `autocomplete → editor → global`,
   `historySearch → editor → global`, `dialog → editor → global`,
   `editor → global`, `list → global`,
   `modelPickerList → list → editor → global`,
   `modelPickerSearch → editor → global`,
-  `toolDetails → list → dialog → global` (deliberately no editor layer).
-  Completion/search keys win locally, but editor editing (Ctrl+A/W/K, Alt+B/F,
-  word deletion, undo, …) keeps working underneath. `getFallbackChain(ctx)`
-  exposes the chain.
+  `toolDetails → list → dialog → global`,
+  `imageDetails → list → dialog → global`,
+  `subagentList → list → dialog → global`,
+  `subagentSession → list → dialog → global` (the last four deliberately have
+  no editor layer). Completion/search keys win locally, but editor editing
+  (Ctrl+A/W/K, Alt+B/F, word deletion, undo, …) keeps working underneath.
+  `getFallbackChain(ctx)` exposes the chain.
 - A binding may be one key or a chord (`"ctrl+x ctrl+e"`).
 - Unknown action ids and malformed keys produce error diagnostics and are
   ignored/disable the action; they never silently fall back to a default.
@@ -272,13 +314,14 @@ keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
   pending chord is inserted into the query before the keymap is consulted;
   raw `keymap.resolve("j", "modelPickerList")` still reports `list.next` for
   custom list components. Only picker contexts get this text-first routing.
-- In picker contexts and `toolDetails` the configured simple
+- In picker contexts, `toolDetails`, `imageDetails`, `subagentList` and
+  `subagentSession` the configured simple
   `app.interrupt` key keeps priority over local bindings (e.g. `list.cancel`
   Ctrl+C) **and over a pending chord**. The chord is cancelled and
-  `app.interrupt` is dispatched, so the modal/picker cannot swallow Ctrl+C.
-  Disabled provider actions never fall through to a generic `editor.complete`
-  event in the picker (only `model.provider.*` events may change the provider
-  group).
+  `app.interrupt` is dispatched, so the modal/picker/overlay cannot swallow
+  Ctrl+C. Disabled provider actions never fall through to a generic
+  `editor.complete` event in the picker (only `model.provider.*` events may
+  change the provider group).
 
 ## Vendored TUI integration (parent action)
 

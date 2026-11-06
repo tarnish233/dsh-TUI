@@ -256,6 +256,159 @@ share and whole-log total use the native token buckets; `sessionStats` fields
 are whitelisted non-negative numbers. One attach snapshot per new attachment
 replays the current facts.
 
+## Subagents
+
+DSH owns every subagent fact. `src/backend/subagents.ts` is a read-only bridge
+over the public projections `subagentCatalog` (parent-owned membership),
+`subagent` (child descriptor identity/mode/label), `subagentTiming` and
+`tokenUsage`, plus the optional `modelSelection` route fold. It does not create,
+resume, prompt, interrupt, drain or persist a child Agent; `subagent-session`
+and every tree refresh use `sessionQuery.observeSession`, a live-preferred cold
+observation that materializes no Agent. The two control commands below are the
+only mutation path, and they call the public `ctx.subagents` primitives
+`prompt`/`interrupt` directly: no scheduler, persistence layer or second Agent
+is introduced.
+
+Membership is the recursive pre-order walk of reachable parent catalogs. Fork-
+inherited catalog facts stay excluded because the native projection already
+filters them by `inheritedEventCount`; the bridge additionally keeps only the
+root's own-suffix `subagent/catalog` event seq for transcript anchoring
+(`catalogSeq`). Each local child's immutable header is checked against the
+catalog parent (`parentSession`, and `origin` when present); a conflicting row
+is omitted and the snapshot is marked `truncated`. External rows are leaves and
+are never observed or traversed. Bounds: 200 entries, depth 8, one 5 s read per
+session, bounded header/run/activity caches.
+
+`SessionInfo.subagents` carries the cached snapshot on connect/resume and after
+each root switch; the `ready` payload is the first authoritative copy.
+`BackendEvent` publishes `{type:'subagents', sessionId, value}` (full snapshot)
+when membership, truncation or a structural row field changes, and
+`{type:'subagent', sessionId, value}` (upsert) for value-only changes. Both are
+rooted at the current top-level `sessionId`; only real changes are emitted, and
+nothing is published before `ready`. Entries are re-derived from live native
+state on every read/publish, so an activity label or projection frame never
+serves a stale row.
+
+Status is mapped honestly. A native `subagent/end` stop reason becomes
+`completed|aborted|error|max-tokens|refusal` → `completed|stopped|failed|
+max-tokens|refusal`; a continuable child settles to `idle` with the same
+`lastStopReason`, a one-shot child may stay `completed`, and an unknown
+extensible reason stays `unknown`. A started run reports `running`/`idle` from
+the exact live Agent, `initializing` before it resolves, and `unknown` when the
+Agent disappeared without an end. Durable-only rows use `subagentTiming`:
+`lastTurnCompleted === true` becomes `idle` (continuable) or `completed`; an open
+turn without a live child, or a closed non-normal turn whose reason is not in
+this projection, stays `unknown` — never a fabricated `stopped`. `runId` is
+process-local and absent from cold rows; an end seen before its start or before
+the catalog row is retained and applied once, and repeated continuable
+activations replace the previous run state. `provider`/`model`/
+`reasoningEffort` are the child's native LLM route (live `agent.model.current()`
+or durable `modelSelection`), not the `ctx.subagents` backend name; `local`
+distinguishes session-backed children from external leaves.
+
+Token totals sum the four disjoint native `tokenUsage` buckets; timing is the
+projection's per-child-session totals (`settledMs`, `activeSince`,
+`activeThrough`, `lastTurnCompleted`). The bridge fabricates no per-run metric,
+per-run token count, tool count or duration, and never forwards a child stream to
+the main transcript.
+
+`lastActivity` is one bounded label per child (64 chars, control/ANSI stripped)
+derived only from selected native facts: `subagent/start`, live Agent status,
+and child `tool/call`, `assistant/message`, `user/message`, `turn/*`,
+`compaction/end`, `approval/asked` or an agent error. It is not a transcript and
+is absent for cold children.
+
+`command('subagent-session', {sessionId})` validates that the id is a child in
+the current root tree (catalog row or native header-lineage proof) and then
+returns a `SessionInfo` for that child: the cold-safe durable event log (same
+8000-event/4 MiB bound, `truncated`/`totalEvents`, `snapshotUnavailable` on a
+failed read), the child's own nested `subagents` snapshot with its direct-child
+`catalogSeq` anchored from that log, and the native route. The events are the
+unmodified DSH payloads, so the installed `transcriptCodec` assembles them
+exactly like a root snapshot. This command never calls `agents.create/resume`;
+the root id, a non-child, an out-of-tree id and an external leaf (which has no
+local Session) are rejected as `INVALID_ARGUMENT`.
+
+`command('subagent-follow', {sessionId, follow})` proves tree membership and
+returns `{sessionId, follow}`. Only followed children emit their own
+`session_event`, `stream_start/chunk/end` and `status`, always under their own
+`sessionId`, so the App can attach a separate store without mixing parent and
+child data; root events are unchanged and unfollowed children emit nothing.
+Follow state is process-local and clears on root switch and `close()`. Events
+after the follow acknowledgement are gap-free; the App still buffers between
+that acknowledgement and its snapshot reset.
+
+`command('subagent-interrupt', {sessionId})` proves current-root tree membership
+with the same catalog/lineage proof and then calls the core public primitive
+`ctx.subagents.interrupt(childSessionId, {kind:'user', parentSessionId})`, where
+`parentSessionId` is the child's *exact durable direct parent* from membership —
+for a nested child that is its own parent session, never the root. Both one-shot
+and continuable children use this path; `interruptByParent` is deliberately not
+used because it only addresses continuable children and cannot stop a one-shot
+run. The root id, an empty id and an out-of-tree id are rejected as
+`INVALID_ARGUMENT` before any native call; external leaves are forwarded with
+their catalog parent and the native authority decides. Success returns
+`{sessionId, parentSessionId, accepted:true}`: this is cancel-signal admission,
+which may be a native no-op (target absent/idle/already complete) and does not
+mean the target is quiescent. The adapter never cancels the root, drains or
+disposes the child, advances a run state or publishes `stopped`; only the
+native `subagent/end`/Agent facts change a row afterwards.
+
+`command('subagent-prompt', {sessionId, delivery?, text?, content?, requestId?})`
+requires membership with `mode === 'continuable'` and `local === true`, then
+calls `ctx.subagents.prompt({requestId, parentSessionId, childSessionId,
+mode:'continuable', delivery, content}, signal)` under the same exact direct
+parent address. `delivery` defaults to `queue` (`steer` targets the nearest
+step); exactly one of `text`/`content` is required — `text` becomes one text
+part, `content` is validated by the same `normalizePromptContent` used by
+`sendContent` (native text/image parts, canonical base64, no local attachment
+or model-vision rule). An absent `requestId` is one fresh `randomUUID()` per
+command invocation and a supplied one is used verbatim and must be non-empty;
+the identity is never retried automatically. Success returns the native
+`{messageId}` plus `{sessionId, parentSessionId, delivery, requestId}` and
+proves inbox acceptance only: later execution is DSH-owned and no optimistic
+transcript, status or queue row is written. Root, out-of-tree, one-shot,
+external and read-only (lineage-only `unknown` mode) children are rejected as
+`INVALID_ARGUMENT` before the native call.
+
+The prompt call owns its `AbortController` until inbox acceptance and is
+registered in the existing active-command table, so `close()` (and a root
+`cancel()`) abort the carrier signal and surface `ABORTED` instead of leaving a
+pending native call; `/reload` still refuses while a command is active. The
+adapter never passes an undefined signal. A native refusal is reported as
+`RUNTIME_REQUEST_FAILED` with the redacted native diagnostic; a receipt without
+a non-empty `messageId` is a failure, never a fabricated success.
+
+Child `approval/request` and `user-questions/request` waterfalls are answered
+only for a child proven in the current tree (catalog row, or a bounded native
+header lineage chain to the root). The `decision` event stays rooted at the
+root `sessionId` and carries `DecisionRequest.origin`
+`{rootSessionId, childSessionId, parentSessionId, label?, untracked?}`;
+`untracked` marks lineage-proven membership whose catalog row is not loaded yet.
+Answers settle the exact adapter request id and keep the native return
+semantics; responses are never auto-answered locally. Out-of-tree requests call
+`next()` (fail closed), and a root decision payload is unchanged.
+
+Capability detection stays live: `subagents`, `subagent-session` and
+`subagent-follow` appear only while `sessionQuery.observeSession` and the
+catalog projection are readable; `subagent-interrupt` additionally requires an
+exact `ctx.subagents.interrupt` function and `subagent-prompt` an exact
+`ctx.subagents.prompt` function, so a partial or older composition never
+advertises a mutation it cannot perform. If the native service appears only
+after the initial pending/root announcement, `subagent/start`/`subagent/end`
+trigger one coalesced refresh: changed control capabilities are re-announced on
+the **same session and attachment**, without a durable snapshot, Editor reset or
+transcript replay; unchanged capabilities do not re-announce. No new Cordis
+`inject` entries are required — `subagents`, `sessionQuery`,
+`sessionProjections`, `tools` and `agents.get` are resolved optionally through
+`ctx.get`, so a composition without the subagent plugin still loads. Listeners,
+timers, run state, cached rows,
+follow state and any in-flight prompt carrier are disposed/cleared on `close()`;
+`/reload` invalidates the cached tree, re-resolves services after reconciliation
+and re-announces the refreshed snapshot so later child changes are published
+again. Reads require `sessionQuery.observeSession` (DSH 0.2.2's concrete engine
+exposes it); without it the snapshot is omitted rather than faked empty.
+
 ## Images
 
 `readImage(ref, signal)` is read-only and session-independent: no Agent is
