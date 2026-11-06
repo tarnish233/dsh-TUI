@@ -66,7 +66,7 @@ white background so both colors stay exact.
 `src/ui/welcome.ts` keeps our identity:
 
 - `DeepSeek Harness`
-- `DSH TUI · v0.2.0` (rendered in the 品牌蓝; the version is read from the
+- `DSH TUI · v0.1.1` (rendered in the 品牌蓝; the version is read from the
   shared `src/version.ts` `VERSION`, so the welcome tagline never carries an
   independent version literal)
 - explicit `DEMO / NO MODEL CALLS` for the offline demo

@@ -1,9 +1,10 @@
 # 版本记录
 
-## v0.2.0
+## v0.1.1
 
-按用户要求，将原生 DSH 插件化与本轮修复作为 **v0.2.0 本地版本标记**。包仍为 `private:true`，未 commit、tag、push 或公开发布；未修改真实 profile、凭据或全局安装。
+按用户明确确认，将当前原生 DSH 插件化与累计修复发布为 **v0.1.1**，版本号从此前的 v0.2.0 回退。包仍为 `private:true`；本次创建 release commit，推送 GitHub `main` 与 `v0.1.1` tag，不发布 registry。未修改真实 profile、凭据或全局安装。
 
+- 修复 `/compact` 丢弃最近一次实际路由 reasoning effort、导致要求 thinking 的模型立即 400 的问题。仅在摘要目标与该路由完全相同时继承 effort，不改普通回合、摘要消息/工具或输出预算，也不把 effort 套到不同模型。失败时按 session/command 关联 `compaction/end.error`，在原生通用提示下一行显示脱敏、限长的真实原因。完整检查 **1033/1033**，两种 renderer 的真实 DSH＋hermetic provider compaction 验收通过；未擅自对真实会话执行压缩。
 - 修复聊天过程中原生模型目录日志覆盖编辑框：同进程 JS stdout/stderr 诊断进入独立的脱敏、有限日志，Pi renderer/protocol 使用专用原始输出 writer；目录成功刷新不进输入/对话，警告限流去重，致命错误在恢复终端后仍可见。生命周期覆盖退出、挂起恢复、HMR 和失败，不删除 provider/凭据或复制刷新逻辑；直接 fd/native/子进程写入不冒充已隔离。
 - 诊断修复后完整检查 **993/993**，新增 **6 个原生日志/生命周期 PTY 场景**与编译归档日志隔离通过；私有日志权限、分片 UTF-8/凭据脱敏、超长行丢弃、重复 lease、存储失败和多行 fatal 均有专项回归。
 - 应用 package、唯一 bin、Cordis row/effect/service、环境变量、源码/fixture/脚本/文档统一为 `dsh-tui`；Pi TUI 的上游身份、许可与 `#pi-tui` seam 不改。
@@ -48,9 +49,9 @@
 - 临时 Rex 测试页已清理，原工作会话及 server window 焦点恢复；未修改用户配置/凭据、全局安装或既有本地链接，无 commit/tag/push/publish，包版本仍 `0.1.1`。
 - 新增本地显示 codec 依赖 `sharp@0.35.5`（Apache-2.0），许可见第三方声明；详情见 [图片说明](docs/IMAGES.md)。
 
-## v0.1.1
+## 历史：v0.1.1（Tools 展示阶段）
 
-按用户选择，仅更新本地版本标记。包、CLI 与启动页统一为 `0.1.1` / `v0.1.1`；未提交、未打 Git 标签、未推送或公开发布，包仍为 private。此版本收录 Tools 展示升级。
+这是此前同名的本地开发标记，不是本次 GitHub release tag。按当时用户选择，仅更新本地版本标记。包、CLI 与启动页统一为 `0.1.1` / `v0.1.1`；该阶段未提交、未打 Git 标签、未推送或公开发布，包仍为 private。此阶段收录 Tools 展示升级。
 
 - 新增连续工具分组、独立 Input/Output 预览、原生 Diff 布局与只读工具 Inspector。
 - `/settings` 增加 Tools tab；保留一个设置/快捷键文件，不增加业务 mode。

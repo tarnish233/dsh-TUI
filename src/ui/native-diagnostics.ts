@@ -96,11 +96,8 @@ const LIMIT_NOTICE = 'Further native diagnostics are suppressed for now; recent 
 /** Strip terminal/layout bytes and collapse to one bounded display-width line. */
 function previewOf(value: unknown, columns: number): string {
   if (typeof value !== 'string') return ''
-  const text = sanitize(value)
-    // C1 controls are not printable text and `sanitize` only covers C0/DEL.
-    .replace(/[\u0080-\u009f]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
+  // `sanitize` already removes terminal sequences and C0/C1 control bytes.
+  const text = sanitize(value).replace(/\s+/g, ' ').trim()
   if (text === '') return ''
   if (visibleWidth(text) <= columns) return text
   // Pi's width truncation keeps styling bookkeeping (reset sequences) for the

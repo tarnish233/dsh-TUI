@@ -1,8 +1,8 @@
-# DSH TUI · v0.2.0
+# DSH TUI · v0.1.1
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前本地版本标记为 **v0.2.0**（`private: true`），收录原生 DSH 插件化与独立批量验收发现的问题修复；没有 commit、Git tag、push 或公开发布。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
+当前发布版本为 **v0.1.1**（`private: true`），收录原生 DSH 插件化、运行诊断隔离与 compaction 修复。用户明确确认版本号从 v0.2.0 回退为 v0.1.1；本次 release commit 推送到 GitHub `main` 并标记 `v0.1.1`，不发布 registry。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
 
 ## 安装与启动（当前本机边界）
 
@@ -101,6 +101,8 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 ## 命令与设置
 
 `/help`、`/settings`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
+
+- **`/compact`**：摘要目标仍是最近一次实际路由时，原生插件接缝继承该请求的显式 reasoning effort；不同摘要模型不串用 effort，没有历史 effort 时保留 DSH 默认。消息、工具和输出预算不变。若压缩失败，界面在原生提示的下一行显示按 command/session 关联、脱敏且限长的 `Native cause`，不再只剩笼统错误。
 
 - **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
 - **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。

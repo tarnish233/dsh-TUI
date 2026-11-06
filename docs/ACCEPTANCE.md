@@ -1,6 +1,15 @@
-# v0.2.0 原生 DSH 边界与交互语义验收
+# v0.1.1 原生 DSH 边界与交互语义验收
 
-## 当前：v0.2.0 原生运行诊断隔离修复
+## 当前：v0.1.1 原生 compaction reasoning 修复
+
+- **完整 `pnpm check`：1033 tests / 1033 pass / 0 fail**，0 skip/cancel/todo，vendor/src 构建、strict TypeScript 与 **93 个测试文件**通过，测试约 **188 秒**。证据为 `.cache/compaction-fix/full-check.log`；版本号调整为 v0.1.1 后对发布源码再次完整执行仍为 **1033/1033**，见 `.cache/compaction-fix/release-v0.1.1-check.log`。
+- **真实失败原因已核验**：用户指定当前目录最新会话后，只提取 compaction 生命周期和安全路由字段。两次 `compaction/start → compaction/end` 分别为 1698/1605ms，均为 provider `400 InvalidParameter: enable_thinking restricted to True`，没有 `compaction/summary`；正常最近路由为 `cloudagent/glm-5.3`、`reasoningEffort:max`。未读取对话正文或凭据。
+- **修复仍在原生接缝**：`src/plugin/compaction.ts` 通过公开 `llm/stream` waterfall，仅对 `purpose:compaction` 且 provider/model 与最新 durable request header 完全相同的请求继承其 effort。不同摘要目标、已有显式 effort、无历史 effort 与普通回合保持原语义；不重写压缩算法、不改全局 DSH、不硬编码模型，消息/tools/toolHistory/maxTokens/sessionId/signal 保留。
+- **真实 DSH＋假 provider 两模式通过**：`test/acceptance-compaction.test.ts` 在 inline/fullscreen 先完成正常回合，再执行 `/compact`。fixture 对缺失 `high` effort 的摘要请求抛出同一 400；修复后 provider 仅调用一次、native `maxTokens:65536` 不变、成功显示 Compacted 并写入 `compaction/summary`，无失败 end。backend seam/diagnostic 23 项与 UI notice 10 项同步通过。
+- **错误不再只剩笼统提示**：backend 以 session＋sourceCommandId 关联实时 `compaction/end.error`，保留原生 generic 并在下一行追加 `Native cause`；32 项/单项存储有界，展示 400 字符，凭据脱敏并清理 ANSI/OSC/C0/C1。成功、其他命令与无 cause 的结果不变。UI 仍只有一个 notice 平面，宽窄/两模式换行与控制字节回归通过。
+- **范围**：本轮工程与原生集成验收不发起真实模型请求，也未擅自压缩或改写用户现有会话。真实 `cloudagent/glm-5.3` 仍需用户重启加载新代码后通过显式 `/resume` 验收；不把 hermetic 成功冒充真实 provider/缓存命中率证明。用户明确确认版本号回退为 **0.1.1/private**，发布范围为 GitHub `main` 与 `v0.1.1` tag，不发布 registry。
+
+## 此前：v0.2.0 原生运行诊断隔离修复
 
 - **完整 `pnpm check`：993 tests / 993 pass / 0 fail**，0 skip/cancel/todo，vendor/src 构建、strict TypeScript 和 **89 个测试文件**均通过，测试约 **184 秒**。HOME/DSH_HOME 隔离，TMPDIR 为仓库外的临时目录，避免临时测试 workspace 意外继承本仓库 Git 状态。
 - **日志与终端 writer 分离**：前端 attachment 生命周期内捕获原生同进程 JS stdout/stderr/console 写入，Pi renderer 和键盘/光标/图像/标题/progress 协议走原始 writer。DSH 的目录刷新/provider/凭据/Agent 逻辑未改，正常 listing 成功既不进入编辑草稿也不进入 transcript。未知 stdout 留日志；真正警告/失败走既有 notice（每窗口预算、有限去重），fatal 不当作 notice。

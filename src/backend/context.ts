@@ -255,6 +255,14 @@ const COMMAND_DRAIN_TIMEOUT_MS = 15_000
 const CANCEL_SETTLE_TIMEOUT_MS = 2_000
 const RELOAD_TIMEOUT_MS = 120_000
 const MAX_TITLE_IDS = 100
+/** Bounded correlation entries for failed native compaction attempts. */
+const MAX_COMPACTION_CAUSES = 32
+/** Bound on one retained native cause so a provider dump cannot grow state. */
+const MAX_COMPACTION_CAUSE_CHARS = 4_096
+/** Bound on the appended native-cause detail so one notice stays readable. */
+const MAX_NATIVE_CAUSE_CHARS = 400
+/** The only human command whose generic failure text is enriched. */
+const COMPACT_COMMAND = 'compact'
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -626,6 +634,7 @@ export class DshContextBackend implements Backend {
   private readonly planStates = new Map<string, PlanSnapshot>()
   private readonly metricsStates = new Map<string, { usage?: UsageSnapshot; stats?: StatsSnapshot }>()
   private readonly titleBaselines = new Map<string, boolean>()
+  private readonly compactionCauses = new Map<string, string>()
   private bound = false
   private native: DshNativeHelpers | undefined
   private live: LiveAgent | undefined
@@ -738,6 +747,7 @@ export class DshContextBackend implements Backend {
     })
     keep('session/event', (session, event) => {
       if (this.live === undefined || session !== this.live.agent.session) return
+      this.rememberCompactionCause(event)
       const wire = sessionEventWire(event, this.toolPresenter?.of(event as SessionEvent))
       this.emit({ type: 'session_event', sessionId: this.live.agent.session.id, event: wire })
     })
@@ -1887,11 +1897,76 @@ export class DshContextBackend implements Backend {
         const commandName = line.trimStart().slice(1).split(/\s/, 1)[0]
         throw codedError('UNSUPPORTED_COMMAND', `unknown or malformed command: /${commandName}`)
       }
-      return jsonSafe({ commandId: execution.commandId, result: execution.result })
+      return jsonSafe({ commandId: execution.commandId, result: this.commandResult(line, execution, live.agent.session.id) })
     } finally {
       this.activeCommands.delete(requestId)
       settle()
     }
+  }
+
+  /**
+   * Remember one failed native compaction attempt's own error text, keyed by
+   * the human command that started it.
+   *
+   * `compaction/end` is appended synchronously inside the native compaction
+   * transaction — before the `/compact` handler settles — and `session/event`
+   * dispatch is synchronous post-commit, so the correlation entry is already
+   * present when the command execution result arrives. Only the live session's
+   * own events are considered, never durable session files.
+   *
+   * @param event - a native session event exactly as appended.
+   */
+  private rememberCompactionCause(event: unknown): void {
+    const item = record(event)
+    if (item?.type !== 'compaction/end') return
+    const data = record(item.data)
+    const commandId = typeof data?.sourceCommandId === 'string' && data.sourceCommandId.length > 0
+      ? data.sourceCommandId
+      : undefined
+    const error = typeof data?.error === 'string' ? data.error.trim() : ''
+    if (commandId === undefined || error.length === 0) return
+    if (this.live === undefined) return
+    const key = compactionCauseKey(this.live.agent.session.id, commandId)
+    this.compactionCauses.delete(key)
+    this.compactionCauses.set(key, error.length > MAX_COMPACTION_CAUSE_CHARS
+      ? error.slice(0, MAX_COMPACTION_CAUSE_CHARS)
+      : error)
+    while (this.compactionCauses.size > MAX_COMPACTION_CAUSES) {
+      const oldest = this.compactionCauses.keys().next()
+      if (oldest.done === true) break
+      this.compactionCauses.delete(oldest.value)
+    }
+  }
+
+  /**
+   * Attach one observed native cause to a failed `/compact` result.
+   *
+   * The generic text native `dsh-command-compact` renders is preserved
+   * verbatim; a bounded, single-line, credential-redacted `Native cause:`
+   * detail is appended only for an error result of the exact `/compact`
+   * command whose `commandId` correlates with a `compaction/end` error. A
+   * successful result, another command, or a command with no observed cause is
+   * returned untouched, so the native generic fallback survives.
+   *
+   * @param line - the exact slash command line that was dispatched.
+   * @param execution - the native `CommandExecution` record.
+   * @param sessionId - the session that owned this command execution.
+   * @returns the native result, enriched only when a cause was observed.
+   */
+  private commandResult(line: string, execution: Record<string, unknown>, sessionId: string): unknown {
+    const result = record(execution.result)
+    const commandId = typeof execution.commandId === 'string' && execution.commandId.length > 0
+      ? execution.commandId
+      : undefined
+    if (commandId === undefined) return execution.result
+    const name = line.trimStart().slice(1).split(/\s/, 1)[0]
+    if (name !== COMPACT_COMMAND) return execution.result
+    const key = compactionCauseKey(sessionId, commandId)
+    const cause = this.compactionCauses.get(key)
+    this.compactionCauses.delete(key)
+    if (result?.kind !== 'error' || typeof result.text !== 'string') return execution.result
+    const detail = cause === undefined ? undefined : oneLineDiagnostic(cause)
+    return detail === undefined ? execution.result : { ...result, text: `${result.text}\nNative cause: ${detail}` }
   }
 
   private abortActiveCommands(reason: string, sessionId?: string): number {
@@ -2781,6 +2856,7 @@ export class DshContextBackend implements Backend {
       if (!controller.signal.aborted) controller.abort()
     }
     this.activeImageReads.clear()
+    this.compactionCauses.clear()
     await this.switching
     this.pending = undefined
     const current = this.live
@@ -2799,6 +2875,37 @@ export class DshContextBackend implements Backend {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/** Prevent a reused command id from correlating across native sessions. */
+function compactionCauseKey(sessionId: string, commandId: string): string {
+  return `${sessionId}\0${commandId}`
+}
+
+/**
+ * Normalize native free-form failure text into one bounded display line.
+ *
+ * Credentials are redacted through {@link redactDiagnostic}; terminal escapes
+ * and C0/C1 controls are then removed, whitespace is collapsed and the result
+ * is capped.
+ *
+ * @param text - native `compaction/end` error text.
+ * @returns a safe single-line detail, or undefined when nothing survives.
+ */
+function oneLineDiagnostic(text: string): string | undefined {
+  const stripped = redactDiagnostic(text)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b[P^_][\s\S]*?\u001b\\/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u009b[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b[@-_]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (stripped.length === 0) return undefined
+  return stripped.length > MAX_NATIVE_CAUSE_CHARS
+    ? `${stripped.slice(0, MAX_NATIVE_CAUSE_CHARS - 3)}...`
+    : stripped
+}
 
 function normalizePromptContent(value: readonly PromptContentPart[]): PromptContentPart[] {
   if (!Array.isArray(value) || value.length === 0) {

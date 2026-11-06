@@ -66,6 +66,27 @@ preset or web frontend is substituted. `test/backend-presets.test.ts` proves the
 contract against a temporary local installation (exported preset assets plus one
 fake plugin class), so an accidental peer/root resolution fails the test.
 
+### Compaction reasoning and failure detail
+
+`src/plugin/compaction.ts` is a narrow listener on DSH's public `llm/stream`
+waterfall, owned by the frontend plugin fiber. It does not replace the
+compaction engine. For `purpose: 'compaction'` only, when no effort is already
+present and the request target exactly matches the session's latest durable
+`request/header`, it re-enters the public LLM stream with that header's
+`reasoningEffort` added. The adapter still runs once. A different configured
+summarization target, a missing effort and every non-compaction purpose keep
+the native request unchanged; messages, tools, tool history, output budget,
+session id and cancellation are preserved. Listener disposal follows the same
+HMR lifecycle as the TUI plugin.
+
+For a failed native `/compact`, the adapter correlates the synchronous live
+`compaction/end.data.error` by both session id and `sourceCommandId`. It keeps
+the native generic result and appends `\\nNative cause: …`, with credential
+redaction, ANSI/C0/C1 cleanup, whitespace collapsing and a 400-character cap.
+At most 32 causes of 4096 characters are retained, entries are consumed once,
+and all are cleared on close. Successes, other commands and results without an
+observed cause remain byte-identical; no durable session file is read.
+
 ## Interface
 
 ```ts

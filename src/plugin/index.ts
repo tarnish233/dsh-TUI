@@ -6,6 +6,7 @@ import type { DshHostContext } from '../backend/context.ts'
 import type { TerminalDiagnosticRecord, TerminalOutputLease } from '../backend/terminal-output.ts'
 import type { NativeDiagnosticProjection } from '../ui/native-diagnostics.ts'
 import { redactDiagnostic } from '../backend/errors.ts'
+import { installCompactionReasoningEffort } from './compaction.ts'
 import { STARTUP_SERVICE, type TuiOptions } from './options.ts'
 import type { TuiStartup } from './startup.ts'
 
@@ -55,6 +56,7 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error('Launch dsh-tui through a native DSH profile with the startup plugin mounted')
   }
   const options: TuiOptions = { ...config, ...startup.options }
+  installCompactionReasoningEffort(ctx, { warn: message => ctx.logger.warn(message) })
   if (startup.options.resumePicker) delete options.resume
   else if (startup.options.resume !== undefined) options.resumePicker = false
   let disposed = false

@@ -31,13 +31,13 @@ export interface NativeScene {
 export async function runNativeScene(
   scenario: (scene: NativeScene, params: JsonRecord) => Promise<void>,
   params: JsonRecord = {},
-  options: { screen?: 'inline' | 'fullscreen'; extraPatch?: readonly JsonRecord[]; timeout?: number } = {},
+  options: { screen?: 'inline' | 'fullscreen'; extraPatch?: readonly JsonRecord[]; streamFixture?: string; timeout?: number } = {},
 ): Promise<void> {
   const fixture = await nativeProfileFixture()
   const resultPath = join(fixture.directory, 'result.json')
   const scenarioPath = join(fixture.cwd, 'scenario.mjs')
   const runnerPath = join(fixture.cwd, 'runner.mjs')
-  const mock = new URL('../fixtures/mock-stream.mjs', import.meta.url).href
+  const mock = options.streamFixture ?? new URL('../fixtures/mock-stream.mjs', import.meta.url).href
   const library = (path: string) => new URL('../../lib/' + path, import.meta.url).href
   const terminalModule = new URL('./terminal.ts', import.meta.url).href
   try {
@@ -48,6 +48,7 @@ import { writeFileSync } from 'node:fs';
 import { App } from ${JSON.stringify(library('app.js'))};
 import { createDshBackend } from ${JSON.stringify(library('backend/context.js'))};
 import { mountNativePresets } from ${JSON.stringify(library('plugin/presets.js'))};
+import { installCompactionReasoningEffort } from ${JSON.stringify(library('plugin/compaction.js'))};
 import { VirtualTerminal, until, delay } from ${JSON.stringify(terminalModule)};
 import { run } from ${JSON.stringify(pathToFileURL(scenarioPath).href)};
 export const name = 'parent-native-scene';
@@ -56,6 +57,7 @@ export function apply(ctx) {
  let app, terminal;
  ctx.effect(() => async () => {app?.restoreTerminal(); await app?.shutdown(); terminal?.dispose()}, 'native-scene.cleanup');
  ctx.effect(() => ctx.appReady.onReady(() => { void (async () => {
+  installCompactionReasoningEffort(ctx,{warn:message=>ctx.logger.warn(message)});
   await mountNativePresets(ctx);
   const events=[];
   const backend=createDshBackend(ctx,{cwd:${JSON.stringify(fixture.cwd)},provider:'deepseek-official',model:'deepseek-v4-flash'});

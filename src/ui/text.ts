@@ -57,7 +57,14 @@ export function tildePath(path: string): string {
   return path.startsWith(`${home}/`) ? `~/${path.slice(home.length + 1)}` : path
 }
 
-/** Strip ANSI/OSC sequences and control characters from tool output. */
+/**
+ * Strip ANSI/OSC sequences and control characters from untrusted display text.
+ *
+ * The C1 block (U+0080–U+009F) is stripped together with the C0/DEL bytes: an
+ * 8-bit CSI/OSC/DCS written as a code point is still a control byte, not
+ * printable text, and native provider/error bodies reach the notice plane
+ * unclassified. Only the renderer may move the cursor.
+ */
 export function sanitize(text: string): string {
   return text
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
@@ -66,5 +73,5 @@ export function sanitize(text: string): string {
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .replace(/\t/g, '    ')
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
 }
