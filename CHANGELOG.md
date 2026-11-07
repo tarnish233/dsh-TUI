@@ -1,5 +1,24 @@
 # 版本记录
 
+## v0.1.3
+
+按用户明确确认，将已验收的 Subagent 进度、消息分组、名字导航及启动／退场修复发布为 **v0.1.3**。范围为本地 release commit、GitHub `main` 与 annotated `v0.1.3` tag；保持 `private:true`，不发布 registry、不修改全局安装或真实配置／凭据／会话。**退出卡住仍是已知未解决问题**，下面的原生退出测试与故障类型调查不等于已修复用户现场。
+
+- 进度区的 native running／initializing 图标改为 Working 同款 `· / ✻ / ✶ / ✳`，复用 App 原来的 100ms 动画时钟；根会话 ready 时仍转，不改变 root busy／badge、退出确认、native token／time 或模型／工具调度。两行摘要＋活动不变，结算后收起并停止空闲动画。
+- 连续 catalog 状态／subagent-settled／agent-message 记录按 Tools 风格分组，复用 `groupTools`、Ctrl+O 和共享临时 disclosure；原生 facts／seq／sender／text 不改、不跨真实 user／assistant／tool／notice 等边界。组标题展开，正文纯选择／复制，不作为折叠或导航区域。
+- 把名字-only 链接覆盖到原始 transcript 状态行和两类 durable 消息，不再整行进入 child：仅可见的原生名字为品牌蓝／加粗／下划线，未知 sender 普通 id 不伪造可打开状态。统一最终 clip／Unicode 宽度几何；motion／drag 不抢选择，outside press／消失再出现不能串成旧导航，hover 后首次复制保留。
+- 发布前 UI 功能验收 `pnpm check` **1291/1291**（104 files）；新增实际 VT records **15/15**、progress／动画 **25/25**，UI 两类 Subagent 专项 **127/127**。离线 Subagent CLI/PTY **10/10**，含名字消息两类各 5 个非名字位置、同款动态帧、退场、复制、草稿和恢复；完整检查另包含原生 live-child 退出 **6 个场景**。编译归档 **300 entries** 的新 Group／Link／Spinner 模块导入与静态 smoke 通过；没有真实 provider 请求。证据 `.cache/subagent-ui-followup/`。
+- 退出问题仅完成调查，未擅改原生退出策略：常规 live-child 原生退出和 native 5s 保底都正常，隔离故障注入证明 App 退出 promise 可能被后续清理挂住，导致尚未请求 native appExit。用户现场具体触发未确证；原生生命周期仍归 DSH，不添加 child drain／私有 supervisor／process.exit。
+
+- 修复首次名字点击要等原生 follow／snapshot 读取完成才出现界面的问题：立即打开现有只读子会话的 `Loading child session…`，再用原生快照和有界实时缓冲更新同一个 view。`initializing` 本来就可打开，不增加 Agent 状态门槛、占位 SessionInfo 或第二 Editor。
+- 加载时 Esc 只关闭子视图，不取消根会话、不丢草稿／图片；关闭、移除、替换 attachment 后的迟到读取不复活界面，同 id 再打开不会被旧请求 unfollow。
+- 编辑框上方进度仅显示 native `running`／`initializing`，保持原有两行摘要＋活动设计。idle／completed／failed／stopped 等结算项立即退场；全部结算则隐藏整个 widget，header／overflow 只统计已知活动项。原生目录与 transcript 事实不删除，continuable 再激活时自然重新出现；显式 idle 回复目标仍显示在唯一 Editor 的目的地提示中。
+- 新增根会话 `/agent`，仅导航现有 Agents 目录／历史；键盘入口、只读子 transcript、原生 Reply/Stop 与 child 回复中的 slash 文本语义不变。手动打开的详情不因结算而自动关闭，避免打断结果阅读。
+- 原生 `subagent-follow:true` 对 external／非本地成员 fail closed，与 child-session 读取一致；释放不重查 membership。没有新增调度、模型调用、持久化、轮询或前端替换。
+- 只读参考 `@tintinweb/pi-subagents` 0.23.1：其 aboveEditor widget 按父回合年龄清理、fleet list 使用独立短暂 linger，conversation viewer 不因完成自动关闭。本项目按本次用户要求立即依据 DSH 原生结算退场，不复制 Pi timer／运行时。`pi-cc-extensions` 没有对应 Subagent 进度 widget。
+- 启动／退场阶段父级 `pnpm check` **1253/1253**（102 files），App 接入 **54/54**、原生 DSH＋hermetic stream **4/4**、Subagent CLI/PTY **8/8**、编译归档 **296 entries** 导入／加载／退场／两行再激活 smoke 通过。草稿、图片、迟到 read/ack、同 id 新 owner、原生控制、命中区与终端恢复都有回归；证据 `.cache/subagent-startup-research/`。
+- v0.1.3 发布源码再次完整 `pnpm check` **1291/1291**（104 files、build／strict TypeScript、约 236 秒），Subagent CLI/PTY **10/10**、启动 identity CLI/PTY **6/6**、compiled archive **300 entries** 的版本／welcome／Group／Link／Spinner smoke 通过。应用 package／shared VERSION／CLI／welcome 统一为 **0.1.3/private**；只提交源码、测试、文档与版本 metadata，构建／缓存／运行状态不进 Git。证据 `.cache/release-v0.1.3/`，详见 [验收记录](docs/ACCEPTANCE.md)。
+
 ## v0.1.2
 
 按用户授权，将本轮 Subagent 只读闭环、原生干预、编辑框上方进度与名字限定内部链接发布为 **v0.1.2**。包仍为 `private:true`；发布范围为 release commit、GitHub `main` 与 `v0.1.2` tag，不发布 registry，不修改真实配置／凭据／会话或全局安装。

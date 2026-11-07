@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "A native DeepSeek Harness terminal application plugin, using a vendored Pi TUI.",
   "type": "module",

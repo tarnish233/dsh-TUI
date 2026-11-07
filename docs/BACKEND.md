@@ -330,7 +330,18 @@ the root id, a non-child, an out-of-tree id and an external leaf (which has no
 local Session) are rejected as `INVALID_ARGUMENT`.
 
 `command('subagent-follow', {sessionId, follow})` proves tree membership and
-returns `{sessionId, follow}`. Only followed children emit their own
+returns `{sessionId, follow}`. `follow:true` fails closed for a native external
+(non-local) leaf with `INVALID_ARGUMENT`, exactly like `subagent-session`: such a
+row owns no local Session, so admitting a follow would promise frames that can
+never exist. After normal argument/capability validation, `follow:false` releases
+process-local follow state without rechecking tree membership or localness.
+When membership is already known from the bridge's native catalog, follow does
+not observe the child transcript or wait for a pending `subagent-session` read.
+An unknown id may still require the existing bounded catalog/header-lineage
+refresh to prove membership. A freshly cataloged local child is enterable while
+its status is still `initializing`, even with no resident child Agent; neither
+follow nor the read creates or resumes one.
+Only followed children emit their own
 `session_event`, `stream_start/chunk/end` and `status`, always under their own
 `sessionId`, so the App can attach a separate store without mixing parent and
 child data; root events are unchanged and unfollowed children emit nothing.

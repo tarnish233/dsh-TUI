@@ -1,6 +1,47 @@
-# v0.1.2 原生 DSH 边界与交互语义验收
+# v0.1.3 原生 DSH 边界与交互语义验收
 
-## 当前：v0.1.2 发布验收
+## 当前：v0.1.3 发布验收
+
+用户明确确认按 `0.1.3/private` 提交当前已验收改动，并推送 `main` 与 annotated `v0.1.3` tag；不发布 registry、不改全局安装。版本统一来自 `package.json` 与 `src/version.ts`，功能范围为 Subagent 启动／退场、动态进度、记录分组与名字-only 导航。**用户退出卡住仍未解决**：下面的正向 native 退出场景与 fault probe 只是调查／回归，不是现场修复声明。正式 release 证据集中在 `.cache/release-v0.1.3/`。
+
+- **发布源码完整 `pnpm check`：1291/1291**，104 个测试文件，build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests 236398ms；`full-check.log`。其中的 real DSH 模型流使用 hermetic fixtures，不调用真实 provider。
+- **版本一致性**：package metadata、`src/version.ts`／`lib/version.js`、CLI `--version` 和 welcome 为 `0.1.3`；`private:true`，依赖与 lockfile 不变，vendored Pi 版本不改。
+- **Subagent CLI/PTY 10/10**：record-links、progress、links、retirement、controls × inline/fullscreen。所有 case exit 0／restore，名字-only 两类消息／group 控制、共享 Working 帧／root-ready、退场与 `/agent` 历史、原生形状的 Reply/Stop/follow-up、复制／草稿／resize 都通过；private copy packets 不碰真实 clipboard。`pty-records.log`、`pty-progress.log`、`pty-links.log`、`pty-retirement.log`、`pty-controls.log`。
+- **启动 identity CLI/PTY 6/6**：两模式 × Kitty/none 静态 logo 共 4 case 验证可见 `v0.1.3`、idle／draft／resize／exit 0，另 2 external SIGINT case 验证 exit 130 与终端恢复；没有 GPU 像素或真实模型声明。`pty-identity.log`。native live-child 的 6 个正向退出场景仍在完整测试里通过，不等于用户退出问题已解决。
+- **编译归档 300 entries**：本地 `dsh-tui-0.1.3.tgz` 导入 App/backend/Progress/Group/Link/Child，metadata／CLI／welcome 0.1.3，动态帧／两行活动／退场／facts group／展开／sender name-only click smoke 通过。仅链接现有依赖，不冒充 clean install；`package/entries.txt`、`package/import-smoke.log`。
+- **Git／数据边界**：发布前 main 与本地基线 `fd29693` 一致、v0.1.3 不存在；本次只推 main＋annotated tag、不 force、不替换旧 tag。源码／测试／文档／manifest 进入提交，lib／vendor dist／缓存／运行状态／凭据不进入 Git，不修改真实配置或全局可执行文件、不发布 registry。
+
+## 发布前：Working 动画、Subagent 分组与名字导航（基于 v0.1.2）
+
+本节保留发布前的工作树状态：当时包为 `0.1.2/private`，HEAD／原 `v0.1.2` tag 为 `fd29693`，尚未 commit/push/tag/publish；这些功能现在纳入 v0.1.3。
+
+- **完整 `pnpm check`：1291/1291**，104 个测试文件，build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests 约 238 秒；`.cache/subagent-ui-followup/full-check.log`。版本／welcome／private import seam／原生插件与既有控制回归保留。
+- **动态进度**：Editor Working 与 above-editor native running／initializing 共享原有 App 的 100ms 时钟和 `· / ✻ / ✶ / ✳` 帧；组件只接收 `spinnerFrame`，没有独立 timer／listener。root-ready 时 child 仍转，但不改 root busy、OS progress、退出确认、原生时间／tokens 或模型调度。两行摘要＋活动不变，全结算即退场并停止空闲动画；历史 transcript 不动画。
+- **连续记录分组**：view 层纯 fold 将相邻 catalog 状态行、subagent-settled／agent-message facts 组成 Tools 风格组，保留各记录身份／seq／sender／原文，真实 user／assistant／tool／attempt／notice 等边界终止分组。不创建持久化 group fact，也不查新 catalog/session。共用 `groupTools` 与 Ctrl+O；组标题是 disclosure，展开正文纯选择／复制，绝不作为 child 导航或折叠区域。
+- **名字限定全面覆盖**：progress、原始 transcript child 状态行、两类 durable 消息、折叠／展开 group members 都只有可见名字是品牌蓝＋粗体＋下划线内部链接。sender 显示已有 native catalog label，未知／external 则普通标识不伪造链接；正文、归属标题、glyph、guide、模式／状态／hint 和空白不导航。最终 clip／CJK／ZWJ 列几何正确；motion／drag unclaimed，outside press→label growth/catalog arrival 与 claimed press→消失再出现不能复活导航。没有 OSC8／浏览器 URL。expanded prefix／childWidth／mouse offset 统一 2 columns，不二次过裁正文。
+- **父级 App／独立 VT**：`test/app-subagent-records.test.ts` **15/15**，progress／动画 **25/25**；两类 durable message 的 collapsed／expanded／groupTools=false、真实 underline／bold／CJK 边界、所有非名字点击、原始 catalog 行、header／Ctrl+O、native selection/copy、hover 后 first drag、late catalog 与消失重现、图片草稿、child/store 隔离均覆盖。动画测试无需第二 backend event 即看到帧变化，root stays ready，root 和 child glyph 同帧，全结算不再 repaint，空 root exit confirmation 不被动画拦截。证据 `app-records.log`、`app-records-progress.log`、`app-progress-startup.log`。
+- **frontend 专项 127/127**：Subagents 72、Progress 55，包含纯 grouping boundary／stable facts／shared disclosure、link 生命周期／partial clip／多行 label flatten、prefix 重基准，以及 one-cell spinner fallback／pinning；完整运行还有全部 UI 与 input 旧回归。formatter 只 flatten paint，不改 native text。
+- **离线 CLI/PTY 10/10**：record-links／progress／progress-links／retirement／controls × 两 renderer，全 exit 0／terminal restore。新 record-links case 覆盖两类消息与目录分组，fullscreen 10 个非名字点击不导航、两个实际名字都进入对应子会话，header／Ctrl+O 折叠展开，原草稿返回。progress case 验证 root-ready 的真实动画帧；既有 name-only selection／16 negatives／overflow、Stop→Reply→follow-up／target exit、`/agent` 历史与结算退场回归通过。所有 OSC52 包只在私有 PTY 捕获，不接触真实剪贴板。证据 `pty-record-links.log`、`pty-progress.log`、`pty-links.log`、`pty-retirement.log`、`pty-controls.log`。
+- **真实 native exit 的正向对照 6 场景**：`test/acceptance-subagent-exit.test.ts` 在临时 profile／hermetic stream 里验证 genuinely root-ready＋live continuable child 的 Ctrl+C-confirm、`/exit`、external SIGINT，两 renderer 共 6，全部正常结束／恢复。此测试在完整 check 内；不宣称已复现用户现场不能退出。原本的 parallel／approval／follow／continuation／interrupt native 4/4 也仍通过。
+- **编译归档 300 entries**：App/backend/Progress/Group/Link/Child imports、0.1.2 CLI/private metadata、同款帧／两行活动／退场、原生 facts 分组／展开、compiled sender name-only click smoke 通过；只链接已有本地依赖，不是 clean install、不发布 registry。证据 `package/entries.txt`、`package/import-smoke.log`。
+- **退出调查的边界**：子 agent 排查证明 native root `appExit` 会取消 child，且非协作 task 也受 native launcher 5s 保底；不能因此给 adapter 加 child drain。隔离 fault probe 复现 App 先恢复终端、后续 flush／drain／dispose 令 `app.exited` 永不结算的故障类型，native exit 因未被请求而无法启动。用户具体触发（清理等待／挂起／fiber unload／fatal restore 等）仍未确证；本轮未改变生产退出策略。报告／probes：`.cache/subagent-exit/`、`.cache/exit-hang/`。
+- **范围**：没有真实 provider、profile／凭据／durable-user-session／clipboard 读写、服务器操作、全局安装或 Git 发布；native DSH lifecycle／models／tools／permissions／persistence 仍归宿主，单 Editor、private `#pi-tui` seam、两行布局、显式会话恢复都不变。日志／构建／归档保持 ignored，`git diff --check` 通过。
+
+## 前次工作树：Subagent 启动响应与结算退场（未发布）
+
+包保持 `0.1.2/private`，HEAD 与已发布 `v0.1.2` tag 仍为 `fd29693`；以下是发布后的本地修复，尚未 commit/push/tag/publish，不代表远程 tag 已包含这些改动。
+
+- **原因与改动**：原来的名字点击已经发出 `subagent-follow`／`subagent-session`，但 App 等两次原生读取结束后才打开视图，中间没有加载反馈。新的同一个 `ChildSessionView` 立即显示 `Loading child session…`；之后用原生 snapshot＋最多 1024 帧缓冲更新同一个 store/view，没有占位 SessionInfo、第二 Editor 或新 Agent。backend 的初始 `local:true + initializing` 成员本来就可读，不需要驻留 child Agent，也不增加启动状态门槛。
+- **完成项退场**：进度仅包含 native `running`／`initializing`；结算后立即从主进度区隐藏，全结算则释放整个 widget。header／overflow 仅统计已知活动项，完整目录、durable transcript、continuable 会话和显式回复目的地不删除；idle 回复目的地只显示在 Editor 提示，不把它当正在工作。根会话 `/agent` 仅导航已有 Agents 历史；手动打开的详情不强制关闭。保留摘要＋当前活动两行、名字-only 内部链接和非链接拖选／复制。
+- **完整 `pnpm check`：1253/1253**，102 个测试文件，build＋strict TypeScript 通过，0 fail/skip/cancel/todo，tests 约 216 秒；`.cache/subagent-startup-research/full-check.log`。包括真实 DSH＋hermetic stream 的并行 child／审批／follow／continuation／interrupt **4/4**，没有真实 provider 请求。
+- **父级 App 接入 54/54**：startup 15、progress 21、原有 controls 9、Help 9；`.cache/subagent-startup-research/app-targeted-expanded.log`。覆盖读取前可见加载、初始化无需等 running、加载时 Esc 不取消根回合、图片草稿、实时缓冲、失败可重开、同 id 旧 read／ack 不能 unfollow 新 owner、membership removal／新 attachment 的迟到拒绝，以及完成后的历史与再次激活。
+- **CLI/PTY 8/8**：两 renderer × retirement／名字链接／上方进度／Stop-Reply。新的 retirement 场景证明原生 fixture 停止／继续／idle 结算后进度收起，显式 idle 回复目标不钉住进度，`/agent` 仍能看 durable follow-up，并恢复原草稿。fullscreen 仍验证实际名字点击、16 个非链接位置、hover 后 native drag/copy、header／overflow 字符范围；`subagent-many` 是明确的离线并行活动 fixture，不是生产模式。所有 case exit 0 与终端恢复；copy packet 只在私有 PTY 捕获，图片由 App 回归覆盖。证据：`pty-retirement.log`、`pty-links.log`、`pty-progress.log`、`pty-controls.log`。
+- **原生 follow 加固**：`follow:true` 对 external／非本地成员 fail closed，与 child-session 读取一致；标准参数／能力校验后的释放不重查 membership。backend 专项验证首个 initializing catalog、无 child Agent 的 follow/read、已知 catalog follow 不等待 child transcript observation；没有新 wire／query、tree 并发优化、调度或持久化。
+- **只读 Pi 对照**：`@tintinweb/pi-subagents` 0.23.1 `src/ui/agent-widget.ts` 的完成项按父回合年龄清理（正常 1 回合，错误 2 回合）；4 秒 linger 属于独立 `fleet-list.ts`，手动 `conversation-viewer` 不在完成时关闭。`pi-cc-extensions` 安装版 1.0.15／工作树 1.0.8 没有对应 Subagent widget。本项目按本次要求立即依 DSH 结算退场，不复制 Pi timer/runtime。
+- **编译归档 296 entries**：本地 pack 的 CLI／welcome 仍是 0.1.2；解压后 App/backend/Progress/Agents/Child/actions 导入、initializing 名字链接、加载 shell 无假 SessionInfo、idle/truncated/回复目标退场、重新激活及两行活动 smoke 通过。仅链接已有本地依赖，不是 clean install、不发布 registry。证据：`package/entries.txt`、`package/import-smoke.log`。
+- **范围**：Node 26.13.0／pnpm 12.6.0／macOS，仍是原生 DSH 同进程插件＋单 Editor。工程测试使用临时 home/workspace 与离线 fixture；没有真实模型／vision／GPU／IME 手感新声明，没有真实 profile／credentials／sessions／clipboard 或全局可执行文件改动。`git diff --check` 通过，源码改动未暂存；构建、归档与日志留在 ignored 目录。
+
+## 已发布：v0.1.2 发布验收
 
 按用户授权，本轮完整 Subagent 功能以 `0.1.2/private` 形成 release commit，并推送 GitHub `main` 与 `v0.1.2` tag；不发布 registry、不改装全局程序。版本号统一来自 `package.json` 与 `src/version.ts`，CLI／welcome 使用同一个值。
 

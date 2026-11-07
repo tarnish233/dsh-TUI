@@ -2772,6 +2772,12 @@ export class DshContextBackend implements Backend {
    * `session_event` and stream frames, always under their own session id, so
    * the App can maintain a separate store without mixing parent/child data.
    * Follow state is process-local and clears on root switch and close.
+   *
+   * `follow:true` proves membership exactly like `subagent-session` and then
+   * fails closed for a native external (non-local) leaf: it owns no local
+   * Session, so admitting a follow would forward nothing and promise a child
+   * transcript that cannot exist. `follow:false` stays unconditional teardown
+   * so a released surface can always clear its state.
    */
   private async subagentFollow(params: Record<string, unknown>): Promise<{ sessionId: string; follow: boolean }> {
     const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
@@ -2787,6 +2793,9 @@ export class DshContextBackend implements Backend {
           'INVALID_ARGUMENT',
           `session ${JSON.stringify(sessionId)} is not a child in the current session's native subagent tree`,
         )
+      }
+      if (membership.mode === 'external' || membership.local === false) {
+        throw codedError('INVALID_ARGUMENT', `external subagent ${JSON.stringify(sessionId)} has no local session to follow`)
       }
       this.subagentBridge.follow(sessionId)
     } else {

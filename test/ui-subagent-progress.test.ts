@@ -4,7 +4,7 @@ import './helpers/truecolor.ts'
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { stripTerminalSequences, visibleWidth, type TuiMouseEvent } from '#pi-tui'
-import type { SubagentEntry } from '../src/backend/types.ts'
+import type { SubagentEntry, SubagentStatus } from '../src/backend/types.ts'
 import { SubagentProgress } from '../src/ui/subagent-progress.ts'
 import { loadInputModule } from '../src/input/testing/harness.ts'
 
@@ -113,14 +113,18 @@ function click(progress: SubagentProgress, x: number, y: number): void {
 // ---------------------------------------------------------------------------
 // Layout and visual shape
 
-test('renders nothing at all for an empty catalog: no spacer, no hitbox', () => {
+test('renders nothing at all for an empty or all-settled catalog: no spacer, no hitbox', () => {
   const h = mount()
   assert.deepEqual(h.progress.render(80), [])
   // There is no row to click and no header to open.
   assert.equal(h.progress.handleMouse(mouse('click', 3, 0)), undefined)
   assert.equal(h.agents, 0)
-  // Setting entries and clearing them again returns to a truly empty frame.
+  // A settled-only catalog is history, not current work: no widget either.
   h.progress.entries = [entry({ status: 'idle' })]
+  assert.deepEqual(h.progress.render(80), [])
+  assert.equal(h.agents, 0)
+  // One live child paints the widget; dropping it returns to a truly empty frame.
+  h.progress.entries = [entry()]
   assert.notEqual(h.progress.render(80).length, 0)
   h.progress.entries = []
   assert.deepEqual(h.progress.render(80), [])
@@ -169,35 +173,41 @@ test('no invented Pi metrics: no turns, tool-use count, context percent or cost'
   }
 })
 
-test('native status vocabulary: continuable completion, external leaf, one-shot completion', () => {
+test('active-only: every settled native status retires; initializing stays live', () => {
+  const settled: SubagentStatus[] = [
+    'idle', 'completed', 'failed', 'stopped', 'max-tokens', 'refusal', 'unknown', 'external',
+  ]
+  for (const status of settled) {
+    const h = mount({ maxRows: 10 })
+    h.progress.entries = [entry({ id: 'settled', label: 'Settled', mode: 'continuable', status, lastActivity: 'stale prose' })]
+    assert.deepEqual(plain(h.progress.render(100)), [], `${status} must not paint a progress row`)
+    assert.deepEqual(h.progress.render(100), [], `${status} leaves no invisible hitbox`)
+  }
   const h = mount({ maxRows: 10 })
   h.progress.entries = [
-    entry({ id: 'cont', label: 'Continuable', mode: 'continuable', status: 'completed', timing: { lastTurnCompleted: true } }),
-    entry({ id: 'once', label: 'One shot', mode: 'one-shot', status: 'completed' }),
-    entry({ id: 'ext', label: 'External task', mode: 'external', status: 'external' }),
-    entry({ id: 'fail', label: 'Broken', mode: 'one-shot', status: 'failed', lastActivity: 'stale prose is not live work' }),
+    entry({ id: 'cont', label: 'Continuable', mode: 'continuable', status: 'running' }),
     entry({ id: 'init', label: 'Starting', mode: 'one-shot', status: 'initializing' }),
   ]
-  const lines = plain(h.progress.render(100))
-  assert.deepEqual(lines, [
-    '● Agents · 5 children · Ctrl+X Ctrl+A open',
-    '├─ ⏺ Starting  one-shot · initializing',
-    '├─ ● Continuable  continuable · last run completed · idle',
-    '├─ ● One shot  one-shot · completed',
-    '├─ ◌ External task  external',
-    '└─ ● Broken  one-shot · failed',
+  assert.deepEqual(plain(h.progress.render(100)), [
+    '● Agents · 2 children · Ctrl+X Ctrl+A open',
+    '├─ ⏺ Continuable  continuable · running',
+    '└─ ⏺ Starting  one-shot · initializing',
     '',
   ])
-  // Only a `running` child may show an activity line.
-  assert.ok(!lines.join('\n').includes('stale prose'), 'a settled activity is never presented as live')
 })
 
-test('all settled children dim the heading but keep the ● marker', () => {
+test('an all-settled catalog renders nothing, even when truncated or with a settled reply target', () => {
   const h = mount()
   h.progress.entries = [entry({ label: 'Idle', mode: 'continuable', status: 'idle' })]
-  const lines = h.progress.render(60)
-  assert.deepEqual(plain(lines), ['● Agents · 1 child · Ctrl+X Ctrl+A open', '└─ ◌ Idle  continuable · idle', ''])
-  assert.ok(lines[0]?.includes('\x1b[2m'), 'an idle catalog uses the dim heading tier')
+  h.progress.truncated = true
+  h.progress.replyTargetId = 'child-1'
+  // The main Editor already states the reply destination; progress is live work only.
+  assert.deepEqual(h.progress.render(60), [])
+  assert.equal(h.progress.handleMouse(mouse('click', 3, 0)), undefined)
+  assert.equal(h.agents, 0)
+  h.progress.truncated = false
+  h.progress.replyTargetId = undefined
+  assert.deepEqual(h.progress.render(60), [])
 })
 
 test('native truncated catalog is stated honestly in the header', () => {
@@ -207,6 +217,80 @@ test('native truncated catalog is stated honestly in the header', () => {
   assert.ok(plain(h.progress.render(100))[0]?.includes('incomplete'))
   h.progress.truncated = false
   assert.ok(!plain(h.progress.render(100))[0]?.includes('incomplete'))
+  // A truncated catalog whose known children are all settled still paints nothing.
+  h.progress.entries = [entry({ label: 'A', status: 'completed' })]
+  h.progress.truncated = true
+  assert.deepEqual(h.progress.render(100), [])
+})
+
+// ---------------------------------------------------------------------------
+// Parent-supplied Working spinner frame (presentation-only seam)
+
+test('a parent-supplied spinnerFrame replaces only live rows and keeps the two-line shape', () => {
+  const h = mount({ maxRows: 8 })
+  h.progress.entries = [
+    entry({ id: 'run', label: 'Run', status: 'running', lastActivity: 'reading src/app.ts' }),
+    entry({ id: 'init', label: 'Starting', status: 'initializing' }),
+    entry({ id: 'done', label: 'Done', status: 'completed' }),
+  ]
+  assert.ok(plain(h.progress.render(100))[1]?.includes('⏺ Run'), 'without input the native static glyph remains')
+  h.progress.spinnerFrame = '✻'
+  assert.deepEqual(plain(h.progress.render(100)), [
+    '● Agents · 2 children · Ctrl+X Ctrl+A open',
+    '├─ ✻ Run  one-shot · running',
+    '│    ⎿  reading src/app.ts',
+    '└─ ✻ Starting  one-shot · initializing',
+    '',
+  ])
+  // Every Working frame in the shared sequence is a legal one-cell marker.
+  for (const frame of ['·', '✻', '✶', '✳']) {
+    h.progress.spinnerFrame = frame
+    const lines = plain(h.progress.render(100))
+    assert.ok(lines[1]?.includes(`${frame} Run`), lines.join('\n'))
+    assert.ok(lines[3]?.includes(`${frame} Starting`), lines.join('\n'))
+    assertWidths(h.progress.render(100), 100, `frame ${frame}`)
+  }
+  h.progress.spinnerFrame = undefined
+  assert.ok(plain(h.progress.render(100))[1]?.includes('⏺ Run'), 'removing the input restores the static marker')
+})
+
+test('an invalid or hostile spinnerFrame falls back instead of widening or leaking', () => {
+  const h = mount()
+  h.progress.entries = [entry({ id: 'run', label: '探索 🚀', status: 'running', lastActivity: 'reading' })]
+  const valid = plain(h.progress.render(100))
+  for (const frame of ['', '   ', 'ab', '🚀', '✻✻', '\x1b[31m\x1b[0m', '\x00']) {
+    h.progress.spinnerFrame = frame
+    const lines = plain(h.progress.render(100))
+    assert.deepEqual(lines, valid, `frame ${JSON.stringify(frame)} must degrade to the static marker`)
+    for (const line of lines) assert.ok(!line.includes('\x1b'), 'no control byte reaches the paint')
+  }
+  // A framed glyph with real SGR is sanitized, not leaked, and stays one cell.
+  h.progress.spinnerFrame = '\x1b[35m✻\x1b[0m'
+  const styled = plain(h.progress.render(100))
+  assert.ok(styled[1]?.includes('✻ 探索 🚀'), styled.join('\n'))
+  for (const line of styled) assert.ok(!line.includes('\x1b'), 'hostile SGR is stripped')
+  for (const width of [16, 24, 40, 80]) assertWidths(h.progress.render(width), width, `width ${width}`)
+})
+
+test('a spinner frame change never resets the name-only hitboxes or a claimed press', () => {
+  const h = mouseFixture()
+  const row = plain(h.progress.render(80))[1] ?? ''
+  const name = colOf(row, 'Run')
+  const nameEnd = name + visibleWidth('Run') - 1
+  // Press on the name, then the parent advances its Working frame and repaints.
+  assert.equal(h.progress.handleMouse(mouse('press', name, 1))?.handled, true)
+  h.progress.spinnerFrame = '✳'
+  const painted = plain(h.progress.render(80))
+  assert.ok(painted[1]?.includes('✳ Run'), painted.join('\n'))
+  assert.equal(colOf(painted[1] ?? '', 'Run'), name, 'a one-cell frame keeps every column')
+  h.progress.handleMouse(mouse('click', name, 1))
+  assert.deepEqual(h.opened, ['run'], 'the pinned press still opens the pressed child')
+  // Non-name cells stay unclaimed across frames too.
+  h.progress.spinnerFrame = '✶'
+  const next = plain(h.progress.render(80))[1] ?? ''
+  for (const x of [0, 1, 2, 3, nameEnd + 1, colOf(next, 'one-shot'), colOf(next, 'running')]) {
+    assert.equal(h.progress.handleMouse(mouse('press', x, 1)), undefined, `col ${x} stays sample text`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -218,9 +302,9 @@ test('budget is a hard total including header, rows, overflow and separator', ()
     h.progress.entries = [
       entry({ id: 'run-a', label: 'Run A', status: 'running', lastActivity: 'reading a' }),
       entry({ id: 'run-b', label: 'Run B', status: 'running', lastActivity: 'reading b' }),
+      entry({ id: 'run-c', label: 'Run C', status: 'running' }),
+      entry({ id: 'run-d', label: 'Run D', status: 'initializing' }),
       entry({ id: 'done-a', label: 'Done A', status: 'completed' }),
-      entry({ id: 'done-b', label: 'Done B', status: 'failed' }),
-      entry({ id: 'idle-a', label: 'Idle A', status: 'idle' }),
     ]
     const lines = h.progress.render(80)
     assert.ok(lines.length <= budget, `budget ${budget} produced ${lines.length} lines`)
@@ -241,7 +325,7 @@ test('a dynamic budget getter is re-sampled on every render', () => {
   h.progress.entries = [
     entry({ id: 'a', label: 'A', status: 'running' }),
     entry({ id: 'b', label: 'B', status: 'running' }),
-    entry({ id: 'c', label: 'C', status: 'idle' }),
+    entry({ id: 'c', label: 'C', status: 'initializing' }),
   ]
   assert.ok(h.progress.render(80).length <= 4)
   budget = 8
@@ -252,20 +336,23 @@ test('a dynamic budget getter is re-sampled on every render', () => {
   assert.deepEqual(h.progress.render(80), [])
 })
 
-test('active rows are prioritized and an overflow count replaces unbounded history', () => {
+test('overflow counts only active children; retired history is never folded in', () => {
   const h = mount({ maxRows: 4 })
   h.progress.entries = [
     entry({ id: 'idle-a', label: 'Idle A', status: 'idle' }),
     entry({ id: 'done-a', label: 'Done A', status: 'completed' }),
     entry({ id: 'run-a', label: 'Run A', status: 'running' }),
     entry({ id: 'run-b', label: 'Run B', status: 'running' }),
+    entry({ id: 'run-c', label: 'Run C', status: 'running' }),
+    entry({ id: 'run-d', label: 'Run D', status: 'initializing' }),
   ]
-  // Two live rows outrank the settled history, which is summarized by status.
+  // Only the four live children exist for this bounded live list, and the two
+  // settled rows are history: neither a row nor a line in `+N more`.
   assert.deepEqual(plain(h.progress.render(80)), [
     '● Agents · 4 children · Ctrl+X Ctrl+A open',
     '├─ ⏺ Run A  one-shot · running',
     '├─ ⏺ Run B  one-shot · running',
-    '└─ +2 more (1 idle, 1 completed)',
+    '└─ +2 more (1 running, 1 initializing)',
   ])
 })
 
@@ -273,13 +360,13 @@ test('a tight budget keeps the running row and the count, not the activity line'
   const h = mount({ maxRows: 3 })
   h.progress.entries = [
     entry({ id: 'run', label: 'Run', status: 'running', lastActivity: 'reading src/app.ts' }),
-    entry({ id: 'other', label: 'Other', status: 'idle' }),
-    entry({ id: 'third', label: 'Third', status: 'completed' }),
+    entry({ id: 'other', label: 'Other', status: 'running' }),
+    entry({ id: 'third', label: 'Third', status: 'initializing' }),
   ]
   assert.deepEqual(plain(h.progress.render(80)), [
     '● Agents · 3 children · Ctrl+X Ctrl+A open',
     '├─ ⏺ Run  one-shot · running',
-    '└─ +2 more (1 idle, 1 completed)',
+    '└─ +2 more (1 running, 1 initializing)',
   ])
   // A roomier frame spends its extra lines on the real activity first.
   const wider = mount({ maxRows: 5 })
@@ -289,7 +376,7 @@ test('a tight budget keeps the running row and the count, not the activity line'
   assert.equal(lines.length, 5)
 })
 
-test('three live children keep their two-line Pi shape under the cap while history collapses', () => {
+test('three live children keep their two-line Pi shape; settled children leave no row or count', () => {
   const h = mount({ maxRows: 8 })
   h.progress.entries = [
     entry({ id: 'run-a', label: 'Run A', status: 'running', lastActivity: 'reading src/app.ts' }),
@@ -302,14 +389,14 @@ test('three live children keep their two-line Pi shape under the cap while histo
     entry({ id: 'ext', label: 'Ext', mode: 'external', status: 'external' }),
   ]
   assert.deepEqual(plain(h.progress.render(80)), [
-    '● Agents · 8 children · Ctrl+X Ctrl+A open',
+    '● Agents · 3 children · Ctrl+X Ctrl+A open',
     '├─ ⏺ Run A  one-shot · running',
     '│    ⎿  reading src/app.ts',
     '├─ ⏺ Run B  one-shot · running',
     '│    ⎿  editing src/ui/blocks.ts',
-    '├─ ⏺ Run C  one-shot · running',
-    '│    ⎿  searching for callers',
-    '└─ +5 more (1 completed, 1 failed, 2 idle, 1 external)',
+    '└─ ⏺ Run C  one-shot · running',
+    '     ⎿  searching for callers',
+    '',
   ])
 })
 
@@ -323,17 +410,17 @@ test('only a budget that cannot hold the pair degrades a live row to its summary
   roomy.progress.entries = entries
   const roomyLines = plain(roomy.progress.render(80))
   assert.ok(roomyLines.includes('│    ⎿  reading a'), roomyLines.join('\n'))
-  assert.ok(roomyLines.includes('│    ⎿  reading b'), roomyLines.join('\n'))
-  assert.equal(roomyLines.length, 7)
+  assert.ok(roomyLines.includes('     ⎿  reading b'), roomyLines.join('\n'))
+  assert.equal(roomyLines.length, 6, 'header + two live pairs + separator')
 
-  // Two lines short: the second pair loses its activity line, not the row, and
-  // the finished child is never promoted above a live one.
+  // Two lines short: the second pair loses its activity line, not the row.
   const tight = mount({ maxRows: 4 })
   tight.progress.entries = entries
   const tightLines = plain(tight.progress.render(80))
   assert.ok(tightLines[1]?.includes('Run A'), tightLines.join('\n'))
   assert.ok(tightLines.includes('│    ⎿  reading a'), tightLines.join('\n'))
   assert.ok(!tightLines.join('\n').includes('reading b'), tightLines.join('\n'))
+  assert.ok(tightLines.join('\n').includes('Run B'), tightLines.join('\n'))
   assert.ok(!tightLines.join('\n').includes('Done A'), tightLines.join('\n'))
 })
 
@@ -354,21 +441,36 @@ test('the separator is the lowest-priority line and never overflows the budget',
 // ---------------------------------------------------------------------------
 // Reply target
 
-test('the reply target is pinned first and marked; removing it restores native order', () => {
+test('the reply target is pinned first among active rows; removing it restores native order', () => {
   const h = mount({ maxRows: 8 })
   h.progress.entries = [
     entry({ id: 'run', label: 'Run', status: 'running' }),
-    entry({ id: 'target', label: 'Target', mode: 'continuable', status: 'idle' }),
+    entry({ id: 'target', label: 'Target', mode: 'continuable', status: 'running', lastActivity: 'native work' }),
   ]
   h.progress.replyTargetId = 'target'
   const lines = plain(h.progress.render(100))
   assert.ok(lines[1]?.includes('Target'), lines.join('\n'))
   assert.ok(lines[1]?.includes('reply target'), lines.join('\n'))
-  assert.ok(lines[2]?.includes('Run'), lines.join('\n'))
+  assert.ok(lines[2]?.includes('native work'), lines.join('\n'))
+  assert.ok(lines[3]?.includes('Run'), lines.join('\n'))
   h.progress.replyTargetId = undefined
   const restored = plain(h.progress.render(100))
   assert.ok(restored[1]?.includes('Run'), restored.join('\n'))
   assert.ok(!restored.join('\n').includes('reply target'))
+})
+
+test('a settled reply target is never resurrected in progress', () => {
+  const h = mount()
+  h.progress.entries = [
+    entry({ id: 'run', label: 'Run', status: 'running' }),
+    entry({ id: 'target', label: 'Target', mode: 'continuable', status: 'idle' }),
+  ]
+  h.progress.replyTargetId = 'target'
+  assert.deepEqual(plain(h.progress.render(100)), [
+    '● Agents · 1 child · Ctrl+X Ctrl+A open',
+    '└─ ⏺ Run  one-shot · running',
+    '',
+  ])
 })
 
 test('an unknown reply target id is ignored instead of inventing a row', () => {
@@ -418,8 +520,8 @@ test('CJK, emoji, hostile ANSI and every column count stay within the width', ()
       model: 'deepseek-chat',
       timing: { settledMs: 12_300 },
     }),
-    entry({ id: 'emoji', label: '👩‍💻 reviewer', mode: 'one-shot', status: 'failed' }),
-    entry({ id: 'dots', label: 'a'.repeat(200), mode: 'unknown', status: 'unknown' }),
+    entry({ id: 'emoji', label: '👩‍💻 reviewer', mode: 'one-shot', status: 'running' }),
+    entry({ id: 'dots', label: 'a'.repeat(200), mode: 'unknown', status: 'initializing' }),
   ]
   for (const width of [1, 2, 5, 20, 40, 80, 120]) {
     const lines = h.progress.render(width)
@@ -444,22 +546,21 @@ test('narrow rows degrade to label plus native status before anything overflows'
 // Mouse affordances
 
 /**
- * Row 0 is the header, row 1 the first child, row 2 its activity line.
+ * Row 0 is the header, row 1 the first child, row 2 its activity line, row 3 a
+ * second live child. Only active children exist in this surface.
  */
 function mouseFixture() {
   const h = mount({ maxRows: 8 })
   h.progress.entries = [
     entry({ id: 'run', label: 'Run', status: 'running', lastActivity: 'reading src/app.ts' }),
-    entry({ id: 'idle', label: 'Idle', status: 'idle' }),
-    entry({ id: 'ext', label: 'External', mode: 'external', status: 'external' }),
+    entry({ id: 'flow', label: 'Flow', status: 'initializing' }),
   ]
   const lines = plain(h.progress.render(80))
   assert.deepEqual(lines, [
-    '● Agents · 3 children · Ctrl+X Ctrl+A open',
+    '● Agents · 2 children · Ctrl+X Ctrl+A open',
     '├─ ⏺ Run  one-shot · running',
     '│    ⎿  reading src/app.ts',
-    '├─ ◌ Idle  one-shot · idle',
-    '└─ ◌ External  external',
+    '└─ ⏺ Flow  one-shot · initializing',
     '',
   ])
   return h
@@ -491,8 +592,8 @@ test('only the painted child name opens a child; the rest of the row is selectio
   click(h.progress, nameEnd, 1)
   assert.deepEqual(h.opened, ['run', 'run'])
   // The other painted child uses the same name-only geometry.
-  click(h.progress, colOf(lines[3] ?? '', 'Idle') + 1, 3)
-  assert.deepEqual(h.opened, ['run', 'run', 'idle'])
+  click(h.progress, colOf(lines[3] ?? '', 'Flow') + 1, 3)
+  assert.deepEqual(h.opened, ['run', 'run', 'flow'])
 })
 
 test('the Agents heading word is the only header link', () => {
@@ -504,7 +605,7 @@ test('the Agents heading word is the only header link', () => {
   assert.equal(h.progress.handleMouse(mouse('press', 0, 0)), undefined)
   assert.equal(h.progress.handleMouse(mouse('press', 1, 0)), undefined)
   // The child count and the advertised chord are not links.
-  assert.equal(h.progress.handleMouse(mouse('press', colOf(header, '3 children'), 0)), undefined)
+  assert.equal(h.progress.handleMouse(mouse('press', colOf(header, '2 children'), 0)), undefined)
   assert.equal(h.progress.handleMouse(mouse('press', colOf(header, 'Ctrl+X'), 0)), undefined)
   click(h.progress, wordEnd, 0)
   assert.equal(h.agents, 1)
@@ -545,17 +646,14 @@ test('hover is offered only on link text and only brightens that link', () => {
   assert.equal(h.progress.render(80)[1], restingRow)
 })
 
-test('an external or absent-callback child is never painted as a fake link', () => {
-  const h = mouseFixture()
+test('a non-openable active child is never painted as a fake link', () => {
+  const h = mount()
+  h.progress.entries = [entry({ id: 'remote', label: 'Remote', status: 'running', local: false })]
   const lines = h.progress.render(80)
-  const external = lines[4] ?? ''
-  assert.ok(!external.includes('\x1b[4m'), 'a non-openable name is never underlined')
-  const externalRow = plain(lines)[4] ?? ''
-  assert.equal(
-    h.progress.handleMouse(mouse('press', colOf(externalRow, 'External'), 4)),
-    undefined,
-  )
-  click(h.progress, colOf(externalRow, 'External'), 4)
+  assert.ok(!(lines[1] ?? '').includes('\x1b[4m'), 'a non-openable name is never underlined')
+  const row = plain(lines)[1] ?? ''
+  assert.equal(h.progress.handleMouse(mouse('press', colOf(row, 'Remote'), 1)), undefined)
+  click(h.progress, colOf(row, 'Remote'), 1)
   assert.deepEqual(h.opened, [])
 
   // Without onOpenChild even the reply-target name stays plain text.
@@ -611,11 +709,17 @@ test('a press outside a name never navigates when a repaint moves a name under i
   assert.deepEqual(h.opened, ['first'])
 })
 
-test('external rows are display-only: no hitbox, no callback', () => {
-  const h = mouseFixture()
-  assert.equal(h.progress.handleMouse(mouse('press', 5, 4)), undefined)
-  click(h.progress, 5, 4)
+test('external tasks are history: no progress row, no hitbox, no callback', () => {
+  const h = mount()
+  h.progress.entries = [
+    entry({ id: 'ext', label: 'External', mode: 'external', status: 'external' }),
+    entry({ id: 'seen-only-in-agents', label: 'Remote', mode: 'external', status: 'external' }),
+  ]
+  assert.deepEqual(h.progress.render(80), [])
+  assert.equal(h.progress.handleMouse(mouse('press', 5, 1)), undefined)
+  click(h.progress, 5, 1)
   assert.deepEqual(h.opened, [])
+  assert.equal(h.agents, 0)
 })
 
 test('without onOpenChild the rows paint but stay inert', () => {
@@ -668,12 +772,12 @@ test('a vanished child cannot retarget the row that lands on its old coordinates
   const h = mount({ maxRows: 8 })
   h.progress.entries = [
     entry({ id: 'gone', label: 'Gone', status: 'running' }),
-    entry({ id: 'stays', label: 'Stays', status: 'idle' }),
+    entry({ id: 'stays', label: 'Stays', status: 'running' }),
   ]
   h.progress.render(80)
   // Press on the first child row, then the catalog removes it.
   assert.deepEqual(h.progress.handleMouse(mouse('press', 5, 1)), { handled: true })
-  h.progress.entries = [entry({ id: 'stays', label: 'Stays', status: 'idle' })]
+  h.progress.entries = [entry({ id: 'stays', label: 'Stays', status: 'running' })]
   const lines = plain(h.progress.render(80))
   assert.ok(lines[1]?.includes('Stays'), lines.join('\n'))
   // The synthesized click must not open whatever now occupies row 1.
@@ -684,20 +788,40 @@ test('a vanished child cannot retarget the row that lands on its old coordinates
 test('press-pinning keeps the same child id across a reorder', () => {
   const h = mount({ maxRows: 8 })
   h.progress.entries = [
-    entry({ id: 'first', label: 'First', status: 'running' }),
+    entry({ id: 'first', label: 'First', status: 'running', lastActivity: 'working' }),
     entry({ id: 'second', label: 'Second', status: 'running' }),
   ]
   h.progress.render(80)
-  h.progress.handleMouse(mouse('press', 5, 1))
-  // The first child settles: the active row order changes under the pointer.
+  // Row 3 is the second child (row 1 is First, row 2 its activity line).
+  assert.deepEqual(h.progress.handleMouse(mouse('press', 5, 3)), { handled: true })
+  // The first activity line settles away: every row shifts up under the pointer.
   h.progress.entries = [
-    entry({ id: 'first', label: 'First', status: 'completed' }),
+    entry({ id: 'first', label: 'First', status: 'running' }),
     entry({ id: 'second', label: 'Second', status: 'running' }),
   ]
   const lines = plain(h.progress.render(80))
-  assert.ok(lines[1]?.includes('Second'), lines.join('\n'))
-  h.progress.handleMouse(mouse('click', 5, 1))
-  assert.deepEqual(h.opened, ['first'], 'the pressed child id is what opens')
+  assert.ok(lines[2]?.includes('Second'), lines.join('\n'))
+  assert.equal(lines[3], '', 'the rows really moved')
+  h.progress.handleMouse(mouse('click', 5, 3))
+  assert.deepEqual(h.opened, ['second'], 'the pressed child id is what opens')
+})
+
+test('a press on a name that retires cannot be replayed after reactivation', () => {
+  const h = mount({ maxRows: 8 })
+  h.progress.entries = [entry({ id: 'run', label: 'Run', status: 'running' })]
+  const name = colOf(plain(h.progress.render(80))[1] ?? '', 'Run')
+  assert.deepEqual(h.progress.handleMouse(mouse('press', name, 1)), { handled: true })
+  // Native settlement removes the row: progress shows live work only.
+  h.progress.entries = [entry({ id: 'run', label: 'Run', status: 'idle' })]
+  assert.deepEqual(h.progress.render(80), [])
+  // Native reactivation brings the same child back before the release.
+  h.progress.entries = [entry({ id: 'run', label: 'Run', status: 'running' })]
+  assert.ok(plain(h.progress.render(80))[1]?.includes('Run'))
+  assert.deepEqual(h.progress.handleMouse(mouse('click', name, 1)), { handled: true })
+  assert.deepEqual(h.opened, [], 'a retired row that reappeared never receives the stale click')
+  // A fresh gesture on the reactivated name navigates normally.
+  click(h.progress, name, 1)
+  assert.deepEqual(h.opened, ['run'])
 })
 
 test('invalidate between press and release cancels the gesture even for the same child id', () => {
@@ -786,9 +910,9 @@ test('the overflow +N more text is the only overflow link', () => {
   const entries = [
     entry({ id: 'run-a', label: 'Run A', status: 'running' }),
     entry({ id: 'run-b', label: 'Run B', status: 'running' }),
-    entry({ id: 'done-a', label: 'Done A', status: 'completed' }),
-    entry({ id: 'done-b', label: 'Done B', status: 'idle' }),
-    entry({ id: 'done-c', label: 'Done C', status: 'failed' }),
+    entry({ id: 'run-c', label: 'Run C', status: 'running' }),
+    entry({ id: 'run-d', label: 'Run D', status: 'running' }),
+    entry({ id: 'run-e', label: 'Run E', status: 'initializing' }),
   ]
   const h = mount({ maxRows: 5 })
   h.progress.entries = entries
@@ -797,8 +921,8 @@ test('the overflow +N more text is the only overflow link', () => {
     '● Agents · 5 children · Ctrl+X Ctrl+A open',
     '├─ ⏺ Run A  one-shot · running',
     '├─ ⏺ Run B  one-shot · running',
-    '├─ ● Done A  one-shot · completed',
-    '└─ +2 more (1 idle, 1 failed)',
+    '├─ ⏺ Run C  one-shot · running',
+    '└─ +2 more (1 running, 1 initializing)',
   ])
   const overflow = lines[4] ?? ''
   const count = colOf(overflow, '+2 more')
@@ -808,7 +932,7 @@ test('the overflow +N more text is the only overflow link', () => {
   for (const x of [0, 1, 2, countEnd + 1]) {
     assert.equal(h.progress.handleMouse(mouse('press', x, 4)), undefined, `col ${x} must stay unclaimed`)
   }
-  click(h.progress, colOf(overflow, '(1 idle'), 4)
+  click(h.progress, colOf(overflow, '(1 running'), 4)
   assert.equal(h.agents, 0, 'grouped status counts never navigate')
   click(h.progress, countEnd, 4)
   assert.equal(h.agents, 1, 'the count opens the existing Agents list')
@@ -974,7 +1098,7 @@ test('a narrow frame drops the row hitbox with the row it could not paint', () =
   const h = mount({ maxRows: 2 })
   h.progress.entries = [
     entry({ id: 'a', label: 'A', status: 'running' }),
-    entry({ id: 'b', label: 'B', status: 'idle' }),
+    entry({ id: 'b', label: 'B', status: 'running' }),
   ]
   const lines = plain(h.progress.render(80))
   assert.equal(lines.length, 2)
@@ -1040,8 +1164,8 @@ test('LF/CRLF/TAB in a native label cannot add rows or leak controls', () => {
   const h = mount({ maxRows: 6 })
   h.progress.entries = [
     entry({ id: 'lf', label: 'first\nsecond', status: 'running', lastActivity: 'reading\nsrc/app.ts' }),
-    entry({ id: 'crlf', label: 'windows\r\nlabel\twith\ttabs', status: 'idle' }),
-    entry({ id: 'emoji', label: '🚀 探索\r\n子代理', mode: 'continuable', status: 'completed' }),
+    entry({ id: 'crlf', label: 'windows\r\nlabel\twith\ttabs', status: 'running' }),
+    entry({ id: 'emoji', label: '🚀 探索\r\n子代理', mode: 'continuable', status: 'initializing' }),
   ]
   const lines = h.progress.render(80)
   assert.ok(lines.length <= 6, `hard budget kept: ${lines.length}`)
@@ -1081,9 +1205,9 @@ test('every width keeps flattened native text single-row at the hard budget', ()
     const h = mount({ maxRows: 8 })
     h.progress.entries = [
       entry({ id: 'a', label: '\n\nleading and trailing\n\n', status: 'running', lastActivity: '\t\t' }),
-      entry({ id: 'b', label: 'line\n'.repeat(80), status: 'idle', provider: 'p\n', model: 'm\n', reasoningEffort: 'e\n' }),
-      entry({ id: 'c', label: '👩‍💻\r\nreviewer', status: 'failed' }),
-      entry({ id: 'd', label: 'x\ty', status: 'completed' }),
+      entry({ id: 'b', label: 'line\n'.repeat(80), status: 'running', provider: 'p\n', model: 'm\n', reasoningEffort: 'e\n' }),
+      entry({ id: 'c', label: '👩‍💻\r\nreviewer', status: 'running' }),
+      entry({ id: 'd', label: 'x\ty', status: 'initializing' }),
       entry({ id: 'e', label: 'z\n', status: 'running', lastActivity: 'busy\n' }),
     ]
     const lines = h.progress.render(width)

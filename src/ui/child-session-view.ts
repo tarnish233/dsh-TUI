@@ -25,6 +25,14 @@
  *
  * No timer is created: native timing is folded from `settledMs`/`activeSince`
  * on each frame, and the parent's renderer decides when to repaint.
+ *
+ * Loading shell: a freshly navigated child is readable only after the parent's
+ * `subagent-follow` + `subagent-session` reads resolve. `loading: true` (or
+ * `setLoading(true)`) replaces only the conversation body with
+ * `Loading child session…` so navigation responds immediately without a fake
+ * `SessionInfo`, a second Editor or a fabricated empty transcript. The parent
+ * owns when it turns off: reset the child store from the native snapshot, then
+ * `setLoading(false)`.
  */
 import {
   ScrollView,
@@ -96,9 +104,20 @@ export interface ChildSessionViewOptions {
   follow?: boolean
   /** Dispose the supplied `view` with this component (default true). */
   ownsView?: boolean
+  /**
+   * Display a loading shell instead of the conversation while the parent's
+   * native follow/snapshot read is still in flight (default false). It is
+   * presentation only: the parent supplies the real entry and, later, the real
+   * native `SessionInfo` through `setEntry`/`update({info})`. No fake snapshot
+   * is created and no editor is added here.
+   */
+  loading?: boolean
 }
 
 const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
+
+/** Body line while the parent's native child snapshot is pending. */
+const LOADING_TEXT = 'Loading child session…'
 
 /** One clickable footer action chip in component-local columns (inclusive). */
 interface FooterChip {
@@ -146,6 +165,7 @@ export class ChildSessionView implements Component, Focusable {
   private disposed = false
   private chordPending = false
   private viewportRows = 1
+  private loadingValue: boolean
   private readonly now: () => number
 
   constructor(tui: TUI, options: ChildSessionViewOptions) {
@@ -157,6 +177,7 @@ export class ChildSessionView implements Component, Focusable {
     this.entryValue = options.entry
     this.infoValue = options.info
     this.breadcrumbValue = options.breadcrumb ?? [options.entry.parentSessionId, subagentLabel(options.entry)]
+    this.loadingValue = options.loading === true
     this.now = options.now ?? Date.now
     this.scrollView = new ScrollView(options.view, {
       scrollbar: 'hidden',
@@ -185,6 +206,22 @@ export class ChildSessionView implements Component, Focusable {
 
   get isDisposed(): boolean {
     return this.disposed
+  }
+
+  /** True while the parent's native snapshot for this child is still pending. */
+  get loading(): boolean {
+    return this.loadingValue
+  }
+
+  /**
+   * Switch the loading shell on/off. Idempotent, never touches the entry, the
+   * store, focus, callbacks or the scroll position; the parent calls this with
+   * `false` once it has reset the child store from the native snapshot.
+   */
+  setLoading(loading: boolean): void {
+    if (this.disposed || this.loadingValue === loading) return
+    this.loadingValue = loading
+    this.invalidate()
   }
 
   get focused(): boolean {
@@ -276,6 +313,10 @@ export class ChildSessionView implements Component, Focusable {
       this.close()
       return
     }
+    // A loading shell has no laid-out conversation yet: scroll keys stay inert
+    // until the native snapshot arrives. Esc/global/intervention keys are
+    // resolved above and keep working exactly as in the loaded surface.
+    if (this.loadingValue && id.startsWith('list.')) return
     switch (id) {
       case 'app.interrupt':
         // Ctrl+C stops an active child; it never closes the surface. A child
@@ -515,22 +556,32 @@ export class ChildSessionView implements Component, Focusable {
 
     const bodyHeight = Math.max(1, limit - chrome)
     this.viewportRows = bodyHeight
-    let content: string[]
-    if (external) {
-      content = [fit(` ${dim(t.muted('External task: this child has no local Session transcript.'))}`, size)]
-    } else {
-      content = this.scrollView.render(size)
-    }
-    const total = content.length
-    this.scrollView.updateLayout(total, bodyHeight, () => this.requestRender())
-    const maxScroll = Math.max(0, total - bodyHeight)
-    const top = Math.max(0, Math.min(this.scrollView.scrollTop, maxScroll))
-    if (total === 0) {
-      push(fit(` ${dim(t.muted('No messages in this agent session.'))}`, size))
+    if (this.loadingValue && !external) {
+      // The native snapshot is still being read: state the pending read
+      // honestly instead of claiming the conversation is empty, and lay out no
+      // scroll content (there is none yet). Everything else on this surface —
+      // breadcrumb, native status, totals, Reply/Stop gating, close keys — is
+      // the normal chrome and stays exactly as it is once loaded.
+      push(fit(` ${dim(t.muted(LOADING_TEXT))}`, size))
       for (let index = 1; index < bodyHeight; index += 1) push('')
     } else {
-      for (let offset = 0; offset < bodyHeight; offset += 1) {
-        push(content[top + offset] ?? '')
+      let content: string[]
+      if (external) {
+        content = [fit(` ${dim(t.muted('External task: this child has no local Session transcript.'))}`, size)]
+      } else {
+        content = this.scrollView.render(size)
+      }
+      const total = content.length
+      this.scrollView.updateLayout(total, bodyHeight, () => this.requestRender())
+      const maxScroll = Math.max(0, total - bodyHeight)
+      const top = Math.max(0, Math.min(this.scrollView.scrollTop, maxScroll))
+      if (total === 0) {
+        push(fit(` ${dim(t.muted('No messages in this agent session.'))}`, size))
+        for (let index = 1; index < bodyHeight; index += 1) push('')
+      } else {
+        for (let offset = 0; offset < bodyHeight; offset += 1) {
+          push(content[top + offset] ?? '')
+        }
       }
     }
 
@@ -563,7 +614,8 @@ export class ChildSessionView implements Component, Focusable {
   private renderCompact(width: number, limit: number, external: boolean): string[] {
     const close = this.bindingLabel('list.cancel') ?? this.bindingLabel('app.cancel') ?? 'Esc'
     const lines = [this.headerBreadcrumb(width), this.headerStatus(width)]
-    if (external) lines.push(fit(` ${dim(t.muted('External task · no local transcript'))}`, width))
+    if (this.loadingValue && !external) lines.push(fit(` ${dim(t.muted(LOADING_TEXT))}`, width))
+    else if (external) lines.push(fit(` ${dim(t.muted('External task · no local transcript'))}`, width))
     lines.push(fit(` ${dim(`${close} close${this.interactive() ? '' : ' · read-only'}`)}`, width))
     this.viewportRows = 1
     // No chip is painted in a short viewport, so no action hitbox may exist.
@@ -578,7 +630,7 @@ export class ChildSessionView implements Component, Focusable {
     if (this.disposed) return undefined
     if (event.type === 'wheel') {
       const delta = event.wheelDelta ?? 0
-      if (delta === 0) return undefined
+      if (delta === 0 || this.loadingValue) return undefined
       this.scrollBy(delta)
       return { handled: true, render: true }
     }

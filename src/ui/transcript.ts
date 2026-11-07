@@ -41,6 +41,13 @@ import {
   type TranscriptNode,
 } from './tool-group.ts'
 import {
+  planSubagentGroupNodes,
+  SubagentGroupBlock,
+  type SubagentFrameNode,
+  type SubagentGroupMember,
+  type SubagentRecordItem,
+} from './subagent-group.ts'
+import {
   clearToolExpansion,
   isToolExpanded,
   retainToolExpansion,
@@ -135,7 +142,12 @@ interface CachedGroupEntry {
   block: ToolGroupBlock
 }
 
-type CacheEntry = CachedItemEntry | CachedGroupEntry
+interface CachedSubagentGroupEntry {
+  readonly tag: 'subagent-group'
+  block: SubagentGroupBlock
+}
+
+type CacheEntry = CachedItemEntry | CachedGroupEntry | CachedSubagentGroupEntry
 
 /** What the frame loop needs from either kind of cached block. */
 interface FrameBlock {
@@ -211,6 +223,10 @@ export class TranscriptView implements Component {
     this.flags.imageDetailsHint = this.options.imageDetailsHint
     this.flags.onSubagentDetails = this.options.onSubagentDetails
     this.flags.subagentDetailsHint = this.options.subagentDetailsHint
+    // Presentation only: a durable settlement/trigger row shows the real child
+    // label (and only then a name link) from the catalog the store already
+    // holds. Nothing is fetched and no child Session is read or resumed.
+    this.flags.subagentEntries = this.store.subagentEntries
     Object.assign(this.flags, toolPreferences(this.options))
     this.flags.onToolDetails = this.options.onToolDetails
     this.flags.onImageDetails = this.options.onImageDetails
@@ -251,11 +267,22 @@ export class TranscriptView implements Component {
     this.options.onRenderRequest?.()
   }
 
+  /**
+   * Frame projection: tool grouping first, then consecutive durable subagent
+   * records. Both are display-only folds of the same declared item order; the
+   * store still holds every native item, seq and message text.
+   */
+  private frameNodes(): readonly SubagentFrameNode[] {
+    const options = this.planOptions()
+    return planSubagentGroupNodes(planTranscriptNodes(this.store.items, options), { groupRecords: options.groupTools })
+  }
+
   /** Root disclosure keys of the current projection (groups and ungrouped cards). */
   private rootToolDisclosureKeys(): string[] {
     const keys: string[] = []
-    for (const node of planTranscriptNodes(this.store.items, this.planOptions())) {
+    for (const node of this.frameNodes()) {
       if (node.kind === 'group') keys.push(toolGroupExpansionKey(node.anchor.callId))
+      else if (node.kind === 'subagent-group') keys.push(toolGroupExpansionKey(node.anchor.id))
       else if (node.item.kind === 'tool') keys.push(toolExpansionKey(node.item.callId))
     }
     return keys
@@ -287,9 +314,13 @@ export class TranscriptView implements Component {
   get expandedDisclosureCount(): number {
     this.syncFlags()
     let count = 0
-    for (const node of planTranscriptNodes(this.store.items, this.planOptions())) {
+    for (const node of this.frameNodes()) {
       if (node.kind === 'group') {
         if (isToolExpanded(toolGroupExpansionKey(node.anchor.callId), this.flags.expandTools)) count += 1
+        continue
+      }
+      if (node.kind === 'subagent-group') {
+        if (isToolExpanded(toolGroupExpansionKey(node.anchor.id), this.flags.expandTools)) count += 1
         continue
       }
       const item = node.item
@@ -353,7 +384,7 @@ export class TranscriptView implements Component {
     this.disposed = true
     this.stopLiveTimer()
     for (const entry of this.cache.values()) {
-      if (entry.tag === 'group') entry.block.dispose()
+      if (entry.tag === 'group' || entry.tag === 'subagent-group') entry.block.dispose()
       else entry.block.clearMouse?.()
     }
     this.cache.clear()
@@ -384,7 +415,7 @@ export class TranscriptView implements Component {
     // The projection is display-only: `store.items` keeps the declared order and
     // every tool card keeps its own item identity/cache. A group is one extra
     // cached host block anchored on its first member's call id.
-    const nodes = planTranscriptNodes(this.store.items, this.planOptions())
+    const nodes = this.frameNodes()
     // Evict what left the frame BEFORE any block is (re)assembled. A group that
     // lost its anchor must release its children while no new group owns them yet;
     // otherwise its cleanup would reset the context the frame just installed on
@@ -402,6 +433,11 @@ export class TranscriptView implements Component {
         block = this.itemBlock(node.item, seen, cwd)
         const key = `${node.item.kind}|${node.item.id}`
         if (this.groupedKeys.has(key) && !grouped.has(key)) ungroupItem(block as ItemBlock)
+      } else if (node.kind === 'subagent-group') {
+        const members: SubagentGroupMember[] = []
+        for (const item of node.members) members.push({ item, block: this.itemBlock(item, seen, cwd) })
+        block = this.subagentGroupBlock(node.anchor, members, seen)
+        disclosureKeys.push(toolGroupExpansionKey(node.anchor.id))
       } else {
         const members: ToolGroupMember[] = []
         for (const item of node.members) {
@@ -471,6 +507,30 @@ export class TranscriptView implements Component {
   }
 
   /**
+   * One cached group per anchor item id, holding the reused member blocks.
+   *
+   * The anchor is the first member, so the component (and its disclosure state)
+   * survives members joining, updating or leaving the run.
+   */
+  private subagentGroupBlock(
+    anchor: SubagentRecordItem,
+    members: readonly SubagentGroupMember[],
+    seen: Set<string>,
+  ): SubagentGroupBlock {
+    const key = `subagent-group|${anchor.id}`
+    seen.add(key)
+    const entry = this.cache.get(key)
+    if (entry !== undefined && entry.tag === 'subagent-group') {
+      entry.block.setMembers(members)
+      return entry.block
+    }
+    const block = new SubagentGroupBlock(anchor, this.flags)
+    block.setMembers(members)
+    this.cache.set(key, { tag: 'subagent-group', block })
+    return block
+  }
+
+  /**
    * Drop cached components that the frame no longer shows.
    *
    * A group releases its children's group contexts here, before the frame's own
@@ -480,7 +540,7 @@ export class TranscriptView implements Component {
   private evictUnplanned(planned: ReadonlySet<string>): void {
     for (const [key, entry] of [...this.cache]) {
       if (planned.has(key)) continue
-      if (entry.tag === 'group') entry.block.clearMouse()
+      if (entry.tag === 'group' || entry.tag === 'subagent-group') entry.block.clearMouse()
       else entry.block.clearMouse?.()
       this.cache.delete(key)
     }
@@ -622,15 +682,21 @@ function applyCwd(block: ItemBlock, cwd: string): void {
 }
 
 /**
- * Cache keys the projection will show this frame: one per item, one per group.
- * Group members keep their own item key because their block is reused by the
- * group (and by the frame once the group dissolves).
+ * Cache keys the projection will show this frame: one per item, one per tool
+ * group and one per subagent group. Group members keep their own item key
+ * because their block is reused by the group (and by the frame once the group
+ * dissolves).
  */
-function plannedKeys(nodes: readonly TranscriptNode[]): ReadonlySet<string> {
+function plannedKeys(nodes: readonly SubagentFrameNode[]): ReadonlySet<string> {
   const planned = new Set<string>()
   for (const node of nodes) {
     if (node.kind === 'item') {
       planned.add(`${node.item.kind}|${node.item.id}`)
+      continue
+    }
+    if (node.kind === 'subagent-group') {
+      planned.add(`subagent-group|${node.anchor.id}`)
+      for (const item of node.members) planned.add(`${item.kind}|${item.id}`)
       continue
     }
     planned.add(`group|${node.anchor.id}`)

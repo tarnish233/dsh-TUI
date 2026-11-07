@@ -41,20 +41,25 @@ import { imageMarkerLine } from './image-marker.ts'
 import { toolImageOccurrences } from './image-data.ts'
 import type { ImageDetailsRequest } from './image-view.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
+import { SubagentLinkHitboxes } from './subagent-link.ts'
 import { bold, cc, dim, italic, markdownTheme, t } from './theme.ts'
-import { fit, plural, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
+import { fit, oneLine, plural, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { ThinkingBlock, type ThinkingRun, type ThinkingScreen } from './thinking-block.ts'
 import type { ToolGroupContext, ToolViewOptions } from './tool-view.ts'
 import { ToolBlock } from './tool-block.ts'
 import {
   subagentActivity,
+  subagentGlyph,
   subagentLabel,
+  subagentLinkStyle,
   subagentModeLabel,
   subagentOpenable,
-  subagentSenderLabel,
+  subagentPaintedLink,
+  subagentSenderDisplay,
   subagentStatusLabel,
+  subagentStatusStyle,
   subagentTone,
-  type SubagentTone,
+  type SubagentLinkSpan,
 } from './subagent-format.ts'
 
 export { toolDisplayName } from './tool-io.ts'
@@ -101,6 +106,13 @@ export interface TranscriptViewOptions extends ToolViewOptions {
   onSubagentDetails?: (sessionId: string) => void
   /** Optional `app.subagents.details` key label advertised on wide rows. */
   subagentDetailsHint?: string
+  /**
+   * Native child catalog used to resolve a durable trigger sender's real label
+   * and openability. `TranscriptView` syncs this from `store.subagentEntries`
+   * before every paint, so parents never assign it and nothing is fetched: the
+   * catalog is already in memory, and no child Session is read for painting.
+   */
+  subagentEntries?: readonly SubagentEntry[]
 }
 
 /** Cache key for the display-only hint labels. */
@@ -702,41 +714,6 @@ class TodosBlock extends CachedBlock {
 // ---------------------------------------------------------------------------
 // Native subagent rows
 
-const SUBAGENT_GLYPHS: Readonly<Record<SubagentTone, string>> = {
-  running: DOT,
-  done: '●',
-  idle: HOLLOW,
-  failed: '●',
-  stopped: HOLLOW,
-  external: HOLLOW,
-  unknown: HOLLOW,
-}
-
-function subagentGlyph(tone: SubagentTone): string {
-  const glyph = SUBAGENT_GLYPHS[tone]
-  switch (tone) {
-    case 'running': return t.accent(glyph)
-    case 'done': return t.green(glyph)
-    case 'failed': return t.redSoft(glyph)
-    case 'stopped': return t.yellow(glyph)
-    case 'idle': return t.muted(glyph)
-    case 'external': return t.subtle(glyph)
-    case 'unknown': return t.subtle(glyph)
-  }
-}
-
-function subagentStatusStyle(tone: SubagentTone, text: string): string {
-  switch (tone) {
-    case 'running': return t.accent(text)
-    case 'done': return t.green(text)
-    case 'failed': return t.redSoft(text)
-    case 'stopped': return t.yellow(text)
-    case 'idle': return t.muted(text)
-    case 'external': return t.subtle(text)
-    case 'unknown': return t.subtle(text)
-  }
-}
-
 /** Append one low-priority segment only when the finished row still fits. */
 function appendIfFits(line: string, segment: string, width: number): string {
   const next = `${line}${dim(' · ')}${segment}`
@@ -750,10 +727,18 @@ function appendIfFits(line: string, segment: string, width: number): string {
  * label, mode, status and (only while running) the one current activity. Mode
  * and activity disappear before the name/status when the width shrinks; the
  * final `fit` guarantees no line ever exceeds the terminal width.
+ *
+ * Only the visible **name** is a child-navigation link: the alignment glyph,
+ * the mode/status/metrics/hint and every gap stay plain text with native
+ * selection. A non-openable (external/remote) child, a missing callback or a
+ * name clipped away by the final paint owns no hitbox at all, and the link
+ * geometry is measured in display columns of the painted line, so CJK, emoji
+ * and hostile ANSI can never widen or misplace the clickable span.
  */
 class SubagentBlock extends CachedBlock {
   private entry: SubagentEntry
-  private readonly registry = new HitboxRegistry()
+  private link: SubagentLinkSpan | undefined
+  private readonly links = new SubagentLinkHitboxes()
 
   constructor(item: SubagentTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
@@ -765,34 +750,50 @@ class SubagentBlock extends CachedBlock {
     this.entry = item.entry
   }
 
+  private get boxId(): string {
+    return `${this.itemId}:name`
+  }
+
   protected viewKey(): string {
-    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}|${this.flags.subagentDetailsHint ?? ''}`
+    const hover = this.links.hoveredId === this.boxId ? 'hover' : 'rest'
+    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}|${this.flags.subagentDetailsHint ?? ''}|${hover}`
   }
 
   protected syncMouse(): void {
     const handler = this.flags.onSubagentDetails
-    // External tasks have no local child Session: the row must not advertise a
-    // details surface the parent cannot open.
-    if (handler === undefined || !subagentOpenable(this.entry)) {
-      this.registry.clear()
+    const link = this.link
+    // External tasks have no local child Session: the name must not advertise
+    // a details surface the parent cannot open, and a clipped-away name owns no
+    // hitbox either.
+    if (handler === undefined || link === undefined || !subagentOpenable(this.entry)) {
+      this.links.sync([])
       return
     }
     const sessionId = this.entry.id
-    this.registry.sync([{
-      id: `${this.itemId}:open`,
+    this.links.sync([{
+      id: this.boxId,
       startRow: 0,
       endRow: 0,
+      startCol: link.startCol,
+      endCol: link.endCol,
       claimPress: true,
       onClick: () => handler(sessionId),
+      onHover: () => { this.flags.onRenderRequest?.() },
     }])
   }
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    return this.registry.handleMouse(event)
+    return this.links.handleMouse(event)
   }
 
+  /**
+   * Eviction/session-replacement teardown. An ordinary repaint (`invalidate`)
+   * deliberately keeps a claimed press pinned: a row that updates in place
+   * between press and release still opens the pressed child.
+   */
   clearMouse(): void {
-    this.registry.clear()
+    this.link = undefined
+    this.links.clear()
   }
 
   protected build(width: number): string[] {
@@ -814,15 +815,26 @@ class SubagentBlock extends CachedBlock {
       width >= glyphWidth + separatorWidth + statusWidth + separatorWidth + visibleWidth(mode) + 8
     const reserved = glyphWidth + separatorWidth + statusWidth +
       (keepMode ? separatorWidth + visibleWidth(mode) : 0)
-    const name = truncateToWidth(subagentLabel(entry), Math.max(1, width - reserved))
-    let line = `${glyph} ${bold(t.text(name))}`
+    // A native label may legally carry LF/CR/TAB; flatten it to one row before
+    // any width math so the stored fact can never add a row to this single-line
+    // row. Only the display copy is folded — the store keeps the exact label.
+    const name = truncateToWidth(oneLine(subagentLabel(entry), Number.MAX_SAFE_INTEGER), Math.max(1, width - reserved))
+    const head = `${glyph} `
+    const linkable = this.flags.onSubagentDetails !== undefined && subagentOpenable(entry)
+    const hovered = this.links.hoveredId === this.boxId
+    const styledName = linkable
+      ? subagentLinkStyle(hovered)(name)
+      : bold(t.text(name))
+    let line = head + styledName
     if (keepMode) line += separator + dim(mode)
     line += separator + subagentStatusStyle(tone, status)
     const activity = subagentActivity(entry)
     if (activity !== undefined && width >= 48) line = appendIfFits(line, t.muted(activity), width)
     const hint = this.flags.onSubagentDetails === undefined ? '' : this.flags.subagentDetailsHint?.trim() ?? ''
     if (hint !== '' && width >= 72) line = appendIfFits(line, t.subtle(hint), width)
-    return [fit(line, width)]
+    const painted = subagentPaintedLink(line, width, visibleWidth(head), visibleWidth(name), linkable)
+    this.link = painted.link
+    return [painted.line]
   }
 }
 
@@ -830,10 +842,18 @@ class SubagentBlock extends CachedBlock {
  * Durable settlement/trigger row (native `user/message` with an attributed
  * source). It is not a human prompt (`> ` band) and not an ephemeral notice:
  * the header states the native attribution, the body is the exact message text.
+ *
+ * Only the sender identity in the header is a child link, and only when the
+ * native catalog already knows that child (its real label is shown) and reports
+ * it openable. Without a catalog row the durable sender id is painted as plain
+ * text: the header says "Subtask status updated" but never offers a click the
+ * parent could not honour. The body paragraphs, the attribution title and the
+ * indent stay non-navigation text.
  */
 class SubagentMessageBlock extends CachedBlock {
   private item: SubagentMessageTranscriptItem | undefined
-  private readonly registry = new HitboxRegistry()
+  private link: SubagentLinkSpan | undefined
+  private readonly links = new SubagentLinkHitboxes()
 
   constructor(item: SubagentMessageTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
@@ -845,33 +865,51 @@ class SubagentMessageBlock extends CachedBlock {
     this.item = item
   }
 
+  private get boxId(): string {
+    return `${this.itemId}:sender`
+  }
+
+  private sender(): { label: string; openable: boolean } {
+    const item = this.item
+    if (item === undefined) return { label: '', openable: false }
+    return subagentSenderDisplay(item.senderSessionId, this.flags.subagentEntries)
+  }
+
   protected viewKey(): string {
-    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}`
+    const sender = this.sender()
+    const hover = this.links.hoveredId === this.boxId ? 'hover' : 'rest'
+    return `${typeof this.flags.onSubagentDetails === 'function' ? 'open' : 'inert'}|${sender.label}|${sender.openable ? 'local' : 'leaf'}|${hover}`
   }
 
   protected syncMouse(): void {
     const handler = this.flags.onSubagentDetails
     const item = this.item
-    if (handler === undefined || item === undefined) {
-      this.registry.clear()
+    const link = this.link
+    if (handler === undefined || item === undefined || link === undefined || !this.sender().openable) {
+      this.links.sync([])
       return
     }
     const sessionId = item.senderSessionId
-    this.registry.sync([{
-      id: `${this.itemId}:sender`,
+    this.links.sync([{
+      id: this.boxId,
       startRow: 0,
       endRow: 0,
+      startCol: link.startCol,
+      endCol: link.endCol,
       claimPress: true,
       onClick: () => handler(sessionId),
+      onHover: () => { this.flags.onRenderRequest?.() },
     }])
   }
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    return this.registry.handleMouse(event)
+    return this.links.handleMouse(event)
   }
 
+  /** Eviction/session-replacement teardown; an in-place repaint keeps the pin. */
   clearMouse(): void {
-    this.registry.clear()
+    this.link = undefined
+    this.links.clear()
   }
 
   private title(): string {
@@ -901,14 +939,21 @@ class SubagentMessageBlock extends CachedBlock {
   protected build(width: number): string[] {
     const item = this.item
     if (item === undefined) return []
-    const sender = subagentSenderLabel(item.senderSessionId)
+    const sender = this.sender()
     const title = this.title()
-    let header = `${t.muted(DOT)} ${bold(t.text(title))}`
-    // The sender is the clickable identity; keep it whole when possible and let
-    // `fit` truncate only at the terminal edge, never in the stored item.
-    const senderSegment = dim(' · ') + t.accentBright(sender)
-    if (visibleWidth(header + senderSegment) <= width) header += senderSegment
-    const out: string[] = [fit(header, width)]
+    const head = `${t.muted(DOT)} ${bold(t.text(title))}`
+    const gap = dim(' · ')
+    const linkable = this.flags.onSubagentDetails !== undefined && sender.openable
+    const hovered = this.links.hoveredId === this.boxId
+    // The sender is the clickable identity. It is always appended and then
+    // clipped by `fit`, so a narrow terminal still shows a readable prefix of the
+    // native label instead of dropping the identity entirely; the link geometry
+    // covers only the columns of that name that actually survived the clip.
+    const styled = linkable ? subagentLinkStyle(hovered)(sender.label) : t.text(sender.label)
+    const raw = `${head}${gap}${styled}`
+    const painted = subagentPaintedLink(raw, width, visibleWidth(head + gap), visibleWidth(sender.label), linkable)
+    this.link = painted.link
+    const out: string[] = [painted.line]
     const paragraphs = this.paragraphs()
     const room = Math.max(1, width - visibleWidth(ELBOW))
     paragraphs.forEach((paragraph, paragraphIndex) => {

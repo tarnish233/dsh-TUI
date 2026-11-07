@@ -1,8 +1,10 @@
-# DSH TUI · v0.1.2
+# DSH TUI · v0.1.3
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前发布版本为 **v0.1.2**（`private: true`），新增原生 Subagent 目录／子会话／Stop/Reply，以及编辑框上方的 Pi 风格进度和名字限定内部链接；保留 v0.1.1 的原生插件化、诊断隔离与 compaction 修复。本次按用户授权通过 GitHub `main` 与 `v0.1.2` tag 发布，不发布 registry。当前工程验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照，不代表当前健康状态。
+当前版本为 **v0.1.3**（`private: true`），收录 Subagent 启动加载响应、结算后进度退场、`/agent` 历史入口、Working 同款动态帧、连续消息分组与全面的名字-only 内部导航；保留两行进度布局及 v0.1.2 的原生目录／子会话／Stop/Reply。按用户授权通过 GitHub `main` 与 annotated `v0.1.3` tag 发布，不发布 registry、不改全局安装。当前验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照。
+
+**已知未解决问题：** 用户报告的退出卡住仍未确认现场触发步骤。常规 native 退出与隔离故障注入已有调查证据，但 v0.1.3 不把它标成已修复，也没有擅自改变 DSH 的退出策略。
 
 ## 安装与启动（当前本机边界）
 
@@ -36,6 +38,7 @@ dsh-tui --demo                 # 默认 fullscreen + tools 场景
 dsh-tui --demo tools-group     # 连续工具分组、I/O 详情与独立 Diff
 dsh-tui --demo images          # 用户/assistant/工具图片与重复附件
 dsh-tui --demo subagent        # 编辑框上方进度、子会话与原生 Reply/Stop 的离线 fixture
+dsh-tui --demo subagent-many   # 同一 fixture + 并行活动项，演示有限高度的 +N more
 ```
 
 demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型、不执行真实工具。它不会在真实连接失败时自动启用。
@@ -61,7 +64,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 - 真实模型流式上屏与结算、排队/steering、取消、权限预设、审批与问题；`/model` 模型选择器（搜索、provider 分组、effort 保留）。
 - 原生 preset 选择、原生命令透传、会话新建/恢复与启动会话选择器；`/reload` 走 native HMR 配置重组合。
 - 图片：`[Image #N]` 原子附件输入、显式只读查看器、用户/assistant/工具/历史图片保序投影；`history.json` 只存文字，不写 base64；队列图片 refs 需要显式 Up 取回重试，不新增调度器。
-- Subagents：编辑框上方的 Pi 风格紧凑进度树；点击 agent 直接查看子会话，另有完整 Agents 树、原生 Stop/Reply 与子审批来源。
+- Subagents：编辑框上方的 Pi 风格两行活动进度树，运行图标与 Working 共用动态帧，根会话 ready 时也转但不改根状态。名字链接立即打开只读子会话／加载界面；连续目录／结算／任务消息分组，正文与非名字单元不导航。已结算项退场，目录／历史通过 `/agent`／Agents 树查看；保留原生 Stop/Reply 与子审批来源。
 - 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、cwd 与 git 只读状态。
 - 品牌蓝主题与静态字符块 DeepSeek logo；无启动动画、无原生图片 logo。
 
@@ -99,16 +102,20 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 
 回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
 
-Subagent 进度紧贴编辑框上方：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。fullscreen 仅点击蓝色、加粗、带下划线的 agent 名字进入对应子会话，Esc 返回原编辑框并保留草稿／图片；`Agents`／`+N more` 文字打开完整树。状态、指标、模型、活动和空白不触发跳转，保留正常拖选／复制；External 不显示伪链接。这些是 TUI 内部导航，不生成外部 URL。inline 保留相同进度样式，通过 `Ctrl+X Ctrl+A` 查看。活跃 child 与回复目标优先显示，终端变矮或输入变高时缩减为摘要／标题；没有 child 时不占行。
+Subagent 进度紧贴编辑框上方，保留两行设计：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。运行图标使用和 Editor Working 相同的 `· → ✻ → ✶ → ✳` 动态帧与 App 的同一个 100ms 时钟；没有每个 child 自己的计时器，根会话 ready／空闲时仍转，但不改根 busy、退出确认、计数或模型调度。进度只显示 `running`／`initializing` child；`idle`、完成、失败或停止项在原生状态更新后立即退场，没有活跃项就完全收起。标题与溢出数只统计已知活跃项，完整原生目录不删除；continuable child 再次运行会重新出现。明确回复目标若已 idle，只保留 Editor 的 `Replying to …` 提示，不用进度行冒充正在工作。
+
+fullscreen 仅点击蓝色、加粗、带下划线的名字进入对应子会话，原生读取尚未完成时立即显示 `Loading child session…`，不等待 child 从 initializing 变成 running。Esc 关闭加载／详情界面，返回同一个 Editor 并保留草稿／图片，不中断根会话；迟到读取不能复活已关闭的界面或释放新 attachment 的 follow。`Agents`／`+N more` 文字打开完整树；根会话 `/agent` 和 `Ctrl+X Ctrl+A` 始终是历史入口。状态、指标、模型、活动和空白保留拖选／复制，不跳转；这些是内部导航，不生成外部 URL。inline 保留相同进度样式与键盘入口。完成项退场不强行关闭用户正在阅读的子会话详情；终端变矮或输入变高时仍按原有预算降级。
 
 macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节会标记诊断，不伪造支持。完整动作与兼容说明见 [输入说明](docs/INPUT.md)。
 
 ## 命令与设置
 
-`/help`、`/settings`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
+`/help`、`/settings`、`/agent`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
 
 - **`/compact`**：摘要目标仍是最近一次实际路由时，原生插件接缝继承该请求的显式 reasoning effort；不同摘要模型不串用 effort，没有历史 effort 时保留 DSH 默认。消息、工具和输出预算不变。若压缩失败，界面在原生提示的下一行显示按 command/session 关联、脱敏且限长的 `Native cause`，不再只剩笼统错误。
-- **Subagents**：编辑框上方默认显示 Pi 风格进度树，使用原生状态、当前活动与可用的 child session 累计指标，不照搬 Pi 的 turn/tool/context 计数。fullscreen 仅点击进度中的 agent 名字链接直接查看子会话，Esc 返回原 Editor；仅 `Agents`／`+N more` 文字打开完整树。其余进度文本可选字复制但不跳转，External 名字不是链接。主对话仍保留每个 direct child 一条不可展开的原生事实行；`Ctrl+X Ctrl+A` 打开 Agents 树，Enter/点击查看子会话，Esc 返回。R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips；Ctrl+C 在活动 child/回复目标上只中断该 child。回复支持原生 queue/steer 与文本/图片，accepted receipt 不冒充执行完成；失败保留草稿。子审批／问题带来源标签，子 transcript 使用独立 store，不会混入父会话。token/timing 是 child session 累计值，不冒充 per-run 统计。快捷键可在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。可运行 `dsh-tui --demo subagent` 查看离线示例。
+- **Subagents / `/agent`**：根会话 `/agent` 是打开现有 Agents 目录的 UI 导航，不注册第二套 DSH 业务命令、不创建或恢复 child。进度只显示原生 running／initializing 项，保持摘要＋活动两行；结算后隐藏，但主对话原生事实行和 Agents 历史仍保留。名字点击立即打开详情／加载界面，Esc 返回原 Editor；只有 `Agents`／`+N more` 文字打开完整树，其余进度文本可选字复制但不跳转。External 在历史中是没有本地 transcript 的叶子，不显示伪链接。`Ctrl+X Ctrl+A` 仍可打开树；R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips。Ctrl+C 在活动 child／回复目标上只中断该 child；child 回复目标中的 `/...` 仍是 child 文本，先 Esc 返回根会话才执行 `/agent` 等根命令。queue/steer、文本／图片、accepted receipt、失败草稿、子审批来源与父子 transcript 隔离均保留。token/timing 仍为 child session 累计值，没有假造 Pi turn/tool/context 计数；快捷键在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。`dsh-tui --demo subagent` 可看离线示例。
+
+- **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；共用现有 `Group tool calls`／`groupTools` 开关，不增加设置层级。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
 
 - **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
 - **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。

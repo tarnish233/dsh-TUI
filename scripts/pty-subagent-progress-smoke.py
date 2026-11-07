@@ -61,6 +61,20 @@ def run(mode):
         helpers.resize(session)
         session.send(b'PTY progress draft')
         screen, header, prompt, agent = widget_frame(session)
+        wait_frame(session, lambda value: any('demo (offline)/deepseek-demo' in line and ' · ready' in line
+                                             for line in value['lines']))
+        # Inspect the actual decoded cells' visible glyph, not raw ANSI bytes.
+        # No backend event is needed: the root is ready but child work animates.
+        frames = set()
+        for _ in range(5):
+            _, _, _, current = widget_frame(session)
+            prefix = current[1].split('Explore repository', 1)[0].rstrip()
+            frames.add(prefix[-1])
+            if len(frames) >= 2:
+                break
+            session.read(0.12)
+        assert len(frames) >= 2 and frames <= {'·', '✻', '✶', '✳'}, 'child progress did not reuse the Working animation: ' + repr(frames)
+        screen, header, prompt, agent = widget_frame(session)
         opened = len(session.raw)
         if mode == 'fullscreen':
             # Unlike the earlier transcript affordance, this is the real
@@ -107,6 +121,7 @@ def run(mode):
         session.send(b'\x03')
         result = session.finish(restore_offset=opened)
         result.update({'progressAboveEditor': True, 'piTreeStyle': True,
+                       'sharedWorkingAnimation': True, 'rootRemainsReady': True,
                        'entry': 'progress row mouse click' if mode == 'fullscreen' else 'shared keybinding',
                        'nativeChildTranscript': True, 'returnToDraft': True,
                        'compactResize': True, 'headerListClick': mode == 'fullscreen'})

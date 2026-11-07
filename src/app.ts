@@ -88,6 +88,8 @@ function styledGitStatus(status: string): string {
   return out
 }
 const EXIT_ARM_MS = 1_000
+/** One renderer-owned clock/frame family for the editor and live child progress. */
+const WORKING_SPINNER_FRAMES = ['·', '✻', '✶', '✳'] as const
 /** Bound on graceful DSH close after the terminal is already restored. */
 const SHUTDOWN_CLOSE_MS = 8_000
 /** Shared 品牌蓝 (brand blue) for the prompt, working status and chrome. */
@@ -145,6 +147,7 @@ const UI_COMMANDS = [
   { name: 'model', description: 'Choose a DSH model' },
   { name: 'effort', description: 'Choose the model reasoning effort' },
   { name: 'preset', description: 'Choose a DSH agent preset' },
+  { name: 'agent', description: 'View native subagents and their session history' },
   { name: 'resume', description: 'Resume a DSH session (picker lists this directory)' },
   { name: 'new', description: 'New DSH session' },
   { name: 'reload', description: 'Reload TUI settings/keybindings and DSH configuration/plugins' },
@@ -315,13 +318,15 @@ export class App {
   }
   private childSessionOverlay?: {
     childId: string
-    info: SessionInfo
+    /** A real child snapshot is absent while the read-only loading shell is open. */
+    info?: SessionInfo
+    context: UiContext
     store: TranscriptStore
     dialog: ChildSessionView
     handle: ReturnType<TUI['showOverlay']>
     returnToList: boolean
   }
-  /** Frames admitted after follow acknowledgement and before the child store reset. */
+  /** Frames observed while native follow/read establishes the child durable cut. */
   private pendingChildFollow?: {
     childId: string
     surface: number
@@ -958,16 +963,20 @@ export class App {
 
   private async openSubagentSession(childId: string, returnToList = false): Promise<void> {
     if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
+    // An already open/loading child owns this navigation. Repeated activation
+    // must not restart reads or release the same native follow underneath it.
+    if (this.childSessionOverlay?.childId === childId) return
     const entry = this.store.subagentEntry(childId)
     if (entry === undefined) {
       this.store.report('The native subagent is not present in this session.', 'error')
       return
     }
-    if (entry.mode === 'external' || entry.local === false) {
+    if (entry.mode === 'external' || entry.status === 'external' || entry.local === false) {
       this.store.report('External subagents have no local transcript to display.')
       return
     }
-    const rootSessionId = this.info?.sessionId
+    const context = this.context()
+    const rootSessionId = context.sessionId
     if (rootSessionId === undefined) return
     this.closeImageDetails()
     this.closeToolDetails()
@@ -976,64 +985,77 @@ export class App {
     this.surfaceGeneration += 1
     const surface = this.surfaceGeneration
     const pending: NonNullable<App['pendingChildFollow']> = { childId, surface, events: [], overflow: false }
+    const childStore = new TranscriptStore()
+    const codec = this.options.backend.transcriptCodec
+    if (codec !== undefined) childStore.setCodec(codec)
+    const view = new TranscriptView(childStore, {
+      ...this.viewOptions,
+      mouseBlocked: false,
+      onToolDetails: undefined,
+      onImageDetails: undefined,
+      onViewportAnchor: undefined,
+      onSubagentDetails: id => { void this.openSubagentSession(id) },
+    })
+    // Navigation is synchronous; only the transcript waits for native reads.
+    // The catalog entry is real, and no placeholder SessionInfo/Agent is made.
+    const dialog = new ChildSessionView(this.tui, {
+      entry,
+      loading: true,
+      store: childStore,
+      view,
+      keymap: this.keymap,
+      breadcrumb: [rootSessionId, entry.label ?? childId],
+      onClose: () => this.closeChildSession(),
+      ...(this.info?.capabilities.includes('subagent-prompt') === true
+        ? { onReply: (current: SubagentEntry) => this.beginSubagentReply(current) } : {}),
+      ...(this.info?.capabilities.includes('subagent-interrupt') === true
+        ? { onStop: (current: SubagentEntry) => { void this.interruptSubagent(current) } } : {}),
+      onInterrupt: () => this.closeChildSession(),
+      onGlobalAction: id => this.handleSubagentGlobalAction(id),
+      onRenderRequest: () => this.render(),
+    })
+    childStore.onChange = () => { dialog.invalidate(); this.render() }
+    const handle = this.tui.showOverlay(dialog, {
+      anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
+      margin: { top: 1, bottom: 1, left: 0, right: 0 },
+    })
+    const overlay: NonNullable<App['childSessionOverlay']> = { childId, context, store: childStore, dialog, handle, returnToList }
+    this.childSessionOverlay = overlay
     this.pendingChildFollow = pending
+    const ownsSurface = () => this.childSessionOverlay === overlay && surface === this.surfaceGeneration && this.sameAttachment(context)
+    const current = () => ownsSurface() && this.pendingChildFollow === pending
+    this.syncOverlayMouse()
+    this.render()
     try {
       await this.options.backend.command('subagent-follow', { sessionId: childId, follow: true })
+      if (!current()) { this.releaseUnownedChildFollow(childId, context); return }
       const raw = await this.options.backend.command('subagent-session', { sessionId: childId })
-      if (this.pendingChildFollow !== pending || surface !== this.surfaceGeneration || this.info?.sessionId !== rootSessionId) return
+      if (!current()) { this.releaseUnownedChildFollow(childId, context); return }
       if (pending.overflow) throw new Error('the live child event buffer was exceeded; reopen the child session')
       const info = object(raw)
       if (info?.sessionId !== childId) throw new Error('DSH returned an invalid child session snapshot')
       const childInfo = info as unknown as SessionInfo
-      const childStore = new TranscriptStore()
-      const codec = this.options.backend.transcriptCodec
-      if (codec !== undefined) childStore.setCodec(codec)
-      childStore.reset(childInfo)
-      const view = new TranscriptView(childStore, {
-        ...this.viewOptions,
-        mouseBlocked: false,
-        onToolDetails: undefined,
-        onImageDetails: undefined,
-        onViewportAnchor: undefined,
-        onSubagentDetails: id => { void this.openSubagentSession(id) },
-      })
-      const dialog = new ChildSessionView(this.tui, {
-        entry: this.store.subagentEntry(childId) ?? entry,
-        info: childInfo,
-        store: childStore,
-        view,
-        keymap: this.keymap,
-        breadcrumb: [rootSessionId, this.store.subagentEntry(childId)?.label ?? entry.label ?? childId],
-        onClose: () => this.closeChildSession(),
-        ...(this.info?.capabilities.includes('subagent-prompt') === true
-          ? { onReply: (current: SubagentEntry) => this.beginSubagentReply(current) } : {}),
-        ...(this.info?.capabilities.includes('subagent-interrupt') === true
-          ? { onStop: (current: SubagentEntry) => { void this.interruptSubagent(current) } } : {}),
-        onInterrupt: () => this.closeChildSession(),
-        onGlobalAction: id => this.handleSubagentGlobalAction(id),
-        onRenderRequest: () => this.render(),
-      })
-      childStore.onChange = () => { dialog.invalidate(); this.render() }
-      const handle = this.tui.showOverlay(dialog, {
-        anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
-        margin: { top: 1, bottom: 1, left: 0, right: 0 },
-      })
-      this.childSessionOverlay = { childId, info: childInfo, store: childStore, dialog, handle, returnToList }
+      overlay.info = childInfo
       this.pendingChildFollow = undefined
+      childStore.reset(childInfo)
+      dialog.update({ info: childInfo })
       for (const event of pending.events) this.routeChildEvent(event)
-      this.syncOverlayMouse()
+      dialog.setLoading(false)
       this.render()
     } catch (error) {
-      if (this.pendingChildFollow === pending) {
-        this.pendingChildFollow = undefined
-        void this.options.backend.command('subagent-follow', { sessionId: childId, follow: false }).catch(() => {})
-      }
-      if (surface === this.surfaceGeneration && !this.closing) {
+      if (ownsSurface()) {
+        this.closeChildSession(false)
         if (returnToList) this.openAgentsOverlay()
         this.store.report('Could not open the child session: ' + errorText(error), 'error')
         this.render()
-      }
+      } else this.releaseUnownedChildFollow(childId, context)
     }
+  }
+
+  /** A stale read/ack may release only its own attachment's unowned follow. */
+  private releaseUnownedChildFollow(childId: string, context: UiContext): void {
+    if (!this.sameAttachment(context) || this.childSessionOverlay?.childId === childId || this.pendingChildFollow?.childId === childId) return
+    void this.options.backend.command('subagent-follow', { sessionId: childId, follow: false }).catch(() => {})
   }
 
   private beginSubagentReply(entry: SubagentEntry): void {
@@ -1118,23 +1140,21 @@ export class App {
     const overlay = this.childSessionOverlay
     if (overlay === undefined) return
     this.childSessionOverlay = undefined
+    if (this.pendingChildFollow?.childId === overlay.childId) this.pendingChildFollow = undefined
     this.surfaceGeneration += 1
     overlay.handle.hide()
     overlay.dialog.dispose()
-    void this.options.backend.command('subagent-follow', { sessionId: overlay.childId, follow: false }).catch(() => {})
+    this.releaseUnownedChildFollow(overlay.childId, overlay.context)
     this.syncOverlayMouse()
     if (returnToList && overlay.returnToList && !this.closing) this.openAgentsOverlay()
     else this.tui.requestRender()
   }
 
   private closeSubagentSurfaces(): void {
-    const pending = this.pendingChildFollow
-    this.pendingChildFollow = undefined
-    if (pending !== undefined) {
-      void this.options.backend.command('subagent-follow', { sessionId: pending.childId, follow: false }).catch(() => {})
-    }
+    // A pending read belongs to the same immediately visible child surface.
     // Bulk teardown must not transiently reopen Agents between the two hides.
     this.closeChildSession(false)
+    this.pendingChildFollow = undefined
     this.closeAgentsOverlay()
     this.syncOverlayMouse()
   }
@@ -1150,9 +1170,14 @@ export class App {
     const child = this.childSessionOverlay
     if (child !== undefined) {
       const entry = this.store.subagentEntry(child.childId)
+      if (entry === undefined || entry.mode === 'external' || entry.status === 'external' || entry.local === false) {
+        this.closeChildSession(false)
+        return
+      }
+      // Settlement refreshes the header, not the user's open conversation.
       // ChildSessionView.setEntry invalidates synchronously. Only call it for
       // a real projection replacement, not on every App.render recursion.
-      if (entry !== undefined && entry !== child.dialog.entry) child.dialog.setEntry(entry)
+      if (entry !== child.dialog.entry) child.dialog.setEntry(entry)
     }
   }
 
@@ -1343,10 +1368,10 @@ export class App {
     this.store.handle(event)
     if ('sessionId' in event && event.sessionId !== this.info?.sessionId) return
     if (event.type === 'status') {
+      const wasBusy = this.isBusy
       this.busy = event.status === 'running'
-      if (this.isBusy) this.startSpinner()
-      else {
-        this.stopSpinner()
+      if (!wasBusy && this.isBusy) this.startedAt = Date.now()
+      if (!this.isBusy) {
         // A settled instruction may have changed git facts; the rate/TTFT
         // chips now come from the native sessionStats fold via `state`.
         this.gitRefresher?.refresh()
@@ -1386,12 +1411,13 @@ export class App {
       const data = object(event.event.data)
       this.output.beginTurn(typeof data?.turn === 'number' ? data.turn : undefined, Date.now())
     } else if (event.type === 'session_event' && (event.event.type === 'command/run' || event.event.type === 'command/done')) {
+      const wasBusy = this.isBusy
       const data = object(event.event.data)
       if (typeof data?.commandId === 'string') {
         if (event.event.type === 'command/run') this.activeCommands.set(data.commandId, typeof data.name === 'string' ? data.name : 'command')
         else this.activeCommands.delete(data.commandId)
       }
-      if (this.isBusy) this.startSpinner(); else this.stopSpinner()
+      if (!wasBusy && this.isBusy) this.startedAt = Date.now()
       this.refreshQueue()
     } else if (event.type === 'decision') {
       const attachmentId = this.info?.attachmentId
@@ -1500,11 +1526,18 @@ export class App {
 
   private startSpinner(): void {
     if (this.spinner) return
-    this.startedAt = Date.now()
     this.spinner = setInterval(() => { this.spinnerStep++; this.render() }, 100)
     this.spinner.unref()
   }
   private stopSpinner(): void { if (this.spinner) clearInterval(this.spinner); this.spinner = undefined }
+
+  /** Animation is presentation only: live children never make the root busy. */
+  private syncSpinner(): void {
+    const childWorking = this.connected && this.store.subagentEntries.some(entry =>
+      entry.status === 'running' || entry.status === 'initializing')
+    if (this.isBusy || childWorking) this.startSpinner()
+    else this.stopSpinner()
+  }
 
   /**
    * Keep the progress widget above the one Editor, never in the transcript's
@@ -1526,7 +1559,8 @@ export class App {
     this.syncImageDetails()
     this.syncSubagentSurfaces()
     this.syncSubagentReplyTarget()
-    const spinner = ['·', '✻', '✶', '✳'][this.spinnerStep % 4]
+    this.syncSpinner()
+    const spinner = WORKING_SPINNER_FRAMES[this.spinnerStep % WORKING_SPINNER_FRAMES.length]!
     const command = this.activeCommands.values().next().value
     this.queueList.rows = this.queueRows
     this.queueList.editingId = this.editingQueueId
@@ -1534,6 +1568,7 @@ export class App {
     this.subagentProgress.entries = this.store.subagentEntries
     this.subagentProgress.truncated = this.store.subagentsTruncated
     this.subagentProgress.replyTargetId = replyTarget?.childId
+    this.subagentProgress.spinnerFrame = spinner
     const rootWorking = this.isBusy ? this.workingStatus(spinner, command, Date.now()) : ''
     this.prompt.setWorkingStatus(replyTarget === undefined ? rootWorking
       : accent('Replying to ' + replyTarget.label) + dim(' · Esc to return') +
@@ -2213,6 +2248,7 @@ export class App {
     if (name === 'help') { await this.openHelp(); return }
     if (name === 'reload') { await this.reloadRuntime(); return }
     if (name === 'settings' || name === 'config') { this.openSettings(); return }
+    if (name === 'agent') { this.openAgentsOverlay(); return }
     if (name === 'model') { if (argument) await this.runRemote('model', { id: argument }); else await this.pick('models'); return }
     if (name === 'effort') { await this.effortCommand(argument); return }
     if (name === 'preset') { await this.presetCommand(argument); return }

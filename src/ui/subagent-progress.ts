@@ -19,13 +19,29 @@
  * session-total time, and the second line is only the real current
  * `lastActivity` of a `running` child.
  *
+ * Active-only presentation: this widget represents **current work**, so the
+ * full native catalog is accepted as input but only entries DSH reports as
+ * `running`/`initializing` are painted. A settled child (idle/completed/…)
+ * retires on the same native catalog frame that settles it — no lingering
+ * row, no turn age, no timer and no local memory. The retired row remains in
+ * `store.subagentEntries` and is reached through the Agents overlay
+ * (`/agent` / `app.subagents.details`) exactly as before; the overflow count
+ * therefore also counts only active children. Pi's 1-turn linger (its widget
+ * ages finished rows on the next `tool_execution_start`) has no DSH analogue
+ * here because DSH has no upper bound on how long a settlement may sit before
+ * the next turn, and the user's contract is that progress is live work only.
+ *
  * Ownership boundaries:
  * - DSH owns the child catalog, statuses, prompts, interrupts and persistence.
  *   This component only projects the `SubagentEntry[]` the parent assigns
- *   before `render()`; it starts no timer, no poll, no child work, keeps no
+ *   before `render()` and filters them to native active status without
+ *   mutating the catalog; it starts no timer, no poll, no child work, keeps no
  *   status of its own and never measures a run locally. It therefore does not
- *   animate: the live marker is a static native glyph and the parent's frame
- *   loop supplies repaints. No transcript is fetched to fill the activity line.
+ *   animate: a host that already runs a `Working…` frame loop may assign the
+ *   current raw glyph through {@link SubagentProgress.spinnerFrame}, and the
+ *   component paints it on running/initializing rows for that frame only. With
+ *   no such input it paints the static native marker. No transcript is fetched
+ *   to fill the activity line.
  * - It is not `Focusable` and installs no input listener, so the one Editor
  *   keeps focus and ordinary typing is untouched. Only mouse affordances are
  *   registered, and only for links whose text actually survived the clip on
@@ -55,18 +71,21 @@ import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import {
   subagentActivity,
   subagentLabel,
+  subagentLinkStyle,
   subagentModeLabel,
   subagentOpenable,
+  subagentPaintedLink,
   subagentRawStatusLabel,
   subagentRouteLabel,
   subagentStatusLabel,
   subagentTimingLabel,
   subagentTokensLabel,
   subagentTone,
+  type SubagentLinkSpan,
   type SubagentTone,
 } from './subagent-format.ts'
-import { fit, oneLine, truncateToWidth, visibleWidth } from './text.ts'
-import { bold, dim, t, underline, type Style } from './theme.ts'
+import { fit, oneLine, sanitize, truncateToWidth, visibleWidth } from './text.ts'
+import { bold, dim, t } from './theme.ts'
 
 /** Total rendered lines when the parent supplies no budget. */
 const DEFAULT_MAX_ROWS = 8
@@ -111,7 +130,9 @@ const TONE_STYLE: Readonly<Record<SubagentTone, (text: string) => string>> = {
 
 /**
  * Status glyph, identical to the Agents overlay and the transcript row so one
- * child reads the same in every surface. Static by design (no component timer).
+ * child reads the same in every surface. Static by design: the component owns
+ * no timer, and only a parent-supplied `spinnerFrame` can replace the live
+ * glyph for one frame (see {@link SubagentProgress.spinnerFrame}).
  */
 const TONE_GLYPH: Readonly<Record<SubagentTone, string>> = {
   running: '⏺',
@@ -164,8 +185,6 @@ export interface SubagentProgressOptions {
 /** One planned child row for this frame. */
 interface RowPlan {
   readonly entry: SubagentEntry
-  /** Live (`running`/`initializing`) rows are prioritized over settled history. */
-  readonly active: boolean
   /** The parent's current reply target: pinned first and visually marked. */
   readonly pinned: boolean
   /** Native current activity; only a live row with a native activity has one. */
@@ -186,10 +205,7 @@ interface RowSelection {
 }
 
 /** Inclusive component-local columns of one painted internal link. */
-interface LinkSpan {
-  readonly startCol: number
-  readonly endCol: number
-}
+type LinkSpan = SubagentLinkSpan
 
 /** One painted line plus the link geometry actually visible on that line. */
 interface PaintedLine {
@@ -207,11 +223,37 @@ interface LinkPaint {
 }
 
 export class SubagentProgress implements Component {
-  /** Native catalog projection, replaced by the parent before every render. */
+  /**
+   * Full native catalog projection, replaced by the parent before every render.
+   * Read-only here: the component filters it to active rows for display and
+   * never removes, mutates or remembers a settled child.
+   */
   entries: readonly SubagentEntry[] = []
+  /**
+   * Parent-supplied raw Working frame for this paint — the same glyph the host
+   * already uses in its `Working…` editor status (`· ✻ ✶ ✳`). The component
+   * owns no timer and no animation: the host assigns one frame before each of
+   * its own renderer paints (for example from the existing 100ms spinner clock
+   * it extends to live catalog rows) and a standalone host simply leaves it
+   * undefined.
+   *
+   * Only native `running`/`initializing` rows read it; the two-line summary +
+   * activity layout is unchanged. Only a single-display-column printable glyph
+   * is accepted: an empty, multi-cell or control-bearing value falls back to
+   * the static native glyph (`⏺`), so a hostile frame can neither widen a row
+   * nor shift the painted name columns by half a cell. Assignment alone never
+   * triggers a render and never resets a hitbox; the next paint re-measures
+   * every name from the final clipped line. Historical transcript rows never
+   * read this field.
+   */
+  spinnerFrame?: string
   /** True only when DSH reports the native catalog as incomplete. */
   truncated = false
-  /** Child id the one root Editor is currently addressing, if any. */
+  /**
+   * Child id the one root Editor is currently addressing, if any. It is a
+   * priority hint among ACTIVE rows only: a settled target is not resurrected
+   * here (the main Editor states the destination).
+   */
   replyTargetId?: string
   private readonly options: SubagentProgressOptions
   private readonly keymap: CcKeymap
@@ -439,9 +481,15 @@ export class SubagentProgress implements Component {
       return []
     }
     const size = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1
-    const entries = this.deduped()
-    // An empty catalog renders nothing at all: no blank spacer, invisible
-    // hitbox or host-side sibling/Editor measurement on ordinary idle paints.
+    // Active-only presentation: the full native catalog stays the input, but
+    // this widget is current work. Settled children (idle/completed/failed/…)
+    // and external leaves are history and live in the Agents overlay; they are
+    // filtered out here without mutating, removing or remembering anything.
+    // An all-settled catalog therefore renders nothing at all — no header, no
+    // spacer, no invisible hitbox — even when the catalog is truncated or a
+    // settled id is still the parent's explicit reply target (the main Editor
+    // already states that destination, and retiring it here is display-only).
+    const entries = this.deduped().filter(isActive)
     if (entries.length === 0) {
       this.syncFrame([])
       return []
@@ -608,14 +656,15 @@ export class SubagentProgress implements Component {
   // Header
 
   /**
-   * `● Agents · 5 children · Ctrl+X Ctrl+A open`
+   * `● Agents · 2 children · Ctrl+X Ctrl+A open`
    *
-   * The native heading marker is brand blue while a child is live, dim once
-   * everything settles. The actionable `Agents` word remains a blue internal
-   * link, not a second status source. The count is dim and honest; the open
-   * hint comes from the real keymap in the
-   * editor context, so a remapped action advertises the new key and a disabled
-   * one advertises nothing instead of a dead chord.
+   * The heading marker is brand blue because this widget only exists while a
+   * child is live; the actionable `Agents` word remains a blue internal link,
+   * not a second status source. The count is dim and counts exactly the active
+   * children painted by this widget — retired history is not represented here
+   * and is reached through the Agents overlay (`/agent`). The open hint comes
+   * from the real keymap in the editor context, so a remapped action advertises
+   * the new key and a disabled one advertises nothing instead of a dead chord.
    *
    * Only the `Agents` word is a link: the bullet, the count and the chord keep
    * their plain text and the native selection behavior.
@@ -630,7 +679,7 @@ export class SubagentProgress implements Component {
     const style = active > 0 ? t.accent : dim
     const word = 'Agents'
     const prefix = style('●') + ' '
-    let line = prefix + (paint.linkable ? linkStyle(paint.hovered)(word) : style(word))
+    let line = prefix + (paint.linkable ? subagentLinkStyle(paint.hovered)(word) : style(word))
     const append = (styled: string): void => {
       const next = `${line}${dim(' · ')}${styled}`
       if (visibleWidth(next) <= width) line = next
@@ -640,7 +689,7 @@ export class SubagentProgress implements Component {
     if (this.truncated) append(t.yellow('incomplete'))
     const hint = this.openHint()
     if (hint !== undefined) append(dim(`${hint} open`))
-    return paintedLine(line, width, visibleWidth(prefix), visibleWidth(word), paint.linkable)
+    return subagentPaintedLink(line, width, visibleWidth(prefix), visibleWidth(word), paint.linkable)
   }
 
   /** Effective `app.subagents.details` chord in the editor context, if any. */
@@ -657,9 +706,11 @@ export class SubagentProgress implements Component {
   // Rows
 
   /**
-   * Priority order for a bounded widget: the parent's reply target first (the
-   * next prompt addresses it), then live children, then settled history, each
-   * group in native catalog order.
+   * Priority order for a bounded live-only widget: the parent's reply target
+   * first when it is still active (the next prompt addresses it), then every
+   * other active child in native catalog order. A settled reply target is
+   * intentionally not admitted — the main Editor already states that
+   * destination and this surface represents current work only.
    */
   private planRows(entries: readonly SubagentEntry[]): readonly RowPlan[] {
     const targetId = this.replyTargetId
@@ -668,11 +719,7 @@ export class SubagentProgress implements Component {
     if (target !== undefined) plans.push(this.planRow(target, true))
     for (const entry of entries) {
       if (target !== undefined && entry.id === target.id) continue
-      if (isActive(entry)) plans.push(this.planRow(entry, false))
-    }
-    for (const entry of entries) {
-      if (target !== undefined && entry.id === target.id) continue
-      if (!isActive(entry)) plans.push(this.planRow(entry, false))
+      plans.push(this.planRow(entry, false))
     }
     return plans
   }
@@ -681,7 +728,6 @@ export class SubagentProgress implements Component {
     const activity = subagentActivity(entry)
     return {
       entry,
-      active: isActive(entry),
       pinned,
       ...(activity === undefined ? {} : { activity }),
     }
@@ -705,7 +751,7 @@ export class SubagentProgress implements Component {
     const entry = plan.entry
     const pinned = plan.pinned
     const tone = subagentTone(entry)
-    const glyph = markStyle(tone)(TONE_GLYPH[tone])
+    const glyph = markStyle(tone)(spinnerGlyph(tone, this.spinnerFrame))
     const head = dim(last ? '└─' : '├─') + ' ' + glyph + ' '
     const statusText = subagentStatusLabel(entry)
     const status = TONE_STYLE[tone](statusText)
@@ -723,7 +769,7 @@ export class SubagentProgress implements Component {
     const labelRoom = Math.max(1, width - visibleWidth(head) - visibleWidth(secondary) - gapWidth)
     const label = truncateToWidth(flatten(subagentLabel(entry)), labelRoom, '…')
     const styledLabel = paint.linkable
-      ? linkStyle(paint.hovered)(label)
+      ? subagentLinkStyle(paint.hovered)(label)
       : pinned ? bold(t.accentBright(label)) : bold(t.text(label))
     let line = head + styledLabel + gap + secondary
     if (pinned) line = appendIfFits(line, t.accentBright('reply target'), width)
@@ -733,7 +779,7 @@ export class SubagentProgress implements Component {
     if (tokens !== undefined) line = appendIfFits(line, dim(tokens), width)
     const route = subagentRouteLabel(entry)
     if (route !== undefined) line = appendIfFits(line, dim(flatten(route)), width)
-    return paintedLine(line, width, visibleWidth(head), visibleWidth(label), paint.linkable)
+    return subagentPaintedLink(line, width, visibleWidth(head), visibleWidth(label), paint.linkable)
   }
 
   /**
@@ -749,12 +795,14 @@ export class SubagentProgress implements Component {
   }
 
   /**
-   * `└─ +3 more (1 idle, 2 completed)`
+   * `└─ +2 more (2 running)`
    *
    * Grouped by the raw native status label, so the count never invents a
-   * category ("finished", a percentage or a business mode). Only the
-   * `+N more` text is a link; the tree guide and the parenthesized grouped
-   * counts stay plain text.
+   * category ("finished", a percentage or a business mode). Because this
+   * widget is active-only, every hidden entry is a live child: retired history
+   * is never folded into this count. Only the `+N more` text is a link; the
+   * tree guide and the parenthesized grouped counts stay plain text. The count
+   * opens the Agents overlay, which still holds the full native catalog.
    */
   private overflowLine(
     hidden: readonly SubagentEntry[],
@@ -770,33 +818,28 @@ export class SubagentProgress implements Component {
     const guide = dim('└─') + ' '
     const count = `+${hidden.length} more`
     const line = guide +
-      (paint.linkable ? linkStyle(paint.hovered)(count) : dim(count)) +
+      (paint.linkable ? subagentLinkStyle(paint.hovered)(count) : dim(count)) +
       dim(` (${detail})`)
-    return paintedLine(line, width, visibleWidth(guide), visibleWidth(count), paint.linkable)
+    return subagentPaintedLink(line, width, visibleWidth(guide), visibleWidth(count), paint.linkable)
   }
 
   /**
-   * Greedy selection in priority order under a hard line budget.
+   * Greedy selection in native priority order under a hard line budget.
    *
-   * A live child is admitted together with its native activity line before any
-   * settled history is considered, so the Pi two-line design survives a busy
-   * catalog: three live children keep their activity lines while finished
-   * children collapse into the `+N more` count. Only when the budget cannot
-   * hold another two-line row does a live child degrade to its summary line;
-   * once a live row cannot be admitted at all, lower-priority settled rows stop
-   * being admitted too.
+   * A live child is admitted together with its native activity line while the
+   * budget can hold the pair, so the Pi two-line design survives a busy
+   * catalog: three live children keep their activity lines and any additional
+   * live children collapse into the `+N more` count. Only when the budget
+   * cannot hold another two-line row does a live child degrade to its summary
+   * line. Settled children never reach this method: they are history, not a
+   * lower-priority slice of a bounded progress list.
    */
   private selectRows(plans: readonly RowPlan[], available: number): RowSelection {
     const rows: SelectedRow[] = []
     const hidden: SubagentEntry[] = []
     let remaining = Math.max(0, Math.floor(available))
     const start = remaining
-    let activeCut = false
     for (const plan of plans) {
-      if (activeCut && !plan.active) {
-        hidden.push(plan.entry)
-        continue
-      }
       if (plan.activity !== undefined && remaining >= 2) {
         rows.push({ plan, withActivity: true })
         remaining -= 2
@@ -807,7 +850,6 @@ export class SubagentProgress implements Component {
         remaining -= 1
         continue
       }
-      if (plan.active) activeCut = true
       hidden.push(plan.entry)
     }
     return { rows, hidden, used: start - remaining }
@@ -819,51 +861,20 @@ function isActive(entry: Pick<SubagentEntry, 'status'>): boolean {
 }
 
 /**
- * Internal TUI link style: bold brand blue + underline, brighter while hovered.
+ * Live marker text for one row.
  *
- * These are hitbox-backed links, never OSC 8 hyperlinks, so the underline is
- * real SGR inside the painted label and no URL/browser/custom scheme exists.
+ * `running`/`initializing` rows prefer the parent's current Working frame; every
+ * other tone (and every invalid frame) keeps the static native glyph. The frame
+ * is whitespace-folded and sanitized first, and only a single display column is
+ * accepted, so the glyph can never widen the row, wrap a line, or shift the
+ * painted name columns by half a cell (CJK/emoji frame values are rejected).
  */
-function linkStyle(hovered: boolean): Style {
-  return hovered
-    ? text => underline(bold(t.accentBright(text)))
-    : text => underline(bold(t.accent(text)))
-}
-
-/**
- * Paint one line and derive its link geometry from the text that survives.
- *
- * `fit` clips through Pi TUI's `truncateToWidth`, so the painted content is a
- * contiguous prefix of the raw line: all of it when the line fits, otherwise
- * only the columns left by the three-cell ellipsis that replaces the tail.
- * Geometry therefore never covers an ellipsis cell or any clipped-away label:
- * a label that starts at or beyond the last painted content cell yields no
- * span at all, and a partially clipped one stops at the last visible column.
- */
-function paintedLine(
-  raw: string,
-  width: number,
-  prefixWidth: number,
-  textWidth: number,
-  linkable: boolean,
-): PaintedLine {
-  const line = fit(raw, width)
-  if (!linkable || textWidth <= 0) return { line }
-  const contentWidth = paintedContentWidth(visibleWidth(raw), width)
-  if (prefixWidth >= contentWidth) return { line }
-  return {
-    line,
-    link: {
-      startCol: prefixWidth,
-      endCol: Math.min(prefixWidth + textWidth - 1, contentWidth - 1),
-    },
-  }
-}
-
-/** Columns of a raw line whose original text is still painted after `fit`. */
-function paintedContentWidth(rawWidth: number, width: number): number {
-  if (rawWidth <= width) return rawWidth
-  return Math.max(0, width - visibleWidth('...'))
+function spinnerGlyph(tone: SubagentTone, frame: string | undefined): string {
+  if (tone !== 'running' || frame === undefined) return TONE_GLYPH[tone]
+  // `sanitize` runs before measuring: a control/escape-bearing value must never
+  // reach the paint even when the parent is trusted to pass a plain glyph.
+  const text = sanitize(flatten(frame)).trim()
+  return text !== '' && visibleWidth(text) === 1 ? text : TONE_GLYPH[tone]
 }
 
 /** Append one low-priority segment only while the row still fits the width. */

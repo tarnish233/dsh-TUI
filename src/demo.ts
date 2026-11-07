@@ -68,6 +68,7 @@ export const DEMO_HINTS = [
   'fail     → assistant/attempt 结算 + 非致命错误',
   'pending  → 已受理但没有结果的工具调用（显示 unknown）',
   'subagent → 原生子 Agent 目录（并行运行/空闲/失败/外部）+ 结算与触发消息',
+  'subagent-many → 同一 fixture + 3 个并行运行的 continuable 子 Agent（进度区溢出验收）',
 ] as const
 
 /** Mirrors DSH's public `CommandDescriptor`; the demo never invents capabilities. */
@@ -149,11 +150,30 @@ const DEMO_CHILD_VERIFY = 'demo-child-verify'
 const DEMO_CHILD_TEST = 'demo-child-test'
 const DEMO_CHILD_EXTERNAL = 'demo-child-external'
 
+/**
+ * Extra fixture-only active children of the `subagent-many` scenario.
+ *
+ * The default `subagent` fixture intentionally has exactly one live child, so
+ * an active-only progress widget can never overflow it. This scenario appends
+ * three deterministic `running` continuable rows (no root catalog seq, so they
+ * never create a transcript anchor) purely so the CLI/PTY active-overflow
+ * acceptance has something real to lay out. They are offline data like every
+ * other demo row: no Agent, model, backend or transport is involved.
+ */
+const DEMO_CHILD_ACTIVE_MANY = [
+  { id: 'demo-child-active-1', label: 'Search callers', activity: 'grepping src/state for subagent references' },
+  { id: 'demo-child-active-2', label: 'Audit fixtures', activity: 'reading docs/FRONTEND-CONTRACT.md' },
+  { id: 'demo-child-active-3', label: 'Map adapters', activity: 'checking width-safe link geometry' },
+] as const
+
 const DEMO_CHILD_SESSIONS: Readonly<Record<string, string>> = {
   [DEMO_CHILD_EXPLORE]: 'I mapped the transcript projection, the live settlement path and the keys that will open the Agents overlay.',
   [DEMO_CHILD_REVIEW]: 'I reviewed the frontend diff. No blocking issues; two width-safe edge cases are covered by the new tests.',
   [DEMO_CHILD_VERIFY]: 'The demo verification fixture stopped before it could run the full suite.',
   [DEMO_CHILD_TEST]: 'Focused UI tests passed against the fixture codec; no model or network call was made.',
+  [DEMO_CHILD_ACTIVE_MANY[0].id]: 'Deterministic demo reply from the Search callers fixture child; no model call is made.',
+  [DEMO_CHILD_ACTIVE_MANY[1].id]: 'Deterministic demo reply from the Audit fixtures fixture child; no model call is made.',
+  [DEMO_CHILD_ACTIVE_MANY[2].id]: 'Deterministic demo reply from the Map adapters fixture child; no model call is made.',
 }
 const DEMO_CWD_FALLBACK = process.cwd()
 
@@ -1048,6 +1068,9 @@ export class DemoBackend implements Backend {
     let reason: unknown = { kind: 'completed' }
     if (imageRequest) {
       reason = await this.imagesFlow(turn, step)
+    } else if (lower.includes('subagent-many') || lower.includes('subagents-many')) {
+      // Explicit offline overflow scenario: same fixture plus extra live children.
+      reason = await this.subagentFlow(turn, step, { activeExtra: DEMO_CHILD_ACTIVE_MANY.length })
     } else if (lower.includes('subagent') || lower.includes('agents') || text.includes('子代理') || text.includes('子任务')) {
       reason = await this.subagentFlow(turn, step)
     } else if (lower.includes('question') || text.includes('问题') || text.includes('问卷')) {
@@ -1305,9 +1328,21 @@ export class DemoBackend implements Backend {
    *
    * Catalog seqs are real parent log seqs, so the transcript anchors one row
    * per direct child exactly where DSH recorded it. The external and nested
-   * rows have no root transcript anchor; they remain in progress/Agents views.
+   * rows have no root transcript anchor and remain in the full Agents catalog;
+   * only native active rows are painted in progress.
+   *
+   * `options.activeExtra` is the fixture-only `subagent-many` scenario: it
+   * appends that many deterministic `running` continuable rows to the final
+   * snapshot (and emits their native-shaped upserts) so the active-only
+   * progress widget has enough live children to exercise its overflow line.
+   * Those rows carry no `catalogSeq`, so they never add a transcript anchor,
+   * and they carry no session totals/timing facts the fixture did not observe.
    */
-  private async subagentFlow(turn: number, step: number): Promise<unknown> {
+  private async subagentFlow(
+    turn: number,
+    step: number,
+    options: { activeExtra?: number } = {},
+  ): Promise<unknown> {
     const sessionId = this.infoValue.sessionId
     const at = this.now()
     const exploreSeq = this.append('subagent/catalog', {
@@ -1454,8 +1489,33 @@ export class DemoBackend implements Backend {
     }
     this.emit({ type: 'subagent', sessionId, value: exploreRunning })
     this.demoSubagents.set(DEMO_CHILD_EXPLORE, exploreRunning)
+    // Fixture-only extra live children (`subagent-many`). They are emitted as
+    // native-shaped upserts so the live progress widget paints them immediately;
+    // no catalog seq means no durable transcript anchor is invented.
+    const extraCount = Math.max(0, Math.min(DEMO_CHILD_ACTIVE_MANY.length, Math.floor(options.activeExtra ?? 0)))
+    const activeExtra: SubagentEntry[] = []
+    for (let index = 0; index < extraCount; index += 1) {
+      const spec = DEMO_CHILD_ACTIVE_MANY[index]!
+      const entry: SubagentEntry = {
+        id: spec.id,
+        parentSessionId: sessionId,
+        createdAt: at + index,
+        mode: 'continuable',
+        label: spec.label,
+        provider: this.infoValue.provider,
+        model: this.infoValue.model,
+        reasoningEffort: this.infoValue.reasoningEffort ?? DEMO_DEFAULT_EFFORT,
+        local: true,
+        status: 'running',
+        lastActivity: spec.activity,
+        lastRunId: `demo-run-many-${index + 1}`,
+      }
+      activeExtra.push(entry)
+      this.demoSubagents.set(entry.id, entry)
+      this.emit({ type: 'subagent', sessionId, value: entry })
+    }
     const finalSnapshot: SubagentSnapshot = {
-      entries: [exploreRunning, review, verify, nested, external],
+      entries: [exploreRunning, review, verify, nested, external, ...activeExtra],
     }
     this.infoValue = { ...this.infoValue, subagents: finalSnapshot }
 
@@ -1465,9 +1525,12 @@ export class DemoBackend implements Backend {
       '- Explore repository：continuable，当前运行中，可点击编辑框上方的 agent 名字链接查看子会话。',
       '- Review changes：one-shot 已完成，并写入原生结算消息。',
       '- Verify build：one-shot 失败，不伪装成成功。',
-      '- External research：外部任务，进度区／Agents 树可见，没有本地会话。',
+      '- External research：外部任务，仅在 Agents 目录／历史中显示，没有本地会话。',
+      ...(activeExtra.length === 0
+        ? []
+        : [`- 并行运行：${activeExtra.map(entry => entry.label).join(' / ')}（fixture，用于进度区溢出验收，无本地 transcript 锚点）。`]),
       '',
-      '仅点击带下划线的 agent 名字进入子会话，Esc 返回原编辑框；状态／指标／活动可选字复制但不跳转。`app.subagents.details` 打开完整 Agents 树。`subagent.reply` / `subagent.interrupt` 分别请求继续对话与停止（仅对适用的子 Agent）。以上全部为离线确定性 fixture，不调用模型。',
+      '仅点击带下划线的 agent 名字进入子会话，Esc 返回原编辑框；状态／指标／活动可选字复制但不跳转。根会话 `/agent` 或 `app.subagents.details` 打开完整 Agents 目录／历史；结算项不占用上方进度。`subagent.reply` / `subagent.interrupt` 分别请求继续对话与停止（仅对适用的子 Agent）。以上全部为离线确定性 fixture，不调用模型。',
     ].join('\n')
     const chunks = [...this.textChunks(0, text, 'text'), ...this.terminalChunks()]
     const meta = await this.liveStream(turn, step, chunks)

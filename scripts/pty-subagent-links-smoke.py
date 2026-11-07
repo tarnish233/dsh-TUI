@@ -100,7 +100,7 @@ def copy_status(session, screen, row):
 
 
 def run(mode):
-    session = Session(mode, 'subagent-links', 'subagent')
+    session = Session(mode, 'subagent-links', 'subagent-many')
     negative_clicks = 0
     try:
         session.wait_for(b'Agents')
@@ -114,9 +114,9 @@ def run(mode):
         assert not screen['cells'][row][name_end][5], 'the name gap is not underlined'
         external = next((y for y, line in enumerate(screen['lines'])
                          if header < y < prompt and 'External research' in line), None)
-        if external is not None:
-            external_start, external_end = columns_for(screen, external, 'External research')
-            assert not any(cell[5] for cell in screen['cells'][external][external_start:external_end]), 'external is not a fake link'
+        assert external is None, 'external history must not consume active progress rows'
+        assert not any('Review changes' in line or 'Verify build' in line
+                       for line in screen['lines'][header + 1:prompt]), 'settled rows must leave active progress'
 
         opened = len(session.raw)
         if mode == 'fullscreen':
@@ -133,8 +133,6 @@ def run(mode):
                       (activity_start + 2, activity), (0, header),
                       (title_start - 1, header), (title_end, header),
                       (count + 1, header), (hint + 1, header)]
-            if external is not None:
-                points.append((external_start + 1, external))
             for x, y in points:
                 click(session, x, y)
                 screen, _, _, _ = widget(session)
@@ -154,6 +152,28 @@ def run(mode):
         if mode == 'inline':
             wait_frame(session, helpers.agents_overlay_visible)
             session.send(b'\x1b')
+        screen, header, prompt, row = widget(session)
+
+        # The retired native catalog remains reachable through the UI-owned
+        # /agent command. Stash/restore uses the same root Editor; no second
+        # composer and no real clipboard is involved.
+        session.send(b'\x13')
+        wait_frame(session, lambda value: not any('❯ PTY link draft' in line for line in value['lines']))
+        session.send(b'/agent\r')
+        history = wait_frame(session, lambda value: helpers.agents_overlay_visible(value)
+                             and any('External research' in line for line in value['lines']))
+        assert 'Review changes' in '\n'.join(history['lines'])
+        external_row = next(y for y, line in enumerate(history['lines']) if 'External research' in line)
+        external_start, external_end = columns_for(history, external_row, 'External research')
+        assert not any(cell[5] for cell in history['cells'][external_row][external_start:external_end]), 'external history is not a fake name link'
+        if mode == 'fullscreen':
+            click(session, external_start + 1, external_row)
+            history = wait_frame(session, helpers.agents_overlay_visible)
+            assert 'I mapped the transcript projection' not in '\n'.join(history['lines'])
+            negative_clicks += 1
+        session.send(b'\x1b')
+        wait_frame(session, lambda value: not helpers.agents_overlay_visible(value))
+        session.send(b'\x13')
         screen, header, prompt, row = widget(session)
 
         if mode == 'fullscreen':
@@ -186,7 +206,8 @@ def run(mode):
         result.update({'nameLinkStyle': True, 'entry': 'agent-name link' if mode == 'fullscreen' else 'shared keybinding',
                        'nameOnlyNavigation': mode == 'fullscreen', 'nonLinkClicks': negative_clicks,
                        'nativeSelectionCopy': mode == 'fullscreen', 'headerOverflowTextOnly': mode == 'fullscreen',
-                       'externalNotLink': external is not None, 'draftPreserved': True, 'resize': True})
+                       'externalNotLink': True, 'settledRetiredFromProgress': True,
+                       'agentHistoryCommand': True, 'draftPreserved': True, 'resize': True})
         return result
     finally:
         session.close()

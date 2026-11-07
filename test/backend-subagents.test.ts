@@ -379,6 +379,70 @@ test('an end for a not-yet-cataloged child applies when the row appears', async 
   assert.equal(entry.lastRunId, 'run-late')
 })
 
+test('a freshly cataloged local child is enterable while initializing, with no child Agent', async () => {
+  const h = await harness({ children: [] })
+  const creates = h.agents.createCalls.length
+  const resumes = h.agents.resumeCalls.length
+
+  // The native start edge precedes the parent-owned catalog fact. A start edge
+  // alone proves no membership row, so nothing is painted or enterable yet.
+  startRun(h.host, 'child-fresh', 'run-fresh', true)
+  await nextTask()
+  assert.equal(subagentSnapshot(h.events), undefined, 'a start edge alone publishes no row')
+  await assert.rejects(
+    h.backend.command('subagent-follow', { sessionId: 'child-fresh', follow: true }),
+    (error: unknown) => (error as { code?: string }).code === 'INVALID_ARGUMENT',
+    'a child without its catalog fact is not a member yet',
+  )
+
+  // The durable parent catalog fact and the child Session exist; no Agent does.
+  childSession(h.world, {
+    id: 'child-fresh',
+    mode: 'continuable',
+    label: 'Explore',
+    live: true,
+    events: [{ type: 'subagent/descriptor', data: { mode: 'continuable', label: 'Explore' } }],
+  })
+  h.world.appendEvent(ROOT, fakeCatalogEvent('child-fresh', 'continuable', 'Explore') as FakeSessionEvent)
+  h.world.setProjection(ROOT, 'subagentCatalog', catalogValue([['child-fresh', 'continuable', 'Explore']]))
+  h.host.emit('session/event', h.rootAgent.session, {
+    seq: 2,
+    type: 'subagent/catalog',
+    data: fakeCatalogEvent('child-fresh', 'continuable', 'Explore').data,
+  })
+  await until(() => entryOf(subagentSnapshot(h.events), 'child-fresh') !== undefined, 'first catalog row')
+
+  const entry = entryOf(subagentSnapshot(h.events), 'child-fresh')!
+  assert.equal(entry.mode, 'continuable')
+  assert.equal(entry.local, true, 'the first local row is never marked non-local')
+  assert.equal(entry.status, 'initializing', 'the start edge is known while the child Agent is absent')
+  assert.equal(entry.lastRunId, 'run-fresh')
+  assert.equal(h.agents.get('child-fresh'), undefined, 'no child Agent exists in the registry')
+
+  // First action on that row, exactly like the first click: follow then read.
+  // Both are native-membership based and create/resume nothing.
+  assert.deepEqual(
+    await h.backend.command('subagent-follow', { sessionId: 'child-fresh', follow: true }),
+    { sessionId: 'child-fresh', follow: true },
+  )
+  const info = await h.backend.command('subagent-session', { sessionId: 'child-fresh' }) as SessionInfo
+  assert.equal(info.sessionId, 'child-fresh')
+  assert.equal(info.snapshotUnavailable, undefined)
+  assert.ok(info.events?.some(event => event.type === 'subagent/descriptor'), 'the durable child cut is returned')
+  assert.equal(h.agents.createCalls.length, creates, 'follow and the read never create an Agent')
+  assert.equal(h.agents.resumeCalls.length, resumes, 'follow and the read never resume an Agent')
+  assert.equal(
+    entryOf(subagentSnapshot(h.events), 'child-fresh')!.status,
+    'initializing',
+    'reading never invents a running status',
+  )
+
+  assert.deepEqual(
+    await h.backend.command('subagent-follow', { sessionId: 'child-fresh', follow: false }),
+    { sessionId: 'child-fresh', follow: false },
+  )
+})
+
 test('external children are leaves; their lifecycle never becomes a local status', async () => {
   const h = await harness({
     children: [['external-child', 'external', 'cloud']],
@@ -407,6 +471,58 @@ test('external children are leaves; their lifecycle never becomes a local status
     h.backend.command('subagent-session', { sessionId: 'external-child' }),
     (error: unknown) => (error as { code?: string }).code === 'INVALID_ARGUMENT',
     'an external leaf has no local transcript to read',
+  )
+  // Follow fails closed for the same native reason: an external execution owns
+  // no local Session, so admitting a follow would promise frames that cannot
+  // exist. Release stays unconditional so teardown can never throw.
+  await assert.rejects(
+    h.backend.command('subagent-follow', { sessionId: 'external-child', follow: true }),
+    (error: unknown) => (error as { code?: string }).code === 'INVALID_ARGUMENT',
+    'an external leaf has no local session to follow',
+  )
+  assert.deepEqual(
+    await h.backend.command('subagent-follow', { sessionId: 'external-child', follow: false }),
+    { sessionId: 'external-child', follow: false },
+    'unfollowing an unopenable row never throws',
+  )
+})
+
+test('follow does not await a pending child transcript read', async () => {
+  const h = await harness({
+    children: [['child-a', 'continuable', 'task']],
+    setup: (world) => {
+      childSession(world, { id: 'child-a', mode: 'continuable', label: 'task' })
+    },
+  })
+  // Model a slow durable transcript read for the child. Membership comes from
+  // the native catalog row, so follow must resolve without waiting for it; the
+  // delayed continuation is bounded and released here only if it is awaited.
+  const real = h.world.sessionQuery
+  const held: string[] = []
+  h.host.use('sessionQuery', {
+    ...real,
+    observeSession: (id: string, options?: { readonly projectionMode?: 'all' | 'none' }) => {
+      if (id !== 'child-a') return real.observeSession(id, options)
+      held.push(id)
+      return new Promise<unknown>(resolve => {
+        const timer = setTimeout(() => { void resolve(real.observeSession(id, options)) }, 3_000)
+        timer.unref?.()
+      })
+    },
+    readSession: real.readSession,
+  })
+
+  const started = Date.now()
+  assert.deepEqual(
+    await h.backend.command('subagent-follow', { sessionId: 'child-a', follow: true }),
+    { sessionId: 'child-a', follow: true },
+  )
+  const elapsed = Date.now() - started
+  assert.deepEqual(held, [], 'follow never observes the child transcript')
+  assert.ok(elapsed < 1_000, `follow resolved without the pending read (${elapsed}ms)`)
+  assert.deepEqual(
+    await h.backend.command('subagent-follow', { sessionId: 'child-a', follow: false }),
+    { sessionId: 'child-a', follow: false },
   )
 })
 

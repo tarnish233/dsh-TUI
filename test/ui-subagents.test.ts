@@ -10,8 +10,11 @@ import { SubagentProjection, buildSubagentTree, flattenSubagentTree } from '../s
 import { TranscriptStore } from '../src/state/transcript.ts'
 import { createItemBlock, type TranscriptViewOptions } from '../src/ui/blocks.ts'
 import { TranscriptView } from '../src/ui/transcript.ts'
+import { SubagentGroupBlock } from '../src/ui/subagent-group.ts'
+import { clearToolExpansion } from '../src/ui/tool-expansion.ts'
 import { AgentsOverlay } from '../src/ui/agents-overlay.ts'
 import { ChildSessionView } from '../src/ui/child-session-view.ts'
+import { SubagentProgress } from '../src/ui/subagent-progress.ts'
 import { subagentCanReply, subagentCanStop } from '../src/ui/subagent-format.ts'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
@@ -116,6 +119,13 @@ function mouse(type: TuiMouseEventType, x: number, y: number): TuiMouseEvent {
 }
 
 const plain = (lines: readonly string[]): string[] => lines.map(line => stripTerminalSequences(line))
+
+/** Display column where `needle` starts in one plain painted line. */
+function colOf(line: string, needle: string): number {
+  const index = line.indexOf(needle)
+  assert.ok(index >= 0, `missing ${JSON.stringify(needle)} in ${JSON.stringify(line)}`)
+  return visibleWidth(line.slice(0, index))
+}
 
 function assertWidths(lines: readonly string[], width: number, label: string): void {
   for (const line of lines) {
@@ -367,7 +377,8 @@ function subagentStore(): TranscriptStore {
 
 test('transcript rows are single-line, width-safe, sanitized and never show per-run metrics', () => {
   const store = subagentStore()
-  const view = new TranscriptView(store, viewOptions())
+  // `groupTools: false` restores one row per record; grouping is covered below.
+  const view = new TranscriptView(store, viewOptions({ groupTools: false }))
   for (const width of [24, 40, 80, 120, 160]) {
     const lines = view.render(width)
     assertWidths(lines, width, 'subagent row')
@@ -400,20 +411,34 @@ test('transcript subagent rows expose no metrics when native timing/tokens are a
   assert.ok(!/\b\d+m \d+s\b/.test(text))
 })
 
-test('clicking a subagent row opens its details; without a callback the row is inert', () => {
+test('only the painted name of a standalone row opens its details', () => {
   const store = subagentStore()
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
-  const lines = view.render(80)
-  const row = plain(lines).findIndex(line => line.includes('Explore 仓库'))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(80))
+  const row = lines.findIndex(line => line.includes('Explore 仓库'))
   assert.ok(row >= 0)
-  view.handleMouse(mouse('press', 2, row))
-  view.handleMouse(mouse('click', 2, row))
+  const text = lines[row] ?? ''
+  const name = colOf(text, 'Explore 仓库')
+  // The status glyph, the guide gap, the mode/status/metrics and the hint are
+  // plain text: a press there stays native (selection/copy), never navigation.
+  for (const x of [name - 2, name - 1, name + visibleWidth('Explore 仓库'), colOf(text, 'continuable'), colOf(text, 'running')]) {
+    assert.equal(view.handleMouse(mouse('press', x, row)), undefined, `col ${x} must stay unclaimed`)
+    view.handleMouse(mouse('click', x, row))
+  }
+  assert.deepEqual(opened, [], 'no non-name cell can open the child')
+  // The first and last display column of the name do.
+  view.handleMouse(mouse('press', name, row))
+  view.handleMouse(mouse('click', name, row))
   assert.deepEqual(opened, ['explore'])
+  const nameEnd = name + visibleWidth('Explore 仓库') - 1
+  view.handleMouse(mouse('press', nameEnd, row))
+  view.handleMouse(mouse('click', nameEnd, row))
+  assert.deepEqual(opened, ['explore', 'explore'])
 
-  const inert = new TranscriptView(store, viewOptions())
+  const inert = new TranscriptView(store, viewOptions({ groupTools: false }))
   inert.render(80)
-  assert.equal(inert.handleMouse(mouse('click', 2, row)), undefined)
+  assert.equal(inert.handleMouse(mouse('click', name, row)), undefined)
 })
 
 test('an external row is visible but never advertises a local details surface', () => {
@@ -495,7 +520,9 @@ test('settlement/trigger rows render native attribution and exact body, never a 
     ],
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
+  // Two adjacent durable records would group; `groupTools: false` keeps one row
+  // per record so this test stays about the standalone row paint.
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
   const lines = view.render(100)
   assertWidths(lines, 100, 'settlement row')
   const text = plain(lines).join('\n')
@@ -506,12 +533,507 @@ test('settlement/trigger rows render native attribution and exact body, never a 
   assert.ok(text.includes('Found it.'))
   assert.ok(!text.includes('Agent child-explore sent a message: \n\nFound it.'), 'exact prefix is not repeated in the paint')
   assert.ok(!text.split('\n').some(line => line.startsWith('> ')), 'never a human prompt band')
+  // No native catalog row exists for either sender here: the durable id is
+  // painted as plain text and the row must not fake a navigation affordance.
+  for (const title of ['Subtask status updated', 'Task message received']) {
+    const row = plain(lines).findIndex(line => line.includes(title))
+    assert.ok(row >= 0)
+    const painted = plain(lines)[row] ?? ''
+    for (const x of [colOf(painted, title), colOf(painted, 'child-')]) {
+      assert.equal(view.handleMouse(mouse('press', x, row)), undefined, `${title} col ${x} stays sample text`)
+      view.handleMouse(mouse('click', x, row))
+    }
+  }
+  assert.deepEqual(opened, [])
+})
 
-  const settleRow = plain(lines).findIndex(line => line.includes('Subtask status updated'))
-  view.handleMouse(mouse('click', 2, settleRow))
-  const agentRow = plain(lines).findIndex(line => line.includes('Task message received'))
-  view.handleMouse(mouse('click', 2, agentRow))
-  assert.deepEqual(opened, ['child-review', 'child-explore'])
+test('a settlement/trigger sender links only its visible native label from the catalog', () => {
+  const summary = 'Background subagent review finished.'
+  const store = newStore({
+    events: [
+      ev('user/message', 2, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: summary }],
+        source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'child-review' },
+      }),
+      ev('user/message', 3, {
+        id: 'agent',
+        role: 'user',
+        content: [{ type: 'text', text: 'Agent child-external sent a message: ' }, { type: 'text', text: 'Remote result.' }],
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: 'child-external' },
+      }),
+    ],
+    subagents: snapshot(
+      entry({ id: 'child-review', parentSessionId: 's1', mode: 'continuable', status: 'completed', label: 'Review changes' }),
+      entry({ id: 'child-external', parentSessionId: 's1', mode: 'external', status: 'external', label: 'External research' }),
+    ),
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const raw = view.render(100)
+  const lines = plain(raw)
+  const text = lines.join('\n')
+  // The catalog knows the children, so their real labels replace the ids.
+  assert.ok(text.includes('Review changes'), text)
+  assert.ok(text.includes('External research'), text)
+  assert.ok(!text.includes('child-review'), 'a known child is painted by its native label')
+  const settleRow = lines.findIndex(line => line.includes('Subtask status updated'))
+  const settleText = lines[settleRow] ?? ''
+  const name = colOf(settleText, 'Review changes')
+  // Attribution title and the gap are plain text.
+  assert.equal(view.handleMouse(mouse('press', colOf(settleText, 'Subtask'), settleRow)), undefined)
+  view.handleMouse(mouse('click', colOf(settleText, 'Subtask'), settleRow))
+  assert.deepEqual(opened, [])
+  // Only the visible name navigates.
+  view.handleMouse(mouse('press', name, settleRow))
+  view.handleMouse(mouse('click', name, settleRow))
+  assert.deepEqual(opened, ['child-review'])
+  // Exactly the name is underlined (one SGR-4 span on the header row).
+  assert.equal((raw[settleRow] ?? '').split('\x1b[4m').length - 1, 1)
+
+  // An external child is honestly non-openable: label painted, no link at all.
+  const externalRow = lines.findIndex(line => line.includes('Task message received'))
+  const externalText = lines[externalRow] ?? ''
+  const externalName = colOf(externalText, 'External research')
+  assert.equal(view.handleMouse(mouse('press', externalName, externalRow)), undefined)
+  view.handleMouse(mouse('click', externalName, externalRow))
+  assert.deepEqual(opened, ['child-review'])
+  assert.equal((raw[externalRow] ?? '').split('\x1b[4m').length - 1, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Consecutive record grouping (Tools-style, display-only)
+
+/** `user → [Alpha, Beta] → assistant → [Gamma, settled]` as durable facts. */
+function groupedStore(): TranscriptStore {
+  const summary = 'Background subagent gamma finished.'
+  return newStore({
+    events: [
+      ev('user/message', 2, user('please check the children')),
+      assistant(5, 'two children spawned'),
+      ev('user/message', 7, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: summary }, { type: 'text', text: 'Body: no blockers.' }],
+        source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'gamma' },
+      }),
+    ],
+    subagents: snapshot(
+      entry({ id: 'alpha', parentSessionId: 's1', catalogSeq: 3, mode: 'continuable', status: 'running', label: 'Alpha 仓库', lastActivity: 'reading src/app.ts' }),
+      entry({ id: 'beta', parentSessionId: 's1', catalogSeq: 4, mode: 'one-shot', status: 'completed', label: 'Beta' }),
+      entry({ id: 'gamma', parentSessionId: 's1', catalogSeq: 6, mode: 'one-shot', status: 'failed', label: 'Gamma' }),
+    ),
+  })
+}
+
+test('consecutive subagent records group like tools and never cross a real boundary', () => {
+  const store = groupedStore()
+  const view = new TranscriptView(store, viewOptions())
+  const lines = plain(view.render(120))
+  // Two runs, one assistant item between them: `[alpha, beta]` and `[gamma, settle]`.
+  const headers = lines.filter(line => line.includes('Subagents:'))
+  assert.equal(headers.length, 2, lines.join('\n'))
+  assert.ok(headers[0]?.includes('2 records'), headers[0])
+  assert.ok(headers[0]?.includes('1 running'), headers[0])
+  assert.ok(headers[0]?.includes('1 completed'), headers[0])
+  assert.ok(headers[1]?.includes('2 records'), headers[1])
+  assert.ok(headers[1]?.includes('1 failed'), headers[1])
+  assert.ok(headers[1]?.includes('1 message'), headers[1])
+  // Members are painted as summary rows; the assistant item stays its own block.
+  const text = lines.join('\n')
+  assert.ok(text.includes('Alpha 仓库'), text)
+  assert.ok(text.includes('Beta'), text)
+  assert.ok(text.includes('Gamma'), text)
+  assert.ok(text.includes('Subtask status updated'), text)
+  assert.ok(text.includes('two children spawned'), text)
+  // Collapsed rows stay summaries: the durable body is folded, the store keeps it.
+  assert.ok(!text.includes('Body: no blockers.'), 'the collapsed group folds the body, it never deletes it')
+  const stored = store.items.find(item => item.kind === 'subagent-message')
+  assert.ok(stored !== undefined && stored.kind === 'subagent-message')
+  if (stored === undefined || stored.kind !== 'subagent-message') return
+  assert.equal(stored.seq, 7, 'the native seq is untouched by grouping')
+  assert.equal(stored.senderSessionId, 'gamma')
+  assert.ok(stored.text.includes('Body: no blockers.'), 'the exact native text stays in the store')
+  // Grouping is a preference: `groupTools: false` restores one row per record,
+  // and a non-record item between records never joins a run.
+  const flat = new TranscriptView(store, viewOptions({ groupTools: false }))
+  assert.equal(plain(flat.render(120)).filter(line => line.includes('Subagents:')).length, 0)
+  assert.equal(plain(flat.render(120)).filter(line => /Alpha 仓库|Beta|Gamma|Subtask status updated/.test(line)).length, 4)
+})
+
+test('a group header only toggles the fold; every member body follows the disclosure', () => {
+  const store = groupedStore()
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ hints: { expand: 'ctrl+o' }, onSubagentDetails: id => opened.push(id) }))
+  const collapsed = plain(view.render(120))
+  const headers = collapsed.map((line, index) => line.includes('Subagents:') ? index : -1).filter(index => index >= 0)
+  assert.equal(headers.length, 2)
+  assert.ok(collapsed[headers[0]!]?.includes('ctrl+o to expand'), collapsed[headers[0]!])
+  // Click the SECOND group (the one holding the durable message body). The
+  // header is a disclosure control: it never opens a child, even when the click
+  // lands on the header text or on the count/chord.
+  const secondRow = headers[1]!
+  for (const x of [colOf(collapsed[secondRow] ?? '', 'Subagents'), colOf(collapsed[secondRow] ?? '', '2 records'), 1]) {
+    view.handleMouse(mouse('press', x, secondRow))
+    view.handleMouse(mouse('click', x, secondRow))
+  }
+  assert.deepEqual(opened, [])
+  const expanded = plain(view.render(120))
+  assert.ok(expanded[secondRow]?.includes('to collapse'), expanded[secondRow])
+  assert.ok(expanded.join('\n').includes('Body: no blockers.'), 'the durable body is painted once expanded')
+  // A local toggle is local: the other run keeps its own fold state.
+  const firstRow = expanded.findIndex(line => line.includes('Subagents:'))
+  assert.ok(expanded[firstRow]?.includes('to expand'), expanded[firstRow])
+  // Ctrl+O is the existing transcript master switch: it unfolds the rest too.
+  view.toggleToolsExpanded()
+  const all = plain(view.render(120))
+  assert.equal(all.join('\n').includes('Body: no blockers.'), true)
+  assert.ok(all[firstRow]?.includes('to collapse'), all[firstRow])
+  assert.deepEqual(opened, [], 'no disclosure path ever opens a child')
+})
+
+test('group member names are the only child links, collapsed or expanded', () => {
+  const store = groupedStore()
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(120))
+  const alphaRow = lines.findIndex(line => line.includes('Alpha 仓库'))
+  assert.ok(alphaRow >= 0)
+  const alphaText = lines[alphaRow] ?? ''
+  // Branch guide, status glyph, status text and the activity tail are plain text.
+  for (const x of [0, 1, 2, 3, colOf(alphaText, 'running'), colOf(alphaText, 'reading')]) {
+    assert.equal(view.handleMouse(mouse('press', x, alphaRow)), undefined, `collapsed col ${x} stays native text`)
+    view.handleMouse(mouse('click', x, alphaRow))
+  }
+  assert.deepEqual(opened, [])
+  const name = colOf(alphaText, 'Alpha 仓库')
+  view.handleMouse(mouse('press', name, alphaRow))
+  view.handleMouse(mouse('click', name, alphaRow))
+  assert.deepEqual(opened, ['alpha'])
+  // A settlement member's attribution stays inert; its sender name navigates.
+  const settleRow = lines.findIndex(line => line.includes('Subtask status updated'))
+  const settleText = lines[settleRow] ?? ''
+  assert.equal(view.handleMouse(mouse('press', colOf(settleText, 'Subtask'), settleRow)), undefined)
+  view.handleMouse(mouse('click', colOf(settleText, 'Subtask'), settleRow))
+  assert.deepEqual(opened, ['alpha'])
+  const sender = colOf(settleText, 'Gamma')
+  view.handleMouse(mouse('press', sender, settleRow))
+  view.handleMouse(mouse('click', sender, settleRow))
+  assert.deepEqual(opened, ['alpha', 'gamma'])
+
+  // Expanded members are the real child blocks: the same name-only geometry.
+  view.toggleToolsExpanded()
+  const expanded = plain(view.render(120))
+  const memberRow = expanded.findIndex(line => line.includes('Alpha 仓库'))
+  assert.ok(memberRow >= 0)
+  const memberText = expanded[memberRow] ?? ''
+  const memberName = colOf(memberText, 'Alpha 仓库')
+  assert.equal(view.handleMouse(mouse('press', colOf(memberText, 'continuable'), memberRow)), undefined)
+  view.handleMouse(mouse('press', memberName, memberRow))
+  view.handleMouse(mouse('click', memberName, memberRow))
+  assert.deepEqual(opened, ['alpha', 'gamma', 'alpha'])
+})
+
+test('a collapsed member name keeps a claimed press across later frames', () => {
+  const store = groupedStore()
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(120))
+  const alphaRow = lines.findIndex(line => line.includes('Alpha 仓库'))
+  const name = colOf(lines[alphaRow] ?? '', 'Alpha 仓库')
+  const claimed = view.handleMouse(mouse('press', name, alphaRow))
+  assert.equal(claimed?.handled, true, 'the member name claims the press')
+  // A native catalog frame repaints the row in place between press and release.
+  store.handle({
+    type: 'subagent',
+    sessionId: 's1',
+    value: entry({ id: 'alpha', parentSessionId: 's1', catalogSeq: 3, mode: 'continuable', status: 'running', label: 'Alpha 仓库', lastActivity: 'now testing' }),
+  })
+  view.render(120)
+  view.handleMouse(mouse('click', name, alphaRow))
+  assert.deepEqual(opened, ['alpha'], 'the pinned press still opens the pressed child')
+})
+
+test('grouping is width-safe and never fakes a link for a clipped-away name', () => {
+  const store = newStore({
+    events: [
+      ev('user/message', 2, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: 'done' }],
+        source: { kind: 'subagent-settled', form: 'notice', summary: 'done', senderSessionId: 'child-review' },
+      }),
+    ],
+    subagents: snapshot(
+      entry({ id: 'a', parentSessionId: 's1', catalogSeq: 3, mode: 'one-shot', status: 'completed', label: '探索仓库 🚀 子代理' }),
+      entry({ id: 'child-review', parentSessionId: 's1', catalogSeq: 4, mode: 'one-shot', status: 'completed', label: 'Review changes' }),
+    ),
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
+  for (const width of [16, 24, 40, 60, 80, 120]) {
+    const lines = view.render(width)
+    assertWidths(lines, width, `group width ${width}`)
+    for (const line of plain(lines)) assert.ok(!line.includes('\x1b'), `sanitized at ${width}`)
+  }
+  // At 16 columns the sender name starts beyond the last painted cell: no link,
+  // no invisible hitbox, and the row still paints (clipped) attribution.
+  const narrow = plain(view.render(16))
+  const settleRow = narrow.findIndex(line => line.includes('Task message'))
+  assert.ok(settleRow >= 0 || narrow.some(line => line.includes('Subtask')))
+  const row = narrow.findIndex(line => /Subtask|Task message/.test(line))
+  if (row >= 0) {
+    for (let x = 0; x < width16(narrow[row] ?? ''); x += 1) view.handleMouse(mouse('click', x, row))
+  }
+  assert.deepEqual(opened, [], 'a clipped-away name never becomes a click target')
+})
+
+const width16 = (line: string): number => Math.min(16, visibleWidth(line))
+
+test('hover still repaints but every move and drag stays unclaimed', () => {
+  const store = subagentStore()
+  const opened: string[] = []
+  let renders = 0
+  const view = new TranscriptView(store, viewOptions({
+    groupTools: false,
+    onSubagentDetails: id => opened.push(id),
+    onRenderRequest: () => { renders += 1 },
+  }))
+  const lines = plain(view.render(80))
+  const row = lines.findIndex(line => line.includes('Explore 仓库'))
+  const text = lines[row] ?? ''
+  const name = colOf(text, 'Explore 仓库')
+  // Entering a name is a local hover repaint, never a claimed event.
+  assert.equal(view.handleMouse(mouse('move', name, row)), undefined)
+  assert.equal(renders, 1, 'hover asks the host for one repaint')
+  assert.equal(view.handleMouse(mouse('move', colOf(text, 'running'), row)), undefined)
+  // A press in plain text, then a drag across the name: nothing is claimed, so
+  // the renderer keeps the text selection it started.
+  assert.equal(view.handleMouse(mouse('press', 0, row)), undefined)
+  assert.equal(view.handleMouse(mouse('drag', name, row)), undefined)
+  assert.equal(view.handleMouse(mouse('click', name, row)), undefined, 'a drag is never a click jump')
+  assert.deepEqual(opened, [])
+  // A fresh press/click gesture on the same name still navigates.
+  view.handleMouse(mouse('press', name, row))
+  view.handleMouse(mouse('click', name, row))
+  assert.deepEqual(opened, ['explore'])
+})
+
+test('an outside press never becomes a link when a label grows or the catalog arrives', () => {
+  const summary = 'Background subagent review finished.'
+  const store = newStore({
+    events: [
+      ev('user/message', 2, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: summary }],
+        source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'child-review' },
+      }),
+    ],
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const before = plain(view.render(100))
+  const row = before.findIndex(line => line.includes('Subtask status updated'))
+  const idStart = colOf(before[row] ?? '', 'child-review')
+  // Press on the durable id: no native catalog row exists yet, so there is no
+  // link there and the press must stay unclaimed for native selection.
+  assert.equal(view.handleMouse(mouse('press', idStart + 2, row)), undefined)
+  // A later native catalog frame resolves the id into a real child label whose
+  // columns cover the press point.
+  store.handle({
+    type: 'subagents',
+    sessionId: 's1',
+    value: snapshot(entry({
+      id: 'child-review', parentSessionId: 's1', mode: 'continuable', status: 'completed', label: 'Review changes and follow-ups',
+    })),
+  })
+  const after = plain(view.render(100))
+  assert.equal(colOf(after[row] ?? '', 'Review changes'), idStart, 'the grown label covers the pressed column')
+  assert.equal(view.handleMouse(mouse('click', idStart + 2, row)), undefined, 'the outside-press tombstone keeps selection native')
+  assert.deepEqual(opened, [])
+  // A fresh gesture on the grown label does navigate.
+  view.handleMouse(mouse('press', idStart + 2, row))
+  view.handleMouse(mouse('click', idStart + 2, row))
+  assert.deepEqual(opened, ['child-review'])
+})
+
+test('a claimed sender name that vanishes and reappears before release never fires', () => {
+  const summary = 'Background subagent review finished.'
+  const store = newStore({
+    events: [
+      ev('user/message', 2, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: summary }],
+        source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'child-review' },
+      }),
+    ],
+    subagents: snapshot(entry({
+      id: 'child-review', parentSessionId: 's1', mode: 'continuable', status: 'completed', label: 'Review changes',
+    })),
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(100))
+  const row = lines.findIndex(line => line.includes('Subtask status updated'))
+  const name = colOf(lines[row] ?? '', 'Review changes')
+  assert.equal(view.handleMouse(mouse('press', name, row))?.handled, true)
+  // A narrow frame clips the name away entirely (no link, no hitbox) …
+  const narrow = plain(view.render(12))
+  assert.ok(!narrow.join('\n').includes('Review changes'))
+  // … and a later wide frame brings the same link back under the same columns.
+  view.render(100)
+  const result = view.handleMouse(mouse('click', name, row))
+  assert.equal(result?.handled, true, 'the stale press is swallowed, not retargeted')
+  assert.deepEqual(opened, [], 'a reappearing link never receives the old gesture')
+})
+
+test('a grouped collapsed name whose link vanishes before release never fires', () => {
+  const store = groupedStore()
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(120))
+  // The second run holds the durable settlement; its sender name is the last row.
+  const row = lines.findIndex(line => line.includes('Subtask status updated'))
+  const name = colOf(lines[row] ?? '', 'Gamma')
+  assert.equal(view.handleMouse(mouse('press', name, row))?.handled, true)
+  // 16 columns clips the whole sender segment (no link, no hitbox) …
+  assert.ok(!plain(view.render(16)).join('\n').includes('Gamma'))
+  // … and a later wide frame brings the same member link back.
+  view.render(120)
+  assert.equal(view.handleMouse(mouse('click', name, row))?.handled, true)
+  assert.deepEqual(opened, [], 'the vanished group member link is void for this gesture')
+})
+
+test('an expanded group body is selectable text: a click never toggles or opens a child', () => {
+  const store = groupedStore()
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ hints: { expand: 'ctrl+o' }, onSubagentDetails: id => opened.push(id) }))
+  view.toggleToolsExpanded()
+  const lines = plain(view.render(120))
+  const bodyRow = lines.findIndex(line => line.includes('Body: no blockers.'))
+  assert.ok(bodyRow >= 0, lines.join('\n'))
+  const x = colOf(lines[bodyRow] ?? '', 'Body:')
+  // Press/drag inside an expanded member body belongs to native selection.
+  assert.equal(view.handleMouse(mouse('press', x, bodyRow)), undefined)
+  assert.equal(view.handleMouse(mouse('drag', x, bodyRow)), undefined)
+  // Even a plain click reports unhandled, so no disclosure can retarget there.
+  assert.equal(view.handleMouse(mouse('click', x, bodyRow)), undefined)
+  const after = plain(view.render(120))
+  assert.ok(after.join('\n').includes('Body: no blockers.'), 'the group stays expanded')
+  // Motion across an expanded member (name or body) is never claimed either.
+  const memberRow = after.findIndex(line => line.includes('Alpha 仓库'))
+  assert.ok(memberRow >= 0)
+  assert.equal(view.handleMouse(mouse('move', colOf(after[memberRow] ?? '', 'Alpha'), memberRow)), undefined)
+  assert.equal(view.handleMouse(mouse('drag', colOf(after[memberRow] ?? '', 'Alpha'), memberRow)), undefined)
+  assert.equal(view.handleMouse(mouse('click', colOf(after[memberRow] ?? '', 'Alpha'), memberRow)), undefined)
+  assert.deepEqual(opened, [])
+})
+
+test('group prefixes, member width and mouse offsets share one consistent budget', () => {
+  clearToolExpansion()
+  const store = groupedStore()
+  const flags = viewOptions({ expandTools: true, onSubagentDetails: () => {} })
+  const records = store.items.filter(item => item.kind === 'subagent' || item.kind === 'subagent-message')
+  assert.equal(records.length, 4)
+  const members = records.map(item => ({ item, block: createItemBlock(item, flags) }) as never)
+  const group = new SubagentGroupBlock(records[0] as never, flags)
+  group.setMembers(members)
+  const width = 80
+  const lines = plain(group.render(width))
+  assert.ok(lines[0]?.includes('Subagents:'), lines[0])
+  const spans = group.rowSpans
+  assert.equal(spans.length, 4)
+  for (const span of spans) {
+    // One prefix width is used for render, child width and pointer re-basing.
+    assert.equal(span.xOffset, 2, 'prefix/xOffset agree')
+    const standalone = plain(span.block.render(width - span.xOffset))
+    const expanded = lines.slice(span.startRow, span.endRow + 1)
+    assert.equal(expanded.length, standalone.length, 'no member row is dropped or added by the prefix')
+    expanded.forEach((line, index) => {
+      const prefix = line.slice(0, 2)
+      assert.ok(['├ ', '└ ', '│ ', '  '].includes(prefix), `unexpected prefix ${JSON.stringify(prefix)}`)
+      assert.equal(line.slice(2), standalone[index], 'the member paint is never over-clipped by the final fit')
+    })
+  }
+  for (const line of lines) assert.ok(line.length <= width)
+  // The same width discipline holds at narrow terminals.
+  for (const narrow of [16, 24, 40]) {
+    const narrowLines = group.render(narrow)
+    assertWidths(narrowLines, narrow, `group ${narrow}`)
+    for (const span of group.rowSpans) {
+      assert.equal(span.xOffset, 2)
+      assert.ok(span.endRow >= span.startRow)
+    }
+  }
+  group.dispose()
+  clearToolExpansion()
+})
+
+test('a native label with LF/CR/TAB stays one flattened row and keeps honest link columns', () => {
+  const store = newStore({
+    events: [ev('user/message', 2, user('go'))],
+    subagents: snapshot(entry({
+      id: 'weird',
+      parentSessionId: 's1',
+      catalogSeq: 3,
+      mode: 'continuable',
+      status: 'running',
+      label: 'Multi\nLine\tLabel',
+      lastActivity: 'x\ty\nz',
+    })),
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const lines = plain(view.render(80))
+  const row = lines.findIndex(line => line.includes('Multi Line Label'))
+  assert.ok(row >= 0, lines.join('\n'))
+  assert.equal(lines.filter(line => line.includes('Multi')).length, 1, 'the flattened label adds no row')
+  const name = colOf(lines[row] ?? '', 'Multi Line Label')
+  // The stored native label keeps its exact bytes.
+  assert.equal(store.subagentEntry('weird')?.label, 'Multi\nLine\tLabel')
+  view.handleMouse(mouse('press', name, row))
+  view.handleMouse(mouse('click', name, row))
+  assert.deepEqual(opened, ['weird'])
+  assertWidths(view.render(80), 80, 'flattened label')
+})
+
+test('a narrow trigger row clips the sender name partially and links only visible cells', () => {
+  const summary = 'done'
+  const store = newStore({
+    events: [
+      ev('user/message', 2, {
+        id: 'settle',
+        role: 'user',
+        content: [{ type: 'text', text: summary }],
+        source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'child-review' },
+      }),
+    ],
+    subagents: snapshot(entry({
+      id: 'child-review', parentSessionId: 's1', mode: 'continuable', status: 'completed', label: 'Review changes',
+    })),
+  })
+  const opened: string[] = []
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  // 40 columns: the attribution fits, the name is partially clipped but readable.
+  const lines = plain(view.render(40))
+  const row = lines.findIndex(line => line.includes('Subtask status updated'))
+  const text = lines[row] ?? ''
+  assert.ok(text.endsWith('...'), 'the clipped tail is explicit')
+  assert.ok(!text.includes('Review changes'), 'only a readable prefix of the name survives')
+  const visibleName = text.indexOf('Review')
+  assert.ok(visibleName >= 0, text)
+  const nameCol = visibleWidth(text.slice(0, visibleName))
+  // The one surviving name cell navigates; the ellipsis cells never do.
+  const lastPainted = visibleWidth(text) - 1
+  assert.equal(view.handleMouse(mouse('press', lastPainted, row)), undefined, 'ellipsis cells are not link text')
+  view.handleMouse(mouse('click', lastPainted, row))
+  assert.deepEqual(opened, [])
+  view.handleMouse(mouse('press', nameCol, row))
+  view.handleMouse(mouse('click', nameCol, row))
+  assert.deepEqual(opened, ['child-review'])
 })
 
 // ---------------------------------------------------------------------------
@@ -776,6 +1298,7 @@ function childHarness(options: {
   onStop?: (entry: SubagentEntry) => void
   onGlobalAction?: (id: string) => void
   now?: () => number
+  loading?: boolean
 } = {}) {
   const tui = createFakeTui(options.rows ?? 32, 100)
   const store = new TranscriptStore({ codec: DEMO_TRANSCRIPT_CODEC })
@@ -812,6 +1335,7 @@ function childHarness(options: {
     onGlobalAction: id => { globals.push(id); options.onGlobalAction?.(id) },
     ...(options.maxHeight === undefined ? {} : { maxHeight: options.maxHeight }),
     now: options.now ?? (() => 100_000),
+    ...(options.loading === undefined ? {} : { loading: options.loading }),
   })
   child.focused = true
   return { tui, store, view, child, closed, globals, replies, stops }
@@ -876,16 +1400,82 @@ test('child view external tasks show no local transcript, and short viewports de
   const external = childHarness({
     entry: entry({ id: 'ext', parentSessionId: 's1', mode: 'external', status: 'external', label: 'External research' }),
     maxHeight: 8,
+    loading: true, // Even a stray presentation hint must not promise a local read.
   })
   const text = plain(external.child.render(50)).join('\n')
   assert.ok(text.includes('External task'))
   assert.ok(text.includes('no local transcript'))
+  assert.ok(!text.includes('Loading child session'))
+  const full = childHarness({ entry: external.child.entry, loading: true })
+  const fullText = plain(full.child.render(100)).join('\n')
+  assert.ok(fullText.includes('no local Session transcript'))
+  assert.ok(!fullText.includes('Loading child session'))
+  assert.ok(!fullText.includes('No messages in this agent session'))
+  assert.ok(!fullText.includes('child answer'))
   for (const width of [16, 24, 40]) {
     const lines = external.child.render(width)
     assertWidths(lines, width, 'external child compact')
   }
   // The supplied child transcript is never painted for an external row.
   assert.ok(!text.includes('child answer'))
+})
+
+test('child view loading shell states the pending read and keeps the native chrome', () => {
+  const harness = childHarness({ loading: true })
+  const lines = harness.child.render(100)
+  assertWidths(lines, 100, 'loading child view')
+  const text = plain(lines).join('\n')
+  assert.ok(text.includes('Loading child session…'), text)
+  assert.ok(!text.includes('No messages in this agent session'), 'loading never claims an empty conversation')
+  assert.ok(!text.includes('child answer 中文'), 'the conversation is not painted while loading')
+  // Header/footer chrome and intervention gating are the normal ones.
+  assert.ok(text.includes('Explore repository'))
+  assert.ok(text.includes('running'))
+  assert.ok(text.includes('continuable'))
+  assert.ok(text.includes('12k tok'))
+  // Scrolling stays inert until the native snapshot arrives.
+  const before = harness.child.render(100)
+  harness.child.handleInput(END)
+  harness.child.handleInput(PAGE_DOWN)
+  assert.deepEqual(plain(harness.child.render(100)), plain(before))
+  assert.equal(
+    harness.child.handleMouse({ ...mouse('click', 1, 1), type: 'wheel', wheelDelta: -1 }),
+    undefined,
+    'wheel navigation is inert while loading',
+  )
+  // Clearing the shell paints the real conversation again; Esc still closes.
+  harness.child.setLoading(false)
+  const loaded = plain(harness.child.render(100)).join('\n')
+  assert.ok(!loaded.includes('Loading child session…'))
+  assert.ok(loaded.includes('child answer 中文'))
+  harness.child.handleInput(ESC)
+  assert.deepEqual(harness.closed, ['close'])
+})
+
+test('child view loading switch is idempotent and keeps the optional native info path', () => {
+  const harness = childHarness()
+  harness.child.setLoading(true)
+  assert.equal(harness.child.loading, true)
+  const first = harness.child.render(80)
+  harness.child.setLoading(true)
+  assert.deepEqual(harness.child.render(80), first, 'setting the same value changes nothing')
+  // The parent still supplies the real native snapshot through update({info}).
+  harness.child.update({ info: { sessionId: 'child-1', cwd: '/tmp', provider: 'native-p', model: 'native-m', capabilities: [] } })
+  assert.equal(harness.child.info?.sessionId, 'child-1')
+  harness.child.setLoading(false)
+  assert.equal(harness.child.loading, false)
+  const text = plain(harness.child.render(80)).join('\n')
+  assert.ok(!text.includes('Loading child session…'))
+  assert.ok(text.includes('child answer'))
+  assert.equal(harness.child.info?.provider, 'native-p')
+
+  // A short viewport keeps the compact frame and still states the pending read.
+  const compact = childHarness({ rows: 9, maxHeight: 8 })
+  compact.child.setLoading(true)
+  const compactText = plain(compact.child.render(60)).join('\n')
+  assert.ok(compactText.includes('Loading child session…'), compactText)
+  assert.ok(!compactText.includes('No messages in this agent session'))
+  assert.ok(compactText.includes('Explore repository'))
 })
 
 test('child view dispose is idempotent, never closes, and releases the owned view', () => {
@@ -1007,6 +1597,48 @@ test('demo subagent events are replay-safe through the shared store', async () =
 
 test('demo hint advertises the subagent fixture without adding a model capability', () => {
   assert.ok(DEMO_HINTS.some(hint => hint.includes('subagent')))
+})
+
+test('demo subagent-many scenario adds only live continuable overflow rows', async () => {
+  const backend = new DemoBackend({ delayMs: 0, cwd: '/tmp/demo' })
+  const store = new TranscriptStore({ codec: DEMO_TRANSCRIPT_CODEC })
+  backend.onEvent(event => store.handle(event))
+  await backend.connect()
+  await backend.send('subagent-many')
+  await backend.whenIdle()
+
+  const entries = store.subagentEntries
+  assert.equal(entries.length, 8, 'the default five-row fixture plus three live extras')
+  const active = entries.filter(row => row.status === 'running' || row.status === 'initializing')
+  assert.deepEqual(active.map(row => row.label), [
+    'Explore repository', 'Search callers', 'Audit fixtures', 'Map adapters',
+  ])
+  for (const row of active.slice(1)) {
+    assert.equal(row.mode, 'continuable')
+    assert.equal(row.local, true)
+    assert.equal(row.parentSessionId, 'demo-session-1')
+    assert.equal(row.catalogSeq, undefined, 'a fixture-only extra invents no transcript anchor')
+    assert.equal(row.totalTokens, undefined, 'no session total the fixture did not observe')
+    assert.equal(row.timing, undefined)
+    assert.ok((row.lastActivity ?? '').length > 0, 'a live row carries its current fixture activity')
+  }
+  // The default durable transcript anchors are unchanged: extras add no rows.
+  assert.equal(store.items.filter(item => item.kind === 'subagent').length, 3)
+  assert.equal(store.items.filter(item => item.kind === 'subagent-message').length, 2)
+
+  // Active-only progress: four live rows overflow a bounded budget as live only.
+  const progress = new SubagentProgress({ keymap: keymap(), maxRows: 6 })
+  progress.entries = store.subagentEntries
+  const lines = plain(progress.render(100))
+  assert.equal(lines[0], '● Agents · 4 children · Ctrl+X Ctrl+A open')
+  assert.ok(lines.includes('└─ +2 more (2 running)'), lines.join('\n'))
+  assert.ok(!lines.join('\n').includes('Review changes'), 'settled fixture history is never progress')
+  progress.dispose()
+
+  // The extra rows are real fixture catalogue children: their read path works.
+  const child = await backend.command('subagent-session', { sessionId: 'demo-child-active-2' }) as SessionInfo
+  assert.equal(child.sessionId, 'demo-child-active-2')
+  await backend.close()
 })
 
 // ---------------------------------------------------------------------------

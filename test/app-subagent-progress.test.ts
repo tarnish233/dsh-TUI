@@ -180,7 +180,8 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       assert.doesNotMatch(f.terminal.screen(), /reading src\/app\.ts/, 'old activity is replaced, not appended')
       f.backend.upsert({ ...alpha, status: 'idle', timing: { settledMs: 10000, lastTurnCompleted: true } })
       await paint(f.terminal)
-      assert.match(f.terminal.screen(), /idle/)
+      assert.equal(agentRow(f.terminal, 'Alpha agent'), -1, 'idle children retire from active progress')
+      assert.equal(f.app.store.subagentEntry(alpha.id)?.status, 'idle', 'retirement leaves the native child catalog intact')
       assert.doesNotMatch(f.terminal.screen(), /reading src\/app\.ts|checking a native fixture/, 'idle children never show stale work as live')
 
       // The progress component never owns input. These printable control-like
@@ -307,17 +308,21 @@ test('fullscreen progress header opens Agents while the progress remains outside
   } finally { await f.close() }
 })
 
-test('fullscreen external progress is honest display-only and cannot open a child transcript', async () => {
+test('fullscreen external history stays in /agent and cannot open a local child transcript', async () => {
   const f = await fixture('fullscreen')
   try {
     f.backend.catalog([child('External task', { mode: 'external', status: 'external', local: false })])
     await paint(f.terminal)
-    const row = agentRow(f.terminal, 'External task')
+    assert.equal(headerRow(f.terminal), -1, 'external history does not hold open active progress')
+    assert.doesNotMatch(f.terminal.screen(), /External task/)
+    await f.app.submit('/agent'); await paint(f.terminal)
+    assert.equal(agentsOverlayVisible(f.terminal), true)
+    const row = screenLines(f.terminal).findIndex(line => line.includes('External task'))
     assert.ok(row >= 0)
     await click(f.terminal, screenLines(f.terminal)[row]!.indexOf('External task') + 2, row)
     assert.equal(f.backend.calls.some(call => call.name.startsWith('subagent')), false)
     assert.match(f.terminal.screen(), /external/)
-    assert.equal(headerRow(f.terminal) >= 0, true)
+    assert.equal(agentsOverlayVisible(f.terminal), true)
   } finally { await f.close() }
 })
 
@@ -374,7 +379,7 @@ test('fullscreen progress overflow opens the full Agents tree without reading a 
     const draft = f.app.editor.captureDraft()
     f.backend.catalog([
       ...Array.from({ length: 12 }, (_, index) => child(`Finished ${index}`, { mode: 'one-shot', status: 'completed' })),
-      ...Array.from({ length: 3 }, (_, index) => child(`Working ${index}`, { lastActivity: `native activity ${index}` })),
+      ...Array.from({ length: 6 }, (_, index) => child(`Working ${index}`, { lastActivity: `native activity ${index}` })),
     ])
     await paint(f.terminal)
     const lines = screenLines(f.terminal)
@@ -484,7 +489,7 @@ test('fullscreen Agents and overflow links exclude glyphs, counts, hints and pad
     const draft = f.app.editor.captureDraft()
     f.backend.catalog([
       ...Array.from({ length: 12 }, (_, index) => child(`Settled ${index}`, { status: 'completed', mode: 'one-shot' })),
-      ...Array.from({ length: 3 }, (_, index) => child(`Working ${index}`, { lastActivity: `native work ${index}` })),
+      ...Array.from({ length: 6 }, (_, index) => child(`Working ${index}`, { lastActivity: `native work ${index}` })),
     ])
     await paint(f.terminal)
     const lines = screenLines(f.terminal)
@@ -503,7 +508,7 @@ test('fullscreen Agents and overflow links exclude glyphs, counts, hints and pad
       [columnFor(heading, 'children') + 2, header],
       [columnFor(heading, 'Ctrl+X') + 1, header], [f.terminal.columns - 1, header],
       [0, overflow], [moreStart - 1, overflow], [moreStart + label.length, overflow],
-      [columnFor(lines[overflow]!, 'completed') + 1, overflow], [f.terminal.columns - 1, overflow],
+      [columnFor(lines[overflow]!, 'running') + 1, overflow], [f.terminal.columns - 1, overflow],
     ]
     for (const [x, y] of points) {
       await click(f.terminal, x!, y!)
@@ -625,3 +630,132 @@ test('CJK and emoji name-link boundaries use visible terminal columns', async ()
     await until(() => f.terminal.screen().includes('native durable child fact for unicode-link-child'), 'clicking the wide name cell opens its child')
   } finally { await f.close() }
 })
+
+for (const screen of ['inline', 'fullscreen'] as const) {
+  test(`settled children leave progress but remain available through /agent and native reactivation (${screen})`, async () => {
+    const f = await fixture(screen)
+    try {
+      f.terminal.type('history navigation draft')
+      const editor = f.app.editor, draft = editor.captureDraft()
+      const active = child('History child', { lastActivity: 'native current activity', lastRunId: 'first-run' })
+      f.backend.catalog([active]); await paint(f.terminal)
+      assert.ok(headerRow(f.terminal) >= 0)
+      const finished = { ...active, status: 'idle' as const, lastStopReason: 'completed', timing: { settledMs: 8000, lastTurnCompleted: true } }
+      f.backend.upsert(finished); await paint(f.terminal)
+      assert.equal(headerRow(f.terminal), -1, 'the settled child no longer consumes above-editor progress space')
+      assert.doesNotMatch(f.terminal.screen(), /History child|native current activity/)
+      assert.deepEqual(f.app.store.subagentEntries, [finished], 'retirement changes display only, not the native catalog')
+      assert.equal(f.backend.calls.some(call => call.name.startsWith('subagent')), false, 'retirement performs no child command')
+
+      await f.app.submit('/agent'); await paint(f.terminal)
+      assert.equal(agentsOverlayVisible(f.terminal), true)
+      assert.match(f.terminal.screen(), /History child/)
+      assert.equal(f.backend.calls.some(call => call.name.startsWith('subagent')), false, '/agent opens the native catalog without child reads')
+      f.terminal.type('\r')
+      await until(() => f.terminal.screen().includes('native durable child fact for History child'), 'settled native child remains readable from /agent')
+      f.terminal.type('\x1b'); await paint(f.terminal)
+      assert.equal(agentsOverlayVisible(f.terminal), true)
+      f.terminal.type('\x1b'); await paint(f.terminal)
+      assert.equal(headerRow(f.terminal), -1)
+      assert.equal(f.app.editor, editor)
+      assert.deepEqual(editor.captureDraft(), draft)
+
+      f.backend.upsert({ ...active, lastRunId: 'second-run', lastActivity: 'native reactivated activity' }); await paint(f.terminal)
+      assert.ok(headerRow(f.terminal) >= 0, 'native reactivation returns the same child to progress')
+      assert.match(f.terminal.screen(), /native reactivated activity/)
+      assert.equal(f.app.editor, editor)
+      assert.deepEqual(editor.captureDraft(), draft)
+      assert.equal(f.backend.sends + f.backend.cancels, 0)
+    } finally { await f.close() }
+  })
+}
+
+test('settlement retires progress without closing a manually opened child conversation', async () => {
+  const f = await fixture('fullscreen')
+  try {
+    f.terminal.type('read final output draft')
+    const editor = f.app.editor, draft = editor.captureDraft()
+    const active = child('Finishing viewed child', { lastActivity: 'native work' })
+    f.backend.catalog([active]); await paint(f.terminal)
+    const row = agentRow(f.terminal, active.id)
+    await click(f.terminal, columnFor(screenLines(f.terminal)[row]!, active.id) + 1, row)
+    await until(() => f.terminal.screen().includes('native durable child fact for Finishing viewed child'), 'child opened before settlement')
+    f.backend.upsert({ ...active, status: 'idle', lastStopReason: 'completed', timing: { settledMs: 9000, lastTurnCompleted: true } })
+    await paint(f.terminal)
+    assert.match(f.terminal.screen(), /native durable child fact for Finishing viewed child/, 'the final conversation remains readable')
+    assert.match(f.terminal.screen(), /idle/, 'the viewed child header receives native settlement')
+    assert.equal(f.backend.calls.some(call => call.name === 'subagent-follow' && call.args.follow === false), false, 'settlement does not unfollow the user-owned view')
+    f.terminal.type('\x1b'); await paint(f.terminal)
+    assert.equal(headerRow(f.terminal), -1)
+    assert.deepEqual(editor.captureDraft(), draft)
+    assert.equal(f.app.editor, editor)
+    assert.equal(f.app.store.subagentEntries.length, 1)
+  } finally { await f.close() }
+})
+
+for (const screen of ['inline', 'fullscreen'] as const) {
+  test(`live child progress shares Working frames while the root remains ready (${screen})`, async () => {
+    const f = await fixture(screen)
+    try {
+      f.terminal.type('animation retained draft')
+      const editor = f.app.editor, draft = editor.captureDraft()
+      const active = child('Alpha spinner', { lastActivity: 'native spinning activity' })
+      const initializing = child('Beta spinner', { status: 'initializing' })
+      f.backend.catalog([active, initializing]); await paint(f.terminal)
+      const frame = (label: string): string => {
+        const row = agentRow(f.terminal, label)
+        assert.ok(row >= 0)
+        const start = columnFor(screenLines(f.terminal)[row]!, label)
+        return screenCell(f.terminal, row, start - 2).getChars()
+      }
+      const family = new Set(['·', '✻', '✶', '✳'])
+      const observed = new Set([frame('Alpha spinner')])
+      const deadline = Date.now() + 1500
+      while (observed.size < 2 && Date.now() < deadline) {
+        await delay(110); await paint(f.terminal)
+        observed.add(frame('Alpha spinner'))
+      }
+      assert.ok(observed.size >= 2, 'native terminal cells visibly animate without another backend event')
+      assert.ok([...observed].every(glyph => family.has(glyph)), 'uses the existing Working glyph family')
+      assert.equal(frame('Beta spinner'), frame('Alpha spinner'), 'initializing/running share one frame clock')
+      assert.equal(f.app.isBusy, false, 'child animation never fabricates root work')
+      assert.equal(f.terminal.progress, false)
+      assert.doesNotMatch(f.terminal.screen(), /Working…/)
+      assert.match(f.terminal.screen(), /native spinning activity/, 'the second activity line stays intact')
+      assert.deepEqual(editor.captureDraft(), draft)
+      assert.equal(f.backend.calls.some(call => call.name.startsWith('subagent')), false, 'animation makes no backend reads')
+
+      f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'running' }); await paint(f.terminal)
+      const workingRow = screenLines(f.terminal).findIndex(line => line.includes('Working…'))
+      assert.ok(workingRow >= 0)
+      assert.equal(screenCell(f.terminal, workingRow, 0).getChars(), frame('Alpha spinner'), 'the editor and children paint the exact same current frame')
+      f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'idle' }); await paint(f.terminal)
+      assert.equal(f.app.isBusy, false)
+      assert.ok(family.has(frame('Alpha spinner')), 'root settling does not stop active child animation')
+
+      f.backend.upsert({ ...active, status: 'idle' })
+      f.backend.upsert({ ...initializing, status: 'idle' }); await paint(f.terminal)
+      assert.equal(headerRow(f.terminal), -1)
+      await delay(180); await f.terminal.flush()
+      const written = f.terminal.writes.length
+      await delay(260); await f.terminal.flush()
+      assert.equal(f.terminal.writes.length, written, 'all settled work stops the animation clock and idle repainting')
+      assert.deepEqual(editor.captureDraft(), draft)
+    } finally { await f.close() }
+  })
+
+  test(`animated children do not intercept the empty-root exit confirmation (${screen})`, async () => {
+    const f = await fixture(screen)
+    try {
+      f.backend.catalog([child('Exit-safe spinner', { lastActivity: 'native work' })]); await paint(f.terminal)
+      assert.equal(f.app.isBusy, false)
+      f.terminal.type('\x03'); await paint(f.terminal)
+      assert.match(f.terminal.screen(), /Press the same exit key again to exit/)
+      assert.equal(f.backend.cancels, 0)
+      f.terminal.type('\x03')
+      assert.equal(await f.app.exited, 0)
+      assert.equal(f.terminal.stopped, true)
+      assert.equal(f.backend.cancels, 0, 'an exit confirmation is not a fabricated child/root interrupt')
+    } finally { await f.close() }
+  })
+}
