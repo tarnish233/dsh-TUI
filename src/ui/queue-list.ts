@@ -33,15 +33,30 @@ export class QueueList implements Component {
   private readonly actions: QueueListActions
   private hovered?: string
   private collapsed = false
+  private defaultCollapsed = false
 
   constructor(actions: QueueListActions) {
     this.actions = actions
   }
 
+  /**
+   * Display preference hook (`queueCollapsed`). The parent calls this only on
+   * the initial mount and when the setting changes; a normal native row update
+   * never re-applies it, so a manual fold/unfold survives streaming updates.
+   */
+  setDefaultCollapsed(value: boolean): void {
+    this.defaultCollapsed = value
+    if (this.collapsed === value) return
+    this.collapsed = value
+    this.actions.changed()
+  }
+
   invalidate(): void {
     this.hitboxes.clear()
     this.hovered = undefined
-    this.collapsed = false
+    // A new/reset list starts from the configured display preference instead of
+    // a hard-coded expanded state.
+    this.collapsed = this.defaultCollapsed
   }
 
   render(width: number): string[] {
@@ -95,9 +110,12 @@ export class QueueList implements Component {
     const imageLabel = row.images > 0 ? ` · ${row.images === 1 ? '1 image' : row.images + ' images'}` : ''
     const prefix = `${indexLabel}${steer} `
     const raw = oneLine(row.text) || (row.images > 0 ? '(image)' : '(empty)')
-    const room = Math.max(4, width - visibleWidth(prefix) - visibleWidth(imageLabel) - BUTTONS_WIDTH - 2)
+    const showButtons = width - visibleWidth(prefix) - visibleWidth(imageLabel) - BUTTONS_WIDTH - 2 >= 4
+    const room = showButtons
+      ? Math.max(1, width - visibleWidth(prefix) - visibleWidth(imageLabel) - BUTTONS_WIDTH - 2)
+      : Math.max(1, width - visibleWidth(prefix) - visibleWidth(imageLabel) - 1)
     const body = truncateToWidth(raw, room, '…')
-    const gap = Math.max(2, width - visibleWidth(prefix) - visibleWidth(body) - visibleWidth(imageLabel) - BUTTONS_WIDTH)
+    const gap = showButtons ? Math.max(2, width - visibleWidth(prefix) - visibleWidth(body) - visibleWidth(imageLabel) - BUTTONS_WIDTH) : 0
     let line = ''
     let column = 0
     const push = (plain: string, styled: string): void => {
@@ -109,35 +127,38 @@ export class QueueList implements Component {
     push(' ', ' ')
     push(body, this.editingId === row.messageId ? t.accent(body) : dim(body))
     if (imageLabel !== '') push(imageLabel, dim(imageLabel))
-    push(' '.repeat(gap), ' '.repeat(gap))
+    if (showButtons) push(' '.repeat(gap), ' '.repeat(gap))
     const regions: MouseHitbox[] = []
-    for (const [buttonIndex, button] of BUTTONS.entries()) {
-      if (column >= width) break
-      if (buttonIndex > 0) push(BUTTON_GAP, BUTTON_GAP)
-      const label = truncateToWidth(button.label, Math.max(1, width - column), '')
-      if (label === '') break
-      const id = `${row.messageId}:${button.action}`
-      const startCol = column
-      push(label, this.hovered === id ? t.accentBright(label) : t.accent(label))
-      regions.push({
-        id,
-        startRow: rowIndex,
-        endRow: rowIndex,
-        startCol,
-        endCol: column - 1,
-        onClick: () => {
-          if (button.action === 'send') this.actions.sendNow(row.messageId)
-          else if (button.action === 'edit') this.actions.edit(row.messageId)
-          else this.actions.cancel(row.messageId)
-        },
-        onHover: entering => {
-          const next = entering ? id : undefined
-          if (this.hovered === next) return
-          this.hovered = next
-          this.actions.changed()
-        },
-      })
+    if (showButtons) {
+      for (const [buttonIndex, button] of BUTTONS.entries()) {
+        const gapWidth = buttonIndex === 0 ? 0 : BUTTON_GAP.length
+        const labelWidth = visibleWidth(button.label)
+        if (column + gapWidth + labelWidth > width) break
+        if (buttonIndex > 0) push(BUTTON_GAP, BUTTON_GAP)
+        const label = button.label
+        const id = `${row.messageId}:${button.action}`
+        const startCol = column
+        push(label, this.hovered === id ? t.accentBright(label) : t.accent(label))
+        regions.push({
+          id,
+          startRow: rowIndex,
+          endRow: rowIndex,
+          startCol,
+          endCol: column - 1,
+          onClick: () => {
+            if (button.action === 'send') this.actions.sendNow(row.messageId)
+            else if (button.action === 'edit') this.actions.edit(row.messageId)
+            else this.actions.cancel(row.messageId)
+          },
+          onHover: entering => {
+            const next = entering ? id : undefined
+            if (this.hovered === next) return
+            this.hovered = next
+            this.actions.changed()
+          },
+        })
+      }
     }
-    return { line, regions }
+    return { line: truncateToWidth(line, width, ''), regions: regions.filter(region => (region.endCol ?? -1) < width) }
   }
 }

@@ -112,21 +112,21 @@ test('default-model save failures are redacted', async () => {
   await backend.close()
 })
 
-test('native loader toggle failures are redacted', async () => {
+test('read-only auto-title diagnostics never carry native loader text', async () => {
   const { backend } = harness((host) => {
     host.use('loader', {
-      entries: () => [{
-        options: { id: 'session-title-llm', name: '@deepseek-ai/dsh-session-title-first-prompt-llm' },
-        disabled: false,
-        update: async () => { throw new Error(`loader error ${TOKEN} ${BEARER}`) },
-      }],
+      entries: () => { throw new Error(`loader error ${TOKEN} ${BEARER}`) },
     })
     host.use('sessionTitle', { refresh: () => {} })
   })
-  await assert.rejects(backend.command('auto-title', { enabled: false }), (error: unknown) => {
-    assertNoSecrets((error as Error).message)
-    return true
-  })
+  const state = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(state.available, false)
+  assertNoSecrets(JSON.stringify(state))
+  const refused = await backend.command('auto-title', { enabled: false }) as Record<string, unknown>
+  assert.equal(refused.available, false)
+  assert.equal(refused.changed, false)
+  assert.match(String(refused.reason), /profile composition/)
+  assertNoSecrets(JSON.stringify(refused))
   await backend.close()
 })
 

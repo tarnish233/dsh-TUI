@@ -44,6 +44,13 @@ Pixel size:
   interior sample are left untouched. Apart from that documented arc the outline
   is not repainted or hand-edited.
 
+## Separate application icon assets
+
+The [application icon](APP-ICON.md) reuses this approved whale grid as a white
+silhouette on an asset-blue rounded-square badge. Its standalone SVG/PNG files
+are distribution artwork, not runtime terminal images: they do not replace this
+startup logo, add image uploads/animation, or change the interface color roles.
+
 ## One renderer path
 
 `src/ui/logo.ts` renders the grid itself as character cells. It uses only Pi TUI

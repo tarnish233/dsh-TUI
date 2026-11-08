@@ -105,7 +105,10 @@ removed, the blue silhouette is sampled into `assets/logo/grid.json`, and the
 enclosed negative space is filled white. The runtime draws that grid with block
 characters only; it does not embed or upload an image. Rendering uses our own
 renderer plus Pi TUI's MIT-licensed public color/width helpers, not a third-party
-art asset. The logo and brand marks belong to DeepSeek; no endorsement is implied.
+art asset. The separate `assets/icon/dsh-tui.svg` and PNG application icons reuse
+the approved grid with a white silhouette and a blue rounded-square background;
+these are static distribution artwork, not terminal image uploads. The logo and
+brand marks belong to DeepSeek; no endorsement is implied.
 
 ## Retired dsh-TUI pixel-whale notices
 

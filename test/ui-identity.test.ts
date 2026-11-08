@@ -71,7 +71,7 @@ test('the visible application identity is dsh-tui and reads the shared release v
   const welcome = readFileSync(join(SRC, 'ui', 'welcome.ts'), 'utf8')
   assert.match(welcome, /const TAGLINE = 'DSH TUI · v' \+ VERSION/)
   assert.match(welcome, /import \{ VERSION \} from '\.\.\/version\.ts'/)
-  assert.equal(VERSION, '0.1.3', 'the shared release identity stays 0.1.3')
+  assert.equal(VERSION, '0.1.4', 'the shared release identity stays 0.1.4')
 })
 
 test('frontend sources reach Pi TUI only through the private #pi-tui seam', () => {

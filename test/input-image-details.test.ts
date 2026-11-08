@@ -41,6 +41,7 @@ test("locked image viewer actions and their default bindings", () => {
     ["image.details.previous-image", ["[", "alt+left"], ["imageDetails"]],
     ["image.details.next-image", ["]", "alt+right"], ["imageDetails"]],
     ["image.details.close", ["escape"], ["imageDetails"]],
+    ["image.details.toggle-preview", ["p"], ["imageDetails"]],
   ]
   for (const [id, bindings, contexts] of expectations) {
     const action = CC_ACTIONS_BY_ID.get(id)
@@ -66,6 +67,76 @@ test("viewer keys resolve in imageDetails and never in the editor", () => {
   assert.equal(actionId(keymap, "]", "editor"), undefined, "`]` stays plain text")
   assert.equal(actionId(keymap, "\x1b[1;3D", "editor"), "editor.move.word-left")
   assert.equal(actionId(keymap, "\x1b[1;3C", "editor"), "editor.move.word-right")
+})
+
+test("viewer-only preview toggle: `p` is registered in imageDetails and nowhere else", () => {
+  const { CC_ACTIONS_BY_ID, createCcKeymap } = mod
+  const definition = CC_ACTIONS_BY_ID.get("image.details.toggle-preview")
+  assert.ok(definition, "image.details.toggle-preview is registered")
+  assert.equal(definition.family, "dialog")
+  assert.deepEqual([...definition.contexts], ["imageDetails"])
+  assert.deepEqual([...definition.defaultBindings], ["p"])
+  assert.equal(definition.implementor, "app")
+  assert.equal(definition.status, "tui-extension")
+
+  const keymap = createCcKeymap({ platform: "posix" })
+  // Action only in the read-only image viewer.
+  assert.equal(actionId(keymap, "p", "imageDetails"), "image.details.toggle-preview")
+  // Plain text in the prompt and in modal text fields / other modals.
+  for (const context of [
+    "editor",
+    "autocomplete",
+    "historySearch",
+    "modalSearch",
+    "settingsList",
+    "queueList",
+    "list",
+    "toolDetails",
+    "subagentList",
+    "global",
+  ] as const) {
+    assert.equal(actionId(keymap, "p", context), undefined, `${context}: p stays text/inert`)
+  }
+  // One grouped Settings row, no new conflict, no error diagnostics.
+  assert.ok(keymap.getHelp().some((row) => row.action === "image.details.toggle-preview" && row.keysLabel === "P"))
+  assert.deepEqual(
+    keymap.getConflicts().filter((diagnostic) => diagnostic.context === "imageDetails"),
+    [],
+  )
+  assert.equal(keymap.getDiagnostics().some((diagnostic) => diagnostic.severity === "error"), false)
+
+  // Remappable and disableable through the same override map; disabled `p` is
+  // inert rather than falling through to a global action.
+  const remapped = createCcKeymap({ platform: "posix", bindings: { "image.details.toggle-preview": "i" } })
+  assert.equal(actionId(remapped, "i", "imageDetails"), "image.details.toggle-preview")
+  assert.equal(actionId(remapped, "p", "imageDetails"), undefined)
+  assert.equal(actionId(remapped, "i", "editor"), undefined, "i stays text in the prompt")
+  const disabled = createCcKeymap({ platform: "posix", bindings: { "image.details.toggle-preview": null } })
+  assert.deepEqual(disabled.getBindings("image.details.toggle-preview"), [])
+  assert.equal(actionId(disabled, "p", "imageDetails"), undefined)
+})
+
+test("a viewer-hosted editor emits the preview toggle once without touching its draft", () => {
+  const tui = createFakeTui()
+  const editor = new mod.CcEditor(asTui(tui), testEditorTheme, { context: "imageDetails" })
+  const events: CcActionEvent[] = []
+  editor.onAction = (event: CcActionEvent) => {
+    events.push(event)
+    return true
+  }
+  renderAt(editor, 80)
+
+  editor.handleInput("p")
+  assert.deepEqual(events.map((event) => event.id), ["image.details.toggle-preview"])
+  assert.equal(events[0]?.context, "imageDetails")
+  assert.equal(editor.getText(), "", "the read-only viewer never gains an editable draft")
+
+  editor.handleInput("p")
+  assert.deepEqual(
+    events.map((event) => event.id),
+    ["image.details.toggle-preview", "image.details.toggle-preview"],
+    "a repeated press is a plain mode toggle, not a chord",
+  )
 })
 
 test("Esc closes the viewer instead of falling through to list.cancel", () => {

@@ -85,8 +85,64 @@ Both deviations are covered by DSH TUI's offline tests
    - Exit condition: upstream exposes an equivalent terminal writer injection
      point, or the host no longer needs to intercept process streams.
 
+5. `src/program-status.ts`, `src/terminal.ts` — complete OSC 7501 records,
+   capability policy, focus reporting and title-stack seams.
+   - `ProgramStatus` gains optional `id`, `title` and `progress` with the exact
+     revision 0.4 limits (4096-byte sequence, 2048/2732-byte `msg`,
+     192/256-byte `title`, 32-byte `app`, 128-byte id over at most 8 segments of
+     32 bytes). `formatProgramStatus()` returns `undefined` when a report must
+     not be sent, including a malformed id: an invalid id never falls back to
+     the root record.
+   - `ProcessTerminal` keeps a bounded set of complete record snapshots
+     (`PROGRAM_STATUS_MAX_RECORDS = 64`, least-recently-updated eviction), clears
+     descendants with a parent clear, emits one root `state=clear` on `stop()`
+     and replays only the records that are still current once support is
+     confirmed again after a restart. No status heartbeat exists: records are
+     replaced, never refreshed on a timer.
+   - The support reply's `states`/`kinds` lists are parsed and honoured
+     (`parseProgramStatusSupport`, `downgradeProgramStatus`). A reply whose
+     `states` list contains no known state is treated as unsupported, and an
+     unadvertised state degrades along a fixed chain (`blocked`→`working`→`idle`,
+     `done`/`error`→`idle`) instead of becoming a false success.
+   - New optional `Terminal` members: `programStatusSupported`,
+     `onProgramStatusSupportChange`, `terminalFocused`, `onFocusChange`,
+     `setFocusReporting`, `saveTitle`, `restoreTitle`, `setProgressFallback`.
+     Focus reporting (DECSET 1004) and title-stack pushes are owned by the
+     attached terminal instance: they are restored on `stop()`, on
+     `restoreOnExit()` and re-armed on `start()`, and no write happens after
+     ownership is released. `CSI I`/`CSI O` are consumed as terminal reports in
+     the single input path, never as text, and an exact report also clears a
+     stale CSI negotiation prefix so the prefix cannot flush into the editor.
+     `restoreOnExit()` stops the legacy progress keepalive before writing its
+     exit bytes, and a `stop()` after that emergency handoff still detaches the
+     stdin handler, timers and raw mode while writing nothing visible.
+   - Legacy OSC 9;4 is now idempotent (repeated frame-path calls write nothing)
+     and is suppressed once a terminal negotiated rich OSC 7501 presentation;
+     `setProgressFallback` lets the host override that policy per terminal.
+   - Exit condition: upstream exposes id/title/progress records, a capability
+     policy and focus/title lifecycle hooks.
+
+6. `src/stdin-buffer.ts` — bounded, fail-closed reassembly of terminal replies.
+   - `expectedReplyPrefixes`/`expectedReplyTimeout` let the owner declare a
+     reply that may be split inside its header (for example a program-status
+     query reply paused longer than the 50 ms sequence timeout) and hold it for
+     a short bounded time. `replyTimeout` bounds any other recognized reply
+     (OSC colour, XTVersion, Kitty graphics).
+   - A recognized reply never becomes editor text. When it does not terminate
+     inside its deadline, or when it exceeds `maxReplyBytes`, the payload is
+     discarded and further input stays discarded (quarantine) until that
+     reply's terminator (BEL/ST) arrives or the same finite deadline passes.
+     While quarantined nothing is accumulated, so a stalled or hostile reply
+     cannot grow memory; a bracketed paste ends the quarantine immediately so
+     pasted content is never swallowed. Lone Escape, legacy `Alt+key`, ordinary
+     typing after a completed/discarded reply and paste framing are unchanged.
+   - Exit condition: upstream bounds reply reassembly and fails closed itself.
+
 All deviations are covered by DSH TUI's offline tests
 (`test/input-lifecycle.test.ts` covers the lifecycle one with a private PTY and
 a fake terminal; `test/input-terminal-output.test.ts` covers writer injection
-with an in-process stream probe and a private PTY); refresh them with every Pi
-TUI upgrade.
+with an in-process stream probe and a private PTY;
+`test/input-terminal-integration.test.ts` covers OSC 7501 encoding/limits,
+capability policy, record replay/clear, focus isolation from input and paste,
+title-stack balance, progress policy, after-stop write gating and the bounded
+reply reassembly); refresh them with every Pi TUI upgrade.

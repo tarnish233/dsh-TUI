@@ -1,30 +1,32 @@
 /**
- * Fullscreen image details overlay (read-only).
+ * Image details inspector (read-only) on the shared modal chrome.
  *
- * One occurrence of the transcript's image sequence is shown in a dedicated,
- * full-width image area. The composition is deliberately *not* a transcript
- * card: Pi TUI's public `Image` component emits Kitty/iTerm2 APC lines and
- * reserves its own blank placement rows, so those lines must never pass through
- * the tool tree indentation, generic wrapping or `sanitize()` (which would strip
- * the graphics sequence). Only the APC lines produced by `Image` are exempt;
- * every other piece of metadata/name/error/source text is sanitized.
+ * One occurrence of the transcript's image sequence is shown in a dedicated
+ * image area inside `ModalFrame`. The composition is deliberately *not* a
+ * transcript card: Pi TUI's public `Image` component emits Kitty/iTerm2 APC
+ * lines and reserves its own blank placement rows. `ModalFrame` passes such
+ * lines through verbatim (`\\x1b_G` / `\\x1b]1337;File=`), so they must never be
+ * wrapped, truncated or `sanitize()`d as text; only metadata/name/error text is
+ * sanitized and width-safe. Geometry comes from the same measured frame options
+ * used for render, so the image budget always equals the real body rows.
  *
- * Lifecycle:
- *   - construction starts one lazy `readImage` request (markers never prefetch);
- *   - `setImage(next)` supersedes it (abort + generation token); a reused key
- *     whose attachment identity/payload changed is reloaded;
- *   - `dispose()` aborts and goes inert; late results are ignored, not cached;
- *   - decode/transcode happens before the first ready frame, never in render.
- *
- * Layout never truncates an APC/blank-row block: the image area gets an explicit
- * row budget derived from the live `maxHeight`, and a too-short viewport falls
- * back to sanitized text while keeping the close hint visible. Cell-dimension
- * changes invalidate the retained `Image` instance; a changed row budget needs a
- * new instance because Pi's `maxHeightCells` is construction-time state.
+ * Preview display preference (renderer only):
+ *   - `auto` starts exactly one lazy `readImage` when constructed, then paints
+ *     the graphics (or the terminal fallback) once decoded;
+ *   - `text` never starts a read/decode on open, keeps the metadata/ref
+ *     identity, and aborts + tombstones a pending read if the mode changes
+ *     while loading. Switching back reuses already-decoded bytes without a
+ *     second read.
+ * `setImage(next)` supersedes a pending read (abort + generation token); a
+ * reused key whose attachment identity/payload changed is reloaded. `dispose()`
+ * aborts and goes inert; late results are ignored, not cached.
  *
  * Input goes through `keymap.resolve(raw, 'imageDetails')`: the shared chord
  * state, interrupt priority and modal precedence apply, unknown global actions
- * stay inert, and hints show the effective binding (including chords).
+ * stay inert, and hints show the effective binding (including chords). Chrome
+ * close/actions and their mouse hitboxes belong to `ModalFrame`; the body only
+ * contains image/status lines, so plain drag outside the chrome keeps native
+ * text selection.
  */
 import {
   Image,
@@ -38,24 +40,24 @@ import {
   type TUI,
 } from '#pi-tui'
 import { formatBinding, type CcKeymap } from '../input/index.ts'
-import type { ImageDetailsDialogOptions, ImageViewItem } from './image-view.ts'
+import type { ImageDetailsDialogOptions, ImagePreviewMode, ImageViewItem } from './image-view.ts'
 import { imageAttachmentKey } from '../attachments.ts'
 import { formatImageBytes, imageRefSummary, imageRefTitle } from './image-data.ts'
 import { isAbortError, loadImageItem } from './image-loader.ts'
 import type { DisplayImage } from './image-codec.ts'
-import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
-import { bold, cc, dim, t } from './theme.ts'
-import { fit, oneLine, sanitize, visibleWidth } from './text.ts'
+import { ModalFrame, type ModalAction, type ModalFrameOptions, type ModalGeometry, type ModalSize } from './modal.ts'
+import { cc, dim, t } from './theme.ts'
+import { fit, oneLine, sanitize } from './text.ts'
 
 type LoadState =
+  /** Text preview requested: nothing was read or decoded for this view. */
+  | { readonly status: 'text' }
   | { readonly status: 'loading' }
   | { readonly status: 'ready'; readonly display: DisplayImage; readonly component: Image }
   | { readonly status: 'error'; readonly reason: string }
 
 const CLOSE_ACTIONS = ['image.details.close', 'list.cancel', 'dialog.cancel', 'app.cancel'] as const
 
-/** Rules, header, metadata, controls, status and hint outside the image area. */
-const CHROME_ROWS = 9
 const MIN_IMAGE_ROWS = 4
 const DEFAULT_IMAGE_ROWS = 24
 
@@ -70,10 +72,12 @@ function clean(value: string, max = 200): string {
 
 export class ImageDetailsDialog implements Component, Focusable {
   readonly capturesViewportInput = true
+  /** Parent-generic dialog hosting uses the wider content size. */
+  readonly modalSize: ModalSize = 'wide'
   readonly keymap: CcKeymap
   private readonly tui: TUI
   private readonly options: ImageDetailsDialogOptions
-  private readonly registry = new HitboxRegistry()
+  private readonly frame = new ModalFrame()
   private image: ImageViewItem
   private state: LoadState = { status: 'loading' }
   private controller: AbortController | undefined
@@ -82,17 +86,24 @@ export class ImageDetailsDialog implements Component, Focusable {
   private done = false
   private focusedState = false
   private chordPending = false
-  private hovered: string | undefined
+  /** Decoded payload kept across an auto → text → auto switch (no re-read). */
+  private decodedPayload: DisplayImage | undefined
+  /** Live body-row budget from the last measured frame. */
+  private rowBudget = DEFAULT_IMAGE_ROWS
   /** Geometry token for the retained Image instance (cell size + budget). */
   private geometryKey = ''
   private componentBudget = 0
+  /** Locally applied preview request while the parent persists the preference. */
+  private requestedPreview: ImagePreviewMode | undefined
+  private requestedFrom: ImagePreviewMode | undefined
 
   constructor(tui: TUI, options: ImageDetailsDialogOptions) {
     this.tui = tui
     this.options = options
     this.image = options.image
     this.keymap = options.keymap
-    this.startLoad()
+    if (this.previewMode() === 'text') this.state = { status: 'text' }
+    else this.startLoad()
   }
 
   // -------------------------------------------------------------------------
@@ -106,9 +117,14 @@ export class ImageDetailsDialog implements Component, Focusable {
     return this.state.status
   }
 
+  /** Effective display preference of this surface (`auto` unless configured). */
+  get preview(): ImagePreviewMode {
+    return this.previewMode()
+  }
+
   /** Decoded PNG payload/metadata once ready; never a byte source for copying. */
   get decoded(): DisplayImage | undefined {
-    return this.state.status === 'ready' ? this.state.display : undefined
+    return this.state.status === 'ready' ? this.state.display : this.decodedPayload
   }
 
   get errorReason(): string | undefined {
@@ -137,6 +153,30 @@ export class ImageDetailsDialog implements Component, Focusable {
   }
 
   /**
+   * Apply a preview preference chosen in this surface. The parent persists it
+   * through `setPreview`; the surface switches immediately either way, so a text
+   * choice can never be blocked behind a settings round-trip.
+   */
+  setPreview(value: ImagePreviewMode): void {
+    if (this.disposed) return
+    this.requestedFrom = this.options.preview ?? 'auto'
+    this.requestedPreview = value
+    this.options.setPreview?.(value)
+    this.applyPreviewMode()
+    this.requestRender()
+  }
+
+  /**
+   * Re-read the parent's live preference (hosts may call this after a settings
+   * change). Enforces the text-mode contract: pending reads are aborted.
+   */
+  refreshPreview(): void {
+    if (this.disposed) return
+    this.applyPreviewMode()
+    this.requestRender()
+  }
+
+  /**
    * Recompute the Image's own cached frame. Cell-dimension (CSI 16t) changes
    * invalidate the retained instance so the new geometry is honored instead of
    * painting an old pixel-per-cell frame.
@@ -144,7 +184,9 @@ export class ImageDetailsDialog implements Component, Focusable {
   invalidate(): void {
     if (this.disposed) return
     this.geometryKey = ''
+    this.frame.invalidate()
     if (this.state.status === 'ready') this.state.component.invalidate()
+    this.applyPreviewMode()
     this.requestRender()
   }
 
@@ -155,6 +197,7 @@ export class ImageDetailsDialog implements Component, Focusable {
    *   creates its own `Image` instance once bytes are ready.
    * - Same bytes with updated display metadata (label/name/originalDimensions)
    *   only refreshes the chrome and the fallback filename; bytes are reused.
+   * - In text preview the new occurrence is never read/decoded.
    */
   setImage(next: ImageViewItem): void {
     if (this.disposed) return
@@ -162,17 +205,69 @@ export class ImageDetailsDialog implements Component, Focusable {
       this.image = next
       this.geometryKey = ''
       this.componentBudget = 0
-      this.startLoad()
+      this.decodedPayload = undefined
+      if (this.previewMode() === 'text') {
+        this.abortRead()
+        this.state = { status: 'text' }
+        this.requestRender()
+      } else {
+        this.startLoad()
+      }
       return
     }
     if (sameImageDisplay(this.image, next)) return
     this.image = next
     if (this.state.status === 'ready') {
       this.state = { status: 'ready', display: this.state.display, component: this.createImageComponent(this.state.display) }
-      this.componentBudget = this.rowBudget()
+      this.componentBudget = this.rowBudget
       this.geometryKey = this.geometryToken()
     }
     this.requestRender()
+  }
+
+  /** Effective mode: a local request wins until the parent's value changes. */
+  private previewMode(): ImagePreviewMode {
+    const option = this.options.preview ?? 'auto'
+    if (this.requestedPreview !== undefined && (this.requestedFrom === undefined || option === this.requestedFrom || option === this.requestedPreview)) {
+      return this.requestedPreview
+    }
+    return option
+  }
+
+  /**
+   * Enter/leave text mode exactly once per transition. Entering text aborts and
+   * tombstones any pending read; leaving text reuses decoded bytes when this
+   * occurrence was already decoded, otherwise a single new read starts.
+   */
+  private applyPreviewMode(): void {
+    if (this.disposed) return
+    if (this.previewMode() === 'text') {
+      if (this.state.status === 'ready') {
+        this.decodedPayload = this.state.display
+        this.state = { status: 'text' }
+      } else if (this.state.status === 'loading') {
+        this.abortRead()
+        this.state = { status: 'text' }
+      } else if (this.state.status === 'error') {
+        this.state = { status: 'text' }
+      }
+      return
+    }
+    if (this.state.status !== 'text') return
+    if (this.decodedPayload !== undefined) {
+      this.state = { status: 'ready', display: this.decodedPayload, component: this.createImageComponent(this.decodedPayload) }
+      this.componentBudget = this.rowBudget
+      this.geometryKey = this.geometryToken()
+      return
+    }
+    this.startLoad()
+  }
+
+  /** Abort the pending read and drop its controller; late results stay inert. */
+  private abortRead(): void {
+    this.controller?.abort()
+    this.controller = undefined
+    this.generation += 1
   }
 
   /** Reuse decoded bytes for a new viewport/metadata; never re-reads the source. */
@@ -183,10 +278,10 @@ export class ImageDetailsDialog implements Component, Focusable {
       'image/png',
       imageTheme,
       {
-        // The real overlay width bounds columns; the current viewport height
-        // bounds rows. Never Pi's compact 60-cell default for this surface.
+        // The measured body width bounds columns; the body-height budget bounds
+        // rows. Never Pi's compact 60-cell default for this surface.
         maxWidthCells: 10_000,
-        maxHeightCells: Math.max(1, this.rowBudget()),
+        maxHeightCells: Math.max(1, this.rowBudget),
         ...(name === undefined ? {} : { filename: name }),
       },
       { widthPx: display.width, heightPx: display.height },
@@ -197,13 +292,11 @@ export class ImageDetailsDialog implements Component, Focusable {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
-    this.generation += 1
+    this.abortRead()
     this.cancelChord()
-    this.controller?.abort()
-    this.controller = undefined
-    this.state = { status: 'loading' }
-    this.registry.clear()
-    this.hovered = undefined
+    this.decodedPayload = undefined
+    this.state = { status: 'text' }
+    this.frame.invalidate()
   }
 
   // -------------------------------------------------------------------------
@@ -223,13 +316,21 @@ export class ImageDetailsDialog implements Component, Focusable {
     }).then(result => {
       if (this.disposed || generation !== this.generation || controller.signal.aborted) return
       this.controller = undefined
+      // A text-mode switch that happened while the read was in flight still
+      // wins: the result is dropped and never painted or treated as ready.
+      if (this.previewMode() === 'text') {
+        this.state = { status: 'text' }
+        this.requestRender()
+        return
+      }
       if (!result.ok) {
         this.state = { status: 'error', reason: clean(result.reason) }
         this.requestRender()
         return
       }
+      this.decodedPayload = result.image
       const component = this.createImageComponent(result.image)
-      this.componentBudget = this.rowBudget()
+      this.componentBudget = this.rowBudget
       this.geometryKey = this.geometryToken()
       this.state = { status: 'ready', display: result.image, component }
       this.requestRender()
@@ -237,6 +338,11 @@ export class ImageDetailsDialog implements Component, Focusable {
       if (this.disposed || generation !== this.generation || controller.signal.aborted) return
       if (isAbortError(error)) return
       this.controller = undefined
+      if (this.previewMode() === 'text') {
+        this.state = { status: 'text' }
+        this.requestRender()
+        return
+      }
       this.state = { status: 'error', reason: clean(errorText(error)) }
       this.requestRender()
     })
@@ -249,6 +355,7 @@ export class ImageDetailsDialog implements Component, Focusable {
 
   private requestRender(): void {
     this.options.onRenderRequest?.()
+    this.tui.requestRender()
   }
 
   // -------------------------------------------------------------------------
@@ -287,6 +394,10 @@ export class ImageDetailsDialog implements Component, Focusable {
       this.navigate(1)
       return
     }
+    if (id === 'image.details.toggle-preview') {
+      this.setPreview(this.previewMode() === 'text' ? 'auto' : 'text')
+      return
+    }
     // Any other resolved global action is deliberately inert inside the viewer.
   }
 
@@ -319,35 +430,26 @@ export class ImageDetailsDialog implements Component, Focusable {
     if (this.done || this.disposed) return
     this.done = true
     this.cancelChord()
-    this.controller?.abort()
-    this.controller = undefined
+    this.abortRead()
     this.options.onClose()
   }
 
   // -------------------------------------------------------------------------
   // Geometry and rendering
 
-  /** Live viewport height converted to a row budget for the image component. */
+  private geometryToken(): string {
+    const cell = getCellDimensions()
+    return `${this.rowBudget}|${cell.widthPx}x${cell.heightPx}|${getCapabilities().images ?? 'none'}`
+  }
+
   private limitRows(): number {
     const value = this.options.maxHeight
     if (value === undefined || !Number.isFinite(value)) return 0
     return Math.max(1, Math.floor(value))
   }
 
-  /** Rows available to the image component; may be below MIN_IMAGE_ROWS. */
-  private rowBudget(): number {
-    const limit = this.limitRows()
-    if (limit === 0) return DEFAULT_IMAGE_ROWS
-    return Math.max(1, limit - CHROME_ROWS)
-  }
-
-  private geometryToken(): string {
-    const cell = getCellDimensions()
-    return `${this.rowBudget()}|${cell.widthPx}x${cell.heightPx}|${getCapabilities().images ?? 'none'}`
-  }
-
   /** Invalidate/recreate only when real geometry changed, then render once. */
-  private renderImageComponent(width: number, budget: number): Image {
+  private renderImageComponent(budget: number): Image {
     const state = this.state
     if (state.status !== 'ready') throw new Error('image component is not ready')
     const token = this.geometryToken()
@@ -371,81 +473,153 @@ export class ImageDetailsDialog implements Component, Focusable {
     return current.component
   }
 
+  /**
+   * Two-pass layout shared by `render` and the public `measure` (tests/hosts):
+   * the inner width sizes the metadata rows, then the same options object sizes
+   * the image body budget. Mouse/geometry helpers can never disagree with the
+   * painted frame.
+   */
+  private layoutFor(size: number): { options: ModalFrameOptions; geometry: ModalGeometry } {
+    const base = this.frameOptions(size)
+    const first = this.frame.measure(size, base)
+    const options: ModalFrameOptions = {
+      ...base,
+      before: this.beforeLines(first.bodyWidth),
+      after: this.afterLines(first.bodyWidth),
+    }
+    return { options, geometry: this.frame.measure(size, options) }
+  }
+
+  /** Geometry of the frame that `render(width)` would produce right now. */
+  measure(width: number): ModalGeometry {
+    return this.layoutFor(Math.max(1, Math.floor(width))).geometry
+  }
+
   render(width: number): string[] {
     if (this.disposed) return []
     const size = Math.max(1, Math.floor(width))
-    const limit = this.limitRows()
-    if (limit > 0 && limit < CHROME_ROWS + MIN_IMAGE_ROWS) return this.renderCompact(size, limit)
+    const { options, geometry } = this.layoutFor(size)
+    this.rowBudget = Math.max(1, geometry.bodyHeight)
+    // Enforce a live preference change (e.g. parent settings) without waiting
+    // for a host callback; text mode aborts any read that is still pending.
+    this.applyPreviewMode()
+    const body = this.bodyLines(geometry.bodyWidth, geometry.bodyHeight)
+    return this.frame.render(size, body, options)
+  }
 
-    const out: string[] = []
-    const boxes: MouseHitbox[] = []
-    const push = (line: string): number => {
-      out.push(line)
-      return out.length - 1
-    }
-
-    push(cc.inactive('─'.repeat(size)))
+  private frameOptions(width: number): ModalFrameOptions {
+    void width
     const { index, total } = this.navigation()
     const position = total > 1 ? `Image ${index + 1} of ${total}` : 'Image'
-    push(fit(` ${bold(cc.permission('Image details'))}${dim(' · ')}${t.text(position)}${dim(' · ')}${t.muted(clean(this.image.label, 60))}`, size))
+    return {
+      title: 'Image details',
+      // Occurrence identity + preview mode: a pressed footer action never acts
+      // on a different occurrence or the opposite preview mode after repaint.
+      ownerKey: `image:${this.image.key}:${this.previewMode()}`,
+      subtitle: `${position} · ${clean(this.image.label, 60)}`,
+      actions: this.frameActions(),
+      onClose: () => this.close(),
+      maxHeight: this.limitRows() === 0 ? 24 : this.limitRows(),
+      keymap: this.keymap,
+    }
+  }
 
+  /**
+   * Action chips: real key bindings for navigation/close, plus a mouse-toggle for
+   * the preview mode. The preview action is deliberately unbound: the input
+   * registry has no image-preview action yet, so no fake shortcut is printed.
+   */
+  private frameActions(): ModalAction[] {
+    const next = this.previewMode() === 'text' ? 'auto' : 'text'
+    const actions: ModalAction[] = []
+    if (this.options.onPreviousImage !== undefined) {
+      actions.push({
+        id: 'prev',
+        label: 'Prev',
+        action: 'image.details.previous-image',
+        disabled: !this.canPrevious(),
+        onActivate: () => this.navigate(-1),
+      })
+    }
+    if (this.options.onNextImage !== undefined) {
+      actions.push({
+        id: 'next',
+        label: 'Next',
+        action: 'image.details.next-image',
+        disabled: !this.canNext(),
+        onActivate: () => this.navigate(1),
+      })
+    }
+    actions.push({
+      // The action id carries the real binding when the registry has one; a
+      // click-only capability without a binding still renders as a clickable
+      // label with no fake key (the frame prints the binding only when bound).
+      id: 'preview',
+      label: next === 'text' ? 'Text only' : 'Preview image',
+      action: 'image.details.toggle-preview',
+      onActivate: () => this.setPreview(next),
+    })
+    actions.push({ id: 'close', label: 'Close', action: 'image.details.close', onActivate: () => this.close() })
+    return actions
+  }
+
+  /** Reference identity/metadata rows; always width-safe and sanitized. */
+  private beforeLines(width: number): string[] {
+    const inner = Math.max(1, width)
     const ref = this.image.attachment
     const title = ref === undefined
       ? `${this.attachmentName() ?? 'clipboard image'} · ${this.image.upload.mediaType}`
       : imageRefTitle(ref)
-    push(fit(` ${t.text(clean(title))}`, size))
+    const lines = [fit(` ${t.text(clean(title))}`, inner)]
     const meta = this.metaText()
-    if (meta !== '') push(fit(` ${dim(meta)}`, size))
-    this.renderControls(push, boxes, size)
-    push(cc.inactive('─'.repeat(size)))
-
-    // Dedicated full-width image area: Pi's lines are pushed verbatim (APC and
-    // placement rows), never truncated or re-wrapped.
-    const budget = this.rowBudget()
-    if (budget < MIN_IMAGE_ROWS) {
-      push(fit(` ${dim(t.muted('Viewport too short for an inline image.'))}`, size))
-    } else {
-      for (const line of this.imageLines(size, budget)) out.push(line)
-    }
-    push(cc.inactive('─'.repeat(size)))
-    push(fit(` ${this.statusLine()}`, size))
-    const hint = this.hintLine()
-    if (hint !== '') push(fit(` ${dim(hint)}`, size))
-
-    this.registry.sync(boxes)
-    return out
-  }
-
-  /**
-   * Very short viewport: text only, but the close affordance and the reason
-   * stay visible. Nothing is sliced after the fact.
-   */
-  private renderCompact(width: number, limit: number): string[] {
-    const { index, total } = this.navigation()
-    const position = total > 1 ? `Image ${index + 1} of ${total}` : 'Image'
-    const close = this.closeKey()
-    const status = this.statusLine()
-    const closeLine = fit(` ${status}${close === undefined ? '' : ` · ${close} close`}`, width)
-    const title = fit(` ${bold(cc.permission('Image details'))}${dim(' · ')}${t.text(position)}`, width)
-    const meta = this.metaText()
-    // Always keep the close affordance, even at a one-row viewport.
-    const lines = limit <= 1
-      ? [closeLine]
-      : limit === 2 || meta === ''
-        ? [title, closeLine]
-        : [title, fit(` ${dim(meta)}`, width), closeLine]
-    this.registry.sync([])
+    if (meta !== '') lines.push(fit(` ${dim(meta)}`, inner))
     return lines
   }
 
+  private afterLines(width: number): string[] {
+    const inner = Math.max(1, width)
+    const lines = [fit(` ${this.statusLine()}`, inner)]
+    const hint = this.hintLine()
+    if (hint !== '') lines.push(fit(` ${dim(hint)}`, inner))
+    return lines
+  }
+
+  private bodyLines(width: number, height: number): string[] {
+    const rows = Math.max(0, Math.floor(height))
+    if (rows === 0) return []
+    if (this.previewMode() === 'text') return this.textPreviewLines(width, rows)
+    if (rows < MIN_IMAGE_ROWS) {
+      // Very short viewport: text only, but the close affordance stays visible.
+      const close = this.closeKey()
+      const suffix = close === undefined ? '' : ` · ${close} close`
+      return [fit(` ${dim(t.muted('Viewport too short for an inline image.'))}${dim(suffix)}`, width)]
+    }
+    const lines = this.imageLines(width, rows)
+    while (lines.length < rows) lines.push('')
+    return lines.slice(0, rows)
+  }
+
+  /** Text-only preview: metadata was already rendered; no read/decode happened. */
+  private textPreviewLines(width: number, rows: number): string[] {
+    const close = this.closeKey()
+    const suffix = close === undefined ? '' : ` · ${close} close`
+    const lines = [
+      fit(` ${t.text('Text preview')}${dim(' · ')}${dim('automatic image preview is off')}`, width),
+      fit(` ${dim('The image was not read or decoded in this mode.')}${dim(suffix)}`, width),
+    ]
+    while (lines.length < rows) lines.push('')
+    return lines.slice(0, rows)
+  }
+
   private imageLines(width: number, budget: number): string[] {
+    if (this.state.status === 'text') return this.textPreviewLines(width, budget)
     if (this.state.status === 'loading') {
       return [fit(` ${dim(t.muted('Loading image…'))}`, width)]
     }
     if (this.state.status === 'error') {
       return [fit(` ${t.redSoft('Image unavailable')}${dim(' · ')}${t.muted(clean(this.state.reason))}`, width)]
     }
-    const component = this.renderImageComponent(width, budget)
+    const component = this.renderImageComponent(budget)
     const lines = component.render(width)
     if (lines.length > budget) {
       // Honest fallback instead of slicing APC lines while still claiming the
@@ -457,8 +631,8 @@ export class ImageDetailsDialog implements Component, Focusable {
 
   private metaText(): string {
     const ref = this.image.attachment
-    if (this.state.status === 'ready') {
-      const display = this.state.display
+    const display = this.state.status === 'ready' ? this.state.display : this.decodedPayload
+    if (display !== undefined) {
       const source = ref === undefined
         ? `${display.sourceMediaType} ${display.sourceWidth}×${display.sourceHeight}`
         : imageRefSummary(ref)
@@ -493,65 +667,29 @@ export class ImageDetailsDialog implements Component, Focusable {
   }
 
   private statusLine(): string {
-    if (this.state.status === 'loading') return dim(t.muted('Loading…'))
-    if (this.state.status === 'error') return cc.error('Unavailable')
-    return terminalImages()
-      ? cc.success('Ready')
-      : `${cc.success('Ready')}${dim(' · ')}${dim('terminal cannot display inline images')}`
-  }
-
-  /** Clickable Close/Prev/Next controls using the shared hitbox layer. */
-  private renderControls(
-    push: (line: string) => number,
-    boxes: MouseHitbox[],
-    width: number,
-  ): void {
-    const plans: Array<{ id: string; label: string; enabled: boolean; run: () => void }> = [
-      { id: 'image-prev', label: '‹ Prev', enabled: this.canPrevious(), run: () => this.navigate(-1) },
-      { id: 'image-next', label: 'Next ›', enabled: this.canNext(), run: () => this.navigate(1) },
-      { id: 'image-close', label: 'Close', enabled: true, run: () => this.close() },
-    ]
-    const parts: string[] = [' ']
-    let used = 1
-    const pending: Array<{ id: string; start: number; end: number; run: () => void }> = []
-    for (const plan of plans) {
-      const label = `[${plan.label}]`
-      if (used + visibleWidth(label) >= width) break
-      const hovered = this.hovered === plan.id
-      const styled = plan.enabled
-        ? hovered ? bold(cc.suggestion(label)) : t.text(label)
-        : dim(label)
-      const start = used
-      parts.push(styled)
-      used += visibleWidth(label)
-      if (plan.enabled) pending.push({ id: plan.id, start, end: used - 1, run: plan.run })
-      parts.push(' ')
-      used += 1
+    switch (this.state.status) {
+      case 'text':
+        return `${t.muted('Text preview')}${dim(' · automatic preview off')}`
+      case 'loading':
+        return dim(t.muted('Loading…'))
+      case 'error':
+        return cc.error('Unavailable')
+      case 'ready':
+        return terminalImages()
+          ? cc.success('Ready')
+          : `${cc.success('Ready')}${dim(' · ')}${dim('terminal cannot display inline images')}`
+      default: {
+        const exhaustive: never = this.state
+        return t.muted(String(exhaustive))
+      }
     }
-    const row = push(fit(parts.join(''), width))
-    for (const control of pending) {
-      boxes.push({
-        id: control.id,
-        startRow: row,
-        endRow: row,
-        startCol: control.start,
-        endCol: control.end,
-        claimPress: true,
-        onClick: () => control.run(),
-        onHover: (entering: boolean) => this.setHover(entering ? control.id : undefined),
-      })
-    }
-  }
-
-  private setHover(id: string | undefined): void {
-    if (id === this.hovered) return
-    this.hovered = id
-    this.requestRender()
   }
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     if (this.disposed) return undefined
-    return this.registry.handleMouse(event)
+    // Chrome owns the close/action hitboxes; body cells stay with the native
+    // renderer so text selection and copy-on-select keep working.
+    return this.frame.handleMouse(event)
   }
 
   /**

@@ -39,6 +39,16 @@ async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen') {
 
 async function paint(terminal: VirtualTerminal) { await delay(30); await terminal.flush() }
 
+/** Search the native read-only row without depending on its roster position. */
+async function showAutoTitle(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  await f.app.submit('/settings'); await paint(f.terminal)
+  f.terminal.type('\x06')
+  for (const char of 'auto title') f.terminal.type(char)
+  await paint(f.terminal)
+  await until(() => f.terminal.screen().includes('Auto title'), 'native auto-title row is visible')
+    .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+}
+
 /**
  * The status footer is the block below the editor frame, rendered as one or
  * more wrapped rows. A long TMPDIR legitimately wraps it, so assertions isolate
@@ -253,48 +263,44 @@ test('model command failures are not hidden by quiet success feedback', async ()
 })
 
 for (const screen of ['inline', 'fullscreen'] as const) {
-  test('successful auto-title changes are shown in Settings without transcript messages (' + screen + ')', async () => {
+  test('native auto-title is a read-only DSH row without transcript messages (' + screen + ')', async () => {
     const f = await fixture(screen)
     try {
-      f.backend.replies.set('auto-title', { available: true, enabled: true })
+      f.backend.replies.set('auto-title', { available: true, enabled: true, editable: false })
       const before = [...f.app.store.items]
-      await f.app.submit('/settings'); await paint(f.terminal)
-      f.terminal.type('1')
-      await until(() => f.terminal.screen().split('\n').some(line => line.includes('Auto title') && /\bon\b/.test(line)), 'native auto-title result is reflected in Settings')
-      await paint(f.terminal)
-      f.terminal.type('\x1b[H'); await paint(f.terminal)
-      assert.ok(f.backend.calls.some(call => call.name === 'auto-title' && call.args.enabled === true))
+      await showAutoTitle(f)
+      await until(() => f.terminal.screen().split('\n').some(line => line.includes('Auto title') && /On · read-only/.test(line)), 'native state is reflected in Settings')
+      assert.equal(f.backend.calls.some(call => call.name === 'auto-title' && call.args.enabled !== undefined), false, 'the UI never requests a native composition change')
       assert.deepEqual(f.app.store.items, before)
-      assert.match(f.terminal.screen(), /may use the model/, 'model-backed title disclosure remains in the setting description')
+      assert.match(f.terminal.screen(), /native titles may[\s\S]*the model/, 'model-backed title disclosure remains in the native row')
     } finally { await f.close() }
   })
 }
 
-test('native auto-title warnings and an unconfirmed effective value remain visible', async () => {
+test('native auto-title details and an unconfirmed effective value stay in the row', async () => {
   for (const field of ['note', 'warning', 'limitation', 'unconfirmed']) {
     const f = await fixture()
     try {
       const warning = 'Native title configuration needs attention: ' + field
-      f.backend.replies.set('auto-title', field === 'unconfirmed' ? { available: true } : { available: true, enabled: true, [field]: warning })
-      await f.app.submit('/settings'); await paint(f.terminal)
-      f.terminal.type('1')
-      await until(() => notices(f.app).length > 0, 'native warning is visible')
-      const text = notices(f.app).at(-1)?.text ?? ''
-      if (field === 'unconfirmed') assert.match(text, /did not report|not report/)
-      else assert.match(text, new RegExp(warning))
-      assert.doesNotMatch(text, /DSH may use the model to generate session titles/, 'routine disclosure belongs in Settings, not in every notice')
+      f.backend.replies.set('auto-title', field === 'unconfirmed' ? { available: true, editable: false } : { available: true, enabled: true, editable: false, [field]: warning })
+      await showAutoTitle(f)
+      await paint(f.terminal)
+      if (field === 'unconfirmed') assert.match(f.terminal.screen(), /Read-only/)
+      else assert.match(f.terminal.screen(), new RegExp(warning))
+      assert.equal(f.backend.calls.some(call => call.name === 'auto-title' && call.args.enabled !== undefined), false)
+      assert.deepEqual(notices(f.app), [], 'read-only native details do not become transcript notices')
     } finally { await f.close() }
   }
 })
 
-test('auto-title preference save failures remain visible after the native change', async () => {
+test('an unwritable local settings path cannot turn the native auto-title row into a write', async () => {
   const f = await fixture()
   try {
-    f.backend.replies.set('auto-title', { available: true, enabled: true })
+    f.backend.replies.set('auto-title', { available: true, enabled: true, editable: false })
     await mkdir(join(f.directory, 'settings.json'))
-    await f.app.submit('/settings'); await paint(f.terminal)
-    f.terminal.type('1')
-    await until(() => notices(f.app).some(item => item.text.includes('local TUI preference was not saved')), 'local save failure is visible')
-    assert.ok(f.backend.calls.some(call => call.name === 'auto-title' && call.args.enabled === true), 'native service still owns the change')
+    await showAutoTitle(f)
+    f.terminal.type('\r'); await paint(f.terminal)
+    assert.equal(f.backend.calls.some(call => call.name === 'auto-title' && call.args.enabled !== undefined), false)
+    assert.equal(notices(f.app).some(item => item.text.includes('local TUI preference')), false)
   } finally { await f.close() }
 })

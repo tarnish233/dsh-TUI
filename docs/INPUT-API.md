@@ -171,6 +171,7 @@ restores `payload.snapshot` with `restoreDraft()` when native admission fails.
 | `image.details.previous-image` | `[`, `alt+left` | `imageDetails` only; stays plain text/word motion in the editor |
 | `image.details.next-image` | `]`, `alt+right` | `imageDetails` only; stays plain text/word motion in the editor |
 | `image.details.close` | `escape` | `imageDetails` only; wins over `list.cancel` for Esc |
+| `image.details.toggle-preview` | `p` | TUI extension; `imageDetails` only. Renderer-only automatic/text-only display toggle (text-only starts no read/decode, changes no facts); `p` stays text in the prompt and modal fields |
 | `app.subagents.details` | `ctrl+x ctrl+a` | TUI extension; opens the native Agents overlay (`subagentList` / `subagentSession`). Plain Ctrl+A stays line start in the prompt |
 | `subagent.reply` | `r` | TUI extension; `subagentList`/`subagentSession` only. Sets the App-owned reply target; leave it with `app.cancel`. Plain `r` stays text in the prompt and every other context |
 | `subagent.interrupt` | `s` | TUI extension; `subagentList`/`subagentSession` only. Stops the focused child inside the overlay. Ctrl+C remains the global `app.interrupt` |
@@ -207,8 +208,10 @@ The image-details viewer uses the `imageDetails` context
 `toolDetails`: Esc closes the viewer (not `list.cancel`), the configured
 `app.interrupt` key always wins (even mid-chord), and `CcEditor` in this context
 discards printable input, editing bytes and bracketed paste instead of inserting
-them. All three viewer actions appear in the same grouped Settings list and use
-the same single override map.
+them. `image.details.toggle-preview` (`p`) is a renderer-only automatic /
+text-only display toggle; text-only mode must not start a read/decode and
+attachments/facts stay intact. All four viewer actions appear in the same
+grouped Settings list and use the same single override map.
 
 The native Agents overlay uses two read-only contexts, `subagentList` (agent
 list) and `subagentSession` (one agent's session view):
@@ -248,6 +251,98 @@ Plain keys: the frontend can keep using Pi's `getKeybindings().matches` for
 non-chord app keys, but then the YAML/JSON override in `CcKeymap` is not in
 effect. Preferred: `editor.getKeymap().resolve(data, context)`.
 
+## Slash completion (commands + DSH skills)
+
+```ts
+import { NativeAutocompleteProvider, createNativeAutocompleteProvider } from "./src/input/index.ts"
+
+const provider = new NativeAutocompleteProvider({
+  commands: () => [...uiCommands, ...nativeCommands], // readonly SlashCommand[] (#pi-tui)
+  skills: () => skillEntries,                          // readonly SkillCatalogEntry[] (backend/types.ts)
+  basePath: cwd,
+  refreshSkills: async (signal) => { /* parent single-flight/dirty query */ },
+})
+editor.setAutocompleteProvider(provider)
+```
+
+Both the class and `createNativeAutocompleteProvider(options)` return the same
+object; the options object is the stable API. `commands`/`skills` are **getters**
+called on every request, so asynchronous metadata updates need no cache
+invalidation here. Nothing else is cached (no catalog, no Editor state, no
+timers, no raw stdin).
+
+Behavior:
+
+- Slash-name menu (`/` at the trimmed line start, no space yet, not forced):
+  native names only — `/name`. There is no `/skill` wrapper and no Pi
+  `skill:` / `skill:name` alias; a skill entry never becomes a fake command and
+  its body is never read or expanded.
+- Order is native: commands in roster order, then skills in catalog order. A
+  name collision shows only the command (command wins).
+- Skill descriptions are labelled with `Skill — …`; `modelInvocable: false`
+  (and any non-`true` value) is labelled `Skill (user-only) — …`. Description /
+  name metadata is stripped of ANSI escapes, C0/C1 control characters and
+  Unicode line separators before it reaches the menu; names that cannot be
+  invoked as `/name` (whitespace, `/`, `\`) are omitted.
+- Everything else is delegated unchanged to Pi's
+  `CombinedAutocompleteProvider`: `@` attachments, relative/absolute/`~` paths,
+  quoted paths, command argument completion, forced (`Tab`) completion, the
+  insertion/cursor rules and `shouldTriggerFileCompletion`.
+- Slash-name requests **start** `refreshSkills(signal)` and return immediately
+  from the current getters (never awaiting the parent query); menu data remains
+  usable if the refresh rejects. It is strictly single-flight: while one parent
+  call is pending, keystrokes, the same menu re-triggered, and background
+  metadata re-queries add no second call. Once it settles, **every** regular
+  slash query may ask again — even the exact same text. The provider does not
+  memoize the query; dirty/in-flight/catalog-validity/scope caching belongs to
+  the parent, which returns an already-fresh catalog without refetching. That
+  keeps unavailable/error/scope changes retryable by the next genuine user
+  query or menu reopen. `file`/`@`/argument/forced completion never refreshes.
+- The signal passed to `refreshSkills` is the provider's lifetime controller and
+  aborts on `provider.dispose()` (and only then): a per-keystroke Editor abort
+  must not cancel the parent's catalog query.
+- Diagnostics: `provider.isRefreshingSkills()`; `provider.dispose()` is
+  idempotent and late refresh results are ignored.
+
+When metadata settles, the parent re-triggers Pi's completion with the seam
+method below (not with a Tab/accept path), so the open menu re-reads the getters.
+
+### `ccRefreshAutocomplete()`
+
+```ts
+editor.ccRefreshAutocomplete() // after metadata settles while the menu is open
+```
+
+Calls Pi's internal `requestAutocomplete({ force: this.autocompleteState === "force",
+explicitTab: false })`. It re-requests candidates for the current draft and
+never applies a completion, pushes undo, changes text or submits — a background
+refresh with exactly one new candidate cannot auto-accept it. It reuses Pi's
+existing request/abort state and debounce (no new Editor state, timer or stdin
+consumer) and does nothing useful without an autocomplete provider. Esc still
+closes the menu; suppressing later refreshes after Esc is the parent's
+scope/tombstone policy, not the seam's.
+
+### Enter acceptance and content-aware payloads
+
+`autocomplete.accept` on Enter (`ccAutocompleteAccept("confirm", onSubmit?)`)
+applies the highlighted candidate to this same Editor state **first**, then
+runs `onSubmit`. `CcEditor` passes a callback that captures the content-aware
+`CcSubmitPayload` on the completed draft (`/review`, not the typed `/rev`) and
+only then calls Pi's clear/submit, so `onSubmitContent` text/content/snapshot
+and the accepted name always agree. Semantics kept:
+
+- Tab (and any Tab-style accept) only edits the draft; it never submits.
+- Without a selected candidate, Enter cancels the menu and submits nothing.
+- File/`@`/argument completions keep Enter as fill-only, even for image-bearing
+  drafts (no content validation or send).
+- The seam's default `confirm` without a callback still calls `submitValue()`,
+  so direct seam consumers are unchanged.
+- Rejected native admission restores `payload.snapshot`, i.e. the completed
+  image-bearing draft, never the stale typed prefix.
+- The candidate apply keeps Pi's undo snapshot, paste/`[Image #N]` registry and
+  prompt-part order; kill/yank/undo and remapped/disabled accept keys are not
+  affected (an unbound Enter keeps its existing submit fallback).
+
 ## Keymap
 
 ```ts
@@ -276,7 +371,8 @@ keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
 
 - Contexts: `editor`, `autocomplete`, `list`, `dialog`, `historySearch`,
   `modelPickerList`, `modelPickerSearch`, `toolDetails`, `imageDetails`,
-  `subagentList`, `subagentSession`, `global`. Fallback
+  `subagentList`, `subagentSession`, `settingsList`, `keybindingsList`,
+  `modalList`, `queueList`, `modalSearch`, `global`. Fallback
   chains (first match wins): `autocomplete → editor → global`,
   `historySearch → editor → global`, `dialog → editor → global`,
   `editor → global`, `list → global`,
@@ -285,10 +381,65 @@ keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
   `toolDetails → list → dialog → global`,
   `imageDetails → list → dialog → global`,
   `subagentList → list → dialog → global`,
-  `subagentSession → list → dialog → global` (the last four deliberately have
-  no editor layer). Completion/search keys win locally, but editor editing
-  (Ctrl+A/W/K, Alt+B/F, word deletion, undo, …) keeps working underneath.
-  `getFallbackChain(ctx)` exposes the chain.
+  `subagentSession → list → dialog → global`,
+  `settingsList → list → dialog → global`,
+  `keybindingsList → list → dialog → global`,
+  `modalList → list → dialog → global`,
+  `queueList → list → dialog → global`,
+  `modalSearch → editor → dialog → global` (the four modal *browse* chains
+  deliberately have no editor layer; `modalSearch` is the modal text field and
+  keeps editor editing). Completion/search/modal-search keys win locally, but
+  editor editing (Ctrl+A/W/K, Alt+B/F, word deletion, undo, …) keeps working
+  underneath. `getFallbackChain(ctx)` exposes the chain.
+
+### Modal / Settings / queue contexts (popup pass)
+
+The unified popup surfaces are keyed by these contexts. Hosts call
+`keymap.resolve(data, ctx)` (or host one `CcEditor` with
+`setContext("modalSearch")` for the search field) and dispatch the returned
+action; the input layer owns no dialog/host state, no second editor and no
+queue storage.
+
+| context | chain | local rows (defaults) |
+| --- | --- | --- |
+| `settingsList` | `settingsList → list → dialog → global` | `modal.search` (Ctrl+F), `settings.reset` (Ctrl+R), `settings.previous-category` (Left, Shift+Tab), `settings.next-category` (Right, Tab) |
+| `keybindingsList` | `keybindingsList → list → dialog → global` | `modal.search` (Ctrl+F), `keybindings.edit` (Enter), `keybindings.reset` (Ctrl+R), `keybindings.disable` (Ctrl+D) |
+| `modalList` | `modalList → list → dialog → global` | `modal.search` (Ctrl+F), `session.scope.toggle` (Ctrl+A) |
+| `queueList` | `queueList → list → dialog → global` | `modal.search` (Ctrl+F), `queue.edit` (`e`), `queue.cancel-entry` (`d`), `queue.send-now` (Ctrl+Enter) |
+| `modalSearch` | `modalSearch → editor → dialog → global` | none (a field, not a list) |
+
+Host guidance (contract):
+
+- Settings is one continuous grouped page. The existing `settings.*-category` IDs are retained for user overrides but mean section jumps, not tab pages. Context-local rows win over inherited dialog/global Tab bindings; root Shift+Tab still only executes native `/permission`. In search/value fields, editing keeps its context and never touches the hidden prompt. Non-text Settings lists/pickers ignore bracketed paste via the existing filter; active paste blocks mouse focus/mode changes until its end.
+- Browse lists never fall through to the editor, so printable/editing bytes are
+  inert. `CcEditor` hosted with these contexts also consumes unbound bytes
+  (`settingsList`/`keybindingsList`/`modalList`/`queueList` are read-only
+  surfaces) and emits only app actions.
+- The modal search field is a real text field: typing, Ctrl+W word kill,
+  kill/yank, undo and Ctrl+A/E/B/F come from the one Pi editor state. Up/Down/
+  Enter/Tab list navigation is passed explicitly by the UI, not resolved from
+  editor bindings. Ctrl+F stays `editor.move.char-right` there (`modal.search`
+  is registered only in browse contexts).
+- `toolDetails` gains `modal.search`, `tool.details.toggle-calls` (Ctrl+L) and
+  `tool.details.wrap` (Ctrl+W); `subagentList` gains `modal.search` and
+  `subagent.filter.toggle` (Tab); `subagentSession` gains `modal.search`.
+  `imageDetails` gains no search field; the viewer's own `p` preview toggle is
+  documented above.
+- `keybindings.edit` intentionally overlaps `list.select` on Enter in
+  `keybindingsList`; the list-local row wins there and `list.select` is the
+  documented fallback when the edit row is disabled/remapped.
+- `app.queue.open` (Ctrl+X Ctrl+Q) is the only global addition; it is a chord
+  and takes no new single-key global binding. `queue.send-now` needs a terminal
+  that reports Ctrl+Enter (Kitty / modifyOtherKeys); plain Enter stays
+  `list.select`.
+- The configured simple `app.interrupt` key keeps priority over local bindings
+  and pending chords in all five new contexts (as in the picker/details/Agents
+  contexts), so Ctrl+C is never swallowed by `list.cancel`.
+- All rows are ordinary `CC_ACTIONS` entries: remap/disable (`null`)/reset in
+  the one grouped Keyboard list and `keybindings.json` map. Local rows never
+  become global (e.g. `keybindings.disable` Ctrl+D is not a global disable and
+  the prompt keeps forward-delete/exit).
+
 - A binding may be one key or a chord (`"ctrl+x ctrl+e"`).
 - Unknown action ids and malformed keys produce error diagnostics and are
   ignored/disable the action; they never silently fall back to a default.
@@ -314,8 +465,9 @@ keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
   pending chord is inserted into the query before the keymap is consulted;
   raw `keymap.resolve("j", "modelPickerList")` still reports `list.next` for
   custom list components. Only picker contexts get this text-first routing.
-- In picker contexts, `toolDetails`, `imageDetails`, `subagentList` and
-  `subagentSession` the configured simple
+- In picker contexts, `toolDetails`, `imageDetails`, `subagentList`,
+  `subagentSession`, `settingsList`, `keybindingsList`, `modalList`,
+  `queueList` and `modalSearch` the configured simple
   `app.interrupt` key keeps priority over local bindings (e.g. `list.cancel`
   Ctrl+C) **and over a pending chord**. The chord is cancelled and
   `app.interrupt` is dispatched, so the modal/picker/overlay cannot swallow

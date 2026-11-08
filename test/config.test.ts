@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { configDirectory, defaults, KeybindingsStore, PromptHistory, PromptHistoryStore, SettingsStore } from '../src/config.ts'
+import { configDirectory, defaults, KeybindingsStore, PromptHistory, PromptHistoryStore, SETTINGS_FORMAT_VERSION, SettingsStore } from '../src/config.ts'
 
 test('TUI configuration defaults to ~/.dsh-tui independently of XDG_CONFIG_HOME', () => {
   const expected = join(homedir(), '.dsh-tui')
@@ -77,7 +77,7 @@ test('default stores use ~/.dsh-tui under a temporary home without migrating leg
     assert.equal(result.stdout, '')
     assert.equal(result.stderr, '')
     const directory = join(home, '.dsh-tui')
-    assert.deepEqual(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')), { ...defaults, showThinking: true })
+    assert.deepEqual(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')), { formatVersion: SETTINGS_FORMAT_VERSION, showThinking: true }, 'only the changed override is stored; runtime defaults stay implicit')
     assert.deepEqual(JSON.parse(await readFile(join(directory, 'keybindings.json'), 'utf8')), { 'app.model.select': ['alt+m'] })
     assert.deepEqual(JSON.parse(await readFile(join(directory, 'history.json'), 'utf8')), { [cwd]: ['temporary recall'] })
     for (const [name, content] of Object.entries(legacyFiles)) assert.equal(await readFile(join(legacy, name), 'utf8'), content)
@@ -202,17 +202,55 @@ test('settings writes re-read disk at save time and never overwrite an external 
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
-test('default settings inherit native auto title and validate the document shape', async () => {
+test('legacy autoTitle is silently ignored on load/reload and removed only by a normal save', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-tui-settings-title-'))
   try {
-    assert.equal(new SettingsStore(dir).get().autoTitle, 'inherit')
     const file = join(dir, 'settings.json')
-    await writeFile(file, JSON.stringify({ autoTitle: 'on' }))
-    assert.match(new SettingsStore(dir).warnings.join('\n'), /autoTitle must be boolean or 'inherit'/)
-    await writeFile(file, JSON.stringify({ autoTitle: null }))
-    assert.match(new SettingsStore(dir).warnings.join('\n'), /autoTitle must be boolean or 'inherit'/)
-    await writeFile(file, JSON.stringify({ autoTitle: false }))
-    assert.equal(new SettingsStore(dir).get().autoTitle, false)
+    for (const formatVersion of [undefined, 1, SETTINGS_FORMAT_VERSION]) {
+      for (const autoTitle of [false, true, null, 'retired-value']) {
+        const original = JSON.stringify({ autoTitle, showThinking: true, formatVersion })
+        await writeFile(file, original)
+        const store = new SettingsStore(dir)
+        assert.deepEqual(store.warnings, [], 'a retired preference is not a configuration error')
+        assert.deepEqual(store.reload(), [], 'reload does not repeat a migration notice')
+        assert.equal(Object.hasOwn(store.get(), 'autoTitle'), false)
+        assert.equal(Object.hasOwn(store.getOverrides(), 'autoTitle'), false)
+        assert.equal(store.get().showThinking, true)
+        assert.equal(await readFile(file, 'utf8'), original, 'reads never rewrite the file')
+        await store.set({ showThinking: false })
+        assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { showThinking: false, formatVersion: SETTINGS_FORMAT_VERSION })
+        assert.deepEqual(new SettingsStore(dir).warnings, [])
+      }
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('ignoring legacy autoTitle does not hide unknown settings or discard them during cleanup', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-tui-settings-title-unknown-'))
+  try {
+    const file = join(dir, 'settings.json')
+    await writeFile(file, JSON.stringify({ autoTitle: false, unrelated: 'keep', showThinking: true }))
+    const store = new SettingsStore(dir)
+    assert.deepEqual(store.warnings, ['Unknown setting: unrelated'])
+    assert.deepEqual(store.reload(), ['Unknown setting: unrelated'])
+    await store.set({ showThinking: false })
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { unrelated: 'keep', showThinking: false, formatVersion: SETTINGS_FORMAT_VERSION })
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('ignoring legacy autoTitle still reports invalid active settings and refuses to overwrite them', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-tui-settings-title-invalid-'))
+  try {
+    const file = join(dir, 'settings.json')
+    for (const invalid of [{ showThinking: 'invalid' }, { formatVersion: 99 }]) {
+      const original = JSON.stringify({ autoTitle: false, ...invalid })
+      await writeFile(file, original)
+      const store = new SettingsStore(dir)
+      assert.equal(store.warnings.length, 1)
+      assert.match(store.warnings[0]!, /^Settings not applied:/)
+      await assert.rejects(store.set({ expandTools: true }), /Refusing to overwrite invalid settings/)
+      assert.equal(await readFile(file, 'utf8'), original)
+    }
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 

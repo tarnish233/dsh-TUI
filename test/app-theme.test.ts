@@ -249,8 +249,8 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       await f.app.submit('/settings')
       await paint(f.terminal)
       assertBlue(f.terminal, 'Settings')
-      f.terminal.type('\x1b[F') // Keyboard shortcuts is the last Settings entry.
-      f.terminal.type('\r')
+      for (let step = 0; step < 6; step++) f.terminal.type('\x1b[C')
+      f.terminal.type('\r') // Keyboard is an explicit Settings category.
       await paint(f.terminal)
       assert.match(f.terminal.screen(), /Keyboard shortcuts/)
       assertBlue(f.terminal, 'Keyboard shortcuts')

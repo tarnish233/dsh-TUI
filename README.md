@@ -1,10 +1,14 @@
-# DSH TUI · v0.1.3
+# DSH TUI · v0.1.4
+
+![DSH TUI app icon](assets/icon/dsh-tui.svg)
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.3**（`private: true`），收录 Subagent 启动加载响应、结算后进度退场、`/agent` 历史入口、Working 同款动态帧、连续消息分组与全面的名字-only 内部导航；保留两行进度布局及 v0.1.2 的原生目录／子会话／Stop/Reply。按用户授权通过 GitHub `main` 与 annotated `v0.1.3` tag 发布，不发布 registry、不改全局安装。当前验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照。
+当前版本为 **v0.1.4**（`private: true`），收录原生 Skills 补全与 Enter 提交修复、连续单页 Settings、统一弹窗与队列／工具／图片查看优化，以及 Rex／Ghostty 终端协议适配；保留已验收的 Subagent 进度、分组、名字导航与原生 Stop/Reply。按用户确认，仅创建本地版本提交和 annotated `v0.1.4` tag，**未推送或发布**，不改全局安装。当前验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照。
 
-**已知未解决问题：** 用户报告的退出卡住仍未确认现场触发步骤。常规 native 退出与隔离故障注入已有调查证据，但 v0.1.3 不把它标成已修复，也没有擅自改变 DSH 的退出策略。
+Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
+
+**已知未解决问题：** 用户报告的退出卡住仍未确认现场触发步骤。常规 native 退出与隔离故障注入已有调查证据，但 v0.1.4 不把它标成已修复，也没有擅自改变 DSH 的退出策略。
 
 ## 安装与启动（当前本机边界）
 
@@ -66,7 +70,9 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 - 图片：`[Image #N]` 原子附件输入、显式只读查看器、用户/assistant/工具/历史图片保序投影；`history.json` 只存文字，不写 base64；队列图片 refs 需要显式 Up 取回重试，不新增调度器。
 - Subagents：编辑框上方的 Pi 风格两行活动进度树，运行图标与 Working 共用动态帧，根会话 ready 时也转但不改根状态。名字链接立即打开只读子会话／加载界面；连续目录／结算／任务消息分组，正文与非名字单元不导航。已结算项退场，目录／历史通过 `/agent`／Agents 树查看；保留原生 Stop/Reply 与子审批来源。
 - 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、cwd 与 git 只读状态。
+- 终端集成：通用 OSC 7501 根／子状态、原生 DSH 标题、OSC 7 workspace、Ghostty 焦点安全的 OSC 777 通知及兼容进度；Rex 使用用户接受的 `app=terminal` 通用活动分类，以显示原生 `>_` 图标（Terminal status On）；标题只保留静态 `🐳`，已去掉鲸鱼前的星号／工作符号及标题动画时钟接缝；Terminal title 可关闭标题展示，普通 UI 动画不变。Rex 默认由其 Program Activity 决定提醒，不叠加通知。取消／历史／尝试结算不冒充成功，原生 command 完成与 turn 完成分开。
 - 品牌蓝主题与静态字符块 DeepSeek logo；无启动动画、无原生图片 logo。
+- 应用图标资产：蓝底白色像素鲸鱼 SVG／512px／64px PNG。它不是终端图片上传协议；Rex 当前使用内置通用 `>_` 图标，正式像素鲸鱼图片仍需终端侧收录，见 [图标与限制](docs/APP-ICON.md)。
 
 ## 常用键
 
@@ -99,23 +105,32 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | Ctrl+V | 原生剪贴板图片附件；无图片时回退为文本（Windows/WSL 另有 Alt+V） |
 | Ctrl+X Ctrl+I | 查看当前草稿或会话图片；`[`/`]` 或 Alt+Left/Right 切换，Esc 关闭 |
 | Ctrl+X Ctrl+A | 打开 Agents 树；Enter 查看子会话，R 回复 continuable child，S 停止活动 child |
+| Ctrl+X Ctrl+Q | 打开原生队列弹窗；按 message id 编辑、立即发送或取消一条排队消息 |
+| Ctrl+F（弹窗内） | 搜索当前 Settings / Keyboard / Help / Tools / Agents / Queue / Resume 内容；字段内仍是 readline 的字符右移 |
 
-回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
+回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel；`Ctrl+X Ctrl+Q` 打开同一个原生队列的搜索弹窗，不会建立第二份队列。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
 
-Subagent 进度紧贴编辑框上方，保留两行设计：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。运行图标使用和 Editor Working 相同的 `· → ✻ → ✶ → ✳` 动态帧与 App 的同一个 100ms 时钟；没有每个 child 自己的计时器，根会话 ready／空闲时仍转，但不改根 busy、退出确认、计数或模型调度。进度只显示 `running`／`initializing` child；`idle`、完成、失败或停止项在原生状态更新后立即退场，没有活跃项就完全收起。标题与溢出数只统计已知活跃项，完整原生目录不删除；continuable child 再次运行会重新出现。明确回复目标若已 idle，只保留 Editor 的 `Replying to …` 提示，不用进度行冒充正在工作。
+Subagent 进度紧贴编辑框上方，保留两行设计：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。运行图标使用和 Editor Working 相同的 `· → ✻ → ✶ → ✳` 动态帧与 App 的同一个 100ms 时钟；没有每个 child 自己的计时器，根会话 ready／空闲时仍转，但不改根 busy、退出确认、计数或模型调度。进度只显示 `running`／`initializing` child；`idle`、完成、失败或停止项在原生状态更新后立即退场，没有活跃项就完全收起。标题与溢出数只统计已知活跃项，完整原生目录不删除；continuable child 再次运行会重新出现。明确回复目标若已 idle，只保留 Editor 的 `Replying to …` 提示，不用进度行冒充正在工作。`Settings → Agents` 可隐藏整个进度区，也可独立关闭 Agents 消息分组；两者都不停止或删除原生 child。
 
 fullscreen 仅点击蓝色、加粗、带下划线的名字进入对应子会话，原生读取尚未完成时立即显示 `Loading child session…`，不等待 child 从 initializing 变成 running。Esc 关闭加载／详情界面，返回同一个 Editor 并保留草稿／图片，不中断根会话；迟到读取不能复活已关闭的界面或释放新 attachment 的 follow。`Agents`／`+N more` 文字打开完整树；根会话 `/agent` 和 `Ctrl+X Ctrl+A` 始终是历史入口。状态、指标、模型、活动和空白保留拖选／复制，不跳转；这些是内部导航，不生成外部 URL。inline 保留相同进度样式与键盘入口。完成项退场不强行关闭用户正在阅读的子会话详情；终端变矮或输入变高时仍按原有预算降级。
 
 macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节会标记诊断，不伪造支持。完整动作与兼容说明见 [输入说明](docs/INPUT.md)。
 
+## Rex / Ghostty
+
+构建后重启即可启用，无需安装通知 daemon、Rex 插件或改终端配置。Settings → General 的 **Terminal status / Terminal title / Terminal notifications** 是显示偏好，不控制 DSH 自动标题生成、权限或 plan。默认 Automatic：Rex 使用原生状态提醒；Ghostty 在确切未聚焦时请求一次隐私安全的通知。Off 只关闭直接通知，Always 可与原生提醒重复。
+
+真实 Rex 两 renderer、原生 DSH 与 CLI/PTY 协议回归已有验证；Ghostty 的支持依据匹配版本源码和 PTY，不把它写成真机 GPU／通知弹窗验收。当前 Rex 及 Ghostty 路径不支持恢复原自定义标题的标题栈，退出后依赖 shell integration 重设；启动前关闭 Terminal title 可避免主动改标题。完整矩阵、SSH/tmux 降级、手测步骤与证据见 [终端支持](docs/TERMINALS.md)及[深度对照](docs/TERMINAL-RESEARCH.zh-CN.md)。
+
 ## 命令与设置
 
 `/help`、`/settings`、`/agent`、`/model [provider/model]`、`/effort [id|status]`、`/preset [id|status]`、`/resume [id]`、`/new`、`/reload`、`/exit` 属于界面或原生控制服务；`/compact`、`/permission`、`/plan`、`/goal`、`/feedback` 等以当前 DSH 命令注册表为准，原样转交并保留原生校验、审计与结果。快捷键入口在 `/settings`，不另设 `/hotkeys`。
 
+- **Skills / `/技能名`**：`/` 补全合并 DSH 原生用户可调用技能，标注 `Skill`／`user-only`；Tab 只补入草稿，Enter 按原有提交规则发送。新空会话用 DSH 公开 `agentPresets.acquireScope` 读取 preset 目录，**启动即可以列出技能且不创建 Agent**；live 会话优先读取当前 preset 的 Skills registry。人类目录与模型工具可见性独立，不因 `skill` schema 未披露而隐藏。技能引用原文交给 DSH pre-step 加载与注入，同名原生命令优先，TUI 不展开正文。`/help` 始终保留只读 Skills 区，区分元数据服务不可用、不完整和真正为空；不可用／失败不会被缓存为永久空目录。根目录不假冒 child 回复范围。详见 [Skills](docs/SKILLS.md)；`dsh-tui --demo skills` 仅展示离线元数据 fixture。
 - **`/compact`**：摘要目标仍是最近一次实际路由时，原生插件接缝继承该请求的显式 reasoning effort；不同摘要模型不串用 effort，没有历史 effort 时保留 DSH 默认。消息、工具和输出预算不变。若压缩失败，界面在原生提示的下一行显示按 command/session 关联、脱敏且限长的 `Native cause`，不再只剩笼统错误。
 - **Subagents / `/agent`**：根会话 `/agent` 是打开现有 Agents 目录的 UI 导航，不注册第二套 DSH 业务命令、不创建或恢复 child。进度只显示原生 running／initializing 项，保持摘要＋活动两行；结算后隐藏，但主对话原生事实行和 Agents 历史仍保留。名字点击立即打开详情／加载界面，Esc 返回原 Editor；只有 `Agents`／`+N more` 文字打开完整树，其余进度文本可选字复制但不跳转。External 在历史中是没有本地 transcript 的叶子，不显示伪链接。`Ctrl+X Ctrl+A` 仍可打开树；R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips。Ctrl+C 在活动 child／回复目标上只中断该 child；child 回复目标中的 `/...` 仍是 child 文本，先 Esc 返回根会话才执行 `/agent` 等根命令。queue/steer、文本／图片、accepted receipt、失败草稿、子审批来源与父子 transcript 隔离均保留。token/timing 仍为 child session 累计值，没有假造 Pi turn/tool/context 计数；快捷键在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。`dsh-tui --demo subagent` 可看离线示例。
 
-- **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；共用现有 `Group tool calls`／`groupTools` 开关，不增加设置层级。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
+- **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；`Settings → Agents → Group agent messages` 独立控制这一展示，旧版本首次读取会沿用当时 `Group tool calls` 的值，迁移后与 Tools 完全独立，恢复默认也不回读 Tools。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
 
 - **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
 - **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。
@@ -124,8 +139,8 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 - **取消与排队**：中断调用原生 `Agent.cancel({kind:'user'}, {keepInbox:true})`；草稿与两个 inbox 队列保留，取消本身不主动续发。空输入 Up/Ctrl+P 取回可编辑的人类文本；后台任务唤醒仍归 DSH。已完成工具副作用不回滚。
 - **审批与问题**：问题中 Esc 以原生 `{cancelled:true}` 结算；Ctrl+C 中止整个回合；审批 Esc 返回原生 `rejected`，与回合 abort 的 `cancelled` 区分。
 - **`/reload`**：空闲且无待决策时，先做本层 idle 检查，再调用 `hmr.runExclusive(() => hmr.reconcileProfile())`。当前 Agent、会话、transcript、草稿和缓存不重建；结果与 restart/pending 提示来自 DSH。忙碌、保留队列或待决策时拒绝。普通配置与插件启停由 DSH 原生重组；需要重启的情况以原生结果为准。直接重载前端插件会卸载/重建界面，不自动恢复最近会话。
-- **`/settings`**：General / Thinking / Tools 三个 tab，加 Keyboard shortcuts 分组编辑。Tools 统一管理分组、默认展开、预览行数、摘要长度与 Diff 布局；设置写同一个 `settings.json`，不增加 profile/覆盖层级。
-- **`/resume`**：启动参数 `--resume <id>` / `-r <id>`，或 `-r` 不带 id 打开当前目录会话选择器（Tab 切当前目录/全部，模糊搜索，Esc 保留新会话）；不自动选择最近会话。重复恢复当前 id 按 DSH 原生语义保留已有 Agent/attachment，不取消流式、队列或待决策；切换其他 id 先准备成功再释放旧连接，失败仍可继续使用当前会话。
+- **`/settings`**：可搜索、可滚动的**连续单页**，用 **General / Thinking / Tools & Diff / Agents / Images / DSH / Keyboard** 分组标题分隔，不再切换 tab 页面。Up/Down 跨组逐项移动；Tab/Shift+Tab（或 Right/Left）跳到下一／上一组，搜索不会被清空。原有 Tools／Diff、Thinking、screen、auto title 与 Keyboard shortcuts 都保留；新增 Agents 进度、Agents 独立分组、图片自动／文本预览、全屏选字复制、队列默认折叠、减少动态效果，以及 General 的终端状态／标题／通知。布尔直接切换，枚举和数字进入明确选择／编辑，每项可恢复默认；保存失败只回退该项并在当前弹窗显示。DSH 分类只提供当前 model／effort／preset／permission／Skills／plan 的状态与已有 picker／command 导航，默认 preset／permission 等 profile 写入仍须安全 native 接缝，未用本地设置冒充。设置写同一个 `settings.json`，不增加 profile/覆盖层级。
+- **`/resume`**：启动参数 `--resume <id>` / `-r <id>`，或 `-r` 不带 id 打开当前目录会话选择器（`Ctrl+A` 切当前目录/全部，模糊搜索，Esc 保留新会话）；不自动选择最近会话。重复恢复当前 id 按 DSH 原生语义保留已有 Agent/attachment，不取消流式、队列或待决策；切换其他 id 先准备成功再释放旧连接，失败仍可继续使用当前会话。
 - **状态栏**：第一行模型、effort、状态、preset、上下文占用、缓存命中、速率/TTFT 与瞬态提示；第二行 cwd、git 分支/状态、权限值。usage/sessionStats 来自原生投影，git 只读本地轮询，绝不 fetch/写索引。
 
 ## 偏好文件
@@ -134,7 +149,7 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 
 ```text
 ~/.dsh-tui/
-├── settings.json      # 显示、思考、Tools 预览/Diff、自动标题偏好
+├── settings.json      # 显示、思考、Tools/Diff、Agents/图片/队列/动效、终端标题/状态/通知；只写实际 override
 ├── keybindings.json   # 自定义快捷键；保存覆盖时才创建
 ├── history.json       # 按工作目录保存的文字 recall，不含图片 bytes/base64
 └── logs/
@@ -174,8 +189,9 @@ pnpm check          # build + typecheck + test
 - [输入 API 与限制](docs/INPUT-API.md) · [输入行为](docs/INPUT.md) · [输入生命周期](docs/INPUT-LIFECYCLE.md)
 - [Tools 分组、详情与设置](docs/TOOLS.md) · [工具 Diff 归属](docs/TOOLS-DIFF-ATTRIBUTION.md)
 - [图片投影、预览、附件输入与边界](docs/IMAGES.md)
-- [模型/provider 原生投影](docs/PROVIDERS.md)
+- [模型/provider 原生投影](docs/PROVIDERS.md) · [Skills 原生接入](docs/SKILLS.md)
 - [DSH 同进程集成](docs/BACKEND.md)
+- [Rex / Ghostty 终端支持](docs/TERMINALS.md) · [Grok Build / CC 深度对照](docs/TERMINAL-RESEARCH.zh-CN.md)
 - [主题与启动区](docs/THEME.md) · [鼠标抽象](docs/MOUSE.md)
 - [总体方案](docs/PROPOSAL.zh-CN.md) · [验收记录](docs/ACCEPTANCE.md)
 - [Review 修复与取消最终验收（历史）](docs/REVIEW-ACCEPTANCE-2026-11-03.md)

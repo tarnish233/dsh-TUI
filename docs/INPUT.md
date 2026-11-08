@@ -71,7 +71,10 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
 | Tool details | Ctrl+X Ctrl+O, `[`/`]`, Alt+Left/Right, Tab/Right, Shift+Tab/Left, c | `app.tools.details` opens the tools inspector on the **latest tool** (TUI extension, not a CC default; plain Ctrl+O keeps expand/collapse). The read-only modal context `toolDetails → list → dialog → global` adds previous/next tool (`[` + Alt+Left, `]` + Alt+Right; Pi's legacy ESC-b/ESC-f reads alias Alt+Left/Right in this context), next/previous section, copy, shared list scrolling (`Up/Down`, `Ctrl+P/N`, `j/k`, PageUp/Down, Home/End), `Esc`/`list.cancel` close. `c` and brackets exist only in `toolDetails`, so they are ordinary text in the editor; unbound printable bytes are inert in the modal. |
-| Native Agents overlay | Ctrl+X Ctrl+A; `r` reply, `s` stop, shared list keys, Enter/Esc, Ctrl+C | `app.subagents.details` opens the native Agents overlay (TUI extension, not a CC default) through the read-only `subagentList → list → dialog → global` and `subagentSession → list → dialog → global` contexts. The agent list and one agent's session view reuse `list.previous/next/pageUp/pageDown/first/last/select/cancel/select-digit` and global `app.interrupt`, and add exactly two overlay-local actions: `subagent.reply` (`r`; the App owns the reply target and `app.cancel` leaves it, no second editor target/mode action) and `subagent.interrupt` (`s`; stops the focused child inside the overlay without rebinding Ctrl+C). Both are ordinary rows in the same grouped Settings list and `keybindings.json` map (remap/disable/reset); plain `r`/`s` stay text in the prompt and every other context. Unbound printable bytes, editing bytes, pasted content and an abandoned character jump are inert (or cancelled) instead of reaching the hidden root editor; root-only editor commands and root-draft app actions (stash, paste, history search, external editor, send/steer/follow-up) fail closed, while global `app.exit` is not swallowed (the App keeps its empty-input policy). `Esc` closes via `list.cancel`, `Ctrl+C` keeps global interrupt priority. |
+| Native Agents overlay | Ctrl+X Ctrl+A; `r` reply, `s` stop, Tab filter, shared list keys, Enter/Esc, Ctrl+C | `app.subagents.details` opens the native Agents overlay (TUI extension, not a CC default) through the read-only `subagentList → list → dialog → global` and `subagentSession → list → dialog → global` contexts. The agent list and one agent's session view reuse `list.previous/next/pageUp/pageDown/first/last/select/cancel/select-digit` and global `app.interrupt`, and add overlay-local actions: `subagent.reply` (`r`; the App owns the reply target and `app.cancel` leaves it, no second editor target/mode action), `subagent.interrupt` (`s`; stops the focused child inside the overlay without rebinding Ctrl+C) and `subagent.filter.toggle` (`Tab`; Active/All filter of the current native catalog in the agent list only). All are ordinary rows in the same grouped Settings list and `keybindings.json` map (remap/disable/reset); plain `r`/`s`/Tab stay ordinary input in the prompt and every other context. Unbound printable bytes, editing bytes, pasted content and an abandoned character jump are inert (or cancelled) instead of reaching the hidden root editor; root-only editor commands and root-draft app actions (stash, paste, history search, external editor, send/steer/follow-up) fail closed, while global `app.exit` is not swallowed (the App keeps its empty-input policy). `Esc` closes via `list.cancel`, `Ctrl+C` keeps global interrupt priority. |
+| Unified modal browse | `settingsList`, `keybindingsList`, `modalList`, `queueList` → `list → dialog → global` (no editor) | The popup/settings pass adds four read-only browse contexts with shared list/dialog/global keys and **no editor fallback**, so editor movement/kill/yank/undo can never type into a settings or queue surface. Context-local rows: `modal.search` (Ctrl+F; Settings, Keyboard shortcuts, generic modal lists, queue, tools inspector, Agents list/session — not the image viewer), `settings.reset` (Ctrl+R), `settings.previous-category`/`next-category` (Left/Shift+Tab, Right/Tab; jumps between groups on the one continuous Settings page, without filtering or clearing search), `keybindings.edit` (Enter), `keybindings.reset` (Ctrl+R), `keybindings.disable` (Ctrl+D), `session.scope.toggle` (Ctrl+A, generic modal list), `queue.edit` (`e`), `queue.cancel-entry` (`d`), `queue.send-now` (Ctrl+Enter), `tool.details.toggle-calls` (Ctrl+L), `tool.details.wrap` (Ctrl+W). Every row is remappable/disableable/reset in the one grouped Keyboard list; local keys never become global (e.g. Ctrl+D disables one shortcut row but still exits only from the prompt). `Ctrl+C` keeps the configured `app.interrupt` priority over `list.cancel` and over a pending chord. app override except the shared list keys |
+| Modal search field | `modalSearch → editor → dialog → global` | A real text field for search input inside any modal: typing, word/whitespace deletion (Ctrl+W), kill/yank, undo and Ctrl+A/E/B/F stay the editor's, so modifiers are not stolen by list navigation. `modal.search` is deliberately not registered here: Ctrl+F stays editor char-right while typing and only opens search from the browse list. List navigation (Up/Down/Enter/Tab) is passed by the owning UI, not resolved from editor bindings; Esc resolves `editor.cancel` (field cancel, then `app.cancel`) and Ctrl+C keeps interrupt priority. No second editor state or input reader is created. |
+| Queue | Ctrl+X Ctrl+Q opens; `e` edit, `d` cancel, Ctrl+Enter send now | `app.queue.open` (global chord) opens the queue list; the queue list itself is the read-only `queueList` context above. All three row actions are queue-local, so `e`/`d` stay ordinary text and Ctrl+D keeps forward-delete/exit in the prompt. Ctrl+Enter requires a terminal that reports the modified key (Kitty protocol / xterm modifyOtherKeys); legacy terminals deliver plain Enter, which stays `list.select` there, so the action is remappable. The queue remains a view of DSH's native inbox: the input layer only emits the named action. |
 | Chords | Ctrl+X Ctrl+E + user chords | prefix wait, **3000 ms** default timeout (expires at the deadline), cancel on mismatch and redispatch, paste/focus/config changes cancel; the keymap owns pending state and hint notification (`onChordChange`), the editor only owns the timeout timer. match (timeout value per CC docs) |
 | Cancel | Esc, Ctrl+C | Esc is contextual: close completion, restore the history-browsing draft, and only then forward `app.cancel`; a consumed local action never also reaches the app. Ctrl+C always resolves `app.interrupt` through the keymap (completion, jump mode, pending chord and dialogs do not swallow it); paste bytes are not keys. match |
 | Character jump | Ctrl+] / Ctrl+Alt+] | Pi extension: only an actual target character (one grapheme) is consumed; DEL/Backspace, control keys and escape sequences cancel the jump and are re-dispatched through `CcKeymap`, so CC whitespace Ctrl+W, CC deletion, remaps and disabled actions still apply. No Pi default fallback. match |
@@ -85,11 +88,21 @@ Open `/settings` → **Keyboard shortcuts**. One grouped list shows current
 keys and action descriptions, including unbound actions; there is no standalone
 `/hotkeys` command, debug/compatibility columns, profile hierarchy or conflict
 resolution wizard. TUI extensions such as `app.tools.details`,
-`app.images.details`, `app.subagents.details`, `subagent.reply` and
-`subagent.interrupt` are ordinary rows in that same list, so opening the native
-Agents overlay, setting a reply target and stopping a child are
-remappable/disableable and reset by deleting their one override. Select a row to edit it; `d` disables it
-and `r` removes just that override to restore the effective app default.
+`app.images.details`, `app.subagents.details`, `subagent.reply`,
+`subagent.interrupt`, `subagent.filter.toggle` and every popup row
+(`modal.search`, `settings.*`, `keybindings.*`, `session.scope.toggle`,
+`queue.*`, `tool.details.toggle-calls`, `tool.details.wrap`, `app.queue.open`)
+are ordinary rows in that same list, so they are remappable/disableable and
+reset by deleting their one override. The pane's own controls are registry
+rows too (`keybindings.edit` Enter, `keybindings.disable` Ctrl+D,
+`keybindings.reset` Ctrl+R) rather than a second override hierarchy; the UI
+owner wires them, and the input layer's `keybindingsList` chain keeps them
+modal-local. `keybindings.edit` deliberately overlaps `list.select` on Enter:
+the list-local row wins in that one context, and `list.select` is the
+documented fallback if the edit action is disabled or remapped elsewhere.
+Select a row to edit it; `keybindings.disable` disables it and
+`keybindings.reset` removes just that override to restore the effective app
+default.
 
 The inline CC editor takes one alternative per line (Shift+Enter adds a line);
 spaces retain native chord syntax, e.g. `ctrl+x ctrl+e`. Option is an alias of
@@ -98,8 +111,10 @@ and reports newly introduced conflicts before an atomic write to the same
 `keybindings.json` override map. Malformed files and failed validation are not
 overwritten; unrelated overrides are preserved, defaults are never dumped.
 
-This configuration pane alone reserves arrows, Enter/Esc, and list-mode d/r
-as recovery controls, so editing navigation cannot lock out its user. Normal
+This configuration pane alone reserves arrows, Enter/Esc, and its own
+`keybindings.*` list rows as recovery controls, so editing navigation cannot
+lock out its user (the legacy literal `d`/`r` list keys are superseded by
+those remappable rows once the Settings UI adopts them). Normal
 editors and other dialogs still honor configured/disabled bindings. Changes
 apply immediately without changing the main draft/undo/paste state. Saving the
 file externally also applies automatically; `/reload` is the manual full
@@ -131,12 +146,18 @@ cannot split a large-paste marker; it stays one undoable edit.
   movement/kill/undo bindings never reach a read-only details surface; an
   unbound printable byte is inert even if the modal is hosted by `CcEditor`)
 - `imageDetails → list → dialog → global` (same read-only shape as
-  `toolDetails`)
+  `toolDetails`). Context-local rows: `image.details.previous-image`
+  (`[`/Alt+Left), `image.details.next-image` (`]`/Alt+Right),
+  `image.details.close` (Esc) and `image.details.toggle-preview` (`p`;
+  renderer-only automatic/text-only display toggle — text-only starts no
+  read/decode and changes no facts), so `p`/brackets stay plain text in the
+  prompt and in modal text fields)
 - `subagentList → list → dialog → global` (native Agents overlay list)
 - `subagentSession → list → dialog → global` (one agent's read-only session
-  view). Both subagent contexts add only `subagent.reply` (`r`) and
-  `subagent.interrupt` (`s`) on top of list, dialog and global app keys; there
-  is no editor layer and no root-editor target/mode action.
+  view). Both subagent contexts add `subagent.reply` (`r`),
+  `subagent.interrupt` (`s`) and `modal.search` (Ctrl+F) on top of list,
+  dialog and global app keys, plus `subagent.filter.toggle` (Tab) in the agent
+  list only; there is no editor layer and no root-editor target/mode action.
 
 Local actions win; global app bindings are a fallback. This is why Ctrl+W,
 Ctrl+A, Alt+B etc. still edit while completion or history search is open, and
@@ -285,7 +306,8 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   history recall, persisted-history identity (id reservation, unresolved
   markers), safe-integer boundary, budget reclaim.
 - `test/input-image-details.test.ts` — `imageDetails` context/chain, locked
-  action ids and bindings, Esc close precedence, global interrupt priority,
+  action ids and bindings, Esc close precedence, preview toggle (`p`
+  viewer-only, remap/disable, no conflict), global interrupt priority,
   read-only inertness (printable/editing/paste), Windows/WSL Alt+V alias.
 - `test/input-image-screen.test.ts` — kitty full-redraw re-upload after a clear
   (Ghostty/Rex), placement-only optimisation on ordinary frames, resize

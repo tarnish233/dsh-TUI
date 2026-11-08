@@ -18,6 +18,9 @@
  *   abort     a streamed attempt that is abandoned mid-flight
  *   fail      a committed assistant/attempt settlement + nonfatal error
  *   pending   an admitted tool call that never receives a result
+ *   skills    read-only native skill metadata (`command('skills')` returns a
+ *             frozen `SkillCatalogSnapshot`) plus an acknowledgement message;
+ *             no skill body, injection, tool or model is simulated
  *
  * Decision cancellation follows DSH: a cancelled approval/question (native
  * `{cancelled:true}` or the local cancel sentinel) is reported as cancelled, not
@@ -43,6 +46,8 @@ import type {
   SessionEvent,
   SessionInfo,
   StreamPresentation,
+  SkillCatalogEntry,
+  SkillCatalogSnapshot,
   SubagentEntry,
   SubagentSnapshot,
   TranscriptCodec,
@@ -69,6 +74,7 @@ export const DEMO_HINTS = [
   'pending  → 已受理但没有结果的工具调用（显示 unknown）',
   'subagent → 原生子 Agent 目录（并行运行/空闲/失败/外部）+ 结算与触发消息',
   'subagent-many → 同一 fixture + 3 个并行运行的 continuable 子 Agent（进度区溢出验收）',
+  'skills   → 只读 native skill 元数据 fixture（/help 的 Skills 段；不读正文、不注入、不调模型）',
 ] as const
 
 /** Mirrors DSH's public `CommandDescriptor`; the demo never invents capabilities. */
@@ -90,6 +96,68 @@ export const DEMO_COMMANDS: readonly DemoCommandDescriptor[] = [
   { name: 'help', description: 'List the offline demo commands.' },
   { name: 'echo', description: 'Echo free-form demo input.', input: { hint: 'text to echo' } },
 ]
+
+/**
+ * Offline skill metadata fixture, native-shaped and frozen.
+ *
+ * These are **display metadata only**, exactly the public `SkillCatalogEntry`
+ * contract: no skill body, no path, no injection payload and no execution
+ * stand-in. `code-review`/`changelog` are model-invocable, `release-notes` is
+ * user-only (`modelInvocable: false`), and `compact` deliberately repeats a
+ * mounted native demo command name so the parent's `/name` collision routing
+ * has a real fixture to accept against. Nothing here reads a skill file or an
+ * Agent: the demo never starts one to fill a menu.
+ */
+export const DEMO_SKILLS: readonly SkillCatalogEntry[] = Object.freeze([
+  Object.freeze({
+    name: 'code-review',
+    description: 'Review the current diff for correctness, regressions and missing tests.',
+    whenToUse: 'Use before handing off a change, when the diff is still small.',
+    modelInvocable: true,
+  }),
+  Object.freeze({
+    name: 'changelog',
+    description: 'Draft a CHANGELOG entry from the committed change set.',
+    whenToUse: 'Use when a user-visible behaviour change has landed.',
+    modelInvocable: true,
+  }),
+  Object.freeze({
+    name: 'release-notes',
+    description: 'Offline fixture of a user-only skill; the model never selects it on its own.',
+    whenToUse: 'Only when you explicitly invoke it.',
+    modelInvocable: false,
+  }),
+  Object.freeze({
+    name: 'compact',
+    description: 'Fixture skill that reuses a mounted native command name (collision acceptance).',
+    modelInvocable: true,
+  }),
+])
+
+/** Frozen snapshot served verbatim by `command('skills')`; never a live catalog. */
+export const DEMO_SKILL_CATALOG: SkillCatalogSnapshot = Object.freeze({
+  entries: DEMO_SKILLS,
+  available: true,
+  complete: true,
+})
+
+/** Fixture-only routing of a `skills` keyword or a fixture `/name` message. */
+type DemoSkillRequest = { readonly kind: 'catalog' } | { readonly kind: 'skill'; readonly entry: SkillCatalogEntry }
+
+/**
+ * Detect only the explicit offline scenarios: the `skills` keyword and a
+ * fixture skill's literal `/name`. Every other message (including mounted
+ * native command lines) keeps its historical demo path, so the fixture never
+ * changes ordinary native command semantics.
+ */
+function demoSkillRequest(text: string): DemoSkillRequest | undefined {
+  const trimmed = text.trim()
+  if (trimmed.toLowerCase() === 'skills') return { kind: 'catalog' }
+  if (!trimmed.startsWith('/')) return undefined
+  const name = (trimmed.slice(1).split(/\s+/, 1)[0] ?? '').toLowerCase()
+  const entry = DEMO_SKILLS.find(skill => skill.name.toLowerCase() === name)
+  return entry === undefined ? undefined : { kind: 'skill', entry }
+}
 
 const DEMO_PRESETS = [
   { id: 'standard', name: 'Standard mode', description: 'Demo full tool set; no real tools execute.' },
@@ -563,7 +631,7 @@ export class DemoBackend implements Backend {
       permissions: { currentValue: 'workspace-write' },
       preset: 'standard',
       reasoningEffort: DEMO_DEFAULT_EFFORT,
-      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'subagents', 'subagent-session', 'subagent-follow', 'subagent-prompt', 'subagent-interrupt', 'demo'],
+      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'skills', 'subagents', 'subagent-session', 'subagent-follow', 'subagent-prompt', 'subagent-interrupt', 'demo'],
       events: [],
     }
   }
@@ -789,6 +857,11 @@ export class DemoBackend implements Backend {
         return this.executeLine('/compact')
       case 'commands':
         return DEMO_COMMANDS.map(command => ({ ...command }))
+      case 'skills':
+        // Read-only fixture metadata, frozen: the demo has no skill registry,
+        // no skill body and no Agent to attach, so it can never grow a second
+        // catalog or claim a capability it does not have.
+        return DEMO_SKILL_CATALOG
       case 'execute': {
         const line = typeof args.line === 'string' ? args.line : undefined
         if (line === undefined || line.trim() === '') throw new Error('DemoBackend command "execute" needs a non-empty { line }')
@@ -1066,8 +1139,14 @@ export class DemoBackend implements Backend {
     this.append('step/start', { turn, step })
 
     let reason: unknown = { kind: 'completed' }
+    const skillRequest = demoSkillRequest(text)
     if (imageRequest) {
       reason = await this.imagesFlow(turn, step)
+    } else if (skillRequest !== undefined) {
+      // Explicit offline scenario: a skill keyword or a fixture `/name` gets a
+      // metadata-only acknowledgement, never an imitation of DSH's skill body
+      // read, pre-step injection or tool work.
+      reason = await this.skillsFlow(turn, step, skillRequest)
     } else if (lower.includes('subagent-many') || lower.includes('subagents-many')) {
       // Explicit offline overflow scenario: same fixture plus extra live children.
       reason = await this.subagentFlow(turn, step, { activeExtra: DEMO_CHILD_ACTIVE_MANY.length })
@@ -2309,6 +2388,32 @@ export class DemoBackend implements Backend {
         },
       },
     })
+    return { kind: 'completed' }
+  }
+
+  /**
+   * Explicit offline skill scenario (`--demo skills`, the `skills` keyword or a
+   * fixture `/name` message). It acknowledges native **metadata** only: no
+   * skill body is read, nothing is injected, no tool or model runs, and DSH
+   * keeps ownership of real skill resolution. A regular native command line
+   * never reaches this flow.
+   */
+  private async skillsFlow(turn: number, step: number, request: DemoSkillRequest): Promise<unknown> {
+    const text = request.kind === 'catalog'
+      ? [
+          'Offline skill fixture: this demo reports read-only native skill metadata only — no skill body was read, and no tool or model ran.',
+          '',
+          `Fixture skill names: ${DEMO_SKILLS.map(skill => '`/' + skill.name + '`').join(', ')}.`,
+          '`/help` lists them in a display-only Skills section; a real session resolves and injects skills in DSH\'s own pre-step.',
+        ].join('\n')
+      : [
+          `Offline skill fixture: \`/${request.entry.name}\` arrived as an ordinary user message; the demo has no skill body and injects nothing.`,
+          '',
+          'DSH owns skill resolution and pre-step injection, so nothing here imitates a skill run.',
+        ].join('\n')
+    const meta = await this.liveStream(turn, step, [...this.textChunks(0, text, 'text'), ...this.terminalChunks()])
+    if (meta === undefined) return { kind: 'aborted' }
+    this.commitMessage(meta, turn, step, [{ type: 'text', text }])
     return { kind: 'completed' }
   }
 

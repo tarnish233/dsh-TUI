@@ -579,6 +579,20 @@ ccTriggerCompletion() {
     this.handleTabCompletion();
 }
 
+/**
+ * Re-request candidates for the *current* draft without accepting them.
+ * Used when asynchronous metadata settles while the menu is already open.
+ * It never pushes undo, changes text or submits: an explicit Tab/Enter accept
+ * stays the only apply path. Reuses Pi's request/abort state and debounce, so
+ * this adds no Editor state, timer or stdin consumer of its own.
+ */
+ccRefreshAutocomplete() {
+    this.requestAutocomplete({
+        force: this.autocompleteState === "force",
+        explicitTab: false,
+    });
+}
+
 ccCancelAutocomplete() {
     this.cancelAutocomplete();
 }
@@ -600,8 +614,13 @@ ccAutocompletePage(direction) {
  * Accept the highlighted completion.
  * `trigger` mirrors Pi's two accept paths: "tab" keeps editing after a
  * slash-command completion, "confirm" submits it.
+ *
+ * `onConfirmSubmit` lets the app run its own submit path *after* the candidate
+ * was applied to this same Editor state, so a content-aware payload is captured
+ * from the completed text. Without it, `confirm` keeps the historical
+ * `submitValue()` behavior for direct seam consumers.
  */
-ccAutocompleteAccept(trigger = "tab") {
+ccAutocompleteAccept(trigger = "tab", onConfirmSubmit) {
     if (!this.autocompleteState || !this.autocompleteList) return false;
     const selected = this.autocompleteList.getSelectedItem();
     if (!selected || !this.autocompleteProvider) {
@@ -626,7 +645,8 @@ ccAutocompleteAccept(trigger = "tab") {
         this.onChange(this.getText());
     }
     if (trigger === "confirm" && isSlashCommand) {
-        this.submitValue();
+        if (typeof onConfirmSubmit === "function") onConfirmSubmit();
+        else this.submitValue();
         return true;
     }
     return true;

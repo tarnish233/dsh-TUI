@@ -70,13 +70,17 @@ test("subagent contexts and fallback chains match the read-only contract", () =>
   for (const context of SUBAGENT_CONTEXTS) assert.ok(CC_CONTEXTS.includes(context), context)
 
   const keymap = createCcKeymap({ platform: "posix" })
+  const expectedLocal: Record<(typeof SUBAGENT_CONTEXTS)[number], string[]> = {
+    subagentList: ["subagent.reply", "subagent.interrupt", "subagent.filter.toggle", "modal.search"],
+    subagentSession: ["subagent.reply", "subagent.interrupt", "modal.search"],
+  }
   for (const context of SUBAGENT_CONTEXTS) {
     assert.deepEqual(keymap.getFallbackChain(context), [context, "list", "dialog", "global"])
     assert.equal(keymap.getFallbackChain(context).includes("editor"), false, "no editor fallback")
     assert.deepEqual(
       keymap.getActions(context).map((action) => action.id),
-      ["subagent.reply", "subagent.interrupt"],
-      `${context} adds only its two overlay-local actions; list.*, dialog.* and global app keys are reused`,
+      expectedLocal[context],
+      `${context} adds only its overlay-local actions; list.*, dialog.* and global app keys are reused`,
     )
   }
   // A returned chain is a copy, not internal state.
@@ -231,13 +235,18 @@ test("both overlay actions appear once in the single grouped Settings shortcut l
   const listed = keymap.getActions().filter((action) => action.id.startsWith("subagent."))
   assert.deepEqual(
     listed.map((action) => action.id),
-    ["subagent.reply", "subagent.interrupt"],
+    ["subagent.reply", "subagent.interrupt", "subagent.filter.toggle"],
     "one registry row each; no separate hotkeys panel or subagent config",
   )
   for (const context of SUBAGENT_CONTEXTS) {
     assert.deepEqual(
       keymap.getHelp(context).map((row) => row.action),
-      ["subagent.reply", "subagent.interrupt"],
+      [
+        "subagent.reply",
+        "subagent.interrupt",
+        ...(context === "subagentList" ? ["subagent.filter.toggle"] : []),
+        "modal.search",
+      ],
     )
   }
   const help = keymap.getHelp()
@@ -258,7 +267,7 @@ test("both overlay actions appear once in the single grouped Settings shortcut l
   assert.ok(keymap.getActions().some((action) => action.id === "subagent.reply"))
   assert.deepEqual(
     keymap.getHelp("subagentList").map((row) => row.action),
-    ["subagent.interrupt"],
+    ["subagent.interrupt", "subagent.filter.toggle", "modal.search"],
   )
 
   // Deleting the override (reset) restores the default in the same list.
@@ -419,7 +428,7 @@ test("mouse input stays outside the shared keymap and the overlay actions", () =
   const subagentActions = mod.CC_ACTIONS.filter((action) => action.id.startsWith("subagent."))
   assert.deepEqual(
     subagentActions.flatMap((action) => action.defaultBindings),
-    ["r", "s"],
+    ["r", "s", "tab"],
     "the overlay actions are plain keyboard keys; mouse stays in the UI layer",
   )
 })
@@ -497,10 +506,13 @@ test("both subagent surfaces reuse list, dialog and global keys with no editor l
     assert.equal(actionId(keymap, "\x01", context, 1_010), "app.subagents.details")
 
     // No editor fallback: movement, kill/yank/undo, deletion and submit are
-    // not reachable through editor actions.
-    for (const data of ["\x01", "\x05", "\x02", "\x06", "\x17", "\x15", "\x0b", "\x19", "\x1f", "\x1by", "\x7f"]) {
+    // not reachable through editor actions. Ctrl+F is the contracted
+    // modal.search row in these browse contexts (see test/input-modal.test.ts),
+    // everything else here stays inert.
+    for (const data of ["\x01", "\x05", "\x02", "\x17", "\x15", "\x0b", "\x19", "\x1f", "\x1by", "\x7f"]) {
       assert.equal(keymap.resolve(data, context).kind, "none", `${context} ${JSON.stringify(data)}`)
     }
+    assert.equal(actionId(keymap, "\x06", context), "modal.search")
     // Plain text is inert (j/k/digits are already list actions above).
     for (const data of ["x", "q", " "]) {
       assert.equal(keymap.resolve(data, context).kind, "none", `${context} ${data}`)

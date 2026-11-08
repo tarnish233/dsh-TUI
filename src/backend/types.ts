@@ -81,6 +81,36 @@ export interface PermissionSelection {
   currentValue: string
 }
 
+/** Read-only DSH skill metadata; the native registry has already resolved invocation policy. */
+export interface SkillCatalogEntry {
+  /** Native identifier, used literally as /name rather than a Pi skill: alias. */
+  readonly name: string
+  readonly description: string
+  readonly whenToUse?: string
+  /** False identifies a user-only skill; all entries permit user invocation. */
+  readonly modelInvocable: boolean
+}
+
+/** A native Agent/preset-scope discovery observation, never a TUI-owned skill catalog. */
+export interface SkillCatalogSnapshot {
+  readonly entries: readonly SkillCatalogEntry[]
+  /** False when the native registry/viewing scope cannot serve a metadata observation. */
+  readonly available: boolean
+  /** Native discovery completeness. Unavailable observations are never complete. */
+  readonly complete: boolean
+}
+
+/**
+ * Native command-versus-prompt discovery for an explicitly submitted slash name.
+ * Unlike menu discovery, this may materialize the user's pending native Agent
+ * so preset-scoped commands have priority even on the first submitted input.
+ */
+export interface InputRoute {
+  readonly kind: 'command' | 'prompt'
+  readonly sessionId: string
+  readonly attachmentId?: string
+}
+
 export interface SessionInfo {
   /** Current root's native child catalog; child Sessions are not independently resumable. */
   subagents?: SubagentSnapshot
@@ -88,6 +118,8 @@ export interface SessionInfo {
   attachmentId?: string
   sessionId: string
   cwd: string
+  /** Native title projection; null means no title, undefined means the service is unavailable. */
+  title?: string | null
   provider: string
   model: string
   /** Adapter-owned reasoning effort selected for the current route, when explicit. */
@@ -259,12 +291,16 @@ export interface DecisionRequest {
 export type BackendEvent =
   | { type: 'ready'; info: SessionInfo }
   | { type: 'status'; sessionId: string; status: 'running' | 'idle' }
+  /** Read-only native title projection; identity is the supplied host attachment, not a local title writer. */
+  | { type: 'title'; sessionId: string; attachmentId?: string; value: string | null }
   | { type: 'permissions'; sessionId: string; value: PermissionSelection }
   | { type: 'todos'; sessionId: string; value: TodosSnapshot }
   | { type: 'plan'; sessionId: string; value: PlanSnapshot }
   | { type: 'metrics'; sessionId: string; usage?: UsageSnapshot; stats?: StatsSnapshot }
   | { type: 'subagents'; sessionId: string; value: SubagentSnapshot }
   | { type: 'subagent'; sessionId: string; value: SubagentEntry }
+  /** Unfiltered native invalidation: consumers refetch metadata for their current attachment. */
+  | { type: 'skills_changed'; sessionId: string; attachmentId?: string }
   | { type: 'stream_start'; sessionId: string; attemptId: string; revision: number; turn: number; step: number }
   | { type: 'stream_chunk'; sessionId: string; attemptId: string; revision: number; index: number; chunk: JsonRecord; /** DSH wall-clock timestamp (epoch ms) of the frame; optional on the wire. */ time?: number }
   | { type: 'stream_end'; sessionId: string; attemptId: string; revision: number; outcome: 'committed' | 'abandoned'; seq?: number }

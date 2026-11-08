@@ -42,7 +42,7 @@ async function fixture(screen: 'inline' | 'fullscreen') {
 async function paint(terminal: VirtualTerminal): Promise<void> { await delay(35); await terminal.flush() }
 
 // A persistent “● Agents · …” progress header is not the temporary modal.
-const agentsOverlayVisible = (terminal: VirtualTerminal): boolean => terminal.screen().split('\n').some(line => /(?<!● )Agents ·/.test(line))
+const agentsOverlayVisible = (terminal: VirtualTerminal): boolean => terminal.screen().split('\n').some(line => /┌─ Agents[─ ]/.test(line))
 
 function childMessage(text: string, seq = 100): SessionEvent {
   return {

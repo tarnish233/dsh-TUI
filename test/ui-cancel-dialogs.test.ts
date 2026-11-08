@@ -191,7 +191,9 @@ test('Esc on a question hides it without answering and the same instance keeps d
     onInterrupt: () => { events.push('interrupt') },
   })
   dialog.focused = true
-  assert.match(text(dialog, 120), /Esc to cancel/)
+  // The footer carries the real bindings; the narrow hint line states the
+  // layered Esc meaning without inventing a key.
+  assert.match(text(dialog, 120), /Tab switches questions · Space toggles · Esc cancels/)
   dialog.handleInput('1') // check Blue
   dialog.handleInput('4') // color #3 would be the custom row for 2 options? no: 2 options -> custom is 3
   dialog.handleInput('\x1b')

@@ -114,7 +114,7 @@ async function openChild(f: Awaited<ReturnType<typeof fixture>>, screen: 'inline
   }
   await paint(f.terminal)
 }
-const agentsVisible = (terminal: VirtualTerminal): boolean => terminal.screen().split('\n').some(line => /(?<!● )Agents ·/.test(line))
+const agentsVisible = (terminal: VirtualTerminal): boolean => terminal.screen().split('\n').some(line => /┌─ Agents[─ ]/.test(line))
 
 for (const screen of ['inline', 'fullscreen'] as const) {
   test(`initializing child opens a loading surface before its native snapshot arrives (${screen})`, async () => {

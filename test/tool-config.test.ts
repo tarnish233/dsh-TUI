@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
-  defaults, SettingsStore, TOOL_SETTING_KEYS,
+  defaults, SETTINGS_FORMAT_VERSION, SettingsStore, TOOL_SETTING_KEYS,
   type Settings,
 } from '../src/config.ts'
 import { toolPreferences } from '../src/ui/tool-view.ts'
@@ -49,9 +49,9 @@ test('all Tools preferences persist together and concurrent updates preserve unr
       diffViewMode: 'split', diffIndicatorMode: 'classic', diffSplitMinWidth: 140,
       editDiffCollapsedLines: 0, writeDiffCollapsedLines: 36, diffWordWrap: false,
     }
-    await Promise.all([store.set(patch), store.set({ thinkingPreviewLines: 5 }), store.set({ autoTitle: false })])
-    assert.deepEqual(store.get(), { ...defaults, ...patch, thinkingPreviewLines: 5, autoTitle: false })
-    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), store.get())
+    await Promise.all([store.set(patch), store.set({ thinkingPreviewLines: 5 }), store.set({ queueCollapsed: true })])
+    assert.deepEqual(store.get(), { ...defaults, ...patch, thinkingPreviewLines: 5, queueCollapsed: true })
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { ...patch, thinkingPreviewLines: 5, queueCollapsed: true, formatVersion: SETTINGS_FORMAT_VERSION }, 'save preserves exact overrides; it does not serialize every default')
     assert.deepEqual(store.reload(), [])
   })
 })

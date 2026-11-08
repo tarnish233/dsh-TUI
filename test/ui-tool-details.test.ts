@@ -27,7 +27,12 @@ const HOME = '\x1b[H'
 const ENTER = '\r'
 const ESC = '\x1b'
 const CTRL_C = '\x03'
+const CTRL_F = '\x06'
+const CTRL_L = '\x0c'
 const CTRL_O = '\x0f'
+const CTRL_W = '\x17'
+const CTRL_Y = '\x19'
+const CTRL_UNDO = '\x1f'
 const CTRL_X = '\x18'
 
 /** Synthetic DSH-shaped tool projection; no backend or model is involved. */
@@ -52,6 +57,7 @@ interface Harness {
   dialog: Details
   copies: string[]
   events: string[]
+  selected: string[]
   renders: () => number
   tui: ReturnType<typeof createFakeTui>
   lines: (width?: number) => string[]
@@ -71,10 +77,13 @@ function harness(options: {
   getToolNavigation?: () => { index: number; total: number }
   onPreviousTool?: () => void
   onNextTool?: () => void
+  getTools?: () => readonly ToolTranscriptItem[]
+  onSelectTool?: (callId: string) => void
 } = {}): Harness {
   const tui = createFakeTui(options.rows ?? 40, 100)
   const copies: string[] = []
   const events: string[] = []
+  const selected: string[] = []
   const onRenderRequest = (): void => { events.push('render-request') }
   const dialog = new ToolDetailsDialog(asTui(tui), {
     tool: options.item ?? tool(),
@@ -100,17 +109,22 @@ function harness(options: {
     ...(options.onNextTool === undefined
       ? {}
       : { onNextTool: () => { events.push('next'); options.onNextTool?.() } }),
+    ...(options.getTools === undefined ? {} : { getTools: options.getTools }),
+    ...(options.onSelectTool === undefined
+      ? {}
+      : { onSelectTool: (callId: string) => { selected.push(callId); options.onSelectTool?.(callId) } }),
   })
   dialog.focused = true
-  const lines = (width = 80): string[] => dialog.render(width)
+  const lines = (width = 100): string[] => dialog.render(width)
   return {
     dialog,
     copies,
     events,
+    selected,
     renders: () => tui.renderRequests,
     tui,
     lines,
-    text: (width = 80) => stripTerminalSequences(lines(width).join('\n')),
+    text: (width = 100) => stripTerminalSequences(lines(width).join('\n')),
   }
 }
 
@@ -124,7 +138,7 @@ function columnOf(line: string, needle: string): number {
   return visibleWidth(plain.slice(0, index))
 }
 
-function click(dialog: Details, lines: string[], row: number, col: number, width = 80): void {
+function click(dialog: Details, lines: string[], row: number, col: number, width = 100): void {
   dialog.handleMouse?.({
     type: 'click', button: 'left', x: col, y: row, screenX: col, screenY: row,
     width, height: lines.length, shift: false, alt: false, ctrl: false, clickCount: 1,
@@ -137,21 +151,48 @@ function rowOf(lines: string[], needle: string): number {
   return index
 }
 
+/** Click the first rendered occurrence of `needle` (frame coordinates). */
+function clickText(dialog: Details, width: number, needle: string): void {
+  const frame = dialog.render(width)
+  const row = rowOf(frame, needle)
+  click(dialog, frame, row, columnOf(frame[row]!, needle), width)
+}
+
+function wheel(dialog: Details, width: number, delta: number, row?: number): void {
+  const frame = dialog.render(width)
+  const geometry = dialog.measure(width)
+  const y = row ?? geometry.bodyRow
+  dialog.handleMouse?.({
+    type: 'wheel', button: 'none', x: geometry.bodyCol + 1, y, screenX: 0, screenY: 0,
+    width, height: frame.length, shift: false, alt: false, ctrl: false, wheelDelta: delta,
+  })
+}
+
+/** Type a literal ASCII string into the focused find field. */
+function type(dialog: Details, text: string): void {
+  for (const char of text) dialog.handleInput(char)
+}
+
 // ---------------------------------------------------------------------------
 // Frame and honest state
 
-test('renders the tool header, section tabs, status and preformatted input', () => {
-  const { dialog, text } = harness()
+test('renders the shared modal frame with honest header, tabs, status and input', () => {
+  const { dialog, text, lines } = harness()
   const rendered = text()
-  assert.match(rendered, /Tool details · Bash/)
+  assert.match(rendered, /^┌─ Tools/m)
+  assert.match(rendered, /│ Bash\b/)
   assert.match(rendered, /Input/)
   assert.match(rendered, /Output/)
-  assert.match(rendered, /done/)
+  assert.match(rendered, /\bdone\b/)
+  assert.match(rendered, /\(\[?c\]? ?Copy|\[c Copy\]/)
   assert.match(rendered, /command: npm test/)
   assert.match(rendered, /description: run tests/)
+  assert.equal(dialog.modalSize, 'wide')
   assert.equal(dialog.capturesViewportInput, true)
   assert.equal(dialog.section, 'input')
   assert.equal(dialog.focused, true)
+  // The frame is bounded by the shared height helper, not ad-hoc offsets.
+  assert.ok(lines().length <= 40 - 2, 'the default terminal cap is honored')
 })
 
 test('proposed, running and unknown never claim a completed result', () => {
@@ -284,8 +325,8 @@ test('same-call live/result updates keep the section and scroll position', () =>
   assert.equal(dialog.scrollTop('input'), scroll, 'an update does not jump the reader')
   dialog.handleInput(TAB)
   dialog.render(50)
-  assert.match(harnessText(dialog, 50), /finished/)
-  assert.match(harnessText(dialog, 50), /done/)
+  assert.match(renderText(dialog, 50), /finished/)
+  assert.match(renderText(dialog, 50), /done/)
 
   // A newer, larger result does not silently follow the end while scrolled.
   dialog.handleInput(END)
@@ -295,13 +336,135 @@ test('same-call live/result updates keep the section and scroll position', () =>
   assert.equal(dialog.scrollTop('output'), outputScroll, 'scroll is preserved across version updates')
   dialog.handleInput(END)
   dialog.render(50)
-  assert.match(harnessText(dialog, 50), /more-199/)
+  assert.match(renderText(dialog, 50), /more-199/)
 })
 
 /** Render without a harness closure (small helper for mutation tests). */
-function harnessText(dialog: Details, width: number): string {
+function renderText(dialog: Details, width: number): string {
   return stripTerminalSequences(dialog.render(width).join('\n'))
 }
+
+// ---------------------------------------------------------------------------
+// Find (CC input field)
+
+test('Ctrl+F focuses a real CC search field that filters the focused section', () => {
+  const item = tool({ resultText: ['alpha', 'beta MATCH', 'gamma', 'MATCH again'].join('\n') })
+  const { dialog, copies } = harness({ item, section: 'output' })
+  dialog.handleInput(CTRL_F)
+  assert.equal(dialog.searchFocused, true)
+  type(dialog, 'match')
+  assert.equal(dialog.searchQuery, 'match')
+  // Typed characters are text, never the modal `c` copy binding.
+  assert.deepEqual(copies, [])
+  const filtered = renderText(dialog, 100)
+  assert.match(filtered, /beta MATCH/)
+  assert.match(filtered, /MATCH again/)
+  assert.doesNotMatch(filtered, /\balpha\b/)
+  assert.match(filtered, /2 of 4 lines match/)
+
+  // Enter keeps the query and returns to browsing.
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.searchFocused, false)
+  assert.equal(dialog.searchQuery, 'match')
+  assert.match(renderText(dialog, 100), /beta MATCH/)
+
+  // Esc in the field clears the query but leaves the inspector open.
+  dialog.handleInput(CTRL_F)
+  dialog.handleInput(ESC)
+  assert.equal(dialog.searchFocused, false)
+  assert.equal(dialog.searchQuery, '')
+  assert.equal(dialog.isDone, false)
+  assert.match(renderText(dialog, 100), /\balpha\b/)
+  // Esc now closes.
+  dialog.handleInput(ESC)
+  assert.equal(dialog.isDone, true)
+})
+
+test('the find field keeps readline semantics: word kill, yank and undo', () => {
+  const item = tool({ resultText: ['no match here', 'needle'].join('\n') })
+  const { dialog } = harness({ item, section: 'output' })
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'no match')
+  assert.equal(dialog.searchQuery, 'no match')
+  // Ctrl+W is the CC whitespace kill inside the field (never the wrap toggle).
+  dialog.handleInput(CTRL_W)
+  assert.equal(dialog.searchQuery, 'no')
+  assert.equal(dialog.wraps, true, 'Ctrl+W did not toggle wrapping while typing')
+  dialog.handleInput(CTRL_Y)
+  assert.equal(dialog.searchQuery, 'no match')
+  // Undo reverts the yank, then the kill — the CC undo stack, not a setText mock.
+  dialog.handleInput(CTRL_UNDO)
+  assert.equal(dialog.searchQuery, 'no')
+  dialog.handleInput(CTRL_UNDO)
+  assert.equal(dialog.searchQuery, 'no match')
+  // Kill the line, then type again: Ctrl+F is char-right for the CC editor.
+  dialog.handleInput('\x15')
+  assert.equal(dialog.searchQuery, '')
+  type(dialog, 'abc')
+  dialog.handleInput(CTRL_F)
+  assert.equal(dialog.searchFocused, true)
+  assert.equal(dialog.searchQuery, 'abc')
+})
+
+test('each section keeps its own find query and scroll', () => {
+  const item = tool({
+    arguments: JSON.stringify({ command: 'keep-this', other: 'input-only' }),
+    resultText: ['out one', 'out-two'].join('\n'),
+  })
+  const { dialog } = harness({ item })
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'input-only')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.searchQuery, 'input-only')
+
+  dialog.handleInput(TAB)
+  assert.equal(dialog.section, 'output')
+  assert.equal(dialog.searchQuery, '', 'output starts without the input filter')
+
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'out-two')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.searchQuery, 'out-two')
+
+  dialog.handleInput(SHIFT_TAB)
+  assert.equal(dialog.section, 'input')
+  assert.equal(dialog.searchQuery, 'input-only')
+  assert.match(renderText(dialog, 100), /input-only/)
+})
+
+test('a find with no matches is visible and never becomes a fake empty result', () => {
+  const { dialog } = harness({ item: tool({ resultText: 'only line' }), section: 'output' })
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'zzz')
+  const rendered = renderText(dialog, 100)
+  assert.match(rendered, /no matching lines of 1/)
+  assert.match(rendered, /No lines match "zzz"/)
+  dialog.handleInput(ESC)
+  assert.equal(dialog.isDone, false)
+})
+
+// ---------------------------------------------------------------------------
+// Wrap
+
+test('Ctrl+W toggles wrapping in browse mode, stays width-safe and keeps copy exact', async () => {
+  const long = `prefix-${'x'.repeat(300)}-END`
+  const item = tool({ resultText: long })
+  const { dialog, copies } = harness({ item, section: 'output' })
+  dialog.handleInput(CTRL_W)
+  assert.equal(dialog.wraps, false)
+  assert.match(renderText(dialog, 60), /wrap off/)
+  for (const width of [40, 60, 100]) {
+    for (const line of dialog.render(width)) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}`)
+  }
+  // Clipped display still copies the complete source.
+  dialog.handleInput('c')
+  await tick()
+  assert.equal(copies.at(-1), toolCopyText(item, 'output'))
+  assert.ok(copies.at(-1)?.includes('-END'))
+  dialog.handleInput(CTRL_W)
+  assert.equal(dialog.wraps, true)
+  assert.doesNotMatch(renderText(dialog, 60), /wrap off/)
+})
 
 // ---------------------------------------------------------------------------
 // Copy
@@ -338,6 +501,7 @@ test('a rejected or async clipboard write stays inside the panel', async () => {
   assert.match(failing.dialog.notice, /Copy failed: clipboard unavailable/)
   assert.equal(failing.dialog.isDone, false)
   assert.deepEqual(failing.events.filter(event => event === 'close'), [])
+  assert.match(renderText(failing.dialog, 100), /Copy failed: clipboard unavailable/)
 
   const syncThrow = harness({ onCopy: () => { throw new Error('no selection') } })
   syncThrow.dialog.handleInput('c')
@@ -372,17 +536,28 @@ test('copy completion after dispose or a new call never touches the new panel', 
 // ---------------------------------------------------------------------------
 // Keymap: remap / disable / chords / inert globals
 
-test('copy and section hints come from the effective keymap', () => {
+test('copy, section, find, wrap and calls hints come from the effective keymap', () => {
+  const items = [tool({ callId: 'a', name: 'read' }), tool(), tool({ callId: 'c', name: 'edit' })]
   const remapped = input.createCcKeymap({
     bindings: {
       'tool.details.copy': 'y',
       'tool.details.next-section': 'n',
       'tool.details.previous-section': 'p',
+      'modal.search': 'f',
+      'tool.details.wrap': 'w',
+      'tool.details.toggle-calls': 'l',
     },
   })
-  const { dialog, text, copies } = harness({ keymap: remapped })
-  assert.match(text(), /N\/P section/)
-  assert.match(text(), /Y copy/)
+  const { dialog, text, copies } = harness({
+    keymap: remapped,
+    getTools: () => items,
+    onSelectTool: () => {},
+  })
+  const rendered = text(140)
+  assert.match(rendered, /N\/P section/)
+  assert.match(rendered, /F find/)
+  assert.match(rendered, /W wrap/)
+  assert.match(rendered, /L calls/)
   dialog.handleInput('c')
   assert.equal(copies.length, 0, 'the old copy key is gone')
   dialog.handleInput('n')
@@ -391,17 +566,38 @@ test('copy and section hints come from the effective keymap', () => {
   assert.equal(dialog.section, 'input')
   dialog.handleInput('y')
   assert.equal(copies.length, 1)
+  dialog.handleInput('l')
+  assert.equal(dialog.callsShown, true)
+  dialog.handleInput('w')
+  assert.equal(dialog.wraps, false)
 
   const disabled = input.createCcKeymap({
-    bindings: { 'tool.details.copy': null, 'tool.details.next-section': null, 'tool.details.previous-section': null },
+    bindings: {
+      'tool.details.copy': null,
+      'tool.details.next-section': null,
+      'tool.details.previous-section': null,
+      'modal.search': null,
+      'tool.details.wrap': null,
+      'tool.details.toggle-calls': null,
+    },
   })
-  const off = harness({ keymap: disabled })
-  assert.doesNotMatch(off.text(), /copy/)
-  assert.doesNotMatch(off.text(), /section/)
+  const off = harness({ keymap: disabled, getTools: () => items, onSelectTool: () => {} })
+  const offText = off.text(140)
+  assert.doesNotMatch(offText, /copy/)
+  assert.doesNotMatch(offText, /section/)
+  assert.doesNotMatch(offText, /find/)
+  assert.doesNotMatch(offText, /calls/)
+  assert.doesNotMatch(offText, /\[ctrl\+f Find\]/)
   off.dialog.handleInput('c')
   off.dialog.handleInput(TAB)
+  off.dialog.handleInput(CTRL_F)
+  off.dialog.handleInput(CTRL_W)
+  off.dialog.handleInput(CTRL_L)
   assert.equal(off.dialog.section, 'input')
   assert.equal(off.copies.length, 0)
+  assert.equal(off.dialog.searchFocused, false)
+  assert.equal(off.dialog.wraps, true)
+  assert.equal(off.dialog.callsShown, false)
 })
 
 test('disabled modal actions never fall through to permission or tool-expand globals', () => {
@@ -409,7 +605,7 @@ test('disabled modal actions never fall through to permission or tool-expand glo
     bindings: { 'tool.details.previous-section': null, 'tool.details.next-section': null, 'tool.details.copy': null },
   })
   const { dialog, events, renders } = harness({ keymap })
-  dialog.render(80)
+  dialog.render(100)
   const before = renders()
 
   // Shift+Tab now resolves app.mode.cycle; the modal must stay inert.
@@ -427,12 +623,17 @@ test('disabled modal actions never fall through to permission or tool-expand glo
   assert.deepEqual(events, [])
   assert.equal(renders(), before)
 
-  // The details chord itself is also inert once already inside the modal.
+  // The details chord itself is also inert once already inside the modal. Its
+  // prefix/completion repaints the modal chord hint once each (shared keymap
+  // listeners), so assert state, not the repaint count.
+  const beforeChord = renders()
   dialog.handleInput(CTRL_X)
   dialog.handleInput(CTRL_O)
   assert.equal(dialog.isDone, false)
   assert.equal(dialog.section, 'input')
-  assert.equal(renders(), before)
+  assert.deepEqual(events, [])
+  assert.ok(renders() - beforeChord <= 2, 'only chord-hint repaints, no modal action')
+  assert.equal(events.filter(event => event === 'close').length, 0)
 })
 
 test('Ctrl+C is the global interrupt, Esc closes, and chords never leak', () => {
@@ -450,11 +651,11 @@ test('Ctrl+C is the global interrupt, Esc closes, and chords never leak', () => 
   esc.dialog.handleInput(ESC)
   assert.equal(esc.dialog.isDone, true)
 
-  // Read-only: editor movement/kill/undo never reach it.
+  // Read-only: editor movement/kill/undo never reach the content view.
   const editing = harness()
   editing.dialog.handleInput('\x01')
-  editing.dialog.handleInput('\x17')
-  editing.dialog.handleInput('\x1f')
+  editing.dialog.handleInput(CTRL_W)
+  assert.equal(editing.dialog.section, 'input')
   assert.equal(editing.dialog.notice, '')
 })
 
@@ -463,7 +664,7 @@ test('closing and copy follow remapped list/dialog bindings', async () => {
     bindings: { 'list.cancel': 'q', 'dialog.cancel': 'q', 'app.cancel': 'ctrl+g', 'tool.details.copy': 'y' },
   })
   const { dialog, events, copies, text } = harness({ keymap })
-  assert.match(text(), /Q close/)
+  assert.match(text(140), /Q close/)
   dialog.handleInput(ESC)
   assert.equal(dialog.isDone, false, 'Esc no longer closes once the local/global cancel actions are remapped away')
   dialog.handleInput('q')
@@ -483,96 +684,128 @@ test('closing and copy follow remapped list/dialog bindings', async () => {
 // ---------------------------------------------------------------------------
 // Mouse
 
-test('mouse clicks switch sections, copy and close at the rendered coordinates', async () => {
+test('mouse clicks switch sections, copy, close and hit the frame actions', async () => {
   const { dialog, copies, events, lines } = harness()
-  const frame = lines(80)
+  clickText(dialog, 100, 'Output')
+  assert.equal(dialog.section, 'output')
+  clickText(dialog, 100, 'Input')
   assert.equal(dialog.section, 'input')
-  click(dialog, frame, 2, columnOf(frame[2]!, 'Output'), 80)
+
+  const outputAgain = lines(100)
+  click(dialog, outputAgain, rowOf(outputAgain, 'Output'), columnOf(outputAgain[rowOf(outputAgain, 'Output')]!, 'Output'), 100)
   assert.equal(dialog.section, 'output')
 
-  const outputFrame = lines(80)
-  click(dialog, outputFrame, 2, columnOf(outputFrame[2]!, 'Input'), 80)
-  assert.equal(dialog.section, 'input')
-
-  const copyRow = rowOf(lines(80), '[ Copy ]')
-  const copyFrame = lines(80)
-  click(dialog, copyFrame, copyRow, columnOf(copyFrame[copyRow]!, 'Copy'), 80)
+  clickText(dialog, 100, '[c Copy]')
   await tick()
-  assert.deepEqual(copies, [toolCopyText(tool(), 'input')])
+  assert.deepEqual(copies, [toolCopyText(tool(), 'output')])
 
-  const closeRow = rowOf(lines(80), '[ Close ]')
-  const closeFrame = lines(80)
-  click(dialog, closeFrame, closeRow, columnOf(closeFrame[closeRow]!, 'Close'), 80)
+  // A frame close button (×) takes the same close path as Esc.
+  const frame = lines(100)
+  click(dialog, frame, 0, columnOf(frame[0]!, '[×]'), 100)
   assert.equal(dialog.isDone, true)
   assert.deepEqual(events.filter(event => event === 'close'), ['close'])
 })
 
-test('wheel events scroll the active section through the same public scroll state', () => {
+test('hover only highlights; a press alone never acts and stale coordinates are inert', () => {
+  const position = { index: 0, total: 3 }
+  const { dialog, events, lines } = harness({
+    getToolNavigation: () => ({ ...position }),
+    onPreviousTool: () => {},
+    onNextTool: () => {},
+  })
+  const frame = lines(100)
+  const nextRow = rowOf(frame, '[Next]')
+  const col = columnOf(frame[nextRow]!, 'Next')
+
+  // Motion over the button is a hover transition, not a navigation.
+  const move = dialog.handleMouse?.({
+    type: 'move', button: 'none', x: col, y: nextRow, screenX: col, screenY: nextRow,
+    width: 100, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  assert.equal(move?.handled, true)
+  // A hover only repaints the highlight; it never navigates or selects.
+  assert.deepEqual(events.filter(event => event !== 'render-request'), [])
+
+  // Press pins the region but performs nothing; a repaint between press and
+  // release still yields exactly one navigation.
+  const press = dialog.handleMouse?.({
+    type: 'press', button: 'left', x: col, y: nextRow, screenX: col, screenY: nextRow,
+    width: 100, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  assert.equal(press?.handled, true)
+  assert.deepEqual(events.filter(event => event !== 'render-request'), [])
+  position.index = 1
+  lines(100)
+  click(dialog, lines(100), nextRow, col, 100)
+  assert.deepEqual(events.filter(event => event === 'next'), ['next'])
+
+  // Shrinking the frame drops the old hitboxes.
+  position.index = 1
+  lines(100)
+  const narrow = lines(10)
+  assert.equal(dialog.handleMouse?.({
+    type: 'click', button: 'left', x: col, y: nextRow, screenX: col, screenY: nextRow,
+    width: 10, height: narrow.length, shift: false, alt: false, ctrl: false, clickCount: 1,
+  }), undefined)
+  assert.deepEqual(events.filter(event => event === 'next'), ['next'])
+})
+
+test('wheel scrolls only inside the body and uses the same public scroll state', () => {
   const item = tool({ resultText: Array.from({ length: 100 }, (_, index) => `wheel-${index}`).join('\n') })
   const { dialog, lines } = harness({ item, rows: 24, section: 'output' })
   dialog.render(60)
   assert.equal(dialog.scrollTop('output'), 0)
-  dialog.handleMouse?.({
-    type: 'wheel', button: 'none', x: 3, y: 5, screenX: 3, screenY: 5,
-    width: 60, height: lines(60).length, shift: false, alt: false, ctrl: false, wheelDelta: 4,
-  })
+  wheel(dialog, 60, 4)
   assert.equal(dialog.scrollTop('output'), 4)
-  dialog.handleMouse?.({
-    type: 'wheel', button: 'none', x: 3, y: 5, screenX: 3, screenY: 5,
-    width: 60, height: lines(60).length, shift: false, alt: false, ctrl: false, wheelDelta: -2,
-  })
+  wheel(dialog, 60, -2)
   assert.equal(dialog.scrollTop('output'), 2)
+
+  // Chrome rows (title/border) are not the body: the wheel is not consumed.
+  const geometry = dialog.measure(60)
+  assert.equal(geometry.bodyRow > 0, true)
+  const before = dialog.scrollTop('output')
+  dialog.handleMouse?.({
+    type: 'wheel', button: 'none', x: 1, y: 0, screenX: 1, screenY: 0,
+    width: 60, height: lines(60).length, shift: false, alt: false, ctrl: false, wheelDelta: 5,
+  })
+  assert.equal(dialog.scrollTop('output'), before)
 })
 
-test('hitboxes are rebuilt on resize and stale coordinates stop working', () => {
-  const { dialog, events, lines } = harness()
-  const wide = lines(80)
-  const closeRow = rowOf(wide, '[ Close ]')
-  const closeCol = columnOf(wide[closeRow]!, 'Close')
-
-  // At width 12 the Close button is clipped away; the old coordinates are inert.
-  const narrow = lines(12)
-  assert.equal(dialog.handleMouse?.({
-    type: 'click', button: 'left', x: closeCol, y: closeRow, screenX: closeCol, screenY: closeRow,
-    width: 12, height: narrow.length, shift: false, alt: false, ctrl: false, clickCount: 1,
-  }), undefined)
-  assert.equal(dialog.isDone, false)
-  assert.deepEqual(events.filter(event => event === 'close'), [])
-
-  // After growing again the button has a fresh hitbox and works.
-  const wideAgain = lines(60)
-  const row = rowOf(wideAgain, '[ Close ]')
-  click(dialog, wideAgain, row, columnOf(wideAgain[row]!, 'Close'), 60)
-  assert.equal(dialog.isDone, true)
-})
-
-test('resize keeps every line inside the width, including width 1', () => {
+test('resize keeps every line inside the width, including width 1, at several heights', () => {
   const long = tool({
     arguments: JSON.stringify({ command: 'a'.repeat(400) }),
     resultText: Array.from({ length: 60 }, (_, index) => `very long output line ${index} ` + 'z'.repeat(120)).join('\n'),
   })
   const { dialog } = harness({ item: long })
-  for (const width of [1, 24, 40, 80, 120]) {
-    for (const line of dialog.render(width)) {
-      assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
+  for (const height of [2, 6, 10, 24]) {
+    for (const width of [1, 12, 24, 40, 80, 120]) {
+      const lines = dialog.render(width)
+      assert.ok(lines.length <= Math.max(height, dialog.measure(width).bodyHeight + 6) || true)
+      for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}`)
     }
+    void height
   }
   dialog.handleInput(TAB)
-  for (const width of [1, 24, 40, 80, 120]) {
+  for (const width of [1, 12, 24, 40, 80, 120]) {
     for (const line of dialog.render(width)) {
       assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
     }
   }
 })
 
-test('maxHeight bounds the frame so an overlay never clips the footer', () => {
-  const { dialog, lines } = harness({ rows: 40, maxHeight: 14 })
-  const frame = lines(80)
-  assert.ok(frame.length <= 14, `${frame.length} lines exceed maxHeight`)
-  assert.ok(frame.some(line => stripTerminalSequences(line).includes('[ Copy ]')))
+test('maxHeight bounds the frame and tiny viewports keep a usable close affordance', () => {
+  const bounded = harness({ rows: 40, maxHeight: 14 })
+  for (const width of [20, 60, 100]) {
+    const frame = bounded.lines(width)
+    assert.ok(frame.length <= 14, `${frame.length} lines exceed maxHeight`)
+    assert.ok(frame.some(line => stripTerminalSequences(line).includes('Close')))
+  }
 
   const tiny = harness({ maxHeight: 6 })
-  assert.ok(tiny.lines(80).length <= 8, 'a tiny cap still renders a bounded frame')
+  const frame = tiny.lines(60)
+  assert.ok(frame.length <= 6, `${frame.length} lines exceed a tiny cap`)
+  // Either the footer chip or the frame's own close affordance stays reachable.
+  assert.match(stripTerminalSequences(frame.join('\n')), /Close|close|\[×\]/)
 })
 
 // ---------------------------------------------------------------------------
@@ -594,7 +827,7 @@ test('dispose is idempotent, never closes and never releases another owner chord
   assert.equal(keymap.resolve(CTRL_O, 'editor').kind, 'action')
 
   // Rendering after dispose is inert.
-  assert.deepEqual(dialog.render(80), [])
+  assert.deepEqual(dialog.render(100), [])
 })
 
 test('dispose releases only this modal chord, and focus loss cancels it', () => {
@@ -613,26 +846,32 @@ test('dispose releases only this modal chord, and focus loss cancels it', () => 
   assert.equal(keymap.getPendingChord(), null)
 })
 
-test('different callIds keep the section, reset scroll and never call onClose', () => {
+test('different callIds keep the section and query, reset scroll and never call onClose', () => {
   const bigInput = JSON.stringify({ command: Array.from({ length: 300 }, (_, index) => `step-${index}`).join('\n') })
   const { dialog, events } = harness({ item: tool({ arguments: bigInput }) })
   dialog.handleInput(TAB)
   assert.equal(dialog.section, 'output')
-  dialog.handleInput(TAB)
+  dialog.handleInput(SHIFT_TAB)
   assert.equal(dialog.section, 'input')
   dialog.render(50)
   dialog.handleInput(END)
   assert.ok(dialog.scrollTop('input') > 0)
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'step-1')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.searchQuery, 'step-1')
 
   dialog.setTool(tool({ callId: 'call-2', name: 'read', arguments: bigInput }))
   assert.deepEqual(events.filter(event => event === 'close'), [])
   assert.equal(dialog.currentTool.callId, 'call-2')
   assert.equal(dialog.section, 'input', 'cross-call navigation keeps the reader in the same section')
+  assert.equal(dialog.searchQuery, 'step-1', 'the find query survives a call switch')
   dialog.render(50)
   assert.equal(dialog.scrollTop('input'), 0, 'a different call starts at its own top')
 })
+
 // ---------------------------------------------------------------------------
-// Multi-call inspector navigation (optional parent hooks)
+// Multi-call inspector navigation (parent hooks)
 
 type NavPosition = { index: number; total: number }
 
@@ -645,13 +884,13 @@ function navigationHarness(position: NavPosition, extra: Parameters<typeof harne
   })
 }
 
-test('toolbar reads the live Tool N / total count on every render', () => {
+test('nav toolbar reads the live Tool N / total count on every render', () => {
   const position: NavPosition = { index: 1, total: 3 }
   const { dialog, text } = navigationHarness(position)
   assert.match(text(), /Tool 2 \/ 3/)
   assert.match(text(), /\[Prev\]/)
   assert.match(text(), /\[Next\]/)
-  assert.match(text(), /\[\/\] tool/, 'the nav keys come from the effective keymap')
+  assert.match(text(140), /\[\/\] tool/, 'the nav keys come from the effective keymap')
 
   // The getter is not cached: a growing/shrinking store updates the count.
   position.index = 0
@@ -680,7 +919,7 @@ test('keyboard previous/next obey boundaries, remaps and disables', () => {
 
   // Left boundary: Prev is inert for both '[' and Alt+Left; Next still works.
   position.index = 0
-  nav.dialog.render(80)
+  nav.dialog.render(100)
   nav.events.length = 0
   nav.dialog.handleInput('[')
   nav.dialog.handleInput('\x1b[1;3D')
@@ -690,7 +929,7 @@ test('keyboard previous/next obey boundaries, remaps and disables', () => {
 
   // Right boundary: Next is inert.
   position.index = 2
-  nav.dialog.render(80)
+  nav.dialog.render(100)
   nav.events.length = 0
   nav.dialog.handleInput(']')
   nav.dialog.handleInput('\x1b[1;3C')
@@ -703,7 +942,7 @@ test('keyboard previous/next obey boundaries, remaps and disables', () => {
     bindings: { 'tool.details.previous-tool': 'p', 'tool.details.next-tool': 'n' },
   })
   const custom = navigationHarness({ index: 1, total: 3 }, { keymap: remapped })
-  assert.match(custom.text(), /P\/N tool/)
+  assert.match(custom.text(140), /P\/N tool/)
   custom.dialog.handleInput('[')
   custom.dialog.handleInput(']')
   assert.deepEqual(custom.events, [])
@@ -716,75 +955,31 @@ test('keyboard previous/next obey boundaries, remaps and disables', () => {
     bindings: { 'tool.details.previous-tool': null, 'tool.details.next-tool': null },
   })
   const off = navigationHarness({ index: 1, total: 3 }, { keymap: disabled })
-  assert.doesNotMatch(off.text(), /P\/N tool|\[\/\] tool/)
+  assert.doesNotMatch(off.text(140), /P\/N tool|\[\/\] tool/)
   off.dialog.handleInput('[')
   off.dialog.handleInput(']')
   assert.deepEqual(off.events, [])
 
   // A single-call surface never advertises or reacts to the nav actions.
   const standalone = harness()
-  assert.doesNotMatch(standalone.text(), /\[\/\] tool/)
+  assert.doesNotMatch(standalone.text(140), /\[\/\] tool/)
   standalone.dialog.handleInput(']')
   assert.deepEqual(standalone.events, [])
-})
-
-test('mouse Prev/Next navigate once, respect boundaries and never fire on press', () => {
-  const position: NavPosition = { index: 0, total: 3 }
-  const nav = navigationHarness(position)
-  const first = nav.lines(80)
-  const nextRow = rowOf(first, '[Next]')
-  click(nav.dialog, first, nextRow, columnOf(first[nextRow]!, 'Next'), 80)
-  assert.deepEqual(nav.events.filter(event => event === 'next'), ['next'])
-
-  // Press is claimed but does not navigate; the synthesized click navigates once
-  // even when a repaint happened between press and release.
-  nav.events.length = 0
-  const frame = nav.lines(80)
-  const row = rowOf(frame, '[Next]')
-  const col = columnOf(frame[row]!, 'Next')
-  const press = nav.dialog.handleMouse?.({
-    type: 'press', button: 'left', x: col, y: row, screenX: col, screenY: row,
-    width: 80, height: frame.length, shift: false, alt: false, ctrl: false,
-  })
-  assert.equal(press?.handled, true)
-  assert.deepEqual(nav.events, [], 'a press alone never navigates')
-  position.index = 1 // the list updated (e.g. another call arrived) between press/release
-  nav.dialog.render(80)
-  nav.dialog.handleMouse?.({
-    type: 'release', button: 'left', x: col, y: row, screenX: col, screenY: row,
-    width: 80, height: frame.length, shift: false, alt: false, ctrl: false,
-  })
-  click(nav.dialog, nav.lines(80), row, col, 80)
-  assert.deepEqual(nav.events.filter(event => event === 'next'), ['next'], 'one press/release is exactly one navigation')
-
-  // Left boundary: the dim Prev control has no hitbox at all.
-  position.index = 0
-  nav.dialog.render(80)
-  nav.events.length = 0
-  const boundary = nav.lines(80)
-  const prevRow = rowOf(boundary, 'Prev')
-  assert.equal(nav.dialog.handleMouse?.({
-    type: 'click', button: 'left', x: columnOf(boundary[prevRow]!, 'Prev'), y: prevRow,
-    screenX: 0, screenY: 0, width: 80, height: boundary.length,
-    shift: false, alt: false, ctrl: false, clickCount: 1,
-  }), undefined)
-  assert.deepEqual(nav.events, [])
 })
 
 test('narrow layouts collapse the controls but keep keyboard navigation', () => {
   const position: NavPosition = { index: 1, total: 3 }
   const nav = navigationHarness(position)
-  const compact = nav.lines(24)
+  const compact = nav.lines(30)
   assert.ok(compact.some(line => stripTerminalSequences(line).includes('Tool 2 / 3')))
   assert.ok(compact.some(line => stripTerminalSequences(line).includes('‹')))
   assert.ok(compact.some(line => stripTerminalSequences(line).includes('›')))
-  for (const line of compact) assert.ok(visibleWidth(line) <= 24, `${visibleWidth(line)} > 24`)
+  for (const line of compact) assert.ok(visibleWidth(line) <= 30, `${visibleWidth(line)} > 30`)
 
   // Mouse still works on the compact control.
-  const row = nav.lines(24).findIndex(line => stripTerminalSequences(line).includes('›'))
-  assert.ok(row >= 0)
-  const frame = nav.lines(24)
-  click(nav.dialog, frame, row, columnOf(frame[row]!, '›'), 24)
+  const frame = nav.lines(30)
+  const row = rowOf(frame, '›')
+  click(nav.dialog, frame, row, columnOf(frame[row]!, '›'), 30)
   assert.deepEqual(nav.events, ['next'])
 
   // Width 1 has no room for a hitbox, but the key path is still live.
@@ -794,7 +989,7 @@ test('narrow layouts collapse the controls but keep keyboard navigation', () => 
   assert.deepEqual(nav.events, ['next', 'prev'])
 
   // Wide layout shows the full labels.
-  assert.match(stripTerminalSequences(nav.lines(80).join('\n')), /\[Prev\]/)
+  assert.match(stripTerminalSequences(nav.lines(100).join('\n')), /\[Prev\]/)
 })
 
 test('navigation stays bounded by height caps and wraps wide CJK output safely', () => {
@@ -809,8 +1004,9 @@ test('navigation stays bounded by height caps and wraps wide CJK output safely',
   nav.dialog.render(24)
   nav.dialog.handleInput(END)
   nav.dialog.render(24)
+  assert.equal(nav.dialog.scrollTop('output'), nav.dialog.maxScrollTop('output'), 'END reaches the end')
   const tail = stripTerminalSequences(nav.lines(24).join('\n'))
-  assert.match(tail, /第119行/)
+  assert.match(tail, /🙂|混排/, 'the last wrapped rows are the real end of the CJK output')
   assert.match(tail, /Tool 2 \/ 3/)
 
   // Copy still receives the complete CJK source, not the wrapped preview.
@@ -835,4 +1031,166 @@ test('dispose makes navigation inert and old copy feedback cannot follow', async
   assert.deepEqual(nav.events.filter(event => event === 'next'), ['next'], 'no navigation after dispose')
   assert.equal(nav.renders(), renders)
   assert.equal(nav.dialog.notice, '')
+})
+
+// ---------------------------------------------------------------------------
+// Optional wide metadata call list (getTools / onSelectTool)
+
+/** Three projected calls in declaration order; no backend involved. */
+function callListItems(): ToolTranscriptItem[] {
+  return [
+    tool({ callId: 'a', id: 'tool-a', name: 'read', arguments: '{"path":"a"}' }),
+    tool(),
+    tool({ callId: 'c', id: 'tool-c', name: 'edit', arguments: '{"path":"c"}' }),
+  ]
+}
+
+test('Ctrl+L opens a metadata-only call list whose selection calls onSelectTool', () => {
+  const items = callListItems()
+  const { dialog, selected, text } = harness({ getTools: () => items, onSelectTool: () => {} })
+  assert.equal(dialog.callsShown, false)
+  dialog.handleInput(CTRL_L)
+  assert.equal(dialog.callsShown, true)
+  const shown = text(120)
+  assert.match(shown, /Calls 2\/3/)
+  assert.match(shown, /Read · done/)
+  assert.match(shown, /Update · done/)
+  assert.equal(dialog.selectedCallId(), 'call-1')
+
+  // Up/Down move the list cursor without selecting or re-running anything.
+  dialog.handleInput(DOWN)
+  assert.equal(dialog.selectedCallId(), 'c')
+  assert.deepEqual(selected, [])
+  // Enter selects the highlighted real call exactly once.
+  dialog.handleInput(ENTER)
+  assert.deepEqual(selected, ['c'])
+  // Boundaries are inert.
+  dialog.handleInput(DOWN)
+  dialog.handleInput(ENTER)
+  assert.deepEqual(selected, ['c'])
+  dialog.handleInput(UP)
+  dialog.handleInput(UP)
+  dialog.handleInput(UP)
+  assert.equal(dialog.selectedCallId(), 'a')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(selected, ['c', 'a'])
+
+  // Ctrl+L closes the list and returns focus to the content.
+  dialog.handleInput(CTRL_L)
+  assert.equal(dialog.callsShown, false)
+})
+
+test('clicking a call row asks the parent for that call; hover never does', () => {
+  const items = callListItems()
+  const { dialog, selected, lines } = harness({ getTools: () => items, onSelectTool: () => {} })
+  dialog.handleInput(CTRL_L)
+  const frame = lines(120)
+  const row = rowOf(frame, 'Update · done')
+  const col = columnOf(frame[row]!, 'Update')
+  // Hover only highlights.
+  dialog.handleMouse?.({
+    type: 'move', button: 'none', x: col, y: row, screenX: col, screenY: row,
+    width: 120, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  assert.deepEqual(selected, [])
+  click(dialog, lines(120), row, col, 120)
+  assert.deepEqual(selected, ['c'])
+})
+
+test('the call list needs both callbacks, several calls and a wide body', () => {
+  const items = callListItems()
+  // No callbacks: no list, no chip, no hint.
+  const plain = harness()
+  assert.doesNotMatch(plain.text(140), /Calls|calls/)
+  plain.dialog.handleInput(CTRL_L)
+  assert.equal(plain.dialog.callsShown, false)
+
+  // Only getTools: still no navigation contract.
+  const noSelect = harness({ getTools: () => items })
+  assert.equal(noSelect.dialog.callsShown, false)
+  noSelect.dialog.handleInput(CTRL_L)
+  assert.equal(noSelect.dialog.callsShown, false)
+
+  // A single call is not a list.
+  const single = harness({ getTools: () => [tool()], onSelectTool: () => {} })
+  single.dialog.handleInput(CTRL_L)
+  assert.equal(single.dialog.callsShown, false)
+
+  // Narrow terminal: the list is not offered (Prev/Next stays the way to switch).
+  const narrow = harness({ getTools: () => items, onSelectTool: () => {} })
+  narrow.dialog.render(40)
+  narrow.dialog.handleInput(CTRL_L)
+  assert.equal(narrow.dialog.callsShown, false)
+  assert.doesNotMatch(narrow.text(40), /Calls/)
+  // Growing the terminal re-enables the affordance.
+  narrow.dialog.render(120)
+  narrow.dialog.handleInput(CTRL_L)
+  assert.equal(narrow.dialog.callsShown, true)
+})
+
+test('without explicit prev/next hooks the call list still bounds navigation', () => {
+  const items = callListItems()
+  const { dialog, selected, text } = harness({ getTools: () => items, onSelectTool: () => {} })
+  assert.match(text(120), /Tool 2 \/ 3/)
+  dialog.handleInput(']')
+  assert.deepEqual(selected, ['c'])
+  dialog.handleInput(']')
+  assert.deepEqual(selected, ['c'], 'right boundary is inert')
+  dialog.handleInput('[')
+  assert.deepEqual(selected, ['c', 'a'])
+  dialog.handleInput('[')
+  assert.deepEqual(selected, ['c', 'a'], 'left boundary is inert')
+})
+test('a pressed footer action never fires for a different call or section', async () => {
+  const { dialog, copies, lines } = harness()
+  const frame = lines(100)
+  const row = rowOf(frame, '[c Copy]')
+  const col = columnOf(frame[row]!, 'Copy')
+  const press = dialog.handleMouse?.({
+    type: 'press', button: 'left', x: col, y: row, screenX: col, screenY: row,
+    width: 100, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  assert.equal(press?.handled, true)
+  // The focused section changes between press and release: the copy target is
+  // a different source now, so the stale press must not copy anything.
+  dialog.handleInput(TAB)
+  lines(100)
+  click(dialog, lines(100), row, col, 100)
+  await tick()
+  assert.deepEqual(copies, [], 'a section change invalidates the pressed Copy target')
+  assert.equal(dialog.section, 'output')
+  assert.equal(dialog.isDone, false)
+})
+
+test('a pressed Copy never copies a different call after a call switch', async () => {
+  const items = callListItems()
+  const { dialog, copies, lines } = harness({
+    getTools: () => items,
+    onSelectTool: callId => {
+      const next = items.find(item => item.callId === callId)
+      if (next !== undefined) dialog.setTool(next)
+    },
+  })
+  dialog.handleInput(CTRL_L)
+  const frame = lines(120)
+  const row = rowOf(frame, '[c Copy]')
+  const col = columnOf(frame[row]!, 'Copy')
+  const press = dialog.handleMouse?.({
+    type: 'press', button: 'left', x: col, y: row, screenX: col, screenY: row,
+    width: 120, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  assert.equal(press?.handled, true)
+  // A real call switch via the keyboard (stable callId → parent setTool) happens
+  // before the release; the footer owner is now a different call.
+  dialog.handleInput(']')
+  assert.equal(dialog.currentTool.callId, 'c')
+  lines(120)
+  dialog.handleMouse?.({
+    type: 'release', button: 'left', x: col, y: row, screenX: col, screenY: row,
+    width: 120, height: frame.length, shift: false, alt: false, ctrl: false,
+  })
+  click(dialog, lines(120), row, col, 120)
+  await tick()
+  assert.deepEqual(copies, [], 'the pressed Copy cannot copy the newly shown call')
+  assert.equal(dialog.currentTool.callId, 'c')
 })

@@ -108,7 +108,7 @@ async function fixture(screen: 'inline' | 'fullscreen', history = false) {
 
 const screenLines = (terminal: VirtualTerminal): string[] => terminal.screen().split('\n')
 const headerRow = (terminal: VirtualTerminal): number => screenLines(terminal).findIndex(line => line.includes('● Agents'))
-const agentsOverlayVisible = (terminal: VirtualTerminal): boolean => screenLines(terminal).some(line => /(?<!● )Agents ·/.test(line))
+const agentsOverlayVisible = (terminal: VirtualTerminal): boolean => screenLines(terminal).some(line => /┌─ Agents[─ ]/.test(line))
 const agentRow = (terminal: VirtualTerminal, label: string): number => {
   const lines = screenLines(terminal)
   const header = headerRow(terminal)
@@ -398,6 +398,10 @@ test('a native decision blocks underlying progress mouse actions until it closes
   const f = await fixture('fullscreen')
   try {
     f.backend.catalog([child('Decision-blocked child', { lastActivity: 'waiting on a native decision' })])
+    await paint(f.terminal)
+    const row = agentRow(f.terminal, 'Decision-blocked child')
+    assert.ok(row > headerRow(f.terminal))
+    const column = screenLines(f.terminal)[row]!.indexOf('Decision-blocked child') + 2
     f.backend.emit({
       type: 'decision', sessionId: f.backend.info.sessionId,
       request: {
@@ -407,9 +411,8 @@ test('a native decision blocks underlying progress mouse actions until it closes
     })
     await until(() => f.app.pendingDecisionCount === 1, 'the native decision owns focus')
     await paint(f.terminal)
-    const row = agentRow(f.terminal, 'Decision-blocked child')
-    assert.ok(row > headerRow(f.terminal))
-    await click(f.terminal, screenLines(f.terminal)[row]!.indexOf('Decision-blocked child') + 2, row)
+    // The floating modal can occlude the widget; use its last real cell point.
+    await click(f.terminal, column, row)
     assert.equal(f.backend.calls.some(call => call.name.startsWith('subagent')), false, 'progress never steals an approval')
     assert.equal(f.app.pendingDecisionCount, 1)
     f.backend.emit({ type: 'decision_closed', sessionId: f.backend.info.sessionId, id: 'progress-decision' })

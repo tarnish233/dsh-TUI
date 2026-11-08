@@ -1,8 +1,10 @@
 import { strict as assert } from 'node:assert'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, mkdir, rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '#pi-tui'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
@@ -11,9 +13,10 @@ import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harn
 const input = await loadInputModule()
 const { SessionPickerDialog } = await import('../src/ui/session-picker.ts')
 
-// Fixtures list sessions exactly as DSH's `sessions` listing does: newest first
-// (sessionQuery `compareSessions`). The picker never re-sorts the listing, so
-// every fixture below is written in that native order on purpose.
+// Fixtures list sessions exactly as the `sessions` DTO listing arrives: already
+// ordered by DSH/its bridge (newest first), which the picker consumes verbatim.
+// Nothing below may be re-sorted locally, so every fixture is written in that
+// native order on purpose.
 
 type CcKeymap = InstanceType<typeof input.CcKeymap>
 type Picker = InstanceType<typeof SessionPickerDialog>
@@ -30,7 +33,7 @@ const DIRECTORY = '/work/alpha'
 const OTHER = '/work/beta'
 
 const KEY = {
-  tab: '\t',
+  tab: '\t', // now inert: the scope toggle is the registry action on Ctrl+A
   up: '\x1b[A',
   down: '\x1b[B',
   pageUp: '\x1b[5~',
@@ -42,6 +45,8 @@ const KEY = {
   ctrlP: '\x10',
   ctrlN: '\x0e',
   backspace: '\x7f',
+  ctrlA: '\x01',
+  ctrlF: '\x06',
 }
 
 function fakeTui(rows = 30, columns = 80) {
@@ -94,10 +99,18 @@ function text(picker: Picker, width = 80): string {
   return stripTerminalSequences(picker.render(width).join('\n'))
 }
 
-/** The one line carrying the selection cursor. */
+/** The one row carrying the selection cursor (frame borders stripped). */
 function selectedLine(picker: Picker, width = 80): string {
-  const line = picker.render(width).map(stripTerminalSequences).find(candidate => candidate.trimStart().startsWith('❯'))
+  const line = picker.render(width).map(stripTerminalSequences).find(candidate => candidate.includes('❯'))
   return line ?? ''
+}
+
+/** Plain rendered text of the frame body rows (no borders, no chrome). */
+function bodyText(picker: Picker, width = 80): string {
+  return text(picker, width)
+    .split('\n')
+    .map(line => line.replace(/^│\s?/, '').replace(/\s*│$/, ''))
+    .join('\n')
 }
 
 function assertWidths(picker: Picker, width: number): void {
@@ -105,11 +118,23 @@ function assertWidths(picker: Picker, width: number): void {
     assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
     const plain = stripTerminalSequences(line)
     assert.ok(!plain.includes('\x1b'), `dangling escape at width ${width}: ${JSON.stringify(line)}`)
-    assert.ok(!/\[[0-9;?]*[a-zA-Z]/.test(plain), `truncated sequence at width ${width}: ${JSON.stringify(line)}`)
+    // A truncation must never cut a CSI sequence in half (bracketed chips such
+    // as `[c…]` are plain text, not escape state).
+    assert.ok(!/\u001b\[[0-9;?]*$/.test(line), `truncated sequence at width ${width}: ${JSON.stringify(line)}`)
   }
 }
 
 const minutes = (value: number): number => value * 60_000
+
+/** Assert these labels are painted in the given top-to-bottom order. */
+function assertOrder(rendered: string, labels: readonly string[]): void {
+  let at = -1
+  for (const label of labels) {
+    const next = rendered.indexOf(label, at + 1)
+    assert.ok(next > at, `${label} must be painted after the previous row:\n${rendered}`)
+    at = next
+  }
+}
 
 test('initial render shows the title, scope indicator, search row, rows and footer', () => {
   const now = Date.now()
@@ -121,20 +146,24 @@ test('initial render shows the title, scope indicator, search row, rows and foot
   })
   assert.equal(p.picker.capturesViewportInput, true)
   const rendered = text(p.picker)
-  assert.match(rendered, /Resume session \(Current Folder\)/)
-  assert.match(rendered, /Current Folder \| All/)
+  assert.match(rendered, /Resume session/, 'the frame title names the surface, not the scope')
+  assert.match(rendered, /Current Folder \| All/, 'the scope segment states the active scope')
   assert.match(rendered, /Search/)
   assert.match(rendered, /1\. Alpha session/)
   assert.match(rendered, /2\. Beta session/)
   assert.match(rendered, /5m ago/)
   assert.match(rendered, /3h ago/)
-  assert.match(rendered, /Tab folder\/all · Enter select · Esc cancel · type to search/)
-  // Pi's order: header, search field, blank line, rows.
+  // Real registry bindings, never a hardcoded Tab or prose key.
+  assert.match(rendered, /\[ctrl\+a All folders\]/)
+  assert.match(rendered, /\[enter Resume\]/)
+  assert.match(rendered, /\[escape Cancel\]/)
+  // Frame order: top border, scope segment, search field, rows.
   const lines = p.picker.render(80).map(stripTerminalSequences)
-  assert.match(lines[0] ?? '', /Resume session \(Current Folder\)/)
-  assert.match(lines[1] ?? '', /Search/)
-  assert.equal(lines[2], '')
-  assert.match(lines[3] ?? '', /Alpha session/)
+  assert.match(lines[0] ?? '', /^┌─ Resume session/)
+  assert.match(lines[1] ?? '', /Current Folder \| All/)
+  assert.match(lines[2] ?? '', /Search/)
+  assert.ok(lines.some(line => /Alpha session/.test(line)), 'the first row is painted inside the body')
+  assert.ok(lines.indexOf(lines.find(line => /Alpha session/.test(line)) ?? '') > 3, 'rows follow the chrome rule')
   for (const width of [4, 10, 24, 40, 80, 120]) assertWidths(p.picker, width)
 })
 
@@ -160,10 +189,11 @@ test('directory scope keeps only this folder; Tab switches to all with shortened
   assert.doesNotMatch(local, /Directoryless session/, 'empty recorded cwd never matches')
   assert.doesNotMatch(local, /\.\./, 'the all-scope cwd column is absent in folder scope')
 
-  p.picker.handleInput(KEY.tab)
+  p.picker.handleInput(KEY.ctrlA)
   const all = text(p.picker)
-  assert.match(all, /Resume session \(All\)/)
+  assert.match(all, /Resume session/)
   assert.match(all, /Current Folder \| All/)
+  assert.match(all, /all folders/)
   assert.match(all, /Elsewhere session/)
   assert.match(all, /~\/work\/foo/, 'the cwd column is home-shortened')
 })
@@ -181,7 +211,7 @@ test('a home prefix longer than the display budget is shortened before the live-
     const cwd = `${homedir()}/work/repo`
     const item = { id: 'opaque-live-session', title: 'Live long-home session', cwd, createdAt: Date.now(), live: true }
     const p = makePicker({ items: [item] })
-    p.picker.handleInput(KEY.tab)
+    p.picker.handleInput(KEY.ctrlA)
     const row = selectedLine(p.picker, 120)
     assert.match(row, /just now · open elsewhere/)
     assert.match(row, /~\/work\/repo/, 'the complete relative suffix stays visible')
@@ -216,6 +246,135 @@ test('the native listing order is displayed as given, unknown stamps included', 
   assert.match(rendered, /1\. Newest session/)
   assert.match(rendered, /4\. Zero stamp session/)
   assert.match(rendered, /unknown time/, 'an absent or zero stamp still displays honestly')
+})
+
+// --- ordering policy: DSH owns the order, the picker never re-derives it ------
+// DSH owns durable sessions. A TUI-local `stat` of a session artifact's mtime, a
+// locally sorted copy of the listing or a newest-session auto-selection would be
+// a second durability truth, so all three stay absent. These tests pin that the
+// *listing* order — not the display stamp, not relevance, not recency
+// heuristics — decides where a row is painted.
+
+test('the listing order wins over the display stamp: no recency re-sort, no auto-selection', () => {
+  const now = Date.now()
+  // Deliberately adversarial: the stamps ASCEND while the listing descends, so
+  // any local sort by the age column (or by a stat-derived mtime) would flip
+  // the rows and change the default selection.
+  const p = makePicker({
+    items: [
+      { id: 'listed-first', title: 'Listed first session', cwd: DIRECTORY, createdAt: now - 5 * 24 * 60 * minutes(1) },
+      { id: 'listed-second', title: 'Listed second session', cwd: DIRECTORY, createdAt: now - 90 * minutes(1) },
+      { id: 'listed-third', title: 'Listed third session', cwd: DIRECTORY, createdAt: now },
+    ],
+  })
+  const rendered = text(p.picker)
+  assertOrder(rendered, ['Listed first session', 'Listed second session', 'Listed third session'])
+  assert.match(rendered, /1\. Listed first session/, 'numbering follows the listing, not the stamp')
+  assert.match(rendered, /3\. Listed third session/)
+  // The stamp is still painted honestly — it just never orders anything.
+  assert.match(rendered, /5d ago/)
+  assert.match(rendered, /just now/)
+  // No newest-session auto-selection: the first row the caller listed is the
+  // one Enter resumes, even though it carries the oldest stamp.
+  assert.match(selectedLine(p.picker), /Listed first session/, 'the first listed row starts selected')
+  p.picker.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['listed-first'], 'Enter resumes the listed-first session, never a newest guess')
+
+  // The same listing arriving through the two-phase header path keeps its order.
+  const late = makePicker({ loading: true })
+  late.picker.setSessions([
+    { id: 'header-a', title: 'Header A session', cwd: DIRECTORY, createdAt: now - 9 * 24 * 60 * minutes(1) },
+    { id: 'header-b', title: 'Header B session', cwd: DIRECTORY, createdAt: now },
+  ])
+  const lateRendered = text(late.picker)
+  assertOrder(lateRendered, ['Header A session', 'Header B session'])
+  assert.match(selectedLine(late.picker), /Header A session/, 'late headers keep their listed order and first pick')
+  assert.deepEqual(late.visibleIds.at(-1), ['header-a', 'header-b'], 'the lazy-title window follows the listing order')
+})
+
+test('scope toggle and search only filter rows: the native order is restored exactly', () => {
+  const now = Date.now()
+  const natives = [
+    { id: 'n1', title: 'Alpha session one', cwd: DIRECTORY, createdAt: now },
+    { id: 'n2', title: 'Beta session two', cwd: OTHER, createdAt: now - minutes(1) },
+    { id: 'n3', title: 'Gamma session three', cwd: DIRECTORY, createdAt: now - minutes(2) },
+    { id: 'n4', title: 'Delta session four', cwd: OTHER, createdAt: now - minutes(3) },
+    { id: 'n5', title: 'Epsilon session five', cwd: DIRECTORY, createdAt: now - minutes(4) },
+  ]
+  const p = makePicker({ items: natives })
+
+  // Current folder: the native subsequence, in native relative order.
+  assertOrder(text(p.picker), ['Alpha session one', 'Gamma session three', 'Epsilon session five'])
+
+  // All folders: the complete listing, still in native order.
+  p.picker.handleInput(KEY.ctrlA)
+  const all = text(p.picker)
+  assertOrder(all, natives.map(item => item.title))
+  assert.match(all, /1\. Alpha session one/)
+  assert.match(all, /5\. Epsilon session five/)
+
+  // An active query may rank matches by relevance (that is the one allowed
+  // re-order) but it can never invent a row or drop a match.
+  for (const char of 'session') p.picker.handleInput(char)
+  const searched = text(p.picker)
+  for (const item of natives) assert.match(searched, new RegExp(item.title), 'search keeps every match')
+  assert.match(searched, /5 of 5 sessions/)
+  assert.doesNotMatch(searched, /No sessions/, 'no phantom empty state')
+
+  // Dropping the query restores the exact native order again.
+  for (let index = 0; index < 'session'.length; index += 1) p.picker.handleInput(KEY.backspace)
+  assertOrder(text(p.picker), natives.map(item => item.title))
+
+  // Narrowing back to the current folder restores the native subsequence, with
+  // the selection still pinned to the same session id.
+  p.picker.handleInput(KEY.escape)
+  p.picker.handleInput(KEY.ctrlA)
+  const narrowed = text(p.picker)
+  assertOrder(narrowed, ['Alpha session one', 'Gamma session three', 'Epsilon session five'])
+  assert.doesNotMatch(narrowed, /Beta session two/, 'the other folder is filtered out again')
+  assert.match(selectedLine(p.picker), /Alpha session one/, 'the selection follows the id across the toggle')
+
+  // A repeated native listing (identical order) is not re-sorted either.
+  p.picker.setSessions(natives)
+  p.picker.handleInput(KEY.ctrlA)
+  assertOrder(text(p.picker), natives.map(item => item.title))
+})
+
+test('streamed titles never re-order the rows they enrich', () => {
+  const now = Date.now()
+  const p = makePicker({
+    items: [
+      { id: 't1', cwd: DIRECTORY, createdAt: now },
+      { id: 't2', title: 'Zulu native', cwd: DIRECTORY, createdAt: now - minutes(1) },
+      { id: 't3', cwd: DIRECTORY, createdAt: now - minutes(2) },
+    ],
+  })
+  const before = text(p.picker)
+  assert.match(before, /1\. \(untitled\)/)
+  assertOrder(before, ['(untitled)', 'Zulu native'])
+
+  // A title that sorts "late" by text must stay where its session was listed.
+  p.picker.setTitles(new Map<string, string | null>([['t1', 'Aaa streamed'], ['t3', 'Mmm streamed']]))
+  const after = text(p.picker)
+  assertOrder(after, ['Aaa streamed', 'Zulu native', 'Mmm streamed'])
+  assert.match(after, /1\. Aaa streamed/, 'the enriched row keeps its listed number')
+  assert.match(after, /3\. Mmm streamed/)
+  assert.match(selectedLine(p.picker), /Aaa streamed/, 'the selection stays on the first listed session')
+  assert.deepEqual(p.visibleIds.at(-1), ['t1', 't2', 't3'], 'the title window follows the listing order')
+})
+
+test('the picker never reads a session artifact and never sorts the listing', () => {
+  // Source-level guard for the ordering policy: DSH owns durable sessions, so
+  // this module must not stat/read a session file (a TUI-owned mtime recency
+  // policy) and must not re-sort the incoming listing. Relevance ordering is
+  // Pi's `fuzzyFilter`, which is a query, not a durability policy.
+  const source = readFileSync(fileURLToPath(new URL('../src/ui/session-picker.ts', import.meta.url)), 'utf8')
+  assert.doesNotMatch(source, /from 'node:fs'|node:fs\/promises/, 'no filesystem access in the picker')
+  assert.doesNotMatch(source, /\bstat(Sync)?\(/, 'no artifact stat (mtime recency) in the picker')
+  assert.doesNotMatch(source, /\b(readFile|readFileSync|readdir|readdirSync|createReadStream)\s*\(/, 'no session-file reads')
+  assert.doesNotMatch(source, /\.mtime\b/, 'no mtime-derived ordering')
+  assert.doesNotMatch(source, /\.sort\s*\(/, 'the native listing order is never re-sorted')
+  assert.match(source, /fuzzyFilter/, 'relevance filtering goes through the shared Pi helper')
 })
 
 test('the age column covers just now, minutes, hours, days, dates and unknown', () => {
@@ -265,7 +424,7 @@ test('typing fuzzy-filters over title and cwd, Backspace restores the full list'
       { id: 'gamma', title: 'Gamma session', cwd: OTHER, createdAt: now - 2000 },
     ],
   })
-  p.picker.handleInput(KEY.tab) // all scope: every session is a candidate
+  p.picker.handleInput(KEY.ctrlA) // all scope: every session is a candidate
   for (const char of 'gamma') p.picker.handleInput(char)
   const filtered = text(p.picker)
   assert.match(filtered, /Gamma session/)
@@ -295,7 +454,7 @@ test('Enter selects the exact session id in both scopes', () => {
   assert.equal(local.cancelled, 0)
 
   const all = makePicker({ items })
-  all.picker.handleInput(KEY.tab)
+  all.picker.handleInput(KEY.ctrlA)
   all.picker.handleInput(KEY.down)
   all.picker.handleInput(KEY.enter)
   assert.deepEqual(all.selected, ['other'])
@@ -318,17 +477,26 @@ test('Enter with an active query selects the filtered row', () => {
   assert.deepEqual(p.selected, ['beta'])
 })
 
-test('Esc cancels the picker, including with an active query', () => {
+test('Esc cancels the picker in browse and leaves the search field first while typing', () => {
   const plain = makePicker({ items: [{ id: 'a', title: 'A session', cwd: DIRECTORY, createdAt: Date.now() }] })
   plain.picker.handleInput(KEY.escape)
-  assert.equal(plain.cancelled, 1)
+  assert.equal(plain.cancelled, 1, 'browse Esc closes the picker')
   assert.deepEqual(plain.selected, [])
 
   const searching = makePicker({ items: [{ id: 'a', title: 'A session', cwd: DIRECTORY, createdAt: Date.now() }] })
   searching.picker.handleInput('a')
   assert.equal(searching.cancelled, 0, 'typing does not cancel')
+  assert.match(text(searching.picker), /esc leaves search/)
+  assert.match(text(searching.picker), /Search a/)
+  // The field is the focused local layer: Esc leaves and clears it, and the
+  // native listing is untouched.
   searching.picker.handleInput(KEY.escape)
-  assert.equal(searching.cancelled, 1, 'Esc is a cancel even while searching')
+  assert.equal(searching.cancelled, 0, 'Esc in the field cancels the search layer, not the surface')
+  assert.doesNotMatch(text(searching.picker), /Search a/, 'the query is cleared')
+  assert.match(text(searching.picker), /A session/, 'every session is listed again')
+  // The next Esc (browse layer) closes it.
+  searching.picker.handleInput(KEY.escape)
+  assert.equal(searching.cancelled, 1)
 })
 
 test('digits quick-select only while the query is empty', () => {
@@ -353,7 +521,7 @@ test('digits quick-select only while the query is empty', () => {
   assert.match(text(typed.picker), /Search b1/)
 })
 
-test('navigation keys still move the filtered rows while searching', () => {
+test('browse keys navigate the list; the search field keeps readline semantics', () => {
   const now = Date.now()
   const p = makePicker({
     items: [
@@ -361,21 +529,35 @@ test('navigation keys still move the filtered rows while searching', () => {
       { id: 'beta', title: 'Beta session', cwd: DIRECTORY, createdAt: now - 1000 },
     ],
   })
-  for (const char of 'session') p.picker.handleInput(char)
-  assert.match(text(p.picker), /Alpha session/)
-  assert.match(text(p.picker), /Beta session/)
+  // Browse layer: the list actions move the selection.
   const start = selectedLine(p.picker)
   p.picker.handleInput(KEY.down)
-  const moved = selectedLine(p.picker)
-  assert.notEqual(moved, start, 'Down moves the selection while searching')
+  assert.notEqual(selectedLine(p.picker), start, 'browse Down moves the selection')
   p.picker.handleInput(KEY.ctrlP)
-  assert.equal(selectedLine(p.picker), start, 'Ctrl+P moves it back')
+  assert.equal(selectedLine(p.picker), start, 'browse Ctrl+P moves it back')
   p.picker.handleInput(KEY.end)
-  assert.match(selectedLine(p.picker), /2\./, 'End selects the last filtered row')
+  assert.match(selectedLine(p.picker), /2\./, 'browse End selects the last row')
   p.picker.handleInput(KEY.ctrlN)
-  assert.match(selectedLine(p.picker), /1\./, 'next wraps inside the filtered list')
+  assert.match(selectedLine(p.picker), /1\./, 'browse next wraps inside the list')
   p.picker.handleInput(KEY.pageDown)
-  assert.match(selectedLine(p.picker), /2\./, 'PageDown pages within the filtered list')
+  assert.match(selectedLine(p.picker), /2\./, 'browse PageDown pages the list')
+
+  // Search layer: the one CC field owns the keyboard. Down/Ctrl+P edit text
+  // instead of moving the list, and Ctrl+A is readline line-start (it must not
+  // toggle the scope); PageDown still pages the modal list.
+  for (const char of 'session') p.picker.handleInput(char)
+  const whileTyping = selectedLine(p.picker)
+  p.picker.handleInput(KEY.down)
+  assert.equal(selectedLine(p.picker), whileTyping, 'Down is editor input while the field owns text')
+  p.picker.handleInput(KEY.ctrlP)
+  assert.equal(selectedLine(p.picker), whileTyping, 'Ctrl+P is editor history input in the field')
+  assert.match(text(p.picker), /current folder/, 'Ctrl+A did not toggle the scope')
+  p.picker.handleInput(KEY.ctrlA)
+  assert.match(text(p.picker), /current folder/, 'Ctrl+A stays readline line-start in the field')
+  p.picker.handleInput(KEY.ctrlF)
+  assert.match(text(p.picker), /Search session/, 'Ctrl+F stays editor char-right, not modal.search')
+  p.picker.handleInput(KEY.pageDown)
+  assert.notEqual(selectedLine(p.picker), whileTyping, 'PageDown still pages the modal list')
   assert.deepEqual(p.selected, [])
 })
 
@@ -419,13 +601,13 @@ test('empty states are scope-aware and query-aware', () => {
   const elsewhere = makePicker({
     items: [{ id: 'other', title: 'Other session', cwd: OTHER, createdAt: Date.now() }],
   })
-  assert.match(text(elsewhere.picker), /No sessions in current folder\. Press Tab to view all\./)
-  elsewhere.picker.handleInput(KEY.tab)
+  assert.match(text(elsewhere.picker), /No sessions in current folder\. Switch scope to view all\./)
+  elsewhere.picker.handleInput(KEY.ctrlA)
   assert.match(text(elsewhere.picker), /Other session/)
 
   const empty = makePicker({ items: [] })
-  assert.match(text(empty.picker), /No sessions in current folder\. Press Tab to view all\./)
-  empty.picker.handleInput(KEY.tab)
+  assert.match(text(empty.picker), /No sessions in current folder\. Switch scope to view all\./)
+  empty.picker.handleInput(KEY.ctrlA)
   assert.match(text(empty.picker), /No sessions found/)
 
   const unmatched = makePicker({
@@ -448,7 +630,7 @@ test('narrow widths stay readable and never leak ANSI', () => {
       { id: 'short', title: 'Short', cwd: DIRECTORY, createdAt: now - 9 * 60 * minutes(1) },
     ],
   })
-  p.picker.handleInput(KEY.tab)
+  p.picker.handleInput(KEY.ctrlA)
   for (const width of [4, 6, 10, 20, 40, 80, 120]) assertWidths(p.picker, width)
   const at40 = p.picker.render(40).map(stripTerminalSequences).join('\n')
   assert.match(at40, /A very long session title that.*…/, 'the title truncates with an ellipsis')
@@ -459,16 +641,18 @@ test('narrow widths stay readable and never leak ANSI', () => {
   assert.ok(at4.some(line => line.length > 0), 'extreme widths still render something usable')
 })
 
-test('focus is propagated to the query field', () => {
+test('the query field takes the caret only in the search layer', () => {
   const p = makePicker({ items: [{ id: 'a', title: 'A session', cwd: DIRECTORY, createdAt: Date.now() }] })
   assert.equal(p.picker.focused, false)
   assert.ok(!p.picker.render(60).join('\n').includes(CURSOR_MARKER), 'no caret while unfocused')
   p.picker.focused = true
   assert.equal(p.picker.focused, true)
-  const searchRow = p.picker.render(60)[1] ?? ''
-  assert.ok(searchRow.includes(CURSOR_MARKER), 'the query field shows the caret when focused')
+  // Browse layer: focus is the surface's, not the text field's.
+  assert.ok(!p.picker.render(60).join('\n').includes(CURSOR_MARKER), 'browse mode paints no caret')
+  p.picker.handleInput('a')
+  assert.ok(p.picker.render(60).join('\n').includes(CURSOR_MARKER), 'the field shows the caret once it owns typing')
   p.picker.focused = false
-  assert.ok(!p.picker.render(60).join('\n').includes(CURSOR_MARKER))
+  assert.ok(!p.picker.render(60).join('\n').includes(CURSOR_MARKER), 'losing focus hides the caret')
 })
 
 test('invalidate is safe and row windowing reports hidden rows', () => {
@@ -479,17 +663,17 @@ test('invalidate is safe and row windowing reports hidden rows', () => {
     cwd: DIRECTORY,
     createdAt: now - index * 1000,
   }))
-  const p = makePicker({ items, rows: 18 }) // rowBudget = max(4, 18 - 14) = 4
+  const p = makePicker({ items, rows: 18 })
   p.picker.invalidate()
   p.picker.invalidate()
   const rendered = text(p.picker)
-  assert.match(rendered, /\(1\/8\)/, 'hidden rows are reported')
+  assert.match(rendered, /1\/8/, 'hidden rows are reported honestly')
   assert.match(rendered, /Session 0/)
-  assert.doesNotMatch(rendered, /Session 7/)
+  assert.doesNotMatch(rendered, /Session 7/, 'rows outside the measured body are not painted')
   p.picker.handleInput(KEY.end)
   const after = text(p.picker)
   assert.match(after, /Session 7/, 'list.last scrolls the window to the selection')
-  assert.match(after, /\(8\/8\)/)
+  assert.match(after, /8\/8/, 'the status line follows the selection')
   for (const width of [4, 40]) assertWidths(p.picker, width)
 })
 test('runs against a real VirtualTerminal-backed TUI', async () => {
@@ -507,10 +691,10 @@ test('runs against a real VirtualTerminal-backed TUI', async () => {
     onCancel: () => { picked.push('cancel') },
   })
   picker.focused = true
-  assert.match(text(picker), /Resume session \(Current Folder\)/)
+  assert.match(text(picker), /Resume session/)
   assert.match(text(picker), /Alpha session/)
   assert.doesNotMatch(text(picker), /Beta session/)
-  picker.handleInput(KEY.tab)
+  picker.handleInput(KEY.ctrlA)
   assert.match(text(picker), /Beta session/)
   picker.handleInput(KEY.down)
   picker.handleInput(KEY.enter)
@@ -523,21 +707,23 @@ test('runs against a real VirtualTerminal-backed TUI', async () => {
 test('phase-1 loading renders immediately and stays dismissable', () => {
   const p = makePicker({ loading: true })
   const rendered = text(p.picker)
-  assert.match(rendered, /Resume session \(Current Folder\)/)
+  assert.match(rendered, /Resume session/)
   assert.match(rendered, /Current Folder \| All/)
   assert.match(rendered, /Search/)
   assert.match(rendered, /Loading sessions…/)
-  assert.match(rendered, /Tab folder\/all · Enter select · Esc cancel · type to search/)
-  assert.deepEqual(p.visibleIds, [], 'nothing is listed yet, so no title fetch is requested')
+  assert.match(rendered, /\[ctrl\+a All folders\]/)
+  assert.match(rendered, /\[enter Resume\]/)
+  assert.match(rendered, /\[escape Cancel\]/)
+  assert.ok(p.visibleIds.every(ids => ids.length === 0), 'nothing is listed yet, so no title fetch is requested')
   for (const width of [4, 8, 12, 40, 80, 120]) assertWidths(p.picker, width)
-  assert.match(text(p.picker, 12), /Loading/, 'the loading row truncates like every other line')
+  assert.match(text(p.picker, 12), /Load/, 'the loading row truncates like every other line')
   p.picker.handleInput(KEY.escape)
   assert.equal(p.cancelled, 1, 'Esc cancels during loading')
 
   // Scope, navigation and interrupt keep working with no rows at all.
   const other = makePicker({ loading: true })
-  other.picker.handleInput(KEY.tab)
-  assert.match(text(other.picker), /Resume session \(All\)/)
+  other.picker.handleInput(KEY.ctrlA)
+  assert.match(text(other.picker), /all folders/)
   assert.match(text(other.picker), /Loading sessions…/)
   other.picker.handleInput(KEY.enter)
   other.picker.handleInput(KEY.down)
@@ -550,8 +736,8 @@ test('phase-1 loading renders immediately and stays dismissable', () => {
   const ended = makePicker({ loading: true })
   ended.picker.setLoading(false)
   assert.doesNotMatch(text(ended.picker), /Loading sessions/)
-  assert.match(text(ended.picker), /No sessions in current folder\. Press Tab to view all\./)
-  ended.picker.handleInput(KEY.tab)
+  assert.match(text(ended.picker), /No sessions in current folder\. Switch scope to view all\./)
+  ended.picker.handleInput(KEY.ctrlA)
   assert.match(text(ended.picker), /No sessions found/)
 })
 
@@ -590,7 +776,7 @@ test('setSessions replaces the listing, ends loading and follows the selection b
   const emptyHeaders = makePicker({ loading: true })
   emptyHeaders.picker.setSessions([])
   assert.doesNotMatch(text(emptyHeaders.picker), /Loading sessions/)
-  assert.match(text(emptyHeaders.picker), /No sessions in current folder\. Press Tab to view all\./)
+  assert.match(text(emptyHeaders.picker), /No sessions in current folder\. Switch scope to view all\./)
 })
 
 test('streamed titles fill rows and the fuzzy search', () => {
@@ -654,14 +840,16 @@ test('onVisibleIds follows the row window and never repeats a consecutive set', 
   p.picker.handleInput(KEY.down)
   assert.equal(p.visibleIds.length, 1, 'unchanged windows are not re-reported')
 
-  p.picker.handleInput(KEY.tab)
+  p.picker.handleInput(KEY.ctrlA)
   assert.deepEqual(p.visibleIds.at(-1), ['a', 'b', 'c'], 'a scope toggle reports the widened window')
 
   for (const char of 'gamma') p.picker.handleInput(char)
   assert.deepEqual(p.visibleIds.at(-1), ['c'], 'a query edit reports the filtered window')
   for (let index = 0; index < 5; index += 1) p.picker.handleInput(KEY.backspace)
   assert.deepEqual(p.visibleIds.at(-1), ['a', 'b', 'c'])
-  p.picker.handleInput(KEY.tab)
+  // Ctrl+A in the field is readline line-start: leave the search layer first.
+  p.picker.handleInput(KEY.escape)
+  p.picker.handleInput(KEY.ctrlA)
   assert.deepEqual(p.visibleIds.at(-1), ['a', 'b'], 'toggling back narrows the window again')
 
   // A streamed title that makes another row match the active query re-reports.
@@ -684,17 +872,28 @@ test('onVisibleIds follows the row window and never repeats a consecutive set', 
     cwd: DIRECTORY,
     createdAt: now - index * 1000,
   }))
-  const windowed = makePicker({ items: tall, rows: 18 }) // rowBudget = max(4, 18 - 14) = 4
-  assert.deepEqual(windowed.visibleIds, [['s0', 's1', 's2', 's3']])
+  const windowed = makePicker({ items: tall, rows: 18 })
+  // Construction reports the pessimistic default window; the first measured
+  // frame replaces it with what the frame body can actually paint. No legacy
+  // `rows - 14` line count is claimed here.
+  windowed.picker.render(80)
+  const firstWindow = windowed.visibleIds.at(-1) ?? []
+  assert.ok(firstWindow.length > 0 && firstWindow.length < tall.length, 'shorter than the catalog')
+  assert.deepEqual(firstWindow, Array.from({ length: firstWindow.length }, (_, index) => `s${index}`))
+  const reports = windowed.visibleIds.length
+  windowed.picker.render(80)
+  assert.equal(windowed.visibleIds.length, reports, 'an unchanged window is never re-reported')
   windowed.picker.handleInput(KEY.end)
-  assert.deepEqual(windowed.visibleIds.at(-1), ['s4', 's5', 's6', 's7'], 'a window shift is reported')
-  assert.equal(windowed.visibleIds.length, 2)
+  const lastWindow = windowed.visibleIds.at(-1) ?? []
+  assert.equal(lastWindow.at(-1), 's7', 'a window shift is reported with the last row')
+  assert.notDeepEqual(lastWindow, firstWindow)
+  assert.equal(windowed.visibleIds.length, reports + 1, 'exactly one report for the shift')
   // The reported ids are exactly the rows the renderer paints.
   const painted = windowed.picker.render(80)
     .map(stripTerminalSequences)
     .map(line => /Session (\d+)/.exec(line)?.[1])
     .filter((value): value is string => value !== undefined)
-  assert.deepEqual(painted.map(value => `s${value}`), windowed.visibleIds.at(-1))
+  assert.deepEqual(painted.map(value => `s${value}`).sort(), [...(windowed.visibleIds.at(-1) ?? [])].sort())
 })
 
 test('setSessions is safe to repeat and respects an active query', () => {
@@ -724,4 +923,124 @@ test('setSessions is safe to repeat and respects an active query', () => {
   assert.match(text(p.picker), /No sessions matching 'beta'/)
   p.picker.setSessions(items)
   assert.match(text(p.picker), /Beta session/, 'the query still applies after an empty listing')
+})
+
+// ---------------------------------------------------------------------------
+// Field layering, mouse identity and frame closure
+
+test('Ctrl+A and Ctrl+F keep their readline meaning whenever the field owns text', () => {
+  const now = Date.now()
+  const p = makePicker({
+    items: [
+      { id: 'alpha', title: 'Alpha session', cwd: DIRECTORY, createdAt: now },
+      { id: 'beta', title: 'Beta session', cwd: OTHER, createdAt: now - 1000 },
+    ],
+  })
+  p.picker.focused = true
+  p.picker.handleInput('alpha')
+  // Caret is at the end of the query: Ctrl+A moves to line start, Ctrl+F moves
+  // right again. Neither toggles the scope nor opens modal.search.
+  p.picker.handleInput(KEY.ctrlA)
+  p.picker.handleInput('>')
+  assert.match(text(p.picker), /Search >alpha/, 'Ctrl+A put the caret at line start')
+  assert.match(text(p.picker), /current folder/, 'Ctrl+A never toggled the scope in the field')
+  p.picker.handleInput(KEY.ctrlF)
+  p.picker.handleInput('<')
+  assert.match(text(p.picker), /Search >a<lpha/, 'Ctrl+F moved the caret right in the field')
+
+  // Browse layer keeps the registry meanings.
+  p.picker.handleInput(KEY.escape) // leave the search
+  p.picker.handleInput(KEY.ctrlF) // modal.search -> the field
+  assert.ok(p.picker.render(80).join('\n').includes(CURSOR_MARKER), 'modal.search focuses the field in browse')
+  p.picker.handleInput(KEY.escape)
+  p.picker.handleInput(KEY.ctrlA) // session.scope.toggle in browse
+  assert.match(text(p.picker), /all folders/)
+})
+
+test('session scope toggle is only bound in browse: remap and disable are respected', () => {
+  const now = Date.now()
+  const items: Item[] = [
+    { id: 'a', title: 'Alpha', cwd: DIRECTORY, createdAt: now },
+    { id: 'b', title: 'Beta', cwd: OTHER, createdAt: now - 1000 },
+  ]
+  const remapped = makePicker({ items, keymap: keymap({ 'session.scope.toggle': 'alt+t' }) })
+  remapped.picker.handleInput(KEY.ctrlA)
+  assert.match(text(remapped.picker), /current folder/, 'the old Ctrl+A default was removed')
+  remapped.picker.handleInput('\x1bt')
+  assert.match(text(remapped.picker), /all folders/)
+  assert.match(text(remapped.picker), /\[alt\+t All folders\]|\[alt\+t Current folder\]/)
+
+  // Tab is no longer the scope key: it must be inert (no scope change, no close).
+  const tab = makePicker({ items })
+  tab.picker.handleInput(KEY.tab)
+  assert.match(text(tab.picker), /current folder/)
+  assert.equal(tab.cancelled, 0, 'Tab neither toggles the scope nor closes the picker')
+
+  const disabled = makePicker({ items, keymap: keymap({ 'session.scope.toggle': null }) })
+  disabled.picker.handleInput(KEY.ctrlA)
+  assert.match(text(disabled.picker), /current folder/, 'a disabled scope action is inert')
+  assert.match(text(disabled.picker), /\[All folders\]/, 'the capability stays clickable')
+  assert.doesNotMatch(text(disabled.picker), /ctrl\+a All folders/, 'no fake binding is advertised')
+})
+
+test('mouse: press+click on the same session resumes it; a stale or unpaired click cannot', () => {
+  const now = Date.now()
+  const p = makePicker({
+    items: [
+      { id: 'alpha', title: 'Alpha session', cwd: DIRECTORY, createdAt: now },
+      { id: 'beta', title: 'Beta session', cwd: DIRECTORY, createdAt: now - 1000 },
+    ],
+  })
+  const lines = p.picker.render(80)
+  const betaRow = lines.findIndex(line => stripTerminalSequences(line).includes('Beta session'))
+  assert.ok(betaRow > 0)
+  const click = (y: number) => ({
+    type: 'click' as const, button: 'left' as const, x: 8, y, screenX: 8, screenY: y,
+    width: 80, height: lines.length, shift: false, alt: false, ctrl: false, clickCount: 1,
+  })
+  const press = (y: number) => p.picker.handleMouse({
+    type: 'press', button: 'left', x: 8, y, screenX: 8, screenY: y,
+    width: 80, height: lines.length, shift: false, alt: false, ctrl: false,
+  })
+
+  // A click with no press must not resume anything.
+  assert.equal(p.picker.handleMouse(click(betaRow))?.render, false)
+  assert.deepEqual(p.selected, [], 'an unpaired click never resumes a session')
+  // Press on Beta, then the query filters the list, then release: swallowed.
+  press(betaRow)
+  p.picker.handleInput('z')
+  p.picker.handleInput(KEY.backspace)
+  assert.deepEqual(p.selected, [], 'a stale press cannot resume a re-filtered row')
+  // Press + click on the same row resumes that exact opaque id.
+  press(betaRow)
+  p.picker.handleMouse(click(betaRow))
+  assert.deepEqual(p.selected, ['beta'])
+})
+
+test('frame closure and footer survive 40/60/80/120 columns and short heights', () => {
+  const now = Date.now()
+  const items: Item[] = Array.from({ length: 6 }, (_, index) => ({
+    id: `s${index}`,
+    title: `Session ${index} with a deliberately long title`,
+    cwd: DIRECTORY,
+    createdAt: now - index * 1000,
+  }))
+  for (const rows of [10, 18, 24, 40]) {
+    for (const width of [40, 60, 80, 120]) {
+      const picker = new SessionPickerDialog(fakeTui(rows, width), {
+        sessions: items,
+        directory: DIRECTORY,
+        keymap: keymap(),
+        onSelect: () => {},
+        onCancel: () => {},
+      })
+      const lines = picker.render(width)
+      for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}`)
+      const rendered = stripTerminalSequences(lines.join('\n'))
+      assert.match(rendered.split('\n')[0] ?? '', /^┌─ /, `top border at ${width}x${rows}`)
+      assert.match(rendered.split('\n').at(-1) ?? '', /^└─+┘$/, `bottom border at ${width}x${rows}`)
+      assert.match(rendered, /\[escape Cancel\]|\[Cancel\]/, `cancel stays discoverable at ${width}x${rows}`)
+      assert.ok(lines.length <= Math.min(rows - 2, Math.floor(rows * 0.9)))
+    }
+  }
 })

@@ -949,13 +949,22 @@ export class CcEditor extends Editor {
     }
   }
 
-  /** Modals with no editable draft behind them (tool/image details, Agents overlay). */
+  /**
+   * Modal surfaces with no editable draft behind them (tool/image details, the
+   * Agents overlay and the unified modal browse lists for Settings, keyboard
+   * shortcuts, generic modal lists and the queue). Their text field is the
+   * separate `modalSearch` context, which stays editable.
+   */
   private isReadOnlyContext(context: CcContext = this.actionContext): boolean {
     return (
       context === "toolDetails" ||
       context === "imageDetails" ||
       context === "subagentList" ||
-      context === "subagentSession"
+      context === "subagentSession" ||
+      context === "settingsList" ||
+      context === "keybindingsList" ||
+      context === "modalList" ||
+      context === "queueList"
     )
   }
 
@@ -1142,8 +1151,11 @@ export class CcEditor extends Editor {
         return
       case "autocomplete.accept":
         if (matchesKey(data, "enter")) {
-          // Slash-command completion submits; capture before the draft is cleared.
-          this.submitNow(() => this.ccAutocompleteAccept("confirm"))
+          // Apply the highlighted candidate on this same Editor state first,
+          // then capture the content-aware payload immediately before Pi clears
+          // the draft. Capturing before the apply would submit the typed
+          // prefix instead of the accepted slash/skill name.
+          this.ccAutocompleteAccept("confirm", () => this.submitNow(() => this.ccSubmit()))
           return
         }
         this.ccAutocompleteAccept("tab")

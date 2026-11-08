@@ -6,8 +6,13 @@ import { getNativePlatformHelper } from "./native-platform.ts";
 import {
 	formatProgramStatus,
 	isProgramStatusReply,
+	downgradeProgramStatus,
+	normalizeProgramStatusId,
+	parseProgramStatusSupport,
+	PROGRAM_STATUS_MAX_RECORDS,
 	PROGRAM_STATUS_QUERY,
 	type ProgramStatus,
+	type ProgramStatusCapabilities,
 } from "./program-status.ts";
 import { StdinBuffer } from "./stdin-buffer.ts";
 import { replaceControlCharacters } from "./utils.ts";
@@ -20,6 +25,16 @@ const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
 const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u`;
 const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
+const FOCUS_REPORTING_ENABLE = "\x1b[?1004h";
+const FOCUS_REPORTING_DISABLE = "\x1b[?1004l";
+/** Bounded wait for a fragmented or never-terminated OSC 7501 reply. */
+const PROGRAM_STATUS_REPLY_TIMEOUT_MS = 1000;
+const FOCUS_REPORT_GAINED = "\x1b[I";
+const FOCUS_REPORT_LOST = "\x1b[O";
+/** xterm window-title stack: push, pop. Ghostty parses and ignores both. */
+const TITLE_STACK_PUSH = "\x1b[22;0t";
+const TITLE_STACK_POP = "\x1b[23;0t";
+const MAX_TITLE_STACK_DEPTH = 8;
 
 export type KeyboardProtocolNegotiationSequence =
 	| { type: "kitty-flags"; flags: number }
@@ -133,10 +148,37 @@ export interface Terminal {
 	setProgress(active: boolean): void;
 
 	/**
-	 * Report what the program is doing (OSC 7501). Sent only to terminals that support it; the latest
-	 * status is re-sent when support is confirmed or the terminal restarts.
+	 * Report one complete OSC 7501 record (OSC 7501). Only written to terminals that support it;
+	 * the bounded record set is re-sent when support is confirmed or the terminal restarts.
 	 */
 	setProgramStatus(status: ProgramStatus): void;
+
+	/**
+	 * Whether the attached terminal answered the OSC 7501 support query (or `PI_PROGRAM_STATUS=1`).
+	 * Optional: a terminal implementation without this member is treated as unsupported.
+	 */
+	readonly programStatusSupported?: boolean;
+
+	/**
+	 * Observe OSC 7501 support transitions (negotiation, stop/restart). The listener is called with
+	 * the current value on subscribe, and returns an unsubscribe function.
+	 */
+	onProgramStatusSupportChange?(listener: (supported: boolean) => void): () => void;
+
+	/** Last focus report from the terminal; `undefined` until the terminal reports one. */
+	readonly terminalFocused?: boolean;
+
+	/** Observe terminal focus reports (`CSI I` / `CSI O`). Returns an unsubscribe function. */
+	onFocusChange?(listener: (focused: boolean) => void): () => void;
+
+	/** Request focus reporting (DECSET 1004) from the attached terminal. */
+	setFocusReporting?(enabled: boolean): void;
+
+	/** Push the window title onto the terminal's title stack. */
+	saveTitle?(): void;
+
+	/** Pop the window title from the terminal's title stack. */
+	restoreTitle?(): void;
 }
 
 /** Options for {@link ProcessTerminal}. */
@@ -189,12 +231,43 @@ export class ProcessTerminal implements Terminal {
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
-	/** Latest program status, kept across stop() so start() can report it again. */
-	private programStatus?: ProgramStatus;
+	/** Last requested legacy progress state, so a policy change can re-sync without a frame. */
+	private progressRequested = false;
+	/** Whether the legacy OSC 9;4 progress sequence is currently on. */
+	private progressActive = false;
+	/**
+	 * Host policy for the legacy OSC 9;4 fallback: `undefined` follows negotiation, `true` always
+	 * allows it, `false` never writes it. See `setProgressFallback`.
+	 */
+	private progressFallback?: boolean;
+	/**
+	 * Complete OSC 7501 record snapshots by record key (root = ""), kept across stop() so start()
+	 * can replay the currently valid records. Bounded by PROGRAM_STATUS_MAX_RECORDS, LRU eviction.
+	 */
+	private readonly programStatusRecords = new Map<string, ProgramStatus>();
+	/** Advertised state/kind subset from the terminal's support reply, when one arrived. */
+	private programStatusCapabilities?: ProgramStatusCapabilities;
 	/** Whether the terminal confirmed OSC 7501 support since the last start(), or `PI_PROGRAM_STATUS=1`. */
-	private programStatusSupported = false;
+	private programStatusSupportedValue = false;
+	/** A support reply with usable capabilities arrived; rich presentation owns progress. */
+	private programStatusNegotiated = false;
 	/** The support query was sent and its DA1 sentinel has not arrived yet. */
 	private programStatusQueryPending = false;
+	private readonly programStatusSupportListeners = new Set<(supported: boolean) => void>();
+	/** Last value delivered to support listeners, so transitions are notified exactly once. */
+	private notifiedProgramStatusSupported = false;
+	private readonly focusChangeListeners = new Set<(focused: boolean) => void>();
+	private _terminalFocused?: boolean;
+	private focusReportingRequested = false;
+	/** DECSET 1004 is currently owned by this terminal instance. */
+	private focusReportingActive = false;
+	private titleStackDepth = 0;
+	/**
+	 * Terminal ownership was handed back (stop() or the emergency exit path). Status, progress,
+	 * focus and title writes are refused until start() re-attaches, so a late event cannot write
+	 * escape sequences to a terminal this instance no longer owns.
+	 */
+	private released = false;
 	private readonly writeOutput: (data: string) => void;
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
@@ -232,6 +305,9 @@ export class ProcessTerminal implements Terminal {
 		if (this.stdinDataHandler) return;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
+		// Re-attached: status, progress, focus and title writes are allowed again.
+		this.released = false;
+		this._terminalFocused = undefined;
 
 		// Save previous state and enable raw mode
 		this.wasRaw = process.stdin.isRaw || false;
@@ -260,6 +336,9 @@ export class ProcessTerminal implements Terminal {
 		// Query Kitty keyboard protocol and fall back to modifyOtherKeys when DA confirms no Kitty response.
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.queryAndEnableKittyProtocol();
+
+		// The requested focus-reporting mode is re-armed on every attach; stop() hands it back.
+		this.syncFocusReporting();
 	}
 
 	/**
@@ -271,16 +350,36 @@ export class ProcessTerminal implements Terminal {
 	 * to handle the case where the response arrives split across multiple events.
 	 */
 	private setupStdinBuffer(): void {
-		this.stdinBuffer = new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() });
+		this.stdinBuffer = new StdinBuffer({
+			escapeTimeout: resolveEscapeTimeoutMs(),
+			// A fragmented program-status reply may be split inside its header, including a
+			// pause longer than the 50ms sequence timeout. Only the pending query window uses
+			// the longer bounded reply hold, so an ordinary Alt+] keeps its escape deadline.
+			expectedReplyPrefixes: () => (this.programStatusQueryPending ? [PROGRAM_STATUS_QUERY] : []),
+			expectedReplyTimeout: PROGRAM_STATUS_REPLY_TIMEOUT_MS,
+		});
 
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
+			// The generic sequence timeout may have delivered a partial CSI prefix
+			// into the existing negotiation buffer. Reassemble short focus reports
+			// there too, without a second reader or extending the lone-Escape delay.
+			const reassembledFocus = this.keyboardProtocolNegotiationBuffer + sequence;
+			if (reassembledFocus === FOCUS_REPORT_GAINED || reassembledFocus === FOCUS_REPORT_LOST) {
+				this.clearKeyboardProtocolNegotiationBuffer();
+				this.handleFocusReport(reassembledFocus === FOCUS_REPORT_GAINED);
+				return;
+			}
+			// Focus reports are terminal replies, never text: consume them before any key path so a
+			// leaked DECSET 1004 cannot type "I"/"O" into the editor. A stale CSI prefix must not
+			// flush into the editor after the report.
+			if (sequence === FOCUS_REPORT_GAINED || sequence === FOCUS_REPORT_LOST) {
+				this.clearKeyboardProtocolNegotiationBuffer();
+				this.handleFocusReport(sequence === FOCUS_REPORT_GAINED);
+				return;
+			}
 			if (isProgramStatusReply(sequence)) {
-				if (this.programStatusQueryPending) {
-					this.programStatusQueryPending = false;
-					this.programStatusSupported = true;
-					this.writeProgramStatus();
-				}
+				this.handleProgramStatusSupportReply(sequence);
 				return;
 			}
 			const negotiation = this.readKeyboardProtocolNegotiationSequence(sequence);
@@ -331,11 +430,14 @@ export class ProcessTerminal implements Terminal {
 		this.pendingKeyboardProtocolDeviceAttributes += 1;
 		this.clearKeyboardProtocolNegotiationBuffer();
 		const programStatusOverride = process.env.PI_PROGRAM_STATUS;
-		this.programStatusSupported = programStatusOverride === "1";
+		this.programStatusCapabilities = undefined;
+		this.programStatusNegotiated = false;
+		this.programStatusSupportedValue = programStatusOverride === "1";
 		this.programStatusQueryPending = programStatusOverride !== "1" && programStatusOverride !== "0";
 		const programStatusQuery = this.programStatusQueryPending ? PROGRAM_STATUS_QUERY : "";
 		this.writeOutput(`${KITTY_KEYBOARD_PROTOCOL_QUERY}${programStatusQuery}${DEVICE_ATTRIBUTES_QUERY}`);
-		this.writeProgramStatus();
+		this.maybeReplayProgramStatus();
+		this.notifyProgramStatusSupport();
 	}
 
 	private handleKeyboardProtocolNegotiationSequence(
@@ -508,30 +610,49 @@ export class ProcessTerminal implements Terminal {
 		// in that case would toggle protocol state (bracketed paste, keyboard protocol, progress)
 		// on a terminal this instance does not own, including after an earlier stop().
 		if (!this.stdinDataHandler) return;
-		if (this.clearProgressInterval()) {
+		// After restoreOnExit() the terminal has already been handed back: stop() must still
+		// detach handlers, timers and raw mode, but it must not write a single visible byte.
+		const outputAllowed = !this.released;
+		if (this.clearProgressInterval() && outputAllowed) {
 			this.writeOutput(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
-		// Remove the status while stopped, for example after exit or while suspended. start() reports it again.
-		if (this.programStatusSupported && this.programStatus) {
-			this.writeOutput(formatProgramStatus({ state: "clear" }));
-		}
-		this.programStatusSupported = false;
+		this.progressActive = false;
+		// Remove the whole record tree while stopped, for example after exit or while suspended.
+		// start() replays the records that are still current once support is confirmed again.
+		if (outputAllowed) this.clearProgramStatusOutput();
+		this.programStatusSupportedValue = false;
+		this.programStatusNegotiated = false;
+		this.programStatusCapabilities = undefined;
 		this.programStatusQueryPending = false;
+		// Hand back every mode this instance owns before giving up the terminal.
+		if (outputAllowed) {
+			this.disableFocusReporting();
+			this.popTitleStack();
+		} else {
+			this.focusReportingActive = false;
+			this.titleStackDepth = 0;
+		}
+		this._terminalFocused = undefined;
+		// Support listeners may request progress/status. Relinquish their write
+		// permission first so a re-entrant callback cannot restart a heartbeat.
+		this.released = true;
+		this.notifyProgramStatusSupport();
 
-		// Disable bracketed paste mode
-		this.writeOutput("\x1b[?2004l");
+		// Disable bracketed paste mode (the emergency path already emitted its own reset bytes)
+		if (outputAllowed) this.writeOutput("\x1b[?2004l");
 
 		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
 		this.clearKeyboardProtocolNegotiationBuffer();
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (shouldDisableKittyProtocol) {
-			this.writeOutput("\x1b[<u");
+			if (outputAllowed) this.writeOutput("\x1b[<u");
 			this.keyboardProtocolPushed = false;
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
-		this.disableModifyOtherKeys();
+		if (outputAllowed) this.disableModifyOtherKeys();
+		else this._modifyOtherKeysActive = false;
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {
@@ -563,7 +684,18 @@ export class ProcessTerminal implements Terminal {
 
 	restoreOnExit(before: string, after: string): void {
 		let sequence = before;
-		if (this.progressInterval) sequence += TERMINAL_PROGRESS_CLEAR_SEQUENCE;
+		// Stop the keepalive first: a running OSC 9;4 interval would otherwise keep writing into
+		// a terminal this instance no longer owns.
+		if (this.clearProgressInterval()) sequence += TERMINAL_PROGRESS_CLEAR_SEQUENCE;
+		if (this.programStatusSupportedValue && this.programStatusRecords.size > 0) {
+			sequence += formatProgramStatus({ state: "clear" }) ?? "";
+		}
+		if (this.focusReportingActive) sequence += FOCUS_REPORTING_DISABLE;
+		for (let i = 0; i < this.titleStackDepth; i++) sequence += TITLE_STACK_POP;
+		this.titleStackDepth = 0;
+		this.progressActive = false;
+		this.focusReportingActive = false;
+		this.released = true;
 		sequence += "\x1b[?2004l";
 		if (this.keyboardProtocolPushed || this._kittyProtocolActive) sequence += "\x1b[<u";
 		if (this._modifyOtherKeysActive) sequence += "\x1b[>4;0m";
@@ -629,36 +761,274 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setTitle(title: string): void {
+		if (this.released) return;
 		// OSC 0;title BEL - set terminal window title. A BEL or ESC in the title would end the sequence early and
 		// send the rest to the terminal as escape sequences (session names come from session files).
 		this.writeOutput(`\x1b]0;${replaceControlCharacters(title)}\x07`);
 	}
 
 	setProgramStatus(status: ProgramStatus): void {
-		this.programStatus = status.state === "clear" ? undefined : status;
-		if (this.programStatusSupported) this.writeOutput(formatProgramStatus(status));
+		const id = normalizeProgramStatusId(status.id);
+		// An invalid id drops the whole report: falling back to the root record would let a caller
+		// silently overwrite the program's own state.
+		if (id === null) return;
+
+		if (status.state === "clear") {
+			if (id === undefined) {
+				this.programStatusRecords.clear();
+			} else {
+				const descendantPrefix = `${id}/`;
+				for (const key of [...this.programStatusRecords.keys()]) {
+					if (key === id || key.startsWith(descendantPrefix)) this.programStatusRecords.delete(key);
+				}
+			}
+			if (!this.released && this.programStatusSupported) {
+				const sequence = formatProgramStatus(id === undefined ? { state: "clear" } : { state: "clear", id });
+				if (sequence !== undefined) this.writeOutput(sequence);
+			}
+			return;
+		}
+
+		// A complete snapshot replaces the addressed record; re-inserting keeps Map order as LRU.
+		const record: ProgramStatus = { ...status };
+		if (id === undefined) delete record.id;
+		else record.id = id;
+		const key = id ?? "";
+		this.programStatusRecords.delete(key);
+		this.programStatusRecords.set(key, record);
+		while (this.programStatusRecords.size > PROGRAM_STATUS_MAX_RECORDS) {
+			const oldest = this.programStatusRecords.keys().next().value;
+			if (oldest === undefined) break;
+			this.programStatusRecords.delete(oldest);
+		}
+		this.writeProgramStatusRecord(record);
 	}
 
-	private writeProgramStatus(): void {
-		if (this.programStatusSupported && this.programStatus) {
-			this.writeOutput(formatProgramStatus(this.programStatus));
+	get programStatusSupported(): boolean {
+		return this.programStatusSupportedValue;
+	}
+
+	onProgramStatusSupportChange(listener: (supported: boolean) => void): () => void {
+		this.programStatusSupportListeners.add(listener);
+		// Deliver the current value so a consumer never races the startup negotiation.
+		try {
+			listener(this.programStatusSupportedValue);
+		} catch {
+			// Host listener code must not break the input path.
+		}
+		return () => {
+			this.programStatusSupportListeners.delete(listener);
+		};
+	}
+
+	get terminalFocused(): boolean | undefined {
+		return this._terminalFocused;
+	}
+
+	onFocusChange(listener: (focused: boolean) => void): () => void {
+		this.focusChangeListeners.add(listener);
+		return () => {
+			this.focusChangeListeners.delete(listener);
+		};
+	}
+
+	setFocusReporting(enabled: boolean): void {
+		if (this.focusReportingRequested === enabled) return;
+		this.focusReportingRequested = enabled;
+		this.syncFocusReporting();
+	}
+
+	saveTitle(): void {
+		// Title-stack operations belong to an attached terminal only; Ghostty 1.4.0 parses and
+		// ignores both, so callers must keep an explicit title fallback.
+		if (!this.stdinDataHandler || this.released) return;
+		if (this.titleStackDepth >= MAX_TITLE_STACK_DEPTH) return;
+		this.writeOutput(TITLE_STACK_PUSH);
+		this.titleStackDepth += 1;
+	}
+
+	restoreTitle(): void {
+		if (!this.stdinDataHandler || this.released) return;
+		// Never pop a stack entry this instance did not push.
+		if (this.titleStackDepth === 0) return;
+		this.writeOutput(TITLE_STACK_POP);
+		this.titleStackDepth -= 1;
+	}
+
+	/**
+	 * Host policy for the legacy OSC 9;4 progress fallback.
+	 *
+	 * `enabled: true` keeps OSC 9;4 available even after a terminal negotiated OSC 7501
+	 * (for an emulator whose GUI still needs legacy progress). `enabled: false` suppresses it
+	 * unconditionally. Without a call the
+	 * fallback is automatic: allowed until a usable support reply is negotiated.
+	 */
+	setProgressFallback(enabled: boolean): void {
+		if (this.progressFallback === enabled) return;
+		this.progressFallback = enabled;
+		this.syncProgress();
+	}
+
+	private get legacyProgressAllowed(): boolean {
+		if (this.progressFallback !== undefined) return this.progressFallback;
+		return !this.programStatusNegotiated;
+	}
+
+	/** Write one complete record, shaped for the advertised capability subset. */
+	private writeProgramStatusRecord(record: ProgramStatus): void {
+		if (this.released || !this.programStatusSupportedValue) return;
+		const shaped = this.programStatusCapabilities
+			? downgradeProgramStatus(record, this.programStatusCapabilities)
+			: record;
+		if (!shaped) return;
+		const sequence = formatProgramStatus(shaped);
+		if (sequence !== undefined) this.writeOutput(sequence);
+	}
+
+	/** Replay the currently valid records into a terminal that just confirmed support. */
+	private maybeReplayProgramStatus(): void {
+		if (this.released || !this.programStatusSupportedValue) return;
+		for (const record of this.programStatusRecords.values()) this.writeProgramStatusRecord(record);
+	}
+
+	private handleProgramStatusSupportReply(sequence: string): void {
+		// DA1 ended the current query, or no query was issued. Never let a late,
+		// unsolicited or previous owner's reply enable reporting for this attach.
+		if (!this.programStatusQueryPending || this.released) return;
+		this.programStatusQueryPending = false;
+		const override = process.env.PI_PROGRAM_STATUS;
+		const capabilities = parseProgramStatusSupport(sequence);
+		if (override === "0") {
+			this.programStatusCapabilities = undefined;
+			this.setProgramStatusSupported(false);
+			return;
+		}
+		if (capabilities) {
+			this.programStatusCapabilities = capabilities;
+			this.programStatusNegotiated = true;
+			// Legacy progress must stop before the first rich record, so a terminal that maps
+			// OSC 9;4 onto the root record cannot wipe the report that follows.
+			this.suppressLegacyProgress();
+			this.setProgramStatusSupported(true);
+			return;
+		}
+		// A reply whose advertised states this build cannot use must not claim support.
+		if (override !== "1") {
+			this.programStatusCapabilities = undefined;
+			this.programStatusNegotiated = false;
+			this.setProgramStatusSupported(false);
 		}
 	}
 
+	private setProgramStatusSupported(next: boolean): void {
+		if (this.programStatusSupportedValue === next) {
+			this.notifyProgramStatusSupport();
+			return;
+		}
+		this.programStatusSupportedValue = next;
+		if (!next) this.programStatusNegotiated = false;
+		if (next) this.maybeReplayProgramStatus();
+		this.notifyProgramStatusSupport();
+	}
+
+	private notifyProgramStatusSupport(): void {
+		if (this.notifiedProgramStatusSupported === this.programStatusSupportedValue) return;
+		this.notifiedProgramStatusSupported = this.programStatusSupportedValue;
+		for (const listener of [...this.programStatusSupportListeners]) {
+			try {
+				listener(this.programStatusSupportedValue);
+			} catch {
+				// Host listener code must not break the input path.
+			}
+		}
+	}
+
+	private handleFocusReport(focused: boolean): void {
+		if (this._terminalFocused === focused) return;
+		this._terminalFocused = focused;
+		for (const listener of [...this.focusChangeListeners]) {
+			try {
+				listener(focused);
+			} catch {
+				// Host listener code must not break the input path.
+			}
+		}
+	}
+
+	private syncFocusReporting(): void {
+		if (!this.stdinDataHandler || this.released) return;
+		if (this.focusReportingRequested && !this.focusReportingActive) {
+			this.writeOutput(FOCUS_REPORTING_ENABLE);
+			this.focusReportingActive = true;
+		} else if (!this.focusReportingRequested && this.focusReportingActive) {
+			this.writeOutput(FOCUS_REPORTING_DISABLE);
+			this.focusReportingActive = false;
+		}
+	}
+
+	private disableFocusReporting(): void {
+		if (!this.focusReportingActive) return;
+		this.writeOutput(FOCUS_REPORTING_DISABLE);
+		this.focusReportingActive = false;
+	}
+
+	/** Pop every title-stack entry this instance pushed. */
+	private popTitleStack(): void {
+		while (this.titleStackDepth > 0) {
+			this.writeOutput(TITLE_STACK_POP);
+			this.titleStackDepth -= 1;
+		}
+	}
+
+	/** One clear for the whole record tree; the root clear removes descendants too. */
+	private clearProgramStatusOutput(): void {
+		if (!this.programStatusSupportedValue || this.programStatusRecords.size === 0) return;
+		const sequence = formatProgramStatus({ state: "clear" });
+		if (sequence !== undefined) this.writeOutput(sequence);
+	}
+
 	setProgress(active: boolean): void {
-		if (active) {
+		this.progressRequested = active;
+		this.syncProgress();
+	}
+
+	/**
+	 * Reconcile the legacy OSC 9;4 progress sequence with the current policy.
+	 *
+	 * Repeated frame-path calls are idempotent: nothing is written when the requested state did not
+	 * change, and the keepalive interval is bounded to one timer while active.
+	 */
+	private syncProgress(): void {
+		if (this.released) return;
+		if (!this.legacyProgressAllowed) {
+			this.suppressLegacyProgress();
+			return;
+		}
+		if (this.progressRequested === this.progressActive) return;
+		this.progressActive = this.progressRequested;
+		if (this.progressActive) {
 			// OSC 9;4;3 - indeterminate progress
 			this.writeOutput(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 			if (!this.progressInterval) {
 				this.progressInterval = setInterval(() => {
 					this.writeOutput(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 				}, TERMINAL_PROGRESS_KEEPALIVE_MS);
+				this.progressInterval.unref?.();
 			}
 		} else {
 			this.clearProgressInterval();
 			// OSC 9;4;0 - clear progress
 			this.writeOutput(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
+	}
+
+	/** Drop a running legacy progress report once rich status owns progress. */
+	private suppressLegacyProgress(): void {
+		if (this.released) return;
+		if (!this.progressActive && !this.progressInterval) return;
+		this.clearProgressInterval();
+		this.progressActive = false;
+		this.writeOutput(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 	}
 
 	private clearProgressInterval(): boolean {

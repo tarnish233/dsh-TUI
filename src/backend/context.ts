@@ -16,7 +16,6 @@
  * @module dsh-tui/backend/context
  */
 import { randomUUID } from 'node:crypto'
-import { stat } from 'node:fs/promises'
 import { imageAttachmentValue, isImageMediaType, sameImageAttachment, asImageAttachmentRef } from '../attachments.ts'
 import { backendError, backendErrorCodeOf, asBackendError, redactDiagnostic } from './errors.ts'
 import type { BackendError } from './errors.ts'
@@ -31,12 +30,15 @@ import type {
   DisplayContentPart,
   ImageAttachmentRef,
   ImageAttachmentValue,
+  InputRoute,
   JsonRecord,
   PlanSnapshot,
   PromptContentPart,
   QueueEntry,
   SessionEvent,
   SessionInfo,
+  SkillCatalogEntry,
+  SkillCatalogSnapshot,
   StatsSnapshot,
   SubagentSnapshot,
   TodosSnapshot,
@@ -126,8 +128,9 @@ interface AgentRegistryLike {
 }
 
 interface CommandsLike {
-  list(agent?: AgentLike): readonly unknown[]
-  execute(agent: AgentLike, line: string, attachments: readonly unknown[], signal: AbortSignal): Promise<unknown>
+  list?(agent?: AgentLike): readonly unknown[]
+  find?(agent: AgentLike, name: string): unknown
+  execute?(agent: AgentLike, line: string, attachments: readonly unknown[], signal: AbortSignal): Promise<unknown>
 }
 
 interface LlmLike {
@@ -201,6 +204,10 @@ interface AgentPresetsLike {
   mount?(agentCtx: unknown, id?: string): Promise<unknown>
   presetForSession?(session: SessionLike): string | null
   composedPreset?(ctx: unknown): string | undefined
+  /** Read the preset-isolated service instance for one exact Agent. */
+  serviceFor?(agent: unknown, name: string): unknown
+  /** Retain the preset revision as a scope lease without creating an Agent. */
+  acquireScope?(id?: string): Promise<unknown>
   readonly defaultId?: string
 }
 
@@ -213,10 +220,26 @@ interface ToolsLike {
   get?(name: string, scope?: unknown): unknown
 }
 
+/**
+ * Structural view of the public `ctx.skills` registry read surface.
+ *
+ * Only `snapshot` is borrowed: this adapter never loads a skill body, keeps a
+ * cached catalog, or owns invocation policy. The native registry has already
+ * resolved `invocation` for every summary.
+ */
+interface SkillsLike {
+  snapshot?(options: { readonly cwd?: string; readonly scope?: unknown; readonly signal?: AbortSignal }): Promise<unknown> | unknown
+  list?(options: { readonly cwd?: string; readonly scope?: unknown; readonly signal?: AbortSignal }): Promise<unknown> | unknown
+}
+
+/** Structural view of the public `ctx.workingDirectory` lookup. */
+interface WorkingDirectoryLike {
+  ensure?(agent: unknown, signal?: AbortSignal): Promise<unknown> | unknown
+}
+
 interface LoaderEntryLike {
   readonly options?: { readonly id?: string; readonly name?: string }
   readonly disabled?: boolean
-  update?(options: { disabled: boolean }): Promise<unknown>
 }
 
 interface LoaderLike {
@@ -230,10 +253,6 @@ interface SessionTitleLike {
 interface SessionsLike {
   flush?(session: SessionLike): Promise<unknown>
   get?(id: string): SessionLike | undefined
-}
-
-interface SessionPersistenceLike {
-  list?(): Promise<readonly unknown[]>
 }
 
 interface LiveAgent {
@@ -266,14 +285,25 @@ interface ActiveCommand {
   readonly settle: () => void
 }
 
+interface ActiveSkillQuery {
+  readonly controller: AbortController
+  readonly sessionId: string
+  readonly attachmentId: string
+  /** Captured pending observation this read belongs to; undefined for a live Agent. */
+  readonly pending: PendingSession | undefined
+  /** Captured preset id: staging another preset on the same pending object is stale. */
+  readonly preset: string | undefined
+}
+
 const BASE_CAPABILITIES = ['stream', 'followup', 'steer', 'cancel', 'new', 'resume', 'state', 'dequeue']
 const SESSIONLESS_COMMANDS = new Set([
-  'new', 'resume', 'sessions', 'titles', 'models', 'presets', 'commands', 'state',
-  'auto-title', 'dequeue', 'cancel',
+  // `skills` is read-only metadata: it must never materialize the pending Agent.
+  'new', 'resume', 'sessions', 'titles', 'models', 'presets', 'commands', 'skills',
+  'state', 'auto-title', 'dequeue', 'cancel',
 ])
 const STAGEABLE_COMMANDS = new Set(['model', 'preset', 'effort'])
 const COMMAND_NAMES = new Set([
-  'models', 'sessions', 'titles', 'commands', 'execute', 'cancel', 'new', 'resume', 'model',
+  'models', 'sessions', 'titles', 'commands', 'skills', 'input-route', 'execute', 'cancel', 'new', 'resume', 'model',
   'presets', 'preset', 'efforts', 'effort', 'permissions', 'auto-title', 'state',
   'reload', 'dequeue', 'queue-remove', 'queue-replace', 'queue-send-now',
   'subagent-session', 'subagent-follow', 'subagent-interrupt', 'subagent-prompt',
@@ -282,6 +312,10 @@ const TITLE_PROVIDER_NAMES = [
   '@deepseek-ai/dsh-session-title-first-prompt-llm',
   '@deepseek-ai/dsh-session-title-all-prompts-llm',
 ]
+/** Why a write request cannot be honoured without owning DSH composition. */
+const AUTO_TITLE_READ_ONLY =
+  'DSH owns auto-title through the profile composition; this TUI exposes no runtime-only switch and never rewrites that composition. '
+  + 'Change the session-title provider enablement in the DSH profile (native plugin manager or profile patch), then reload or restart.'
 const METRICS_KEYS = new Set(['contextPressure', 'tokenUsage', 'contextBreakdown', 'sessionStats'])
 const STATS_FIELDS = ['turns', 'steps', 'llmMs', 'toolMs', 'ttftMs', 'ttftSteps', 'decodeMs', 'decodeTokens'] as const
 const MAX_SNAPSHOT_EVENTS = 8000
@@ -317,6 +351,135 @@ function jsonSafe(value: unknown): unknown {
     return text === undefined ? undefined : JSON.parse(text)
   } catch {
     return undefined
+  }
+}
+
+/** The honest answer when no native viewing scope can be read. */
+function unavailableSkills(): SkillCatalogSnapshot {
+  return { entries: [], available: false, complete: false }
+}
+
+/** One native `/name` token: lower-kebab, the same grammar as DSH's skill gesture. */
+function isNativeInputName(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(value)
+}
+
+interface PresetLeaseLike {
+  readonly key?: unknown
+  [Symbol.asyncDispose]?: () => Promise<void>
+}
+
+/**
+ * Normalize the public `agentPresets.acquireScope()` lease.
+ *
+ * The native contract is `{key} & AsyncDisposable`; this adapter never copies
+ * the preset composition, only borrows the retained revision for one read and
+ * always releases it.
+ */
+function normalizePresetLease(value: unknown): { readonly key: unknown; release(): Promise<void> } | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const lease = value as PresetLeaseLike
+  if (lease.key === undefined) return undefined
+  const dispose = lease[Symbol.asyncDispose]
+  return {
+    key: lease.key,
+    release: async () => {
+      if (typeof dispose === 'function') await dispose.call(value)
+    },
+  }
+}
+
+/**
+ * Project one native `SkillCatalogSnapshot` into the UI metadata whitelist.
+ *
+ * The registry has already resolved invocation policy; this function only
+ * verifies the structural shape, drops non-user-invocable entries and never
+ * reads a body, path, locator or resource base. A malformed entry is skipped
+ * and forces `complete:false` so the consumer never presents a partial catalog
+ * as authoritative.
+ *
+ * @param value - the raw native snapshot value.
+ * @returns the projected observation, or undefined for a malformed envelope.
+ */
+function skillCatalogSnapshot(value: unknown): SkillCatalogSnapshot | undefined {
+  const payload = record(value)
+  if (payload === undefined || !Array.isArray(payload.skills)) return undefined
+  const projected = projectSkillEntries(payload.skills)
+  return {
+    entries: projected.entries,
+    available: true,
+    complete: payload.complete === true && projected.valid,
+  }
+}
+
+/**
+ * Project a public `ctx.skills.list()` result when the registry has no
+ * `snapshot`. The native list carries no completeness flag, so the observation
+ * is explicitly incomplete rather than defaulted to authoritative.
+ */
+function skillCatalogList(value: unknown): SkillCatalogSnapshot | undefined {
+  if (!Array.isArray(value)) return undefined
+  const projected = projectSkillEntries(value)
+  return { entries: projected.entries, available: true, complete: false }
+}
+
+function projectSkillEntries(values: readonly unknown[]): {
+  readonly entries: SkillCatalogEntry[]
+  readonly valid: boolean
+} {
+  const entries: SkillCatalogEntry[] = []
+  let valid = true
+  for (const raw of values) {
+    const projected = skillCatalogEntry(raw)
+    if (projected.kind === 'invalid') {
+      valid = false
+      continue
+    }
+    if (projected.kind === 'filtered') continue
+    entries.push(projected.entry)
+  }
+  return { entries, valid }
+}
+
+type SkillEntryProjection =
+  | { readonly kind: 'entry'; readonly entry: SkillCatalogEntry }
+  | { readonly kind: 'filtered' }
+  | { readonly kind: 'invalid' }
+
+/**
+ * Validate one native skill summary without inventing invocation policy.
+ *
+ * `invocation.userInvocable` decides inclusion; `invocation.modelInvocable` is
+ * carried through unresolved so the UI can label a user-only skill. Any
+ * non-boolean policy value or non-string routing field is invalid rather than
+ * defaulted.
+ */
+function skillCatalogEntry(value: unknown): SkillEntryProjection {
+  const item = record(value)
+  if (item === undefined) return { kind: 'invalid' }
+  const name = item.name
+  const description = item.description
+  const invocation = record(item.invocation)
+  const modelInvocable = invocation?.modelInvocable
+  const userInvocable = invocation?.userInvocable
+  if (typeof name !== 'string' || name.length === 0 || name.trim() !== name || /[\s/]/u.test(name)) {
+    return { kind: 'invalid' }
+  }
+  if (typeof description !== 'string') return { kind: 'invalid' }
+  if (typeof modelInvocable !== 'boolean' || typeof userInvocable !== 'boolean') {
+    return { kind: 'invalid' }
+  }
+  const whenToUse = item.whenToUse
+  if (whenToUse !== undefined && typeof whenToUse !== 'string') return { kind: 'invalid' }
+  if (!userInvocable) return { kind: 'filtered' }
+  return {
+    kind: 'entry',
+    entry: {
+      name,
+      description,
+      ...(typeof whenToUse === 'string' && whenToUse.length > 0 ? { whenToUse } : {}),
+      modelInvocable,
+    },
   }
 }
 
@@ -672,9 +835,12 @@ export class DshContextBackend implements Backend {
   private readonly pendingDecisions = new Map<string, PendingDecision>()
   private readonly activeCommands = new Map<string, ActiveCommand>()
   private readonly activeImageReads = new Map<string, AbortController>()
+  /** In-flight skill metadata reads; metadata only, never a model turn. */
+  private readonly activeSkillQueries = new Map<string, ActiveSkillQuery>()
+  /** A native skills/change arrived while no live Agent existed. */
+  private skillsDirty = false
   private readonly planStates = new Map<string, PlanSnapshot>()
   private readonly metricsStates = new Map<string, { usage?: UsageSnapshot; stats?: StatsSnapshot }>()
-  private readonly titleBaselines = new Map<string, boolean>()
   private readonly compactionCauses = new Map<string, string>()
   private readonly subagentBridge: SubagentBridge
   private readonly childPresenters = new Map<string, { readonly agent: AgentLike; readonly presenter: ToolPresenter }>()
@@ -687,7 +853,6 @@ export class DshContextBackend implements Backend {
   private closedEmitted = false
   private decisionSeq = 0
   private modelFailureSignature = ''
-  private titleOverride: boolean | undefined
   private toolPresenter: ToolPresenter | undefined
   private reloading: Promise<unknown> | undefined
   private codec: TranscriptCodec | undefined
@@ -863,6 +1028,21 @@ export class DshContextBackend implements Backend {
       if (cached === undefined || cached.agent === record(payload)?.agent) this.childPresenters.delete(childId)
       this.subagentBridge.noteAgentDisposed(childId)
     }, { global: true })
+    // The native registry invalidation is unfiltered and carries no payload.
+    // Pending metadata reads are legitimate (preset-scope leases), so a root
+    // invalidation is forwarded for whatever current observation exists; an
+    // arriving pre-commit event is replayed after the ready announcement.
+    keep('skills/change', () => {
+      const live = this.live
+      if (live !== undefined) {
+        this.emit({ type: 'skills_changed', sessionId: live.agent.session.id, attachmentId: live.attachmentId })
+        return
+      }
+      const pending = this.pending
+      if (pending === undefined || this.closed) return
+      this.skillsDirty = true
+      this.emit({ type: 'skills_changed', sessionId: pending.sessionId, attachmentId: pending.attachmentId })
+    }, { global: true })
     keep('subagent/start', info => {
       this.refreshSubagentControlCapabilities()
       this.subagentBridge.noteStart(record(info) ?? {})
@@ -882,6 +1062,15 @@ export class DshContextBackend implements Backend {
             const currentValue = record(value)?.currentValue
             if (typeof currentValue === 'string') {
               this.emit({ type: 'permissions', sessionId, value: { currentValue } })
+            }
+            return
+          }
+          if (key === 'title') {
+            // The projection is the native title truth: null means no title,
+            // undefined means the projection did not report a value. Never
+            // synthesize, cache or announce a TUI-owned title.
+            if (value === null || typeof value === 'string') {
+              this.emit({ type: 'title', sessionId, attachmentId: this.live.attachmentId, value })
             }
             return
           }
@@ -971,6 +1160,9 @@ export class DshContextBackend implements Backend {
     if (has('hmr', 'runExclusive')) caps.push('reload')
     if (has('commands', 'list')) caps.push('commands')
     if (has('commands', 'execute')) caps.push('execute')
+    // Skill metadata readability is the native registry API alone; tool-schema
+    // visibility never decides whether user-invocable skills exist.
+    if (has('skills', 'snapshot') || has('skills', 'list')) caps.push('skills', 'input-route')
     if (has('agents', 'create')) caps.push('model')
     if (this.subagentBridge.available()) {
       caps.push('subagents', 'subagent-session', 'subagent-follow')
@@ -1054,6 +1246,8 @@ export class DshContextBackend implements Backend {
         await this.discardAgent(prepared)
         throw error
       }
+      // Retire the pending reads before the captured observation disappears.
+      this.abortSkillQueries('session materialized', pending.sessionId)
       if (this.pending === pending) this.pending = undefined
       this.emitAnnouncement(await this.sessionInfo(false))
     })
@@ -1204,6 +1398,9 @@ export class DshContextBackend implements Backend {
 
   private async closeAgent(target: LiveAgent, reason: string): Promise<void> {
     const sessionId = target.agent.session.id
+    // The attachment epoch ends here: a metadata read that started against it
+    // must reject rather than deliver a catalog for a retired Agent.
+    this.abortSkillQueries(reason, sessionId)
     this.closePendingDecisions(reason, sessionId)
     try {
       target.agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1336,6 +1533,7 @@ export class DshContextBackend implements Backend {
         // semantics). A same-id candidate cannot coexist with it, so a
         // tear-down-then-resume reattachment has no rollback. See
         // docs/BACKEND.md "Lifecycle and attachments".
+        this.retirePendingQueries('session switched')
         this.pending = undefined
         return await this.sessionInfo(true)
       }
@@ -1352,6 +1550,7 @@ export class DshContextBackend implements Backend {
         await this.discardAgent(prepared)
         throw error
       }
+      this.retirePendingQueries('session switched')
       this.pending = undefined
       if (previous !== undefined) await this.closeAgent(previous, 'session switched')
       return await this.sessionInfo(true)
@@ -1372,6 +1571,7 @@ export class DshContextBackend implements Backend {
         this.subagentBridge.setRoot(undefined)
         this.childPresenters.clear()
       }
+      this.retirePendingQueries('session switched')
       this.pending = {
         sessionId: randomUUID(),
         attachmentId: randomUUID(),
@@ -1401,6 +1601,13 @@ export class DshContextBackend implements Backend {
   private emitAnnouncement(info: SessionInfo): void {
     this.subagentControlCapabilities = this.subagentControlCapabilitySignature()
     this.emit({ type: 'ready', info })
+    // A provider registration during preset mount can precede the ready for
+    // this very attachment. Replay it now so a consumer that cached the pending
+    // observation refetches against the committed native scope.
+    if (this.skillsDirty && this.live !== undefined) {
+      this.skillsDirty = false
+      this.emit({ type: 'skills_changed', sessionId: this.live.agent.session.id, attachmentId: this.live.attachmentId })
+    }
     // The ready payload is the authoritative first snapshot; `announce` only
     // records it so later publishes stay idempotent.
     if (info.subagents !== undefined) this.subagentBridge.announce(info.sessionId, info.subagents)
@@ -1462,6 +1669,7 @@ export class DshContextBackend implements Backend {
     const route = this.agentRoute(live.agent)
     const permissions = this.permissionsOf(session)
     const preset = this.currentPreset()
+    const title = this.titleOf(session)
     const info: SessionInfo = {
       attachmentId: live.attachmentId,
       sessionId: session.id,
@@ -1471,6 +1679,7 @@ export class DshContextBackend implements Backend {
       ...(typeof route?.reasoningEffort === 'string' ? { reasoningEffort: route.reasoningEffort } : {}),
       ...(preset === undefined ? {} : { preset }),
       ...(permissions === undefined ? {} : { permissions }),
+      ...(title === undefined ? {} : { title }),
       capabilities: this.capabilities(),
     }
     if (includeSnapshot) {
@@ -1931,6 +2140,22 @@ export class DshContextBackend implements Backend {
     }
   }
 
+  /**
+   * One native title projection read. `null` is a real no-title value; any
+   * unavailable read stays `undefined` so callers omit the field rather than
+   * inventing a local title. No query, provider call or log scrape here.
+   */
+  private titleOf(session: SessionLike): string | null | undefined {
+    const projections = this.service<ProjectionsLike>('sessionProjections')
+    if (typeof projections?.stateOf !== 'function') return undefined
+    try {
+      const value = projections.stateOf(session, 'title')
+      return value === null || typeof value === 'string' ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   private planSnapshotOf(value: unknown): PlanSnapshot {
     const state = record(value) ?? {}
     const running = record(state.running)
@@ -2077,6 +2302,12 @@ export class DshContextBackend implements Backend {
     if (typeof name !== 'string' || name.length === 0) throw codedError('INVALID_ARGUMENT', 'command requires a name')
     if (!COMMAND_NAMES.has(name)) throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
     const params = record(args) ?? {}
+    // Explicit-submission classification prevalidates its token before the
+    // lazy Agent path runs: a malformed name must never create a durable
+    // session just to be rejected.
+    if (name === 'input-route' && !isNativeInputName(params.name)) {
+      throw codedError('INVALID_ARGUMENT', 'input-route requires a native lower-kebab name without a slash')
+    }
     if (name === 'reload') return await this.reloadRuntime()
     if (!SESSIONLESS_COMMANDS.has(name) && !STAGEABLE_COMMANDS.has(name)) await this.ensureCurrent()
     switch (name) {
@@ -2084,9 +2315,11 @@ export class DshContextBackend implements Backend {
       case 'sessions': return await this.listSessions(params)
       case 'titles': return await this.listTitles(params)
       case 'commands': return this.controlCommands()
+      case 'skills': return await this.skillCatalog()
+      case 'input-route': return this.inputRoute(params)
       case 'execute': return await this.executeCommand(params)
       case 'cancel': await this.cancel(); return undefined
-      case 'new': return await this.switchSession('new', {}, true)
+      case 'new': return await this.switchSession('new', typeof params.preset === 'string' ? { preset: params.preset } : {}, true)
       case 'resume': return await this.switchSession('resume', { sessionId: typeof params.sessionId === 'string' ? params.sessionId : undefined }, true)
       case 'model': return await this.setModel(params)
       case 'presets': return await this.listPresets()
@@ -2156,6 +2389,289 @@ export class DshContextBackend implements Backend {
       this.activeCommands.delete(requestId)
       settle()
     }
+  }
+
+  /**
+   * Read the current root's user-facing skill metadata from the native registry.
+   *
+   * This mirrors the desktop Remote: a live Agent reads the preset-isolated
+   * `skills` service (falling back to the host registry) for its exact scope; a
+   * pending session retains the selected preset revision through the public
+   * `agentPresets.acquireScope` lease and reads without creating an Agent.
+   * Tool-schema visibility is never consulted — human `/name` injection lives
+   * in `agent/pre-step`, not in the model-facing tool schema. Only native name,
+   * description, whenToUse and resolved invocation flags leave this method.
+   *
+   * @returns the projected observation; `available:false` only when no native
+   *   registry can serve a metadata observation at all.
+   */
+  private async skillCatalog(): Promise<SkillCatalogSnapshot> {
+    const live = this.live
+    const pending = live === undefined ? this.pending : undefined
+    if (live === undefined && pending === undefined) return unavailableSkills()
+    const capturedPreset = pending?.preset
+    const controller = new AbortController()
+    const queryId = randomUUID()
+    this.activeSkillQueries.set(queryId, {
+      controller,
+      sessionId: live?.agent.session.id ?? pending!.sessionId,
+      attachmentId: live?.attachmentId ?? pending!.attachmentId,
+      pending,
+      preset: capturedPreset,
+    })
+    let releaseLease: (() => Promise<void>) | undefined
+    try {
+      if (live !== undefined) {
+        const registry = this.skillRegistryFor(live.agent)
+        if (registry === undefined) return unavailableSkills()
+        const cwd = await this.skillCatalogCwd(live.agent, controller.signal)
+        this.assertSkillQueryCurrent(controller, live, undefined, undefined)
+        const snapshot = await this.readSkillMetadata(registry, {
+          cwd,
+          scope: live.agent,
+          signal: controller.signal,
+        })
+        this.assertSkillQueryCurrent(controller, live, undefined, undefined)
+        return snapshot
+      }
+      const presets = this.service<AgentPresetsLike>('agentPresets')
+      if (typeof presets?.acquireScope === 'function') {
+        let lease: unknown
+        try {
+          lease = await presets.acquireScope(capturedPreset)
+        } catch (error) {
+          this.assertSkillQueryCurrent(controller, undefined, pending, capturedPreset)
+          throw codedError('RUNTIME_REQUEST_FAILED', `the native agent-preset scope could not be acquired: ${errorMessage(error)}`)
+        }
+        const normalized = normalizePresetLease(lease)
+        if (normalized === undefined) {
+          throw codedError('RUNTIME_REQUEST_FAILED', 'the native agent-preset scope lease returned no scope key')
+        }
+        // A lease acquired after close/switch is still released below.
+        releaseLease = normalized.release
+        this.assertSkillQueryCurrent(controller, undefined, pending, capturedPreset)
+        const registry = this.hostSkillRegistry()
+        if (registry === undefined) return unavailableSkills()
+        const snapshot = await this.readSkillMetadata(registry, {
+          cwd: this.options.cwd,
+          scope: normalized.key,
+          signal: controller.signal,
+        })
+        this.assertSkillQueryCurrent(controller, undefined, pending, capturedPreset)
+        return snapshot
+      }
+      // No native lease API: read the mounted global registry as an explicitly
+      // incomplete/global observation, never a fabricated per-preset table.
+      const registry = this.hostSkillRegistry()
+      if (registry === undefined) return unavailableSkills()
+      const observation = await this.readSkillMetadata(registry, {
+        cwd: this.options.cwd,
+        signal: controller.signal,
+      })
+      this.assertSkillQueryCurrent(controller, undefined, pending, capturedPreset)
+      return { ...observation, complete: false }
+    } finally {
+      this.activeSkillQueries.delete(queryId)
+      if (releaseLease !== undefined) {
+        try {
+          await releaseLease()
+        } catch (error) {
+          this.warn(`the native agent-preset skill scope lease could not be released: ${errorMessage(error)}`)
+        }
+      }
+    }
+  }
+
+  /** Read the native registry, preferring `snapshot` and its completeness fact. */
+  private async readSkillMetadata(
+    registry: SkillsLike,
+    options: { readonly cwd?: string; readonly scope?: unknown; readonly signal: AbortSignal },
+  ): Promise<SkillCatalogSnapshot> {
+    let raw: unknown
+    if (typeof registry.snapshot === 'function') {
+      try {
+        raw = await Promise.resolve(registry.snapshot(options))
+      } catch (error) {
+        if (options.signal.aborted) throw codedError('ABORTED', 'the skill catalog query was cancelled')
+        throw codedError('RUNTIME_REQUEST_FAILED', `the native skill registry failed: ${errorMessage(error)}`)
+      }
+      const snapshot = skillCatalogSnapshot(raw)
+      if (snapshot === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'the native skill registry returned an invalid catalog')
+      return snapshot
+    }
+    if (typeof registry.list === 'function') {
+      try {
+        raw = await Promise.resolve(registry.list(options))
+      } catch (error) {
+        if (options.signal.aborted) throw codedError('ABORTED', 'the skill catalog query was cancelled')
+        throw codedError('RUNTIME_REQUEST_FAILED', `the native skill registry failed: ${errorMessage(error)}`)
+      }
+      const listed = skillCatalogList(raw)
+      if (listed === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'the native skill registry returned an invalid catalog')
+      return listed
+    }
+    return unavailableSkills()
+  }
+
+  /**
+   * Resolve the live registry exactly like the desktop Remote: the preset's
+   * isolated `skills` service first, then the host registry. A lookup failure
+   * stays visible and falls back rather than deleting the capability.
+   */
+  private skillRegistryFor(agent: AgentLike): SkillsLike | undefined {
+    const presets = this.service<AgentPresetsLike>('agentPresets')
+    if (typeof presets?.serviceFor === 'function') {
+      try {
+        const scoped = record(presets.serviceFor(agent, 'skills'))
+        if (scoped !== undefined) {
+          const registry = scoped as unknown as SkillsLike
+          if (typeof registry.snapshot === 'function' || typeof registry.list === 'function') return registry
+        }
+      } catch (error) {
+        this.warn(`DSH preset skill registry lookup failed: ${errorMessage(error)}`)
+      }
+    }
+    return this.hostSkillRegistry()
+  }
+
+  /** The host-plane registry row; the pending lease read uses this instance. */
+  private hostSkillRegistry(): SkillsLike | undefined {
+    const registry = this.service<SkillsLike>('skills')
+    if (registry === undefined) return undefined
+    return typeof registry.snapshot === 'function' || typeof registry.list === 'function'
+      ? registry
+      : undefined
+  }
+
+  /**
+   * Fail closed when a metadata read no longer belongs to the current
+   * observation. Pending captures both the exact pending object and the preset
+   * id, so staging another preset on the same object invalidates the read.
+   */
+  private assertSkillQueryCurrent(
+    controller: AbortController,
+    live: LiveAgent | undefined,
+    pending: PendingSession | undefined,
+    preset: string | undefined,
+  ): void {
+    if (controller.signal.aborted) {
+      const reason = controller.signal.reason
+      if (reason instanceof Error) throw reason
+      throw codedError('ABORTED', 'the skill catalog query was cancelled')
+    }
+    if (this.closed) throw codedError('CLOSED', 'the backend is closed')
+    if (live !== undefined) {
+      if (this.live !== live) {
+        throw codedError('STALE_SESSION', 'the DSH Agent attachment changed during skill discovery')
+      }
+      return
+    }
+    if (this.live !== undefined || this.pending !== pending || pending?.preset !== preset) {
+      throw codedError('STALE_SESSION', 'the DSH session or preset changed during skill discovery')
+    }
+  }
+
+  /** Resolve the native session workspace; only a missing service falls back. */
+  private async skillCatalogCwd(agent: AgentLike, signal: AbortSignal): Promise<string> {
+    const workingDirectory = this.service<WorkingDirectoryLike>('workingDirectory')
+    if (typeof workingDirectory?.ensure === 'function') {
+      let value: unknown
+      try {
+        value = await Promise.resolve(workingDirectory.ensure(agent, signal))
+      } catch (error) {
+        if (signal.aborted) throw codedError('ABORTED', 'the skill catalog query was cancelled')
+        throw codedError('RUNTIME_REQUEST_FAILED', `the native working-directory service failed: ${errorMessage(error)}`)
+      }
+      if (typeof value === 'string' && value.trim().length > 0) return value
+      throw codedError('RUNTIME_REQUEST_FAILED', 'the native working-directory service returned no directory')
+    }
+    const cwd = textOf(agent.session.header?.cwd)
+    return cwd ?? this.options.cwd
+  }
+
+  /** Retire pending reads before their captured pending observation disappears. */
+  private retirePendingQueries(reason: string): void {
+    const pending = this.pending
+    if (pending !== undefined) this.abortSkillQueries(reason, pending.sessionId)
+  }
+
+  /** Abort in-flight metadata reads for close, attachment retirement or preset changes. */
+  private abortSkillQueries(reason: string, sessionId?: string): number {
+    let count = 0
+    for (const entry of this.activeSkillQueries.values()) {
+      if (sessionId !== undefined && entry.sessionId !== sessionId) continue
+      if (entry.controller.signal.aborted) continue
+      entry.controller.abort(codedError('ABORTED', reason))
+      count += 1
+    }
+    return count
+  }
+
+  /**
+   * Classify one explicit user-submitted `/name` line against the current Agent.
+   *
+   * This is a submission-time decision, not a menu/catalog read. The native
+   * Agent has already been materialized by the ordinary lazy path, so its
+   * agent-scoped command catalog (which a pending `commands` list cannot show)
+   * is the precedence authority. Nothing is executed, sent or loaded here; the
+   * caller applies the returned kind to the existing `execute`/`send`
+   * primitives with the exact original line.
+   *
+   * @param params - `{name}`: the token after `/`, without the slash.
+   * @returns the command-or-prompt decision for the exact current attachment.
+   */
+  private inputRoute(params: Record<string, unknown>): InputRoute {
+    const live = this.live
+    if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    const requested = params.name
+    if (!isNativeInputName(requested)) {
+      throw codedError('INVALID_ARGUMENT', 'input-route requires a native lower-kebab name without a slash')
+    }
+    const sessionId = live.agent.session.id
+    const attachmentId = live.attachmentId
+    if (this.nativeCommandResolves(live.agent, requested)) {
+      return { kind: 'command', sessionId, attachmentId }
+    }
+    // The native `/name` pre-step injection does not require a visible `skill`
+    // tool schema. Only the absence of any native skill registry keeps the
+    // command error path; an unknown name is literal user input otherwise.
+    if (this.skillRegistryFor(live.agent) === undefined) {
+      return { kind: 'command', sessionId, attachmentId }
+    }
+    return { kind: 'prompt', sessionId, attachmentId }
+  }
+
+  /**
+   * Exact scoped command lookup: `commands.find(agent, name)`, with a `list`
+   * fallback for hosts that only mount the catalog read.
+   *
+   * A lookup failure cannot prove absence, so it keeps native precedence (the
+   * existing execute path surfaces the native failure) instead of turning a
+   * command name into a model prompt.
+   */
+  private nativeCommandResolves(agent: AgentLike, name: string): boolean {
+    const commands = this.service<CommandsLike>('commands')
+    if (commands === undefined) return false
+    if (typeof commands.find === 'function') {
+      try {
+        const found = commands.find(agent, name)
+        return found !== undefined && found !== null
+      } catch (error) {
+        this.warn(`DSH command lookup failed: ${errorMessage(error)}`)
+        return true
+      }
+    }
+    if (typeof commands.list === 'function') {
+      try {
+        return commands.list(agent).some(value => record(value)?.name === name)
+      } catch (error) {
+        this.warn(`DSH command catalog failed: ${errorMessage(error)}`)
+        return true
+      }
+    }
+    // A partially mounted command service is not evidence of an absent name:
+    // without a readable native lookup, do not route a possible command to a model.
+    return true
   }
 
   /**
@@ -2423,6 +2939,7 @@ export class DshContextBackend implements Backend {
         throw codedError('STALE_SESSION', 'the Agent attachment changed during preset selection')
       }
       pending.preset = staged
+      this.abortSkillQueries('agent preset changed', pending.sessionId)
       return this.pendingInfo()
     }
     const live = this.live
@@ -2439,6 +2956,7 @@ export class DshContextBackend implements Backend {
       throw codedError('RUNTIME_REQUEST_FAILED', errorMessage(error))
     }
     if (this.live !== live) throw codedError('STALE_SESSION', 'the Agent attachment changed during preset selection')
+    this.abortSkillQueries('agent preset changed', live.agent.session.id)
     this.toolPresenter = this.makeToolPresenter(live.agent)
     return await this.sessionInfo(false)
   }
@@ -2595,20 +3113,17 @@ export class DshContextBackend implements Backend {
     const query = this.service<SessionQueryLike>('sessionQuery')
     if (typeof query?.listSessions !== 'function') throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no session query service')
     const limit = clampInteger(args.limit, 30, 1, 200)
+    // DSH owns session order: `sessionQuery.listSessions()` returns the logical
+    // corpus in deterministic newest-first order (createdAt descending, id
+    // ascending for ties), live-preferred. Keep that order and the native header
+    // metadata; this adapter only hides subagent children and applies the
+    // caller's bound. It never stats a durable artifact, derives an activity
+    // time or re-sorts, so no second durability truth exists here.
     const records = await query.listSessions()
-    const activity = await this.sessionActivity(records)
     const visible = records
       .map(item => record(item))
       .filter((item): item is Record<string, unknown> => item !== undefined && record(item.header) !== undefined)
       .filter(item => record(item.header)?.origin !== 'subagent')
-      .sort((left, right) => {
-        const leftHeader = record(left.header) ?? {}
-        const rightHeader = record(right.header) ?? {}
-        const a = activity.get(String(leftHeader.id)) ?? (left.live === true ? Number.MAX_SAFE_INTEGER : Number(leftHeader.createdAt ?? 0))
-        const b = activity.get(String(rightHeader.id)) ?? (right.live === true ? Number.MAX_SAFE_INTEGER : Number(rightHeader.createdAt ?? 0))
-        if (a === b) return Number(rightHeader.createdAt ?? 0) - Number(leftHeader.createdAt ?? 0)
-        return b - a
-      })
       .slice(0, limit)
     const titles = args.titles === false ? undefined : await this.titlesOf(query, visible.map(item => String(record(item.header)?.id)))
     return visible.map((item) => {
@@ -2619,45 +3134,9 @@ export class DshContextBackend implements Backend {
         ...(titles === undefined ? {} : { title: titles.get(id) ?? null }),
         cwd: typeof header.cwd === 'string' ? header.cwd : '',
         createdAt: header.createdAt,
-        ...(activity.has(id) ? { activityAt: activity.get(id) } : {}),
         live: item.live === true,
       }
     })
-  }
-
-  private async sessionActivity(records: readonly unknown[]): Promise<Map<string, number>> {
-    const persistence = this.service<SessionPersistenceLike>('sessionPersistence')
-    if (typeof persistence?.list !== 'function') return new Map()
-    let snapshots: readonly unknown[]
-    try {
-      snapshots = await persistence.list()
-    } catch {
-      return new Map()
-    }
-    const paths = new Map<string, string>()
-    for (const snapshot of snapshots) {
-      const item = record(snapshot)
-      const header = record(item?.header)
-      const location = record(item?.location)
-      if (typeof header?.id === 'string' && location?.kind === 'jsonl' && typeof location.path === 'string') {
-        paths.set(header.id, location.path)
-      }
-    }
-    const activity = new Map<string, number>()
-    for (const recordValue of records) {
-      const header = record(recordValue)?.header
-      const id = record(header)?.id
-      if (typeof id !== 'string') continue
-      const path = paths.get(id)
-      if (path === undefined) continue
-      try {
-        const identity = await stat(path)
-        if (typeof identity.mtimeMs === 'number' && Number.isFinite(identity.mtimeMs)) activity.set(id, identity.mtimeMs)
-      } catch {
-        /* vanished artifacts keep the creation-order fallback */
-      }
-    }
-    return activity
   }
 
   private titleMapOf(observations: unknown): Map<string, string> {
@@ -2976,6 +3455,17 @@ export class DshContextBackend implements Backend {
   }
 
   // ------------------------------------------------------------- auto-title
+  //
+  // Read-only by design. DSH owns session-title composition: a provider runs
+  // only while its profile Loader entry is enabled, and every public mutation
+  // path persists that composition (`EntryTree.update()` reports to the owning
+  // Include, which rewrites the profile; `pluginManager.setPluginEnabled()`
+  // saves a profile patch). Cordis 1.1.0's bare `Entry.update()` does not
+  // commit, but it mutates a live DSH entry's options outside the tree's
+  // journal/reconcile path, and the Loader itself persists `disabled` when
+  // such an enabled fiber unloads. No public runtime-only switch exists, so
+  // this adapter reports the native state and refuses to change it: a TUI
+  // display preference never rewrites another plugin's Loader entry.
 
   private titleProviderEntries(): LoaderEntryLike[] {
     const loader = this.service<LoaderLike>('loader')
@@ -2991,111 +3481,69 @@ export class DshContextBackend implements Backend {
     return entries
   }
 
+  /** Whether the raw `disabled` flag of a live entry is set; a throwing
+   * `!!js` expression means the provider is not guaranteed to run. */
+  private titleEntryDisabled(entry: LoaderEntryLike): boolean {
+    try {
+      return entry.disabled === true
+    } catch {
+      return true
+    }
+  }
+
+  /** Read-only native snapshot. `available` reports whether the native state
+   * can be read; `editable` is always false because DSH composition owns it. */
   private autoTitleState(entries = this.titleProviderEntries()): Record<string, unknown> {
     const service = this.service<SessionTitleLike>('sessionTitle')
     const plugins = entries.map((entry) => {
-      const id = String(entry.options?.id)
-      // The baseline is the first native state this adapter observed: the host
-      // composition is the original, so no scratch-profile comparison exists.
-      if (!this.titleBaselines.has(id)) this.titleBaselines.set(id, entry.disabled === true)
+      const disabled = this.titleEntryDisabled(entry)
       return {
-        id,
+        id: String(entry.options?.id),
         name: String(entry.options?.name),
-        enabled: entry.disabled !== true,
-        inheritedEnabled: this.titleBaselines.get(id) !== true,
+        enabled: !disabled,
       }
     })
     const effectiveEnabled = plugins.some(plugin => plugin.enabled)
-    const mode = this.titleOverride === true ? 'enabled' : this.titleOverride === false ? 'disabled' : 'inherit'
-    const inheritedEnabled = plugins.some(plugin => plugin.inheritedEnabled)
-    const enabled = mode === 'inherit' ? inheritedEnabled : effectiveEnabled
-    const available = service !== undefined && typeof service.refresh === 'function' && plugins.length > 0
-    const drift = mode === 'inherit' && inheritedEnabled !== effectiveEnabled
+    const readable = service !== undefined && typeof service.refresh === 'function' && plugins.length > 0
     return {
-      available,
-      enabled,
+      available: readable,
+      editable: false,
+      enabled: effectiveEnabled,
       effectiveEnabled,
-      mode,
-      inherited: this.titleOverride === undefined,
-      inheritedEnabled,
+      // The profile composition is the only source; this adapter holds no
+      // runtime override and must never imply one.
+      mode: 'inherit',
+      inherited: true,
+      inheritedEnabled: effectiveEnabled,
       mayIssueModelRequests: effectiveEnabled,
       plugins,
-      ...(available ? {} : {
+      ...(readable ? {} : {
         limitation: plugins.length === 0
           ? 'The selected DSH composition declares no native session-title provider.'
           : 'The runtime mounted no native session-title service.',
       }),
-      ...(drift ? {
-        limitation: 'The live Loader state differs from the observed native baseline; restart dsh-tui after updating the composition to inherit it exactly.',
-      } : {}),
-    }
-  }
-
-  private async updateTitleEntry(entry: LoaderEntryLike, disabled: boolean): Promise<void> {
-    if (typeof entry.update !== 'function') throw codedError('CAPABILITY_UNAVAILABLE', 'the native loader entry cannot be updated')
-    try {
-      await entry.update({ disabled })
-    } catch (error) {
-      throw codedError(
-        'RUNTIME_REQUEST_FAILED',
-        `DSH could not ${disabled ? 'disable' : 'enable'} the native session-title plugin ${String(entry.options?.id)}: ${errorMessage(error)}`,
-      )
     }
   }
 
   private async autoTitle(args: Record<string, unknown>): Promise<unknown> {
     const hasWanted = Object.prototype.hasOwnProperty.call(args, 'enabled')
-    const entries = this.titleProviderEntries()
-    if (!hasWanted) return this.autoTitleState(entries)
-    const service = this.service<SessionTitleLike>('sessionTitle')
-    if (service === undefined || typeof service.refresh !== 'function' || entries.length === 0) {
-      throw codedError('CAPABILITY_UNAVAILABLE', 'this DSH composition exposes no native session-title provider to toggle')
-    }
+    const state = this.autoTitleState()
+    if (!hasWanted) return state
     const wanted = args.enabled
     if (wanted !== null && wanted !== undefined && typeof wanted !== 'boolean') {
       throw codedError('INVALID_ARGUMENT', 'auto-title enabled must be true, false or null')
     }
-    let changed = false
-    if (wanted === null || wanted === undefined) {
-      for (const entry of entries) {
-        const id = String(entry.options?.id)
-        const baselineDisabled = this.titleBaselines.get(id)
-        if (baselineDisabled === undefined) continue
-        if ((entry.disabled === true) !== baselineDisabled) {
-          await this.updateTitleEntry(entry, baselineDisabled)
-          changed = true
-        }
-      }
-      this.titleOverride = undefined
-    } else if (wanted === false) {
-      for (const entry of entries) {
-        if (entry.disabled === true) continue
-        await this.updateTitleEntry(entry, true)
-        changed = true
-      }
-      this.titleOverride = false
-    } else {
-      const active = entries.filter(entry => entry.disabled !== true)
-      if (active.length === 0) {
-        const primary = entries.find(entry => entry.options?.id === 'session-title-llm') ?? entries[0]
-        if (primary !== undefined) {
-          await this.updateTitleEntry(primary, false)
-          changed = true
-        }
-      }
-      this.titleOverride = true
-    }
-    const after = this.autoTitleState(this.titleProviderEntries())
+    // Fail closed: there is no public DSH runtime-only switch, and writing the
+    // profile composition is DSH's decision, not a TUI display preference.
     return {
-      ...after,
-      changed,
+      ...state,
+      available: false,
+      editable: false,
+      changed: false,
       restartRequired: false,
-      ...(wanted === true && after.effectiveEnabled === false
-        ? { limitation: after.limitation ?? 'The native title provider did not start; inspect DSH plugin diagnostics.' }
-        : {}),
-      ...(this.titleOverride === undefined
-        ? { note: 'Inherited from the native DSH composition observed at startup.' }
-        : { note: 'Runtime override; the Settings value can be reapplied on the next launch.' }),
+      reason: AUTO_TITLE_READ_ONLY,
+      limitation: typeof state.limitation === 'string' ? state.limitation : AUTO_TITLE_READ_ONLY,
+      note: 'Read-only: the DSH profile composition owns session-title enablement.',
     }
   }
 
@@ -3217,18 +3665,20 @@ export class DshContextBackend implements Backend {
     const text = typeof params.text === 'string' ? params.text : undefined
     const content = Array.isArray(params.content) ? params.content : undefined
     let message: UserMessageLike
+    // Never remove the original before the replacement is admitted: a native
+    // attachment refusal must leave the queued input intact.
+    const existing = messageId === undefined ? undefined : this.findRecallable(agent, messageId)
     if (content !== undefined) {
-      if (messageId !== undefined) this.dropRecallable(agent, messageId)
       message = await this.admitUserMessage(normalizePromptContent(content as readonly PromptContentPart[]))
     } else if (text !== undefined) {
       if (text.trim() === '') throw codedError('INVALID_ARGUMENT', 'queue-send-now requires non-empty text')
-      if (messageId !== undefined) this.dropRecallable(agent, messageId)
       message = this.asUserMessage(this.userMessage(text))
-    } else if (messageId !== undefined) {
-      message = this.findRecallable(agent, messageId)
+    } else if (existing !== undefined) {
+      message = existing
     } else {
       throw codedError('INVALID_ARGUMENT', 'queue-send-now requires text, content, or messageId')
     }
+    if (existing !== undefined) this.dropRecallable(agent, existing.id)
     this.promote(agent, message)
     return { messageId: message.id }
   }
@@ -3348,6 +3798,9 @@ export class DshContextBackend implements Backend {
     if (this.reloading !== undefined) {
       throw codedError('RUNTIME_REQUEST_FAILED', 'another reload is already in progress')
     }
+    // Recomposition can replace skill providers and the preset-scoped tool, so
+    // an in-flight metadata read must not deliver a pre-reload catalog.
+    this.abortSkillQueries('runtime reloaded', this.live?.agent.session.id)
     this.assertReloadIdle()
     const hmr = this.service<HmrLike>('hmr')
     if (typeof hmr?.runExclusive !== 'function' || typeof hmr.reconcileProfile !== 'function') {
@@ -3403,6 +3856,10 @@ export class DshContextBackend implements Backend {
       if (!controller.signal.aborted) controller.abort()
     }
     this.activeImageReads.clear()
+    // Metadata reads are aborted, never joined: an uncooperative provider or
+    // directory scan must not extend shutdown (same policy as an image read).
+    this.abortSkillQueries('backend closed')
+    this.activeSkillQueries.clear()
     this.compactionCauses.clear()
     await this.switching
     this.pending = undefined

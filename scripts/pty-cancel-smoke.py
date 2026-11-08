@@ -190,12 +190,13 @@ def busy_settings_interrupt(mode):
         session.wait_for(b'Working', offset)
         offset = len(session.raw)
         session.send(b'/settings\r')
-        session.wait_for(b'Keyboard shortcuts', offset)
+        session.wait_for(b'Settings', offset)
+        session.wait_for(b'Default screen', offset)
         offset = len(session.raw)
         session.send(b'\x03')
-        session.wait_for(b'ready', offset)
-        # Global interruption may leave a generic Settings surface visible.
-        # Close that local layer explicitly before testing idle exit keys.
+        # A continuous Settings page can cover the ready footer. Close only
+        # the local overlay before inspecting idle state; Ctrl+C still owns
+        # native turn interruption while Settings has focus.
         escape_offset = len(session.raw)
         session.send(b'\x1b')
         # read(timeout) may return immediately on any available output; it is
@@ -204,6 +205,8 @@ def busy_settings_interrupt(mode):
         # Pi draws its focused empty editor with an inverse-space caret; it
         # intentionally keeps the hardware cursor hidden during rendering.
         session.wait_for(b'\x1b[7m \x1b[27m', escape_offset)
+        session.wait_for(b'ready', offset)
+        assert '完成。Demo'.encode('utf8') not in session.raw[offset:], 'interruption must not silently finish the ordinary demo turn'
         arm_offset = len(session.raw)
         session.send(b'\x03')
         session.wait_for(b'again to exit', arm_offset)

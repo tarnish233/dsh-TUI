@@ -160,15 +160,15 @@ test('parent image App: image viewing returns to the original tool inspector and
     f.backend.tool(image.attachment)
     f.app.editor.handleInput('inspector draft stays')
     f.terminal.type('\x18'); f.terminal.type('\x0f'); await paint(f.terminal)
-    assert.match(f.terminal.screen(), /Tool details/)
+    assert.match(f.terminal.screen(), /┌─ Tools/)
     await open(f.terminal); await ready(f.terminal)
     assert.match(f.terminal.screen(), /Image details/)
     f.terminal.type('\x1b'); await paint(f.terminal)
-    assert.match(f.terminal.screen(), /Tool details/)
+    assert.match(f.terminal.screen(), /┌─ Tools/)
     assert.match(f.terminal.screen(), /Output/)
     f.terminal.type('\x1b'); await paint(f.terminal)
     assert.equal(f.app.editor.getExpandedText(), 'inspector draft stays')
-    assert.doesNotMatch(f.terminal.screen(), /Tool details|Image details/)
+    assert.doesNotMatch(f.terminal.screen(), /┌─ Tools|Image details/)
   } finally { await f.close() }
 })
 

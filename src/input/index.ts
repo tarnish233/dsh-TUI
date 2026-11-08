@@ -3,6 +3,8 @@
  *
  * Public surface:
  * - `CcEditor`: CC/readline editor on one Pi Editor state.
+ * - `NativeAutocompleteProvider`: thin slash-command/skill menu combination
+ *   over Pi's `CombinedAutocompleteProvider` (native `/name`, no `skill:` aliases).
  * - `CcKeymap` / `createCcKeymap`: configurable, contextual keymap with chords
  *   and diagnostics, independent from Pi's global keybindings.
  * - CC_ACTIONS: the named action registry (editor, autocomplete, app, list,
@@ -75,6 +77,12 @@ export {
   serializeCcDraftSnapshot,
   type CcDraftSnapshot,
 } from "./snapshot.ts"
+
+export {
+  NativeAutocompleteProvider,
+  createNativeAutocompleteProvider,
+  type NativeAutocompleteProviderOptions,
+} from "./native-autocomplete.ts"
 
 export {
   graphemeAfter,

@@ -26,11 +26,17 @@ export interface Settings {
   thinkingPreviewLines: number
   /** Live thinking-duration timer interval in ms; 0 disables the timer. */
   thinkingLiveTimerMs: number
-  /**
-   * Local preference for native DSH session titles. `inherit` leaves the
-   * native profile default untouched; the effective value is owned by DSH.
-   */
-  autoTitle: boolean | 'inherit'
+  /** Renderer-only preferences, never native lifecycle or admission policies. */
+  showSubagentProgress: boolean
+  groupSubagentMessages: boolean
+  imagePreview: 'auto' | 'text'
+  copyOnSelect: boolean
+  queueCollapsed: boolean
+  reducedMotion: boolean
+  /** Renderer-owned terminal metadata; never native title generation or Agent policies. */
+  terminalStatus: boolean
+  terminalTitle: boolean
+  terminalNotifications: 'auto' | 'off' | 'always'
 }
 
 export const defaults: Settings = {
@@ -39,7 +45,29 @@ export const defaults: Settings = {
   diffViewMode: 'auto', diffIndicatorMode: 'bars', diffSplitMinWidth: 120,
   editDiffCollapsedLines: 24, writeDiffCollapsedLines: 0, diffWordWrap: true,
   showThinking: false, thinkingPreviewLines: 3, thinkingLiveTimerMs: 250,
-  autoTitle: 'inherit',
+  showSubagentProgress: true, groupSubagentMessages: true, imagePreview: 'auto',
+  copyOnSelect: true, queueCollapsed: false, reducedMotion: false,
+  terminalStatus: true, terminalTitle: true, terminalNotifications: 'auto',
+}
+
+/** One flat document marker; it is not another preference layer. */
+export const SETTINGS_FORMAT_VERSION = 2
+
+function normalizeSettingsDocument(data: Record<string, unknown> = {}): Record<string, unknown> {
+  if (data.formatVersion !== undefined && data.formatVersion !== 1 && data.formatVersion !== SETTINGS_FORMAT_VERSION) {
+    throw new Error('Unsupported settings formatVersion')
+  }
+  const next = { ...data }
+  // Auto-title enablement belongs to DSH's profile composition. Silently
+  // ignore the retired local override: it is not an actionable config error.
+  // Reads stay side-effect-free; a normal settings save removes this key.
+  delete next.autoTitle
+  // Snapshot the old coupled behavior once. With version 2, an absent Agents
+  // override intentionally uses its own default, including after reset.
+  if (data.formatVersion !== SETTINGS_FORMAT_VERSION && data.groupSubagentMessages === undefined && typeof data.groupTools === 'boolean') {
+    next.groupSubagentMessages = data.groupTools
+  }
+  return next
 }
 
 /** One flat preference roster, shared by App, the Tools tab and render options. */
@@ -65,12 +93,13 @@ export const THINKING_LIVE_TIMER_MS_VALUES = [0, 90, 250, 500] as const
 /** Validate both disk input and queued partial updates before any write. */
 function parseSettings(data: Record<string, unknown> = {}): Settings {
   if (data.screen !== undefined && data.screen !== 'inline' && data.screen !== 'fullscreen') throw new Error('screen must be inline or fullscreen')
-  for (const key of ['expandTools', 'groupTools', 'diffWordWrap', 'showThinking'] as const) {
+  for (const key of ['expandTools', 'groupTools', 'diffWordWrap', 'showThinking', 'showSubagentProgress', 'groupSubagentMessages', 'copyOnSelect', 'queueCollapsed', 'reducedMotion', 'terminalStatus', 'terminalTitle'] as const) {
     if (data[key] !== undefined && typeof data[key] !== 'boolean') throw new Error(`${key} must be boolean`)
   }
   if (data.thinkingPreviewLines !== undefined && !THINKING_PREVIEW_LINES_VALUES.includes(data.thinkingPreviewLines as never)) throw new Error(`thinkingPreviewLines must be one of ${THINKING_PREVIEW_LINES_VALUES.join(', ')}`)
   if (data.thinkingLiveTimerMs !== undefined && !THINKING_LIVE_TIMER_MS_VALUES.includes(data.thinkingLiveTimerMs as never)) throw new Error(`thinkingLiveTimerMs must be one of ${THINKING_LIVE_TIMER_MS_VALUES.join(', ')}`)
-  if (data.autoTitle !== undefined && data.autoTitle !== 'inherit' && typeof data.autoTitle !== 'boolean') throw new Error("autoTitle must be boolean or 'inherit'")
+  if (data.imagePreview !== undefined && data.imagePreview !== 'auto' && data.imagePreview !== 'text') throw new Error('imagePreview must be auto or text')
+  if (data.terminalNotifications !== undefined && data.terminalNotifications !== 'auto' && data.terminalNotifications !== 'off' && data.terminalNotifications !== 'always') throw new Error('terminalNotifications must be auto, off or always')
   if (data.diffViewMode !== undefined && !DIFF_VIEW_MODE_VALUES.includes(data.diffViewMode as never)) throw new Error(`diffViewMode must be one of ${DIFF_VIEW_MODE_VALUES.join(', ')}`)
   if (data.diffIndicatorMode !== undefined && !DIFF_INDICATOR_MODE_VALUES.includes(data.diffIndicatorMode as never)) throw new Error(`diffIndicatorMode must be one of ${DIFF_INDICATOR_MODE_VALUES.join(', ')}`)
   const ranges = {
@@ -101,7 +130,15 @@ function parseSettings(data: Record<string, unknown> = {}): Settings {
     showThinking: data.showThinking as boolean | undefined ?? defaults.showThinking,
     thinkingPreviewLines: data.thinkingPreviewLines as number | undefined ?? defaults.thinkingPreviewLines,
     thinkingLiveTimerMs: data.thinkingLiveTimerMs as number | undefined ?? defaults.thinkingLiveTimerMs,
-    autoTitle: data.autoTitle as Settings['autoTitle'] | undefined ?? defaults.autoTitle,
+    showSubagentProgress: data.showSubagentProgress as boolean | undefined ?? defaults.showSubagentProgress,
+    groupSubagentMessages: data.groupSubagentMessages as boolean | undefined ?? defaults.groupSubagentMessages,
+    imagePreview: data.imagePreview as Settings['imagePreview'] | undefined ?? defaults.imagePreview,
+    copyOnSelect: data.copyOnSelect as boolean | undefined ?? defaults.copyOnSelect,
+    queueCollapsed: data.queueCollapsed as boolean | undefined ?? defaults.queueCollapsed,
+    reducedMotion: data.reducedMotion as boolean | undefined ?? defaults.reducedMotion,
+    terminalStatus: data.terminalStatus as boolean | undefined ?? defaults.terminalStatus,
+    terminalTitle: data.terminalTitle as boolean | undefined ?? defaults.terminalTitle,
+    terminalNotifications: data.terminalNotifications as Settings['terminalNotifications'] | undefined ?? defaults.terminalNotifications,
   }
 }
 
@@ -201,6 +238,7 @@ export class SettingsStore {
   readonly warnings: string[] = []
   private invalid = false
   private value: Settings = { ...defaults }
+  private document: Record<string, unknown> = {}
   private writes: Promise<void> = Promise.resolve()
 
   constructor(directory = configDirectory()) {
@@ -210,6 +248,15 @@ export class SettingsStore {
 
   get(): Settings { return { ...this.value } }
 
+  /** Known saved/migrated overrides only, without exposing unrelated values. */
+  getOverrides(): Partial<Settings> {
+    const result: Partial<Settings> = {}
+    for (const key of Object.keys(defaults) as (keyof Settings)[]) {
+      if (Object.hasOwn(this.document, key)) Object.assign(result, { [key]: this.value[key] })
+    }
+    return result
+  }
+
   /**
    * Re-read the file without losing the last valid settings on a bad edit.
    * Unknown keys are warnings; parse/schema errors leave the old value live
@@ -218,13 +265,13 @@ export class SettingsStore {
   reload(): string[] {
     const warnings: string[] = []
     try {
-      const data = readObject(this.path)
-      if (data !== undefined) {
-        for (const key of Object.keys(data)) {
-          if (!Object.hasOwn(defaults, key)) warnings.push('Unknown setting: ' + key)
-        }
+      const data = normalizeSettingsDocument(readObject(this.path))
+      for (const key of Object.keys(data)) {
+        if (key !== 'formatVersion' && !Object.hasOwn(defaults, key)) warnings.push('Unknown setting: ' + key)
       }
-      this.value = parseSettings(data)
+      const next = parseSettings(data)
+      this.document = data
+      this.value = next
       this.invalid = false
     } catch (error) {
       this.invalid = true
@@ -240,12 +287,30 @@ export class SettingsStore {
    * moment the write runs, so an external broken edit is never overwritten and
    * the in-memory value only changes after a successful save.
    */
-  async set(patch: Partial<Settings>): Promise<void> {
+  set(patch: Partial<Settings>): Promise<void> {
+    for (const key of Object.keys(patch)) {
+      if (!Object.hasOwn(defaults, key)) return Promise.reject(new Error('Unknown setting: ' + key))
+    }
+    return this.updateDocument(data => ({ ...data, ...patch }))
+  }
+
+  reset(key: keyof Settings): Promise<void> {
+    if (!Object.hasOwn(defaults, key)) return Promise.reject(new Error('Unknown setting: ' + key))
+    return this.updateDocument(data => {
+      const next = { ...data }
+      delete next[key]
+      return next
+    })
+  }
+
+  private updateDocument(update: (data: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
     const write = this.writes.catch(() => {}).then(async () => {
       this.reload()
       if (this.invalid) throw new Error('Refusing to overwrite invalid settings file: ' + this.path)
-      const next = parseSettings({ ...this.value, ...patch })
-      await atomicJson(this.path, next)
+      const document = { ...update(this.document), formatVersion: SETTINGS_FORMAT_VERSION }
+      const next = parseSettings(document)
+      await atomicJson(this.path, document)
+      this.document = document
       this.value = next
     })
     this.writes = write

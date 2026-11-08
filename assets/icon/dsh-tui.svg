@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">DSH TUI</title>
+  <desc id="desc">White pixel whale on a DeepSeek blue rounded-square badge. Derived from the approved startup logo grid.</desc>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#335de0"/>
+  <path fill="#ffffff" transform="translate(7 13.25) scale(1.5625 3.125)" d="M8 0h4v1h-4ZM15 0h1v1h-1ZM22 0h1v1h-1ZM4 1h12v1h-12ZM21 1h4v1h-4ZM30 1h2v1h-2ZM2 2h16v1h-16ZM22 2h9v1h-9ZM1 3h19v1h-19ZM23 3h7v1h-7ZM0 4h27v1h-27ZM0 5h3v1h-3ZM10 5h8v1h-8ZM20 5h6v1h-6ZM0 6h3v1h-3ZM12 6h7v1h-7ZM21 6h5v1h-5ZM1 7h3v1h-3ZM14 7h11v1h-11ZM2 8h3v1h-3ZM16 8h8v1h-8ZM3 9h4v1h-4ZM11 9h3v1h-3ZM17 9h6v1h-6ZM5 10h20v1h-20ZM8 11h9v1h-9Z"/>
+</svg>

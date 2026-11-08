@@ -23,6 +23,11 @@ async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen', config?: 
 
 async function painted(terminal: VirtualTerminal) { await delay(25); await terminal.flush() }
 
+async function openKeyboardCategory(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  for (let step = 0; step < 6; step++) f.terminal.type('\x1b[C')
+  await painted(f.terminal)
+}
+
 test('actual installed Pi patch + App: CC input, clipboard paste markers, clear recall and exit', async () => {
   const f = await fixture()
   try {
@@ -105,7 +110,7 @@ test('App history search retains readline edits and cancellation restores lossle
 })
 
 test('App model picker, shared configured list keys and actual Shift+Tab permission cycle', async () => {
-  const f = await fixture('fullscreen', { 'list.next': 'ctrl+f', 'list.previous': 'ctrl+b' })
+  const f = await fixture('fullscreen', { 'list.next': 'ctrl+f', 'list.previous': 'ctrl+b', 'modal.search': 'alt+f' })
   try {
     await f.app.submit('/model'); await painted(f.terminal)
     assert.match(f.terminal.screen(), /Choose model/)
@@ -116,7 +121,7 @@ test('App model picker, shared configured list keys and actual Shift+Tab permiss
     await until(() => f.app.session?.permissions?.currentValue === 'danger-full-access', 'permission preset changes via native-shaped command')
     assert.ok(f.backend.info.events?.every(event => event.type !== 'plan/mode'), 'permission shortcut never creates a plan mode')
     await f.app.submit('/settings'); await painted(f.terminal)
-    f.terminal.type('\t'); await painted(f.terminal)
+    f.terminal.type('\x1b[C'); await painted(f.terminal)
     f.terminal.type('\x06'); await painted(f.terminal)
     const screen = f.terminal.screen()
     assert.ok(screen.split('\n').some(line => line.includes('❯') && line.includes('Preview lines')), screen)
@@ -252,12 +257,18 @@ test('keyboard help lives in Settings; /reload applies TUI resources and keeps t
     await f.app.submit('/help'); await painted(f.terminal)
     assert.doesNotMatch(f.terminal.screen(), /\/hotkeys/)
     f.terminal.type('\x1b[F'); await painted(f.terminal)
-    assert.match(f.terminal.screen(), /\/reload\b/, 'long command lists are browsed by scrolling, not selecting')
+    assert.match(f.terminal.screen(), /Skills 4/, 'the appended Skills section is browsed by scrolling, not selecting')
+    assert.match(f.terminal.screen(), /\/release-notes \[user-only\]/)
+    f.terminal.type('\x1b[H'); await painted(f.terminal)
+    assert.match(f.terminal.screen(), /Commands 10/, 'Home returns to the unchanged command section')
+    f.terminal.type('\x1b[6~'); await painted(f.terminal)
+    assert.match(f.terminal.screen(), /\/reload\b/, 'the original commands remain reachable by paging')
     assert.equal(f.app.store.items.length, beforeHelp, 'Help is a display panel, not a transcript notice')
     f.terminal.type('\x1b'); await painted(f.terminal)
     await f.app.submit('/settings'); await painted(f.terminal)
+    await openKeyboardCategory(f)
     assert.match(f.terminal.screen(), /Keyboard shortcuts/)
-    f.terminal.type('3'); await painted(f.terminal)
+    f.terminal.type('\r'); await painted(f.terminal)
     assert.match(f.terminal.screen(), /Navigation/)
     assert.match(f.terminal.screen(), /Start of line/)
     f.terminal.type(String.fromCharCode(27)); await painted(f.terminal)
@@ -299,7 +310,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       f.terminal.type('draft preserved ')
       f.terminal.type('\x1b[200~' + '中文 draft\n'.repeat(30) + '\x1b[201~')
       const editor = f.app.editor, before = editor.captureDraft()
-      await f.app.submit('/settings'); f.terminal.type('3'); await painted(f.terminal)
+      await f.app.submit('/settings'); await openKeyboardCategory(f); f.terminal.type('\r'); await painted(f.terminal)
       assert.match(f.terminal.screen(), /Keyboard shortcuts/)
       assert.match(f.terminal.screen(), /Navigation/)
       assert.doesNotMatch(f.terminal.screen(), /cc-match|editor\.move/)
@@ -322,12 +333,12 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       f.terminal.type('\x11')
       assert.equal(editor.getCursor().col, 0, 'the edited shortcut executes on the real main editor')
 
-      await f.app.submit('/settings'); f.terminal.type('3'); await painted(f.terminal)
-      f.terminal.type('d')
+      await f.app.submit('/settings'); await openKeyboardCategory(f); f.terminal.type('\r'); await painted(f.terminal)
+      f.terminal.type('\x04')
       await until(() => !f.app.keymap.getBindings('editor.move.line-start').length, 'disabled action is live')
       await painted(f.terminal)
       assert.equal(JSON.parse(await readFile(file, 'utf8'))['editor.move.line-start'], null)
-      f.terminal.type('r')
+      f.terminal.type('\x12')
       await until(() => f.app.keymap.getBindings('editor.move.line-start').includes('ctrl+a'), 'default restored')
       await painted(f.terminal)
       assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), {})
@@ -342,7 +353,7 @@ test('shortcut conflicts stay in the edit pane and malformed configuration is ne
     const file = join(f.directory, 'keybindings.json')
     await writeFile(file, JSON.stringify({ 'app.model.select': 'alt+m' }))
     await until(() => f.app.keymap.getBindings('app.model.select')[0] === 'alt+m', 'unrelated override applied')
-    await f.app.submit('/settings'); f.terminal.type('3'); f.terminal.type('\r'); await painted(f.terminal)
+    await f.app.submit('/settings'); await openKeyboardCategory(f); f.terminal.type('\r'); f.terminal.type('\r'); await painted(f.terminal)
     for (let count = 0; count < 4; count++) f.terminal.type('\x15')
     f.terminal.type('ctrl+e'); f.terminal.type('\r')
     await until(() => f.terminal.screen().includes('Shortcut conflict'), 'conflict rendered without saving')

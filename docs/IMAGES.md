@@ -51,28 +51,34 @@ transcriptImageOccurrences(items) -> ImageOccurrence[]
 
 ## ImageDetailsDialog
 
-父 App 用公开 `tui.showOverlay` 打开，保留底层 ToolDetails overlay，关闭后回到原 section/scroll。
+父 App 用共享 `ModalFrame`（wide）与公开 `tui.showOverlay` 打开，保留底层 ToolDetails overlay，关闭后回到原 section/scroll。
 
 ```ts
 new ImageDetailsDialog(tui, {
   image: ImageViewItem, keymap, readImage, maxHeight?,
+  preview?: 'auto' | 'text', setPreview?: (value) => void,
   onClose, onInterrupt?, onRenderRequest?,
   getImageNavigation?, onPreviousImage?, onNextImage?,
 })
-dialog.setImage(next)   // 同一 key 但 ref/data 变化会重新加载
-dialog.invalidate()     // 让保留的 Image 实例按新 cell 几何重算
-dialog.dispose()        // abort + inert，不调用 onClose
+dialog.setImage(next)     // 同一 key 但 ref/data 变化会重新加载
+dialog.setPreview('text') // 展示模式；切 text 时 abort 旧读且不再发起新读
+dialog.invalidate()       // 让保留的 Image 实例按新 cell 几何重算
+dialog.dispose()          // abort + inert，不调用 onClose
 ```
 
-- 构建时发起且只发起一次 `readImage`；`setImage` abort 旧请求并递增 generation，迟到结果不解码、不缓存、不绘制。
-- 图片区域是独立全宽区域：Pi TUI `Image` 产出的 APC/占位空行原样输出，不经过 tool 树缩进、通用 wrap 或 sanitize；其余 metadata 全部 sanitize。
+- 构建时 `preview: 'auto'` 发起且只发起一次 `readImage`；`'text'` 不发起读取／解码，仍保留 occurrence、ref 与 metadata。
+  `image.details.toggle-preview`（默认 `p`）在同一 occurrence 上切换；切到 text 会 abort 并 tombstone 旧请求，
+  迟到结果不缓存、不绘制；切回 auto 可复用已解码字节，否则重新按当前请求预算读取。
+- 图片区域是独立全宽区域：Pi TUI `Image` 产出的 APC/占位空行通过 ModalFrame 原样输出，不经过 tool 树缩进、
+  通用 wrap 或 sanitize；其余 metadata / status 全部 sanitize。图片区域按实测 body 高度和当前 cell 几何裁剪，
+  不截断 APC payload 后继续声称旧高度。
 - 每个 occurrence 使用自己的 `Image` 实例；CSI 16t 几何变化时调用 `invalidate()`。行预算随 live `maxHeight` 变化；预算不足走文字 fallback，绝不截断 APC 后继续声称旧高度。极矮 viewport 显示紧凑文字并保留 close 提示。
 - 只有 DSH 已校验的 native ref 才走 PNG 头直通（仍执行全部 encoded/decoded/pixel/edge 预算）；upload/默认导出始终经 sharp 真实解码，截断/坏 chunk 的 PNG 不会被当成 Ready。JPEG/GIF/WebP 及超预算 PNG 在加载阶段经 sharp 公共异步 API `rotate()+resize()+png()`，不在 render 热路径。
 - `src/ui/image-cache.ts`：以完整 ref identity（attachmentId + mediaType + bytes + dimensions）为 key 的 LRU，按字节/条目限量（默认约 48 MiB / 24 项）。abort/dispose 的结果不入缓存；cache hit 必须重新通过**当前请求**的预算，否则丢弃并重新读取/解码。
 - decode 有并发上限；abort 后不再启动压缩 ladder/排队工作。已在 native sharp 中执行的当前解码会自然完成并由调用方丢弃（sharp 不可瞬时中断）。
 - fallback：无 inline-image 协议时由 Pi `Image` 输出文字占位，dialog 同时显示 `terminal cannot display inline images`，metadata/close 仍可用；解码失败显示清洗后的原因，不伪造图片。
-- 键盘走 `keymap.resolve(raw, 'imageDetails')`：共享 chord 状态、`app.interrupt` 优先、未知 global action 在 viewer 内 inert。`image.details.previous-image` / `next-image` / `close` 与 hint 都读 effective binding；边界处按钮/动作禁用。header 的 Prev/Next/Close 使用既有 `HitboxRegistry`，不新增 SGR 解析。
-- Ctrl+C 只调用 `onInterrupt`；父 App 决定 busy 时中断一次、idle 时仅关 viewer（草稿不变）。
+- 键盘走 `keymap.resolve(raw, 'imageDetails')`：共享 chord 状态、`app.interrupt` 优先、未知 global action 在 viewer 内 inert。`image.details.previous-image` / `next-image` / `close` / `toggle-preview` 与提示都读 effective binding；边界处按钮/动作禁用。标题的 Prev/Next/Preview/Close 使用共享 frame actions 与 `HitboxRegistry`，不新增 SGR 解析。
+- Ctrl+C 只调用 `onInterrupt`；父 App 决定 busy 时中断一次、idle 时仅关 viewer（草稿不变）。`Settings → Images → Viewer preview` 的持久偏好通过父级 `setPreview` 回写；text 是纯展示偏好，不改变附件提交或 DSH vision 准入。
 
 ## Tool 图片
 

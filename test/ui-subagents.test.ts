@@ -12,7 +12,7 @@ import { createItemBlock, type TranscriptViewOptions } from '../src/ui/blocks.ts
 import { TranscriptView } from '../src/ui/transcript.ts'
 import { SubagentGroupBlock } from '../src/ui/subagent-group.ts'
 import { clearToolExpansion } from '../src/ui/tool-expansion.ts'
-import { AgentsOverlay } from '../src/ui/agents-overlay.ts'
+import { AgentsOverlay, type AgentsViewState } from '../src/ui/agents-overlay.ts'
 import { ChildSessionView } from '../src/ui/child-session-view.ts'
 import { SubagentProgress } from '../src/ui/subagent-progress.ts'
 import { subagentCanReply, subagentCanStop } from '../src/ui/subagent-format.ts'
@@ -96,7 +96,9 @@ function newStore(options: { events?: SessionEvent[]; subagents?: SubagentSnapsh
   return store
 }
 
-const viewOptions = (extra: Partial<TranscriptViewOptions> = {}): TranscriptViewOptions => ({
+type ViewOptionsShape = TranscriptViewOptions & { groupSubagentMessages?: boolean }
+
+const viewOptions = (extra: Partial<ViewOptionsShape> = {}): ViewOptionsShape => ({
   showThinking: true,
   expandTools: false,
   ...extra,
@@ -377,8 +379,9 @@ function subagentStore(): TranscriptStore {
 
 test('transcript rows are single-line, width-safe, sanitized and never show per-run metrics', () => {
   const store = subagentStore()
-  // `groupTools: false` restores one row per record; grouping is covered below.
-  const view = new TranscriptView(store, viewOptions({ groupTools: false }))
+  // Independent `groupSubagentMessages: false` restores one row per record;
+  // the durable grouping projection is covered below.
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false }))
   for (const width of [24, 40, 80, 120, 160]) {
     const lines = view.render(width)
     assertWidths(lines, width, 'subagent row')
@@ -414,7 +417,7 @@ test('transcript subagent rows expose no metrics when native timing/tokens are a
 test('only the painted name of a standalone row opens its details', () => {
   const store = subagentStore()
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const lines = plain(view.render(80))
   const row = lines.findIndex(line => line.includes('Explore 仓库'))
   assert.ok(row >= 0)
@@ -436,7 +439,7 @@ test('only the painted name of a standalone row opens its details', () => {
   view.handleMouse(mouse('click', nameEnd, row))
   assert.deepEqual(opened, ['explore', 'explore'])
 
-  const inert = new TranscriptView(store, viewOptions({ groupTools: false }))
+  const inert = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false }))
   inert.render(80)
   assert.equal(inert.handleMouse(mouse('click', name, row)), undefined)
 })
@@ -520,9 +523,10 @@ test('settlement/trigger rows render native attribution and exact body, never a 
     ],
   })
   const opened: string[] = []
-  // Two adjacent durable records would group; `groupTools: false` keeps one row
-  // per record so this test stays about the standalone row paint.
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  // Two adjacent durable records would group; independent
+  // `groupSubagentMessages: false` keeps one row per record so this test stays
+  // about the standalone row paint.
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const lines = view.render(100)
   assertWidths(lines, 100, 'settlement row')
   const text = plain(lines).join('\n')
@@ -570,7 +574,7 @@ test('a settlement/trigger sender links only its visible native label from the c
     ),
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const raw = view.render(100)
   const lines = plain(raw)
   const text = lines.join('\n')
@@ -655,9 +659,10 @@ test('consecutive subagent records group like tools and never cross a real bound
   assert.equal(stored.seq, 7, 'the native seq is untouched by grouping')
   assert.equal(stored.senderSessionId, 'gamma')
   assert.ok(stored.text.includes('Body: no blockers.'), 'the exact native text stays in the store')
-  // Grouping is a preference: `groupTools: false` restores one row per record,
-  // and a non-record item between records never joins a run.
-  const flat = new TranscriptView(store, viewOptions({ groupTools: false }))
+  // Grouping is an independent display preference:
+  // `groupSubagentMessages: false` restores one row per record, and a
+  // non-record item between records never joins a run.
+  const flat = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false }))
   assert.equal(plain(flat.render(120)).filter(line => line.includes('Subagents:')).length, 0)
   assert.equal(plain(flat.render(120)).filter(line => /Alpha 仓库|Beta|Gamma|Subtask status updated/.test(line)).length, 4)
 })
@@ -797,6 +802,7 @@ test('hover still repaints but every move and drag stays unclaimed', () => {
   let renders = 0
   const view = new TranscriptView(store, viewOptions({
     groupTools: false,
+    groupSubagentMessages: false,
     onSubagentDetails: id => opened.push(id),
     onRenderRequest: () => { renders += 1 },
   }))
@@ -833,7 +839,7 @@ test('an outside press never becomes a link when a label grows or the catalog ar
     ],
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const before = plain(view.render(100))
   const row = before.findIndex(line => line.includes('Subtask status updated'))
   const idStart = colOf(before[row] ?? '', 'child-review')
@@ -875,7 +881,7 @@ test('a claimed sender name that vanishes and reappears before release never fir
     })),
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const lines = plain(view.render(100))
   const row = lines.findIndex(line => line.includes('Subtask status updated'))
   const name = colOf(lines[row] ?? '', 'Review changes')
@@ -986,7 +992,7 @@ test('a native label with LF/CR/TAB stays one flattened row and keeps honest lin
     })),
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   const lines = plain(view.render(80))
   const row = lines.findIndex(line => line.includes('Multi Line Label'))
   assert.ok(row >= 0, lines.join('\n'))
@@ -1016,7 +1022,7 @@ test('a narrow trigger row clips the sender name partially and links only visibl
     })),
   })
   const opened: string[] = []
-  const view = new TranscriptView(store, viewOptions({ groupTools: false, onSubagentDetails: id => opened.push(id) }))
+  const view = new TranscriptView(store, viewOptions({ groupTools: false, groupSubagentMessages: false, onSubagentDetails: id => opened.push(id) }))
   // 40 columns: the attribution fits, the name is partially clipped but readable.
   const lines = plain(view.render(40))
   const row = lines.findIndex(line => line.includes('Subtask status updated'))
@@ -1225,6 +1231,27 @@ test('overlay mouse clicks select and open; wheel is handled', () => {
   assert.deepEqual(overlay.handleMouse({ ...mouse('click', 1, 1), type: 'wheel', wheelDelta: 1 }), { handled: true, render: true })
 })
 
+test('overlay wheel scrolls without snapping back to the selected row', () => {
+  const many: SubagentEntry[] = Array.from({ length: 24 }, (_, index) => entry({
+    id: `wheel-${index}`,
+    parentSessionId: 's1',
+    createdAt: index + 1,
+    mode: 'one-shot',
+    status: 'completed',
+    label: `Wheel child ${index}`,
+  }))
+  const harness = agentsHarness({ entries: many, rows: 16, maxHeight: 12 })
+  const { overlay } = harness
+  const before = plain(overlay.render(80)).join('\n')
+  const selected = overlay.selectedEntry?.id
+  overlay.handleMouse({ ...mouse('click', 2, 2), type: 'wheel', wheelDelta: 1 })
+  const after = plain(overlay.render(80)).join('\n')
+  assert.notEqual(after, before, 'wheel input actually moves the visible window')
+  assert.equal(overlay.selectedEntry?.id, selected, 'wheel only scrolls; it does not change native selection')
+  overlay.handleMouse({ ...mouse('click', 2, 2), type: 'wheel', wheelDelta: -1 })
+  assert.equal(plain(overlay.render(80)).join('\n'), before, 'the wheel is reversible')
+})
+
 test('overlay focus is preserved across updates and short/fullscreen viewports degrade safely', () => {
   const tui = createFakeTui(6, 30)
   const overlay = new AgentsOverlay(asTui(tui), {
@@ -1285,6 +1312,398 @@ test('overlay and child view create no hidden timers', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Agents overlay: search, Active/All filter, selection identity, restore
+
+const CTRL_F = '\x06'
+const CTRL_U = '\x15'
+const TAB = '\t'
+
+function agentsHarness(options: {
+  entries?: SubagentEntry[]
+  rows?: number
+  maxHeight?: number
+  keymap?: InstanceType<typeof input.CcKeymap>
+  initialState?: AgentsViewState
+} = {}) {
+  const tui = createFakeTui(options.rows ?? 32, 100)
+  const opened: string[] = []
+  const replies: string[] = []
+  const stops: string[] = []
+  const closed: string[] = []
+  const overlay = new AgentsOverlay(asTui(tui), {
+    entries: options.entries ?? interventionEntries(),
+    keymap: options.keymap ?? keymap(),
+    onClose: () => closed.push('close'),
+    onOpen: value => opened.push(value.id),
+    onReply: value => replies.push(value.id),
+    onStop: value => stops.push(value.id),
+    now: () => 100_000,
+    ...(options.maxHeight === undefined ? {} : { maxHeight: options.maxHeight }),
+    ...(options.initialState === undefined ? {} : { initialState: options.initialState }),
+  })
+  overlay.focused = true
+  return { tui, overlay, opened, replies, stops, closed }
+}
+
+test('Agents search is a real CC field: r/s type, matching selects, Esc keeps the modal', () => {
+  const harness = agentsHarness()
+  const { overlay } = harness
+  overlay.handleInput(CTRL_F)
+  // Typing reply/stop letters is query text, never a native action.
+  for (const char of 'review') overlay.handleInput(char)
+  assert.equal(overlay.query, 'review')
+  assert.deepEqual(harness.replies, [])
+  assert.deepEqual(harness.stops, [])
+  assert.equal(overlay.selectedEntry?.id, 'settled', 'selection follows the filtered native id')
+  let text = plain(overlay.render(100)).join('\n')
+  assert.ok(text.includes('Review'), text)
+  assert.ok(!text.includes('Explore'), 'non-matching native rows are hidden')
+  // Enter opens the selected child; it does not submit/close the search.
+  overlay.handleInput(ENTER)
+  assert.deepEqual(harness.opened, ['settled'])
+  assert.deepEqual(harness.closed, [])
+  // Esc leaves the field (query and filtered list stay); a second Esc closes.
+  overlay.handleInput(ESC)
+  assert.deepEqual(harness.closed, [])
+  text = plain(overlay.render(100)).join('\n')
+  assert.ok(text.includes('Review'))
+  overlay.handleInput(ESC)
+  assert.deepEqual(harness.closed, ['close'])
+})
+
+test('Agents search kill/undo grammar and Backspace keep the field editable', () => {
+  const harness = agentsHarness()
+  const { overlay } = harness
+  overlay.handleInput(CTRL_F)
+  for (const char of 'review') overlay.handleInput(char)
+  overlay.handleInput(CTRL_U)
+  assert.equal(overlay.query, '')
+  // The selected native id is still valid, so clearing the query keeps it.
+  assert.equal(overlay.selectedEntry?.id, 'settled')
+  for (const char of 'ex') overlay.handleInput(char)
+  assert.equal(overlay.query, 'ex')
+  assert.equal(overlay.selectedEntry?.id, 'live', 'nearest visible matching native id')
+  for (const char of 'ternal') overlay.handleInput(char)
+  assert.equal(overlay.query, 'external')
+  assert.equal(overlay.selectedEntry?.id, 'ext')
+  overlay.handleInput('\x7f')
+  assert.equal(overlay.query, 'externa')
+  // Ctrl+F while the field is focused stays editor char-right: no toggle/close.
+  overlay.handleInput(CTRL_F)
+  assert.equal(overlay.query, 'externa')
+  assert.deepEqual(harness.closed, [])
+})
+
+test('Agents search uses Ctrl+A/kill/yank/undo; browse mode never edits or kills', () => {
+  const harness = agentsHarness()
+  const { overlay } = harness
+  overlay.handleInput(CTRL_F)
+  const type = (text: string): void => { for (const char of text) overlay.handleInput(char) }
+  type('abc def')
+  overlay.handleInput('\x17') // Ctrl+W whitespace kill
+  assert.equal(overlay.query, 'abc ')
+  overlay.handleInput('\x1f') // undo restores the word and cursor
+  assert.equal(overlay.query, 'abc def')
+  overlay.handleInput('\x01') // Ctrl+A line start
+  overlay.handleInput('\x0b') // Ctrl+K kill to end
+  assert.equal(overlay.query, '')
+  overlay.handleInput('\x19') // Ctrl+Y yank
+  assert.equal(overlay.query, 'abc def')
+  overlay.handleInput('\x1f') // undo the yank
+  assert.equal(overlay.query, '')
+  // Leaving the field makes the same editing bytes inert: no hidden editor.
+  overlay.handleInput(ESC)
+  overlay.handleInput('\x01')
+  overlay.handleInput('\x0b')
+  overlay.handleInput('\x19')
+  assert.equal(overlay.query, '')
+  assert.deepEqual(harness.closed, [])
+})
+
+test('Agents Active/All filter only reads native status and remaps a vanished selection', () => {
+  const harness = agentsHarness()
+  const { overlay } = harness
+  assert.equal(overlay.filter, 'all')
+  overlay.handleInput(TAB)
+  assert.equal(overlay.filter, 'active')
+  let text = plain(overlay.render(100)).join('\n')
+  assert.ok(text.includes('Explore'))
+  assert.ok(text.includes('Build'))
+  assert.ok(!text.includes('Review'), 'a settled child retires from Active')
+  assert.ok(!text.includes('External'), 'external rows are not active work')
+  assert.equal(overlay.selectedEntry?.id, 'live')
+  // The selected native child settles while the filter is active: choose the
+  // nearest visible row, never resurrect the removed/settled id.
+  overlay.setEntry(entry({ id: 'live', parentSessionId: 's1', createdAt: 1, mode: 'continuable', status: 'completed', label: 'Explore' }))
+  assert.equal(overlay.selectedEntry?.id, 'once')
+  overlay.handleInput(TAB)
+  assert.equal(overlay.filter, 'all')
+  text = plain(overlay.render(100)).join('\n')
+  assert.ok(text.includes('Review'))
+  assert.ok(text.includes('External'))
+})
+
+test('Agents filter action is remappable and a disabled action does nothing', () => {
+  const remapped = new input.CcKeymap({ bindings: { 'subagent.filter.toggle': 'f' } })
+  const harness = agentsHarness({ keymap: remapped })
+  harness.overlay.handleInput(TAB)
+  assert.equal(harness.overlay.filter, 'all', 'the disabled default key is inert')
+  harness.overlay.handleInput('f')
+  assert.equal(harness.overlay.filter, 'active')
+  const disabled = agentsHarness({ keymap: new input.CcKeymap({ bindings: { 'subagent.filter.toggle': null } }) })
+  disabled.overlay.handleInput(TAB)
+  disabled.overlay.handleInput('f')
+  assert.equal(disabled.overlay.filter, 'all')
+})
+
+test('Agents selection is a stable native id across reorder, upsert and removal', () => {
+  const entries = overlayEntries()
+  const harness = agentsHarness({ entries })
+  const { overlay } = harness
+  // Select the second root.
+  overlay.handleInput(DOWN)
+  overlay.handleInput(DOWN)
+  assert.equal(overlay.selectedEntry?.id, 'root-idle')
+  // Native order changes: the same id stays selected, never the same row index.
+  overlay.setEntries([...entries].reverse())
+  assert.equal(overlay.selectedEntry?.id, 'root-idle')
+  // A live upsert of another child does not steal the selection.
+  overlay.setEntry(entry({ id: 'new-live', parentSessionId: 's1', createdAt: 9, mode: 'continuable', status: 'running', label: 'New live' }))
+  assert.equal(overlay.selectedEntry?.id, 'root-idle')
+  // Removing the selected child picks a remaining visible row by native order.
+  overlay.setEntries(entries.filter(value => value.id !== 'root-idle'))
+  const selected = overlay.selectedEntry?.id
+  assert.ok(selected !== undefined && selected !== 'root-idle')
+  assert.ok(overlay.entries.some(value => value.id === selected))
+})
+
+test('Agents captureView/initialState preserve query, filter, native id and scroll', () => {
+  const many: SubagentEntry[] = []
+  for (let index = 0; index < 24; index += 1) {
+    many.push(entry({
+      id: `child-${String(index).padStart(2, '0')}`,
+      parentSessionId: 's1',
+      createdAt: index + 1,
+      mode: 'one-shot',
+      status: index % 2 === 0 ? 'running' : 'completed',
+      label: `Child ${index}`,
+    }))
+  }
+  const harness = agentsHarness({ entries: many, rows: 16 })
+  const { overlay } = harness
+  overlay.handleInput(CTRL_F)
+  for (const char of 'child-1') overlay.handleInput(char)
+  overlay.handleInput(TAB)
+  for (let step = 0; step < 20; step += 1) overlay.handleInput(DOWN)
+  overlay.handleInput(CTRL_F) // leave the field, keep the query
+  overlay.render(80)
+  const state = overlay.captureView()
+  assert.equal(state.query, 'child-1')
+  assert.equal(state.filter, 'active')
+  assert.ok(state.selectedId !== undefined)
+
+  const restored = agentsHarness({ entries: many, rows: 16, initialState: state })
+  assert.equal(restored.overlay.query, state.query)
+  assert.equal(restored.overlay.filter, state.filter)
+  assert.equal(restored.overlay.selectedEntry?.id, state.selectedId)
+  restored.overlay.render(80)
+  assert.equal(restored.overlay.captureView().selectedId, state.selectedId)
+  const text = plain(restored.overlay.render(80)).join('\n')
+  assert.ok(text.includes('child-1'), 'the restored query is visible and active')
+
+  // A removed native id never revives: reconcile to a visible row.
+  const removed = agentsHarness({ entries: many, initialState: { ...state, selectedId: 'gone' } })
+  const fallback = removed.overlay.selectedEntry?.id
+  assert.ok(fallback !== undefined && fallback !== 'gone')
+  assert.ok(many.some(value => value.id === fallback))
+})
+
+test('Agents setMessage is visible in the current surface and can be cleared', () => {
+  const harness = agentsHarness()
+  assert.ok(!plain(harness.overlay.render(100)).join('\n').includes('Native stop failed'))
+  harness.overlay.setMessage('Native stop failed: permission denied', true)
+  assert.ok(plain(harness.overlay.render(100)).join('\n').includes('Native stop failed: permission denied'))
+  harness.overlay.setMessage('Reply target accepted')
+  const text = plain(harness.overlay.render(100)).join('\n')
+  assert.ok(text.includes('Reply target accepted'))
+  assert.ok(!text.includes('permission denied'), 'the old message is replaced, not stacked')
+  harness.overlay.setMessage()
+  assert.ok(!plain(harness.overlay.render(100)).join('\n').includes('Reply target accepted'))
+  harness.overlay.setMessage('x\x1b[31mred')
+  assert.ok(!plain(harness.overlay.render(100)).join('\n').includes('\x1b'), 'message text is sanitized')
+})
+
+test('Agents selection, hover, drag, search and filter never read or act on a child', () => {
+  let opens = 0
+  let replies = 0
+  let stops = 0
+  const tui = createFakeTui(32, 100)
+  const overlay = new AgentsOverlay(asTui(tui), {
+    entries: interventionEntries(),
+    keymap: keymap(),
+    onClose: () => {},
+    onOpen: () => { opens += 1 },
+    onReply: () => { replies += 1 },
+    onStop: () => { stops += 1 },
+  })
+  overlay.focused = true
+  let lines = overlay.render(100)
+  const row = plain(lines).findIndex(line => line.includes('Review'))
+  assert.ok(row >= 0)
+  for (let step = 0; step < 3; step += 1) overlay.handleInput(DOWN)
+  overlay.handleInput(UP)
+  overlay.handleInput(HOME)
+  overlay.handleInput(END)
+  overlay.handleInput(PAGE_DOWN)
+  overlay.handleInput(PAGE_DOWN)
+  overlay.handleInput('\x06')
+  for (const char of 'review') overlay.handleInput(char)
+  overlay.handleInput(TAB)
+  overlay.handleInput(TAB)
+  overlay.handleInput(ESC)
+  lines = overlay.render(100)
+  overlay.handleMouse(mouse('move', 2, row))
+  overlay.handleMouse(mouse('drag', 2, row))
+  overlay.handleMouse(mouse('press', 2, row))
+  overlay.handleMouse({ ...mouse('click', 2, 1), type: 'wheel', wheelDelta: 1 })
+  assert.deepEqual([opens, replies, stops], [0, 0, 0], 'no selection/hover/search path reads or acts')
+  // Only an explicit Enter/open, reply key and stop key act, each exactly once.
+  // A completed continuable row can reply but cannot stop; restore the full
+  // catalog and select the running child so both capabilities are applicable.
+  overlay.handleInput(CTRL_F)
+  overlay.handleInput(CTRL_U)
+  overlay.handleInput(ESC)
+  selectRow(overlay, 'live')
+  overlay.handleInput(ENTER)
+  overlay.handleInput(actionKeys('subagent.reply').raw)
+  overlay.handleInput(actionKeys('subagent.interrupt').raw)
+  assert.equal(opens, 1)
+  assert.equal(replies, 1)
+  assert.equal(stops, 1)
+})
+
+test('Agents tiny geometry stays width-safe, bounded and clickable without fake chips', () => {
+  for (const rows of [1, 2, 3, 4, 5, 6, 8]) {
+    for (const width of [1, 4, 8, 12, 20, 40]) {
+      const tui = createFakeTui(rows, width)
+      const closed: string[] = []
+      const overlay = new AgentsOverlay(asTui(tui), {
+        entries: interventionEntries(),
+        maxHeight: rows,
+        keymap: keymap(),
+        onClose: () => closed.push('close'),
+        onReply: () => {},
+        onStop: () => {},
+      })
+      const lines = overlay.render(width)
+      assertWidths(lines, width, `tiny ${rows}x${width}`)
+      assert.ok(lines.length <= Math.max(1, rows - 2), `tiny ${rows}x${width} stays inside its height token`)
+      for (let lineRow = 0; lineRow < lines.length; lineRow += 1) {
+        for (let col = 0; col < width; col += 1) {
+          overlay.handleMouse(mouse('press', col, lineRow))
+          overlay.handleMouse(mouse('click', col, lineRow))
+        }
+      }
+      overlay.dispose()
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Subagent grouping is independent from tool grouping (facts unchanged)
+
+test('groupSubagentMessages is independent: tool grouping cannot enable or disable it', () => {
+  const store = groupedStore()
+  const toolGroupOff = new TranscriptView(store, viewOptions({ groupTools: false }))
+  const toolGroupOffLines = plain(toolGroupOff.render(120))
+  assert.equal(toolGroupOffLines.filter(line => line.includes('Subagents:')).length, 2,
+    'groupTools=false never disables durable subagent groups')
+
+  const flat = new TranscriptView(store, viewOptions({ groupTools: true, groupSubagentMessages: false }))
+  const flatLines = plain(flat.render(120))
+  assert.equal(flatLines.filter(line => line.includes('Subagents:')).length, 0)
+  assert.equal(flatLines.filter(line => /Alpha 仓库|Beta|Gamma|Subtask status updated/.test(line)).length, 4)
+  // Native facts, order and boundary stay exactly as DSH declared them.
+  assert.deepEqual(store.items.map(item => item.kind), ['user', 'subagent', 'subagent', 'assistant', 'subagent', 'subagent-message'])
+  assert.deepEqual(store.items.filter(item => item.kind === 'subagent').map(item => item.kind === 'subagent' ? item.entry.id : ''), ['alpha', 'beta', 'gamma'])
+  const stored = store.items[5]
+  assert.equal(stored?.kind, 'subagent-message')
+  if (stored?.kind === 'subagent-message') {
+    assert.equal(stored.seq, 7)
+    assert.ok(stored.text.includes('Body: no blockers.'))
+  }
+  // The shared temporary Ctrl+O disclosure still toggles the same group state.
+  const interactive = new TranscriptView(store, viewOptions())
+  interactive.render(120)
+  interactive.toggleToolsExpanded()
+  assert.ok(plain(interactive.render(120)).join('\n').includes('Body: no blockers.'))
+  interactive.toggleToolsExpanded()
+  assert.ok(!plain(interactive.render(120)).join('\n').includes('Body: no blockers.'))
+})
+
+test('Agents ownerKey drops a pressed reply/stop when the selected child changes', () => {
+  const harness = agentsHarness()
+  const { overlay } = harness
+  selectRow(overlay, 'live')
+  let lines = plain(overlay.render(100))
+  const footer = lines.findIndex(line => line.includes('reply') && line.includes('stop'))
+  assert.ok(footer >= 0)
+  const replyCol = (lines[footer] ?? '').indexOf('reply')
+  overlay.handleMouse(mouse('press', replyCol, footer))
+  // Selection moves to another native child before the release: the pressed
+  // action belonged to `live` and must never run for `settled`.
+  selectRow(overlay, 'settled')
+  lines = plain(overlay.render(100))
+  overlay.handleMouse(mouse('click', replyCol, footer))
+  assert.deepEqual(harness.replies, [], 'a stale press cannot mutate the new owner')
+
+  // A fresh press/click on the new owner's own reply chip does fire.
+  const settledFooter = plain(overlay.render(100)).findIndex(line => line.includes('reply'))
+  overlay.handleMouse(mouse('press', replyCol, settledFooter))
+  overlay.handleMouse(mouse('click', replyCol, settledFooter))
+  assert.deepEqual(harness.replies, ['settled'])
+})
+
+test('Agents drag across a selected row never becomes an open or a child read', () => {
+  const harness = agentsHarness()
+  const lines = plain(harness.overlay.render(100))
+  const row = lines.findIndex(line => line.includes('Explore'))
+  assert.ok(row >= 0)
+  harness.overlay.handleMouse(mouse('press', 3, row))
+  harness.overlay.handleMouse(mouse('drag', 8, row))
+  harness.overlay.handleMouse(mouse('click', 8, row))
+  assert.deepEqual(harness.opened, [], 'a drag is never a click-to-open')
+  assert.deepEqual([harness.replies, harness.stops], [[], []])
+})
+
+test('Agents unbound reply/stop keys keep the real clickable capabilities', () => {
+  const unbound = new input.CcKeymap({ bindings: { 'subagent.reply': null, 'subagent.interrupt': null } })
+  let replies = 0
+  let stops = 0
+  const overlay = new AgentsOverlay(asTui(createFakeTui(30, 100)), {
+    entries: interventionEntries(),
+    keymap: unbound,
+    onClose: () => {},
+    onReply: () => { replies += 1 },
+    onStop: () => { stops += 1 },
+  })
+  overlay.focused = true
+  selectRow(overlay, 'live')
+  const lines = plain(overlay.render(100))
+  const footer = lines.findIndex(line => line.includes('[reply]'))
+  assert.ok(footer >= 0, lines.join('\n'))
+  assert.ok((lines[footer] ?? '').includes('[stop]'))
+  assert.ok(!(lines[footer] ?? '').includes('r reply'))
+  assert.ok(!(lines[footer] ?? '').includes('s stop'))
+  overlay.handleMouse(mouse('press', (lines[footer] ?? '').indexOf('[reply]') + 1, footer))
+  overlay.handleMouse(mouse('click', (lines[footer] ?? '').indexOf('[reply]') + 1, footer))
+  overlay.handleMouse(mouse('press', (lines[footer] ?? '').indexOf('[stop]') + 1, footer))
+  overlay.handleMouse(mouse('click', (lines[footer] ?? '').indexOf('[stop]') + 1, footer))
+  assert.equal(replies, 1)
+  assert.equal(stops, 1)
+})
+
+// ---------------------------------------------------------------------------
 // Child Session view
 
 function childHarness(options: {
@@ -1299,6 +1718,7 @@ function childHarness(options: {
   onGlobalAction?: (id: string) => void
   now?: () => number
   loading?: boolean
+  keymap?: InstanceType<typeof input.CcKeymap>
 } = {}) {
   const tui = createFakeTui(options.rows ?? 32, 100)
   const store = new TranscriptStore({ codec: DEMO_TRANSCRIPT_CODEC })
@@ -1327,7 +1747,7 @@ function childHarness(options: {
     }),
     store,
     view,
-    keymap: keymap(),
+    keymap: options.keymap ?? keymap(),
     onClose: () => { closed.push('close'); options.onClose?.() },
     ...(options.onInterrupt === undefined ? {} : { onInterrupt: options.onInterrupt }),
     ...(options.onReply === undefined ? {} : { onReply: (value: SubagentEntry) => { replies.push(value.id); options.onReply?.(value) } }),
@@ -1713,8 +2133,8 @@ test('overlay requests reply/stop through the shared keymap, gated by the native
   // running continuable: both requests are available and advertised.
   selectRow(overlay, 'live')
   let text = plain(overlay.render(100)).join('\n')
-  assert.ok(text.includes(`[${replyKey.label}] reply`), 'reply hint comes from the keymap')
-  assert.ok(text.includes(`[${stopKey.label}] stop`), 'stop hint comes from the keymap')
+  assert.ok(text.includes(`${replyKey.raw} reply`), 'reply hint comes from the keymap')
+  assert.ok(text.includes(`${stopKey.raw} stop`), 'stop hint comes from the keymap')
   press(replyKey)
   press(stopKey)
   assert.deepEqual(replies, ['live'])
@@ -1765,16 +2185,23 @@ test('overlay action hints and keys follow shared keymap remap and disable', () 
   })
   overlay.focused = true
   selectRow(overlay, 'live')
-  const text = plain(overlay.render(100)).join('\n')
-  const remappedLabel = input.formatBinding(['p'])
-  assert.ok(text.includes(`[${remappedLabel}] reply`), 'the remapped key is advertised')
-  assert.ok(!text.includes('stop'), 'a disabled action is not advertised')
+  let text = plain(overlay.render(100)).join('\n')
+  assert.ok(text.includes('p reply'), 'the remapped key is advertised')
+  assert.ok(text.includes('[stop]'), 'a disabled key keeps the real clickable capability')
+  assert.ok(!text.includes('s stop'), 'no fictitious key is painted for a disabled action')
   overlay.handleInput('p')
   assert.deepEqual(replies, ['live'])
-  // The old default and the disabled action are both dead keys.
+  // The old default and the disabled action keys are dead, but the visible
+  // Stop chip still invokes the native request.
   for (const key of ['r', 's']) overlay.handleInput(key)
   assert.deepEqual(replies, ['live'])
   assert.deepEqual(stops, [])
+  const stopLines = plain(overlay.render(100))
+  const footer = stopLines.findIndex(line => line.includes('[stop]'))
+  assert.ok(footer >= 0)
+  overlay.handleMouse(mouse('press', (stopLines[footer] ?? '').indexOf('stop'), footer))
+  overlay.handleMouse(mouse('click', (stopLines[footer] ?? '').indexOf('stop'), footer))
+  assert.deepEqual(stops, ['live'], 'an unbound key never hides the real action chip')
 })
 
 test('overlay without reply/stop callbacks is inert and paints no action chips', () => {
@@ -1875,54 +2302,77 @@ test('overlay Ctrl+C stops the active child first, then falls back to interrupt/
   assert.deepEqual(closed, ['close', 'closed-plain'])
 })
 
-test('narrow or short overlays omit action chips and keep no invisible hitbox', () => {
+test("narrow overlays keep every action chip's paint and hitbox in sync", () => {
   const tui = createFakeTui(30, 100)
   const replies: string[] = []
   const stops: string[] = []
+  const closed: string[] = []
   const overlay = new AgentsOverlay(asTui(tui), {
     entries: interventionEntries(),
     keymap: keymap(),
-    onClose: () => {},
+    onClose: () => closed.push('close'),
     onReply: value => replies.push(value.id),
     onStop: value => stops.push(value.id),
   })
+  overlay.focused = true
   selectRow(overlay, 'live')
+  // Click only outside every painted `[...]` chip; no invisible hitbox may fire.
+  const outsideChips = (lines: readonly string[], row: number, col: number): boolean => {
+    const line = lines[row] ?? ''
+    let index = line.indexOf('[')
+    while (index >= 0) {
+      const end = line.indexOf(']', index)
+      if (end < 0) break
+      const start = visibleWidth(line.slice(0, index))
+      const stop = visibleWidth(line.slice(0, end + 1))
+      if (col >= start && col < stop) return false
+      index = line.indexOf('[', end + 1)
+    }
+    return true
+  }
   for (const width of [12, 20, 28, 34]) {
     const lines = overlay.render(width)
     assertWidths(lines, width, 'narrow overlay')
-    const text = plain(lines).join('\n')
-    assert.ok(!text.includes('reply'), `width ${width} does not advertise a clipped action`)
-    assert.ok(!text.includes('stop'), `width ${width} does not advertise a clipped action`)
+    const before = replies.length + stops.length
+    const painted = plain(lines)
     for (let row = 0; row < lines.length; row += 1) {
       for (let col = 0; col < width; col += 1) {
+        if (!outsideChips(painted, row, col)) continue
         overlay.handleMouse(mouse('press', col, row))
         overlay.handleMouse(mouse('click', col, row))
       }
     }
+    assert.equal(replies.length + stops.length, before, `width ${width}: no invisible action chip`)
   }
-  // The narrow sweep may have opened rows (Enter/open semantics), but it must
-  // never have triggered an intervention the user cannot see.
-  assert.equal(replies.length, 0)
-  assert.deepEqual(stops, [])
+  // A wide footer paints both actions; clicking their visible labels fires them.
+  selectRow(overlay, 'live')
+  const wide = plain(overlay.render(100))
+  const footer = wide.findIndex(line => line.includes('reply') && line.includes('stop'))
+  assert.ok(footer >= 0)
+  overlay.handleMouse(mouse('press', (wide[footer] ?? '').indexOf('reply'), footer))
+  overlay.handleMouse(mouse('click', (wide[footer] ?? '').indexOf('reply'), footer))
+  overlay.handleMouse(mouse('press', (wide[footer] ?? '').indexOf('stop'), footer))
+  overlay.handleMouse(mouse('click', (wide[footer] ?? '').indexOf('stop'), footer))
+  assert.deepEqual(replies, ['live'])
+  assert.deepEqual(stops, ['live'])
+  assert.equal(closed.length, 0)
 
+  // Tiny height: the real return affordance wins the single footer row.
+  const shortReplies: string[] = []
   const short = new AgentsOverlay(asTui(createFakeTui(6, 30)), {
     entries: interventionEntries(),
     keymap: keymap(),
-    onClose: () => {},
-    onReply: value => replies.push(value.id),
+    onClose: () => closed.push('short-close'),
+    onReply: value => shortReplies.push(value.id),
     maxHeight: 6,
   })
   const compact = short.render(30)
   assert.ok(compact.length <= 6)
-  assert.ok(!plain(compact).join('\n').includes('reply'))
-  for (let row = 0; row < compact.length; row += 1) {
-    for (let col = 0; col < 30; col += 1) {
-      short.handleMouse(mouse('press', col, row))
-      short.handleMouse(mouse('click', col, row))
-    }
-  }
-  // A click may open the selected child; it never replies.
-  assert.deepEqual(replies, [])
+  const compactText = plain(compact).join('\n')
+  assert.ok(compactText.includes('close'), compactText)
+  short.handleInput(ESC)
+  assert.deepEqual(closed, ['short-close'])
+  assert.deepEqual(shortReplies, [])
 })
 
 test('dispose releases overlay action hitboxes', () => {
@@ -1954,8 +2404,8 @@ test('child view reply asks the parent to return to its main Editor and creates 
   const text = plain(lines).join('\n')
   const replyKey = actionKeys('subagent.reply')
   const stopKey = actionKeys('subagent.interrupt')
-  assert.ok(text.includes(`[${replyKey.label}] reply`))
-  assert.ok(text.includes(`[${stopKey.label}] stop`))
+  assert.ok(text.includes(`${replyKey.raw} reply`))
+  assert.ok(text.includes(`${stopKey.raw} stop`))
   assert.ok(!text.includes('read-only'), 'an intervention-capable surface is not labelled read-only')
   assert.ok(!text.includes('╭'), 'no composer is created inside the child view')
   harness.child.handleInput(replyKey.raw)
@@ -2022,7 +2472,7 @@ test('child view without callbacks is inert; the footer still says read-only', (
   assert.deepEqual(harness.closed, [])
 })
 
-test('child view action chips are clickable and a narrow footer paints none', () => {
+test('child view action chips are clickable and stay aligned at narrow widths', () => {
   const harness = childHarness({ onReply: () => {}, onStop: () => {} })
   const lines = plain(harness.child.render(100))
   const row = lines.findIndex(line => line.includes('reply') && line.includes('stop'))
@@ -2036,20 +2486,78 @@ test('child view action chips are clickable and a narrow footer paints none', ()
   harness.child.handleMouse(mouse('click', stopCol, row))
   assert.deepEqual(harness.stops, ['child-1'])
 
+  const outsideChips = (rendered: readonly string[], lineRow: number, col: number): boolean => {
+    const line = rendered[lineRow] ?? ''
+    let index = line.indexOf('[')
+    while (index >= 0) {
+      const close = line.indexOf(']', index)
+      if (close < 0) break
+      const from = visibleWidth(line.slice(0, index))
+      const to = visibleWidth(line.slice(0, close + 1))
+      if (col >= from && col < to) return false
+      index = line.indexOf('[', close + 1)
+    }
+    return true
+  }
   const narrow = childHarness({ onReply: () => {}, onStop: () => {}, rows: 20 })
   for (const width of [12, 18, 24]) {
     const compactLines = narrow.child.render(width)
     assertWidths(compactLines, width, 'narrow child view')
-    assert.ok(!plain(compactLines).join('\n').includes('reply'))
+    const painted = plain(compactLines)
     for (let lineRow = 0; lineRow < compactLines.length; lineRow += 1) {
       for (let col = 0; col < width; col += 1) {
+        if (!outsideChips(painted, lineRow, col)) continue
         narrow.child.handleMouse(mouse('press', col, lineRow))
         narrow.child.handleMouse(mouse('click', col, lineRow))
       }
     }
   }
-  assert.deepEqual(narrow.replies, [])
-  assert.deepEqual(narrow.stops, [])
+  // The chips painted at a narrow width are the only ones that can fire.
+  assert.ok(narrow.replies.length <= 1, 'one visible reply chip at most')
+  assert.ok(narrow.stops.length <= 1, 'one visible stop chip at most')
+  for (const fired of [...narrow.replies, ...narrow.stops]) assert.equal(fired, 'child-1')
+})
+
+test('child view ownerKey drops a pressed action when the child target changes', () => {
+  const harness = childHarness({ onReply: () => {}, onStop: () => {} })
+  let lines = plain(harness.child.render(100))
+  let footer = lines.findIndex(line => line.includes('reply') && line.includes('stop'))
+  assert.ok(footer >= 0)
+  const replyCol = (lines[footer] ?? '').indexOf('reply')
+  const stopCol = (lines[footer] ?? '').indexOf('stop')
+  harness.child.handleMouse(mouse('press', replyCol, footer))
+  // Same child id, native status settles: the stop chip disappears, so its
+  // press cannot turn into a stop after the repaint.
+  harness.child.update({ entry: entry({ id: 'child-1', parentSessionId: 's1', mode: 'continuable', status: 'completed', label: 'Explore repository' }) })
+  lines = plain(harness.child.render(100))
+  harness.child.handleMouse(mouse('click', replyCol, footer))
+  assert.deepEqual(harness.replies, [], 'a vanished stop chip never retargets reply')
+  assert.deepEqual(harness.stops, [])
+
+  // A different native child identity invalidates the press even when the same
+  // reply action label survives.
+  footer = plain(harness.child.render(100)).findIndex(line => line.includes('reply'))
+  harness.child.handleMouse(mouse('press', replyCol, footer))
+  harness.child.update({ entry: entry({ id: 'child-2', parentSessionId: 's1', mode: 'continuable', status: 'running', label: 'Other child' }) })
+  plain(harness.child.render(100))
+  harness.child.handleMouse(mouse('click', replyCol, footer))
+  assert.deepEqual(harness.replies, [], 'a press is bound to its native child id')
+})
+
+test('child view unbound reply/stop keys keep the real clickable capabilities', () => {
+  const unbound = new input.CcKeymap({ bindings: { 'subagent.reply': null, 'subagent.interrupt': null } })
+  const harness = childHarness({ onReply: () => {}, onStop: () => {}, keymap: unbound })
+  const lines = plain(harness.child.render(100))
+  const footer = lines.findIndex(line => line.includes('[reply]') && line.includes('[stop]'))
+  assert.ok(footer >= 0, lines.join('\n'))
+  assert.ok(!(lines[footer] ?? '').includes('r reply'))
+  assert.ok(!(lines[footer] ?? '').includes('s stop'))
+  harness.child.handleMouse(mouse('press', (lines[footer] ?? '').indexOf('[reply]') + 1, footer))
+  harness.child.handleMouse(mouse('click', (lines[footer] ?? '').indexOf('[reply]') + 1, footer))
+  harness.child.handleMouse(mouse('press', (lines[footer] ?? '').indexOf('[stop]') + 1, footer))
+  harness.child.handleMouse(mouse('click', (lines[footer] ?? '').indexOf('[stop]') + 1, footer))
+  assert.deepEqual(harness.replies, ['child-1'])
+  assert.deepEqual(harness.stops, ['child-1'])
 })
 
 test('child view dispose releases action hitboxes and keeps forwarding app.exit', () => {

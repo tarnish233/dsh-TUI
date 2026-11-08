@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { stripTerminalSequences, visibleWidth } from '#pi-tui'
+import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '#pi-tui'
 import { asTui, createFakeTui, loadInputModule, testEditorTheme } from '../src/input/testing/harness.ts'
 
 // Real input subsystem (vendored Pi TUI + CC seam), no fallback editor.
@@ -60,6 +60,8 @@ function makePicker(options: {
   currentProvider?: string
   currentModel?: string
   keymap?: CcKeymap
+  loading?: boolean
+  error?: string
   onSelect?: (id: string) => void
   onCancel?: () => void
   onInterrupt?: () => void
@@ -77,6 +79,8 @@ function makePicker(options: {
   const state = { cancelled: 0, interrupted: 0 }
   const dialog = new ModelPickerDialog(tui, {
     models: options.models,
+    ...(options.loading === undefined ? {} : { loading: options.loading }),
+    ...(options.error === undefined ? {} : { error: options.error }),
     currentProvider: options.currentProvider,
     currentModel: options.currentModel,
     keymap: options.keymap ?? keymap(),
@@ -106,6 +110,10 @@ function assertWidths(dialog: Picker, width: number): void {
     assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
   }
 }
+
+/** The caret marker only exists while the query field owns typing (search mode). */
+const fieldFocused = (dialog: Picker, width = 80): boolean =>
+  dialog.render(width).join('\n').includes(CURSOR_MARKER)
 
 function typeText(dialog: Picker, value: string): void {
   for (const char of value) dialog.handleInput(char)
@@ -281,7 +289,7 @@ test('Up/Down at the query boundary navigate models and return to browse; otherw
   p.dialog.handleInput(KEY.down)
   let rendered = text(p.dialog)
   assert.match(rendered, /2\/2/, 'Down at the boundary moved the model selection')
-  assert.match(rendered, /type to search/, 'model navigation returned to browse mode')
+  assert.equal(fieldFocused(p.dialog), false, 'model navigation returned to browse mode')
   p.dialog.handleInput(KEY.up)
   rendered = text(p.dialog)
   assert.match(rendered, /1\/2/)
@@ -360,7 +368,7 @@ test('Ctrl+C stays global through a pending chord and chord mismatch text become
   assert.equal(q.dialog.keymap.getPendingChord(), null)
   let rendered = text(q.dialog)
   assert.match(rendered, /Search a/)
-  assert.match(rendered, /type\s+to\s+filter/, 'mismatch printable activated search')
+  assert.equal(fieldFocused(q.dialog), true, 'mismatch printable activated search')
   typeText(q.dialog, 'b')
   assert.match(text(q.dialog), /Search ab/)
 })
@@ -378,7 +386,7 @@ test('browse Alt+B/F word movement activates search and uses the query editor', 
 
   const browse = makePicker({ models, currentProvider: 'p' })
   browse.dialog.handleInput(KEY.altB)
-  assert.match(text(browse.dialog), /type\s+to\s+filter/, 'Alt+B from browse activated the query')
+  assert.equal(fieldFocused(browse.dialog), true, 'Alt+B from browse activated the query')
 })
 
 test('Ctrl+C outside paste interrupts globally and Esc cancels locally, each once', () => {
@@ -439,8 +447,9 @@ test('remapped/disabled provider and list actions respect the shared keymap', ()
   const disabled = makePicker({ models, keymap: keymap({ 'model.provider.next': null }) })
   disabled.dialog.handleInput(KEY.tab)
   assert.match(text(disabled.dialog), /provider 1\/2/, 'generic completion/Tab fallback is inert')
-  assert.match(text(disabled.dialog), /type to search/, 'disabled provider Tab does not activate search')
-  assert.match(text(p.dialog), /Alt\+N\/Alt\+M provider/, 'hints use the configured bindings')
+  assert.equal(fieldFocused(disabled.dialog), false, 'disabled provider Tab does not activate search')
+  assert.match(text(p.dialog), /\[alt\+n Provider\]/, 'the footer prints the configured binding')
+  assert.match(text(p.dialog), /\[alt\+m Provider\]/)
 })
 
 test('chords stay owned by the one editor and chord-bound provider actions still work', () => {
@@ -539,22 +548,29 @@ epsilon${KEY.pasteEnd}`)
   }
 })
 
-test('reserves App chrome rows so the footer/cwd/hint stay visible', () => {
+test('the shared frame owns the height budget and keeps the footer inside it', () => {
   const models: Item[] = []
   for (let index = 0; index < 100; index += 1) {
     models.push({ id: `opaque-${index}`, provider: 'alpha', model: `item-${index}`, label: `Catalog item ${index}` })
   }
-  const p = makePicker({ models, currentProvider: 'alpha', currentModel: 'item-50', rows: 22, columns: 80 })
-  const lines = p.dialog.render(80)
-  assert.ok(lines.length <= 16, `${lines.length} lines leave less than 6 rows for App chrome`)
-  const rendered = stripTerminalSequences(lines.join('\n'))
-  assert.match(rendered, /Search/)
-  assert.match(rendered, /Catalog item 50/)
-  assert.match(rendered, /provider/)
-  p.dialog.handleInput('\x1b[F')
-  const after = stripTerminalSequences(p.dialog.render(80).join('\n'))
-  assert.match(after, /Catalog item 99/, 'last selected result stays visible')
-  assert.ok(p.dialog.render(80).length <= 16)
+  for (const rows of [10, 18, 22, 40]) {
+    const p = makePicker({ models, currentProvider: 'alpha', currentModel: 'item-50', rows, columns: 80 })
+    const lines = p.dialog.render(80)
+    // modalHeight: never the full terminal, always two rows of slack.
+    const budget = Math.min(rows - 2, Math.floor(rows * 0.9))
+    assert.ok(lines.length <= budget, `${lines.length} lines exceed the frame budget ${budget}`)
+    const rendered = stripTerminalSequences(lines.join('\n'))
+    assert.match(rendered, /Search/)
+    assert.match(rendered, /Catalog item 50/)
+    assert.match(rendered, /Provider/, 'the provider action stays discoverable')
+    // Closed chrome plus a real footer action is the acceptance shape.
+    assert.match(rendered.split('\n')[0] ?? '', /^┌─ /)
+    assert.match((rendered.split('\n').at(-1) ?? ''), /^└─+┘$/)
+    assert.match(rendered, /\[escape Cancel\]|\[Cancel\]/, 'the cancel affordance survives short heights')
+    const atEnd = makePicker({ models, currentProvider: 'alpha', currentModel: 'item-50', rows, columns: 80 })
+    atEnd.dialog.handleInput('\x1b[F')
+    assert.match(stripTerminalSequences(atEnd.dialog.render(80).join('\n')), /Catalog item 99/, 'last selected result stays visible')
+  }
 })
 
 test('long CJK/emoji/ANSI provider labels stay sanitized and width-safe', () => {
@@ -626,4 +642,142 @@ test('dispose is idempotent and does not steal another editor’s pending chord'
   other.handleInput('\x05') // ctrl+e completes the other editor's chord
   assert.equal(shared.getPendingChord(), null)
   other.dispose()
+})
+// ---------------------------------------------------------------------------
+// Asynchronous native catalog and mouse parity
+
+test('async catalog: loading, empty, no-match and native failure are distinct and never submit', () => {
+  const p = makePicker({ models: [], loading: true, currentProvider: undefined })
+  p.dialog.focused = true
+  let rendered = text(p.dialog)
+  assert.match(rendered, /Loading models…/)
+  assert.doesNotMatch(rendered, /No models are available/)
+
+  p.dialog.render(80)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'Enter on a loading roster cannot select')
+
+  p.dialog.setLoading(false)
+  rendered = text(p.dialog)
+  assert.match(rendered, /No models are available\./)
+  assert.doesNotMatch(rendered, /Loading models/)
+
+  p.dialog.setError('native model catalog rejected the read')
+  rendered = text(p.dialog)
+  assert.match(rendered, /native model catalog rejected the read/)
+  p.dialog.setError(undefined)
+  assert.doesNotMatch(text(p.dialog), /native model catalog rejected the read/)
+
+  // A single late candidate must not be applied on arrival.
+  p.dialog.setModels([{ id: 'p/only', provider: 'p', model: 'only', label: 'Only' }])
+  assert.deepEqual(p.selected, [], 'arriving catalog data never answers for the user')
+  rendered = text(p.dialog)
+  assert.match(rendered, /Only/)
+  assert.match(rendered, /1 model/)
+
+  // A query with no match is its own state, not an empty catalog.
+  typeText(p.dialog, 'zzz')
+  rendered = text(p.dialog)
+  assert.match(rendered, /No models match "zzz" in p\./)
+  assert.doesNotMatch(rendered, /No models are available\./)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'Enter on a no-match list cannot select')
+})
+
+test('setModels keeps the current provider and the selected model id, without re-submitting', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  assert.deepEqual(p.selected, [])
+  // Re-delivery of the same roster (e.g. a reload) keeps the highlight.
+  p.dialog.setModels(roster)
+  assert.match(text(p.dialog), /a-two\s+current/)
+  const marked = text(p.dialog)
+  assert.match(marked, /❯.*Alpha Two/, 'the current route stays the highlighted row')
+  assert.deepEqual(p.selected, [], 're-delivery does not select anything')
+
+  // A catalog that no longer contains the provider falls back to the first
+  // group; the query and the selection index stay sane.
+  p.dialog.setModels([{ id: 'beta/b-one', provider: 'beta', model: 'b-one', label: 'Beta One' }])
+  const after = text(p.dialog)
+  assert.match(after, /provider 1\/1/)
+  assert.match(after, /Beta One/)
+  assert.deepEqual(p.selected, [])
+})
+
+test('mouse: a click needs a press on the same model id and never selects a moved row', () => {
+  const input = keymap()
+  const models: Item[] = [
+    { id: 'p/one', provider: 'p', model: 'one', label: 'One' },
+    { id: 'p/two', provider: 'p', model: 'two', label: 'Two' },
+  ]
+  const p = makePicker({ models, keymap: input })
+  const lines = p.dialog.render(80)
+  const rowTwo = lines.findIndex(line => stripTerminalSequences(line).includes('Two'))
+  assert.ok(rowTwo > 0)
+  const click = (y: number) => ({
+    type: 'click' as const, button: 'left' as const, x: 6, y, screenX: 6, screenY: y,
+    width: 80, height: lines.length, shift: false, alt: false, ctrl: false, clickCount: 1,
+  })
+  // Click without press: swallowed.
+  assert.equal(p.dialog.handleMouse(click(rowTwo))?.render, false)
+  assert.deepEqual(p.selected, [])
+  // Press + click on the same row selects that opaque id (Enter parity).
+  p.dialog.handleMouse({
+    type: 'press', button: 'left', x: 6, y: rowTwo, screenX: 6, screenY: rowTwo,
+    width: 80, height: lines.length, shift: false, alt: false, ctrl: false,
+  })
+  p.dialog.handleMouse(click(rowTwo))
+  assert.deepEqual(p.selected, ['p/two'])
+})
+
+test('narrow widths keep the frame closed and the footer actionable', () => {
+  const models: Item[] = roster
+  for (const width of [40, 60, 80, 120]) {
+    for (const rows of [10, 18, 24]) {
+      const p = makePicker({ models, currentProvider: 'alpha', currentModel: 'a-two', rows, columns: width })
+      const lines = p.dialog.render(width)
+      for (const line of lines) assert.ok(visibleWidth(line) <= width)
+      const rendered = stripTerminalSequences(lines.join('\n'))
+      assert.match(rendered.split('\n')[0] ?? '', /^┌─ /)
+      assert.match(rendered.split('\n').at(-1) ?? '', /^└─+┘$/)
+      assert.match(rendered, /Cancel/, 'cancel stays discoverable at every size')
+    }
+  }
+})
+
+test('an async first catalog honors the explicit current provider, not the first roster entry', () => {
+  // Reproduces the App flow: a picker opens before the native catalog exists,
+  // with the session's real route. The roster that lands has a different
+  // provider first, so "first group" would silently open the wrong provider.
+  const rosterItems: Item[] = [
+    { id: 'deepseek-official/deepseek-chat', provider: 'deepseek-official', model: 'deepseek-chat', label: 'DeepSeek Chat' },
+    { id: 'deepseek-official/deepseek-reasoner', provider: 'deepseek-official', model: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
+    { id: 'picker-alpha/alpha-one', provider: 'picker-alpha', model: 'alpha-one', label: 'Alpha One' },
+    { id: 'picker-alpha/alpha-two', provider: 'picker-alpha', model: 'alpha-two', label: 'Alpha Two' },
+  ]
+  const p = makePicker({ models: [], loading: true, currentProvider: 'picker-alpha', currentModel: 'alpha-two' })
+  p.dialog.focused = true
+  assert.match(text(p.dialog), /Loading models…/)
+  assert.deepEqual(p.selected, [], 'nothing is selected while the catalog is pending')
+
+  p.dialog.setModels(rosterItems)
+  const rendered = text(p.dialog)
+  assert.match(rendered, /provider 2\/2/, 'the explicit current provider, not the first group')
+  assert.match(rendered, /Alpha One/)
+  assert.match(rendered, /Alpha Two/)
+  assert.match(rendered, /a-two|alpha-two/, 'the current model row is present')
+  assert.doesNotMatch(rendered, /DeepSeek Chat/, 'the first roster provider is not opened')
+  assert.match(rendered, /❯.*Alpha Two/, 'the current native route is highlighted')
+  assert.deepEqual(p.selected, [], 'arriving data still selects nothing')
+
+  // Enter picks the highlighted row of that provider, verbatim.
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['picker-alpha/alpha-two'])
+})
+
+test('setModels falls back to the first group when the explicit provider is gone', () => {
+  const p = makePicker({ models: [], currentProvider: 'retired-provider', currentModel: 'gone', loading: true })
+  p.dialog.setModels([{ id: 'p/one', provider: 'p', model: 'one', label: 'One' }])
+  assert.match(text(p.dialog), /provider 1\/1/)
+  assert.match(text(p.dialog), /One/)
+  assert.deepEqual(p.selected, [])
 })

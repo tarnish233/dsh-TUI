@@ -23,11 +23,15 @@ assert NODE, 'node is required'
 
 def run(mode):
     config = tempfile.mkdtemp(prefix='dsh-pi-pty-')
+    home, workspace = Path(config) / 'home', Path(config) / 'workspace'
+    home.mkdir(); workspace.mkdir()
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir(ROOT)
-        os.execv(NODE, [NODE, str(ROOT / 'bin/dsh-tui.mjs'), '--demo', '--' + mode,
-                           '--config-dir', config, 'PTY streaming demonstration'])
+        os.chdir(workspace)
+        env = {**os.environ, 'HOME': str(home), 'DSH_HOME': str(home / '.dsh'),
+               'XDG_CONFIG_HOME': str(home / '.config')}
+        os.execve(NODE, [NODE, str(ROOT / 'bin/dsh-tui.mjs'), '--demo', '--' + mode,
+                            '--config-dir', config, 'PTY streaming demonstration'], env)
     records, raw = [], bytearray()
     started = time.monotonic()
     resized_small = resized_large = typed = False
@@ -81,10 +85,10 @@ def run(mode):
                 keyboard_offset = len(raw)
                 os.write(fd, b'/settings\r')
                 keyboard_stage = 3
-            elif keyboard_stage == 3 and b'Keyboard shortcuts' in raw[keyboard_offset:]:
-                # The tabbed Settings list no longer prints SelectDialog's
-                # numeric labels. Keyboard shortcuts is last on General:
-                # End selects it, Enter opens it, Enter edits its first binding.
+            elif keyboard_stage == 3 and b'Settings' in raw[keyboard_offset:] and b'Default screen' in raw[keyboard_offset:]:
+                # Settings is one continuous grouped page. Keyboard shortcuts
+                # is the final row: End selects it, Enter opens it, then Enter
+                # edits its first binding; no category/tab switch is needed.
                 keyboard_offset = len(raw)
                 os.write(fd, b'\x1b[F\r\r')
                 keyboard_stage = 4

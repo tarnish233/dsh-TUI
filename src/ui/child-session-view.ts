@@ -1,15 +1,18 @@
 /**
- * Native child Session view (controlled surface).
+ * Native child Session view (controlled, large read-only modal).
  *
  * The parent owns the child `TranscriptStore` and the child `TranscriptView`
  * (built from the same native codec/options as the main transcript). This
- * component only frames them:
+ * component only frames them with the shared `ModalFrame`:
  *
- *   breadcrumb → native status/mode/model · session-total tokens · timing
+ *   title: Agents › <native child label>
+ *   subtitle: <root session> › <native label>
+ *   before: native status/mode/model · session-total tokens · timing, identity
  *   ───────────
  *   child transcript (scrollable, no composer)
  *   ───────────
- *   effective key hints (+ Reply/Stop action chips when applicable)
+ *   status: parent message / read-only notice
+ *   actions: Reply / Stop / Close (real effective bindings)
  *
  * Intervention is requested, never performed: Reply calls `onReply` so the
  * **parent** returns to its main Editor (this surface never grows a second
@@ -19,9 +22,9 @@
  * and never stops anything.
  *
  * Input resolves in the `subagentSession` context (`subagentSession → list →
- * dialog → global`, no editor fallback), so typing cannot edit anything. The
- * global quit action (`app.exit`) is forwarded to the parent through
- * `onGlobalAction` instead of being swallowed.
+ * dialog → global`, no editor fallback), so typing cannot edit anything and no
+ * second composer exists. The global quit action (`app.exit`) is forwarded to
+ * the parent through `onGlobalAction` instead of being swallowed.
  *
  * No timer is created: native timing is folded from `settledMs`/`activeSince`
  * on each frame, and the parent's renderer decides when to repaint.
@@ -33,6 +36,11 @@
  * `SessionInfo`, a second Editor or a fabricated empty transcript. The parent
  * owns when it turns off: reset the child store from the native snapshot, then
  * `setLoading(false)`.
+ *
+ * Search is intentionally not implemented in this pass: a safe search would
+ * have to copy durable transcript facts into a second index. The surface remains
+ * fully readable/scrollable, and `modal.search` is inert here rather than
+ * pretending to search.
  */
 import {
   ScrollView,
@@ -43,10 +51,10 @@ import {
   type TuiMouseEventResult,
 } from '#pi-tui'
 import type { SessionInfo, SubagentEntry } from '../backend/types.ts'
-import { createCcKeymap, formatBinding, type CcKeymap } from '../input/index.ts'
+import { createCcKeymap, type CcKeymap } from '../input/index.ts'
 import type { TranscriptStore } from '../state/transcript.ts'
 import type { TranscriptView } from './transcript.ts'
-import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
+import { modalBinding, modalHeight, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import {
   subagentCanReply,
   subagentCanStop,
@@ -59,8 +67,8 @@ import {
   subagentTone,
   type SubagentTone,
 } from './subagent-format.ts'
-import { fit, sanitize, visibleWidth } from './text.ts'
-import { bold, cc, dim, t } from './theme.ts'
+import { fit, sanitize } from './text.ts'
+import { dim, t } from './theme.ts'
 
 export interface ChildSessionViewOptions {
   /** Durable child catalog entry this view belongs to. */
@@ -96,7 +104,7 @@ export interface ChildSessionViewOptions {
    */
   onGlobalAction?: (actionId: string) => void
   onRenderRequest?: () => void
-  /** Height cap; defaults to the terminal rows minus two. */
+  /** Height cap combined with the shared `modalHeight` token. */
   maxHeight?: number
   /** Clock for the native session-total duration; injectable for tests. */
   now?: () => number
@@ -118,13 +126,6 @@ const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cance
 
 /** Body line while the parent's native child snapshot is pending. */
 const LOADING_TEXT = 'Loading child session…'
-
-/** One clickable footer action chip in component-local columns (inclusive). */
-interface FooterChip {
-  readonly action: 'reply' | 'stop'
-  readonly startCol: number
-  readonly endCol: number
-}
 
 const TONE_STYLE: Readonly<Record<SubagentTone, (text: string) => string>> = {
   running: t.accent,
@@ -150,13 +151,15 @@ function toneGlyph(tone: SubagentTone): string {
 
 export class ChildSessionView implements Component, Focusable {
   readonly capturesViewportInput = true
+  /** Parent generic dialog hosting uses the wide modal token. */
+  readonly modalSize: ModalSize = 'wide'
   readonly keymap: CcKeymap
   readonly store: TranscriptStore
   readonly view: TranscriptView
   private readonly tui: TUI
   private readonly options: ChildSessionViewOptions
   private readonly scrollView: ScrollView
-  private readonly registry = new HitboxRegistry()
+  private readonly frame = new ModalFrame()
   private entryValue: SubagentEntry
   private infoValue: SessionInfo | undefined
   private breadcrumbValue: readonly string[]
@@ -166,6 +169,7 @@ export class ChildSessionView implements Component, Focusable {
   private chordPending = false
   private viewportRows = 1
   private loadingValue: boolean
+  private messageValue: { readonly text: string; readonly error: boolean } | undefined
   private readonly now: () => number
 
   constructor(tui: TUI, options: ChildSessionViewOptions) {
@@ -224,6 +228,19 @@ export class ChildSessionView implements Component, Focusable {
     this.invalidate()
   }
 
+  /**
+   * Visible status for a parent-owned native action failure/confirmation
+   * (reply/stop). Shown in this surface's own status row, never behind the
+   * transcript. `undefined` clears it.
+   */
+  setMessage(message?: string, error = false): void {
+    if (this.disposed) return
+    const text = message === undefined ? '' : sanitize(message).trim()
+    if (text === '') this.messageValue = undefined
+    else this.messageValue = { text, error }
+    this.requestRender()
+  }
+
   get focused(): boolean {
     return this.focusedState
   }
@@ -273,6 +290,7 @@ export class ChildSessionView implements Component, Focusable {
 
   invalidate(): void {
     if (this.disposed) return
+    this.frame.invalidate()
     this.view.invalidate()
     this.requestRender()
   }
@@ -282,7 +300,7 @@ export class ChildSessionView implements Component, Focusable {
     if (this.disposed) return
     this.disposed = true
     this.cancelChord()
-    this.registry.clear()
+    this.frame.invalidate()
     if (this.options.ownsView !== false) this.view.dispose()
     else this.view.invalidate()
   }
@@ -359,7 +377,8 @@ export class ChildSessionView implements Component, Focusable {
         return
       default:
         // No editor fallback and no parent model/permission/tool/settings
-        // action may run from a child conversation.
+        // action may run from a child conversation. `modal.search` is inert
+        // here (no second fact index, see the module doc).
         return
     }
   }
@@ -396,11 +415,6 @@ export class ChildSessionView implements Component, Focusable {
     return true
   }
 
-  private runAction(action: 'reply' | 'stop'): void {
-    if (action === 'reply') this.replyChild()
-    else this.stopChild()
-  }
-
   private scrollBy(lines: number): void {
     this.scrollView.scrollBy(lines)
     this.requestRender()
@@ -416,20 +430,27 @@ export class ChildSessionView implements Component, Focusable {
   // -------------------------------------------------------------------------
   // Rendering
 
+  /**
+   * Height budget from the shared wide token plus any parent cap. The frame
+   * measures its own chrome; this component never subtracts a chrome constant.
+   */
   private limitRows(): number {
-    const rows = this.tui.terminal.rows
-    const terminalCap = Number.isFinite(rows) && rows > 0 ? Math.max(6, Math.floor(rows) - 2) : 24
+    const token = modalHeight(this.tui, this.modalSize)
     const configured = this.options.maxHeight
-    if (configured === undefined || !Number.isFinite(configured) || configured <= 0) return terminalCap
-    return Math.max(6, Math.min(terminalCap, Math.floor(configured)))
+    if (configured === undefined || !Number.isFinite(configured) || configured <= 0) return token
+    return Math.max(1, Math.min(token, Math.floor(configured)))
+  }
+
+  private innerWidth(size: number, limit: number): number {
+    return size >= 8 && limit >= 6 ? Math.max(1, size - 4) : size
   }
 
   private headerBreadcrumb(width: number): string {
     const parts = this.breadcrumbValue
       .map(part => sanitize(part).trim())
       .filter(part => part !== '')
-    const text = parts.join(' › ')
-    return fit(` ${dim('Agents')}${dim(' › ')}${t.text(text)}`, width)
+    const suffix = this.external() ? dim(' · no local transcript') : ''
+    return fit(t.text(parts.join(' › ')) + suffix, width)
   }
 
   private headerStatus(width: number): string {
@@ -447,7 +468,7 @@ export class ChildSessionView implements Component, Focusable {
     if (tokens !== undefined) pieces.push(dim(tokens))
     const timing = subagentTimingLabel(entry.timing, this.now())
     if (timing !== undefined) pieces.push(dim(timing))
-    return fit(` ${pieces.join(dim(' · '))}`, width)
+    return fit(pieces.join(dim(' · ')), width)
   }
 
   private effectiveEntry(): SubagentEntry {
@@ -467,67 +488,11 @@ export class ChildSessionView implements Component, Focusable {
     if (entry.mode === 'external' || entry.status === 'external') {
       pieces.push(dim('external task · no local transcript'))
     }
-    return fit(` ${pieces.join(dim(' · '))}`, width)
+    return fit(pieces.join(dim(' · ')), width)
   }
 
-  /**
-   * Footer line plus the clickable action chips it actually painted.
-   *
-   * Without `onReply`/`onStop` the surface is literally read-only for this row
-   * and says so. With callbacks, only the actions the native row supports are
-   * advertised (from the shared keymap), and a footer too narrow for the chips
-   * drops them entirely so no unclickable/invisible affordance stays behind.
-   */
-  private footer(width: number): { line: string; chips: FooterChip[] } {
-    const base: string[] = []
-    const previous = this.bindingLabel('list.previous')
-    const next = this.bindingLabel('list.next')
-    const close = this.bindingLabel('list.cancel') ?? this.bindingLabel('app.cancel')
-    if (previous !== undefined && next !== undefined) base.push(`${previous}/${next} scroll`)
-    if (close !== undefined) base.push(`${close} close`)
-
-    const actions: Array<{ action: 'reply' | 'stop'; text: string }> = []
-    const replyKey = this.actionKey('subagent.reply')
-    if (replyKey !== undefined && this.replyTarget() !== undefined) actions.push({ action: 'reply', text: `[${replyKey}] reply` })
-    const stopKey = this.actionKey('subagent.interrupt')
-    if (stopKey !== undefined && this.stopTarget() !== undefined) actions.push({ action: 'stop', text: `[${stopKey}] stop` })
-    if (actions.length === 0) {
-      if (this.options.onReply === undefined && this.options.onStop === undefined) base.push('read-only')
-      return { line: base.join(' · '), chips: [] }
-    }
-
-    const plain = [...actions.map(action => action.text), ...base].join(' · ')
-    if (visibleWidth(plain) > width) return { line: base.join(' · '), chips: [] }
-
-    let line = ''
-    const chips: FooterChip[] = []
-    const pushPart = (text: string, styled: string, action?: 'reply' | 'stop'): void => {
-      if (line !== '') line += dim(' · ')
-      const start = visibleWidth(line)
-      line += styled
-      if (action !== undefined) chips.push({ action, startCol: start, endCol: start + visibleWidth(text) - 1 })
-    }
-    for (const action of actions) pushPart(action.text, t.accentBright(action.text), action.action)
-    for (const part of base) pushPart(part, dim(part))
-    return { line, chips }
-  }
-
-  private bindingLabel(action: string): string | undefined {
-    const binding = this.keymap.getBindings(action)[0]
-    return binding === undefined ? undefined : formatBinding(binding.split(' '))
-  }
-
-  /**
-   * Effective key for one action in the `subagentSession` chain. A session-only
-   * or disabled shared action never advertises a dead key here.
-   */
-  private actionKey(actionId: string): string | undefined {
-    const action = this.keymap.getAction(actionId)
-    if (action === undefined) return undefined
-    const chain = this.keymap.getFallbackChain('subagentSession')
-    if (!action.contexts.some(entry => chain.includes(entry))) return undefined
-    const binding = this.keymap.getBindings(actionId)[0]
-    return binding === undefined ? undefined : formatBinding(binding.split(' '))
+  private external(): boolean {
+    return this.entryValue.mode === 'external' || this.entryValue.status === 'external'
   }
 
   /** True when this surface has any native intervention request available. */
@@ -535,96 +500,104 @@ export class ChildSessionView implements Component, Focusable {
     return this.options.onReply !== undefined || this.options.onStop !== undefined
   }
 
+  private statusLines(width: number): readonly string[] {
+    if (this.messageValue !== undefined) {
+      const style = this.messageValue.error ? t.redSoft : t.muted
+      return [fit(style(this.messageValue.text), width)]
+    }
+    if (this.external()) {
+      return [fit(dim(t.muted('External task · no local transcript · read-only')), width)]
+    }
+    if (!this.interactive()) {
+      return [fit(dim(t.muted('read-only · viewing native facts')), width)]
+    }
+    return []
+  }
+
+  private modalActions(limit: number): readonly ModalAction[] {
+    const actions: ModalAction[] = []
+    // A real native capability stays clickable even when its key binding is
+    // disabled: the frame paints the label without a fictitious shortcut.
+    const reply = this.replyTarget()
+    if (reply !== undefined) {
+      actions.push({ id: `reply:${reply.id}`, label: 'reply', action: 'subagent.reply', onActivate: () => { if (this.entryValue.id === reply.id) this.replyChild() } })
+    }
+    const stop = this.stopTarget()
+    if (stop !== undefined) {
+      actions.push({ id: `stop:${stop.id}`, label: 'stop', action: 'subagent.interrupt', onActivate: () => { if (this.entryValue.id === stop.id) this.stopChild() } })
+    }
+    const closeBinding = modalBinding(this.keymap, 'list.cancel', true) ?? modalBinding(this.keymap, 'app.cancel', true)
+    const closeAction: ModalAction = {
+      id: 'close',
+      label: 'close',
+      ...(closeBinding === undefined ? {} : { action: 'list.cancel' }),
+      onActivate: () => this.close(),
+    }
+    // Keep the real return affordance first when only one footer row fits.
+    if (limit < 6) return [closeAction, ...actions.slice(0, 1)]
+    actions.push(closeAction)
+    return actions
+  }
+
+  private frameOptions(size: number, limit: number): ModalFrameOptions {
+    const width = this.innerWidth(size, limit)
+    return {
+      title: `Agents › ${sanitize(subagentLabel(this.entryValue))}`,
+      // Stable child Session identity: a press cannot survive a different
+      // child, even when both rows carry the same action label.
+      ownerKey: `child:${this.entryValue.id}`,
+      subtitle: this.headerBreadcrumb(width),
+      before: [this.headerStatus(width), this.headerIdentity(width)],
+      after: this.statusLines(width),
+      actions: this.modalActions(limit),
+      onClose: () => this.close(),
+      maxHeight: limit,
+      keymap: this.keymap,
+    }
+  }
+
   render(width: number): string[] {
     if (this.disposed) return []
     const size = Math.max(1, Math.floor(width))
     const limit = this.limitRows()
-    const external = this.entryValue.mode === 'external' || this.entryValue.status === 'external'
-    // 4 header rows (rule/breadcrumb/status/rule) + 3 footer rows
-    // (rule/identity/hint); the conversation gets everything else.
-    const chrome = 7
-    if (limit < chrome + 2) return this.renderCompact(size, limit, external)
+    const external = this.external()
+    const options = this.frameOptions(size, limit)
+    const probe = this.frame.measure(size, options)
+    const bodyHeight = Math.max(0, probe.bodyHeight)
+    const bodyWidth = Math.max(1, probe.bodyWidth)
+    this.viewportRows = Math.max(1, bodyHeight)
 
-    const out: string[] = []
-    const push = (line: string): void => {
-      out.push(line)
-    }
-    push(cc.inactive('─'.repeat(size)))
-    push(this.headerBreadcrumb(size))
-    push(this.headerStatus(size))
-    push(cc.inactive('─'.repeat(size)))
-
-    const bodyHeight = Math.max(1, limit - chrome)
-    this.viewportRows = bodyHeight
+    const body: string[] = []
     if (this.loadingValue && !external) {
       // The native snapshot is still being read: state the pending read
       // honestly instead of claiming the conversation is empty, and lay out no
       // scroll content (there is none yet). Everything else on this surface —
       // breadcrumb, native status, totals, Reply/Stop gating, close keys — is
       // the normal chrome and stays exactly as it is once loaded.
-      push(fit(` ${dim(t.muted(LOADING_TEXT))}`, size))
-      for (let index = 1; index < bodyHeight; index += 1) push('')
+      body.push(fit(dim(t.muted(LOADING_TEXT)), bodyWidth))
+      for (let index = 1; index < bodyHeight; index += 1) body.push('')
+    } else if (external) {
+      body.push(fit(dim(t.muted('External task: this child has no local Session transcript.')), bodyWidth))
+      for (let index = 1; index < bodyHeight; index += 1) body.push('')
     } else {
-      let content: string[]
-      if (external) {
-        content = [fit(` ${dim(t.muted('External task: this child has no local Session transcript.'))}`, size)]
-      } else {
-        content = this.scrollView.render(size)
-      }
-      const total = content.length
-      this.scrollView.updateLayout(total, bodyHeight, () => this.requestRender())
-      const maxScroll = Math.max(0, total - bodyHeight)
+      const content = this.scrollView.render(bodyWidth)
+      this.scrollView.updateLayout(content.length, Math.max(1, bodyHeight), () => this.requestRender())
+      const maxScroll = Math.max(0, content.length - Math.max(1, bodyHeight))
       const top = Math.max(0, Math.min(this.scrollView.scrollTop, maxScroll))
-      if (total === 0) {
-        push(fit(` ${dim(t.muted('No messages in this agent session.'))}`, size))
-        for (let index = 1; index < bodyHeight; index += 1) push('')
+      if (content.length === 0) {
+        body.push(fit(dim(t.muted('No messages in this agent session.')), bodyWidth))
+        for (let index = 1; index < bodyHeight; index += 1) body.push('')
       } else {
-        for (let offset = 0; offset < bodyHeight; offset += 1) {
-          push(content[top + offset] ?? '')
-        }
+        for (let offset = 0; offset < bodyHeight; offset += 1) body.push(content[top + offset] ?? '')
       }
     }
 
-    push(cc.inactive('─'.repeat(size)))
-    push(this.headerIdentity(size))
-    const footer = this.footer(size)
-    const boxes: MouseHitbox[] = []
-    if (footer.line !== '') {
-      const row = out.length
-      push(fit(` ${footer.line}`, size))
-      for (const chip of footer.chips) {
-        boxes.push({
-          id: `child-action:${chip.action}`,
-          startRow: row,
-          endRow: row,
-          startCol: chip.startCol + 1,
-          endCol: chip.endCol + 1,
-          claimPress: true,
-          onClick: () => this.runAction(chip.action),
-        })
-      }
-    }
-    // Never grow past the viewport, and never leave a hitbox on a clipped row.
-    if (out.length > limit) out.length = limit
-    this.registry.sync(boxes.filter(box => box.endRow < out.length))
-    return out.map(line => fit(line, size))
-  }
-
-  /** Short viewport: identity + status + close affordance, never a hidden editor. */
-  private renderCompact(width: number, limit: number, external: boolean): string[] {
-    const close = this.bindingLabel('list.cancel') ?? this.bindingLabel('app.cancel') ?? 'Esc'
-    const lines = [this.headerBreadcrumb(width), this.headerStatus(width)]
-    if (this.loadingValue && !external) lines.push(fit(` ${dim(t.muted(LOADING_TEXT))}`, width))
-    else if (external) lines.push(fit(` ${dim(t.muted('External task · no local transcript'))}`, width))
-    lines.push(fit(` ${dim(`${close} close${this.interactive() ? '' : ' · read-only'}`)}`, width))
-    this.viewportRows = 1
-    // No chip is painted in a short viewport, so no action hitbox may exist.
-    this.registry.sync([])
-    return lines.slice(0, Math.max(1, limit)).map(line => fit(line, width))
+    const lines = this.frame.render(size, body, options)
+    return lines.map(line => fit(line, size))
   }
 
   // -------------------------------------------------------------------------
-  // Mouse: wheel scrolls the conversation; Reply/Stop chips are clickable.
+  // Mouse: frame owns chrome/action chips; body delegates to the transcript.
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     if (this.disposed) return undefined
@@ -634,6 +607,10 @@ export class ChildSessionView implements Component, Focusable {
       this.scrollBy(delta)
       return { handled: true, render: true }
     }
-    return this.registry.handleMouse(event)
+    const chrome = this.frame.handleMouse(event)
+    if (chrome !== undefined) return chrome
+    const body = this.frame.bodyMouse(event)
+    if (body === undefined) return undefined
+    return this.view.handleMouse(body)
   }
 }

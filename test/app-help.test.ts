@@ -6,7 +6,7 @@ import test from 'node:test'
 import { App } from '../src/app.ts'
 import type { Backend, BackendEvent, JsonRecord, SessionInfo } from '../src/backend/types.ts'
 import { DEMO_TRANSCRIPT_CODEC } from '../src/demo.ts'
-import { delay, until, VirtualTerminal } from './helpers/terminal.ts'
+import { delay, modalScreen, until, VirtualTerminal } from './helpers/terminal.ts'
 
 /** Parent-owned control fixture only; no Agent, native persistence or model calls. */
 class HelpBackend implements Backend {
@@ -73,7 +73,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       const editor = f.app.editor, before = editor.captureDraft(), transcript = [...f.app.store.items]
       const attachment = f.app.session?.attachmentId
       await f.app.submit('/help'); await paint(f.terminal)
-      const rendered = f.terminal.screen()
+      const rendered = modalScreen(f.terminal, 'Help')
       assert.match(rendered, /Help/)
       const heading = rendered.split('\n').find(line => line.includes('Commands') && line.includes('Custom commands')) ?? ''
       assert.ok(heading, 'wide terminals show separate command columns')

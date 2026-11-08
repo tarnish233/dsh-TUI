@@ -193,6 +193,109 @@ test('native projections publish todos, an engaged plan once, and deduped metric
   await backend.close()
 })
 
+test('native title baseline comes from the title projection even without a visible title event', async () => {
+  const projections = new FakeProjections()
+  projections.state.set('title', 'Native baseline')
+  const { backend, events } = harness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+    fakeHost.use('sessionQuery', {
+      // A durable log whose retained suffix contains no title event: the
+      // baseline must still come from the native title projection.
+      readSession: async (sessionId: string) => ({ session: { id: sessionId }, events: [] }),
+    })
+  })
+  await backend.connect()
+  await backend.send('prompt')
+  const current = await backend.connect()
+  const info = await backend.command('resume', { sessionId: current.sessionId }) as SessionInfo
+  assert.equal(info.title, 'Native baseline')
+  assert.equal((info.events ?? []).some(event => event.type === 'session/title'), false)
+  assert.deepEqual(info.events, [], 'the retained event suffix has no title event')
+  const ready = events.filter(event => event.type === 'ready').at(-1)
+  assert.equal(ready?.type === 'ready' ? ready.info.title : undefined, 'Native baseline')
+  await backend.close()
+})
+
+test('native title updates and null clears come from projection changes with the live attachment', async () => {
+  const projections = new FakeProjections()
+  const { backend, events } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+  })
+  const session = agentsSession(backend)
+  const info = await backend.connect()
+  projections.set(session, 'title', 'First native title')
+  projections.set(session, 'title', null)
+  const titles = events.filter(event => event.type === 'title')
+  assert.equal(titles.length, 2)
+  assert.deepEqual(titles[0], {
+    type: 'title', sessionId: info.sessionId, attachmentId: info.attachmentId, value: 'First native title',
+  })
+  assert.deepEqual(titles[1], {
+    type: 'title', sessionId: info.sessionId, attachmentId: info.attachmentId, value: null,
+  })
+  await backend.close()
+})
+
+test('an old session title change is rejected after switching, and unavailable titles stay omitted', async () => {
+  const projections = new FakeProjections()
+  const { backend, agents, events } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+  })
+  const oldSession = agents.agents[0]?.session
+  assert.ok(oldSession)
+  await backend.command('new')
+  await backend.send('next')
+  const newSession = agents.agents[1]?.session
+  assert.ok(newSession)
+  assert.notEqual(newSession, oldSession)
+  const current = await backend.connect()
+  projections.set(oldSession, 'title', 'stale old title')
+  assert.equal(events.filter(event => event.type === 'title').length, 0, 'a retired session cannot change the live title')
+  projections.set(newSession, 'title', 'fresh title')
+  const titles = events.filter(event => event.type === 'title')
+  assert.deepEqual(titles, [{
+    type: 'title', sessionId: current.sessionId, attachmentId: current.attachmentId, value: 'fresh title',
+  }])
+  await backend.close()
+
+  const withoutProjection = await liveHarness()
+  const omitted = await withoutProjection.backend.connect()
+  assert.equal(Object.hasOwn(omitted, 'title'), false, 'an unavailable title projection is omitted, not null')
+  await withoutProjection.backend.close()
+})
+
+test('title projection forwarding never writes title-provider enablement or profile entries', async () => {
+  const projections = new FakeProjections()
+  let providerRefreshes = 0
+  let entryUpdates = 0
+  const { backend } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+    fakeHost.use('sessionTitle', {
+      refresh: async () => {
+        providerRefreshes += 1
+        return undefined
+      },
+    })
+    fakeHost.use('loader', {
+      entries: () => [{
+        options: { id: 'title-entry', name: '@deepseek-ai/dsh-session-title-first-prompt-llm' },
+        disabled: false,
+        update: () => {
+          entryUpdates += 1
+        },
+      }],
+    })
+  })
+  const session = agentsSession(backend)
+  projections.set(session, 'title', 'Native only')
+  await nextTask()
+  assert.equal(providerRefreshes, 0, 'title forwarding never calls the provider')
+  assert.equal(entryUpdates, 0, 'title forwarding never mutates the Loader/profile entry')
+  const info = await backend.connect()
+  assert.equal(info.title, 'Native only')
+  await backend.close()
+})
+
 test('session events preserve native surface facts and add ephemeral tool presentation', async () => {
   const { host, backend, agent } = await liveHarness((fakeHost) => {
     fakeHost.use('tools', {
@@ -269,20 +372,28 @@ test('a failed durable read is reported as incomplete, never empty', async () =>
   await backend.close()
 })
 
-test('resume and session listing use only the native query surface', async () => {
+test('resume and session listing use only the native query surface and preserve native order', async () => {
+  let persistenceReads = 0
   const { backend } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionPersistence', { list: async () => { persistenceReads += 1; return [] } })
     fakeHost.use('sessionQuery', {
       listSessions: async () => [
+        // Deliberately ascending stamps: a TUI recency sort would reverse the
+        // native listing. Native order is the only order exposed to the picker.
         { header: { id: 's1', cwd: '/w', createdAt: 10 }, live: false },
-        { header: { id: 's2', cwd: '/w', createdAt: 20, origin: 'subagent' }, live: false },
+        { header: { id: 's2', cwd: '/w', createdAt: 20 }, live: true },
+        { header: { id: 'child', cwd: '/w', createdAt: 30, origin: 'subagent' }, live: false },
       ],
       readTitleSnapshots: async (ids: readonly string[]) => ids.map(id => ({ sessionId: id, status: 'fulfilled', value: { title: { title: `title-${id}` } } })),
       readSession: async (id: string) => ({ session: { id }, events: [], inheritedEventCount: 0 }),
     })
   })
   const sessions = await backend.command('sessions') as Array<Record<string, unknown>>
-  assert.deepEqual(sessions.map(row => row.id), ['s1'])
+  assert.deepEqual(sessions.map(row => row.id), ['s1', 's2'])
+  assert.deepEqual(sessions.map(row => row.createdAt), [10, 20], 'native header stamps remain display metadata')
   assert.equal(sessions[0]?.title, 'title-s1')
+  assert.equal(sessions.some(row => Object.hasOwn(row, 'activityAt')), false, 'no adapter-derived activity field')
+  assert.equal(persistenceReads, 0, 'listing never stats durable artifacts through sessionPersistence')
   const titles = await backend.command('titles', { ids: ['s1', 's1', 's9'] }) as Array<Record<string, unknown>>
   assert.deepEqual(titles, [
     { sessionId: 's1', title: 'title-s1' },
@@ -291,7 +402,7 @@ test('resume and session listing use only the native query surface', async () =>
   await backend.close()
 })
 
-test('auto-title toggles only native Loader entries and restores the observed baseline', async () => {
+test('auto-title reports the native composition read-only and never mutates the Loader entry', async () => {
   const updates: Array<{ id: string; disabled: boolean }> = []
   const entry = {
     options: { id: 'session-title-llm', name: '@deepseek-ai/dsh-session-title-first-prompt-llm' },
@@ -306,16 +417,86 @@ test('auto-title toggles only native Loader entries and restores the observed ba
     fakeHost.use('sessionTitle', { refresh: () => {} })
   })
   const initial = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(initial.available, true)
+  assert.equal(initial.editable, false)
   assert.equal(initial.enabled, true)
+  assert.equal(initial.mode, 'inherit')
   assert.equal(initial.inherited, true)
-  const disabled = await backend.command('auto-title', { enabled: false }) as Record<string, unknown>
-  assert.equal(disabled.enabled, false)
-  assert.equal(disabled.mode, 'disabled')
-  assert.deepEqual(updates, [{ id: 'session-title-llm', disabled: true }])
-  const restored = await backend.command('auto-title', { enabled: null }) as Record<string, unknown>
-  assert.equal(restored.enabled, true)
-  assert.equal(restored.inherited, true)
-  assert.deepEqual(updates.at(-1), { id: 'session-title-llm', disabled: false })
+  assert.equal(initial.mayIssueModelRequests, true)
+  assert.deepEqual(initial.plugins, [
+    { id: 'session-title-llm', name: '@deepseek-ai/dsh-session-title-first-prompt-llm', enabled: true },
+  ])
+
+  for (const wanted of [false, true, null]) {
+    const refused = await backend.command('auto-title', { enabled: wanted }) as Record<string, unknown>
+    assert.equal(refused.available, false, 'a write is never claimed as applied')
+    assert.equal(refused.editable, false)
+    assert.equal(refused.changed, false)
+    assert.equal(refused.enabled, true, 'the live native state is only reported')
+    assert.match(String(refused.reason), /profile composition/)
+    assert.match(String(refused.limitation), /profile composition/)
+  }
+  assert.deepEqual(updates, [], 'the adapter never calls the Loader entry update path')
+  assert.equal(entry.disabled, false, 'the native entry options are untouched')
+  const after = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(after.enabled, true)
+  assert.equal(after.mode, 'inherit')
+  await backend.close()
+})
+
+test('auto-title inherits a disabled native provider without enabling it', async () => {
+  const entry = {
+    options: { id: 'session-title-llm', name: '@deepseek-ai/dsh-session-title-all-prompts-llm' },
+    disabled: true,
+    update: async () => { throw new Error('the adapter must never call entry.update') },
+  }
+  const { backend } = harness((fakeHost) => {
+    fakeHost.use('loader', { entries: () => [entry] })
+    fakeHost.use('sessionTitle', { refresh: () => {} })
+  })
+  const state = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(state.available, true)
+  assert.equal(state.enabled, false)
+  assert.equal(state.effectiveEnabled, false)
+  assert.equal(state.mayIssueModelRequests, false)
+  assert.equal(state.mode, 'inherit')
+  const refused = await backend.command('auto-title', { enabled: true }) as Record<string, unknown>
+  assert.equal(refused.available, false)
+  assert.equal(refused.changed, false)
+  assert.equal(refused.enabled, false)
+  assert.equal(entry.disabled, true, 'a disabled provider stays exactly as the composition declared it')
+  await backend.close()
+})
+
+test('auto-title reports a missing native provider honestly and keeps argument validation', async () => {
+  const { backend } = harness()
+  const state = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(state.available, false)
+  assert.equal(state.editable, false)
+  assert.match(String(state.limitation), /declares no native session-title provider/)
+  const refused = await backend.command('auto-title', { enabled: false }) as Record<string, unknown>
+  assert.equal(refused.available, false)
+  assert.equal(refused.changed, false)
+  assert.match(String(refused.limitation), /declares no native session-title provider/)
+  assert.match(String(refused.reason), /profile composition/)
+  await assert.rejects(backend.command('auto-title', { enabled: 'yes' }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, 'INVALID_ARGUMENT')
+    return true
+  })
+  await backend.close()
+})
+
+test('auto-title treats an unreadable Loader as an unavailable read instead of failing', async () => {
+  const { backend } = harness((fakeHost) => {
+    fakeHost.use('loader', {
+      entries: () => { throw new Error('loader exploded') },
+    })
+    fakeHost.use('sessionTitle', { refresh: () => {} })
+  })
+  const state = await backend.command('auto-title') as Record<string, unknown>
+  assert.equal(state.available, false)
+  assert.deepEqual(state.plugins, [])
+  assert.doesNotMatch(JSON.stringify(state), /loader exploded/)
   await backend.close()
 })
 

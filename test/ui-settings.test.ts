@@ -3,7 +3,7 @@
 import './helpers/truecolor.ts'
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { stripTerminalSequences, visibleWidth } from '#pi-tui'
+import { stripTerminalSequences } from '#pi-tui'
 import {
   defaults,
   DIFF_INDICATOR_MODE_VALUES,
@@ -22,9 +22,10 @@ import {
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
 const input = await loadInputModule()
-const { SETTINGS_TABS, SettingsDialog } = await import('../src/ui/settings.ts')
+const { SETTINGS_CATEGORIES, SettingsDialog } = await import('../src/ui/settings.ts')
 
 type CcKeymap = InstanceType<typeof input.CcKeymap>
+type Dialog = InstanceType<typeof SettingsDialog>
 
 const RIGHT = '\x1b[C'
 const LEFT = '\x1b[D'
@@ -33,48 +34,71 @@ const UP = '\x10'
 const ENTER = '\r'
 const ESC = '\x1b'
 const CTRL_C = '\x03'
+const CTRL_F = '\x06'
+const CTRL_R = '\x12'
+
+const tick = (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+
+const lines = (dialog: Dialog, width: number): string[] => dialog.render(width)
+const text = (dialog: Dialog, width = 80): string => stripTerminalSequences(lines(dialog, width).join('\n'))
+
+const lineOf = (dialog: Dialog, needle: string, width = 80): number => {
+  const index = dialog.render(width).findIndex(line => stripTerminalSequences(line).includes(needle))
+  assert.ok(index >= 0, `${needle} is rendered`)
+  return index
+}
 
 interface Harness {
-  dialog: InstanceType<typeof SettingsDialog>
+  dialog: Dialog
   patches: Array<Partial<Settings>>
+  resets: Array<keyof Settings>
   events: string[]
   renders: () => number
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
 }
 
 function harness(options: {
   settings?: Partial<Settings>
   keymap?: CcKeymap
   screen?: 'inline' | 'fullscreen'
-  autoTitleLabel?: string
-  onChange?: (patch: Partial<Settings>) => void | Promise<void>
-  onAutoTitle?: () => void
+  onChange?: (patch: Partial<Settings>) => void | Promise<void | Settings>
+  onReset?: (key: keyof Settings) => void | Promise<void | Settings>
   onKeybindings?: () => void
   onCancel?: () => void
   onInterrupt?: () => void
   withInterrupt?: boolean
+  nativeEntries?: () => readonly { id: string; label: string; value: string; description?: string; available?: boolean; onActivate?: () => void }[]
+  initialState?: { category: 'general' | 'thinking' | 'tools' | 'agents' | 'images' | 'dsh' | 'keyboard'; rowId?: string; query?: string; scroll?: number }
+  maxHeight?: number
   rows?: number
 } = {}): Harness {
   const tui = createFakeTui(options.rows ?? 30, 100)
   const patches: Array<Partial<Settings>> = []
+  const resets: Array<keyof Settings> = []
   const events: string[] = []
   const dialog = new SettingsDialog(asTui(tui), {
     settings: { ...defaults, ...options.settings },
-    ...(options.autoTitleLabel === undefined ? {} : { autoTitleLabel: options.autoTitleLabel }),
     onChange: patch => {
       patches.push(patch)
       return options.onChange?.(patch)
     },
-    onAutoTitle: () => {
-      events.push('autoTitle')
-      options.onAutoTitle?.()
-    },
+    ...(options.onReset === undefined ? {} : { onReset: key => { resets.push(key); return options.onReset?.(key) } }),
     onKeybindings: () => {
       events.push('keybindings')
       options.onKeybindings?.()
     },
+    ...(options.nativeEntries === undefined ? {} : { getNativeEntries: options.nativeEntries }),
     ...(options.keymap === undefined ? {} : { keymap: options.keymap }),
     ...(options.screen === undefined ? {} : { screen: options.screen }),
-    path: '/tmp/settings.json',
+    ...(options.initialState === undefined ? {} : { initialState: options.initialState }),
+    ...(options.maxHeight === undefined ? {} : { maxHeight: options.maxHeight }),
+    path: '/tmp/temporary/settings.json',
     onCancel: () => {
       events.push('cancel')
       options.onCancel?.()
@@ -84,333 +108,573 @@ function harness(options: {
       : {}),
   })
   dialog.focused = true
-  return { dialog, patches, events, renders: () => tui.renderRequests }
+  return { dialog, patches, resets, events, renders: () => tui.renderRequests }
 }
 
-const text = (dialog: InstanceType<typeof SettingsDialog>, width = 72): string =>
-  stripTerminalSequences(dialog.render(width).join('\n'))
-
-const rowIndex = (dialog: InstanceType<typeof SettingsDialog>, id: string): number => {
-  const index = dialog.rows().findIndex((row: { id: string }) => row.id === id)
-  assert.ok(index >= 0, `row ${id} exists on the active tab`)
-  return index
-}
-
-/** Move the selection to `id` on the active tab. */
-function selectRow(dialog: InstanceType<typeof SettingsDialog>, id: string): void {
-  const from = rowIndex(dialog, dialog.activeRowId ?? '')
-  const to = rowIndex(dialog, id)
+/** Move within the one visible list to `id` (search/query must be empty). */
+function selectRow(dialog: Dialog, id: string): void {
+  const rows = dialog.getVisibleRows()
+  const to = rows.findIndex(row => row.id === id)
+  assert.ok(to >= 0, `row ${id} exists in the visible list (${rows.map(row => row.id).join(',')})`)
+  const from = rows.findIndex(row => row.id === dialog.activeRowId)
   const step = to >= from ? DOWN : UP
   for (let count = Math.abs(to - from); count > 0; count -= 1) dialog.handleInput(step)
   assert.equal(dialog.activeRowId, id)
 }
 
+/** Every visible row of one group, in the same metadata order as the page. */
+function sectionRows(dialog: Dialog, category: string): string[] {
+  return dialog.getVisibleRows().filter(row => row.category === category).map(row => row.id)
+}
+
+/** Section jump (the `settings.next-category` / `previous-category` actions). */
+function jumpToSection(dialog: Dialog, category: string): void {
+  for (let step = 0; step < SETTINGS_CATEGORIES.length * 2 && dialog.activeCategory !== category; step += 1) {
+    dialog.handleInput(RIGHT)
+  }
+  assert.equal(dialog.activeCategory, category)
+}
+
+/** Enter opens the typed picker; down selects the following roster value. */
+function cycleOnce(dialog: Dialog): void {
+  dialog.handleInput(ENTER)
+  dialog.handleInput(DOWN)
+  dialog.handleInput(ENTER)
+}
+
 // ---------------------------------------------------------------------------
+// One continuous page
 
-test('settings expose three tabs with the documented roster and current values', () => {
-  const { dialog } = harness({ settings: { expandTools: true, thinkingPreviewLines: 5, thinkingLiveTimerMs: 90 }, screen: 'inline' })
+test('every available section shares one continuous page in metadata order', () => {
+  const { dialog } = harness({ rows: 80 })
   assert.equal(dialog.capturesViewportInput, true)
-  assert.deepEqual(SETTINGS_TABS.map((tab: { id: string }) => tab.id), ['general', 'thinking', 'tools'])
-  assert.deepEqual(SETTINGS_TABS.map((tab: { label: string }) => tab.label), ['General', 'Thinking', 'Tools'])
-  assert.equal(dialog.activeTab, 'general')
-  // General has no duplicate tool-display row anymore; shortcuts stay last.
-  assert.deepEqual(dialog.rows().map((row: { id: string }) => row.id), ['autoTitle', 'screen', 'keys'])
-  assert.deepEqual(dialog.rows().map((row: { label: string }) => row.label), ['Auto title', 'Default screen', 'Keyboard shortcuts'])
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), ['inherit', 'fullscreen (next launch) · running inline', 'edit'])
+  assert.equal(dialog.modalSize, 'standard')
+  assert.deepEqual(SETTINGS_CATEGORIES.map(item => item.id), ['general', 'thinking', 'tools', 'agents', 'images', 'dsh', 'keyboard'])
+  assert.deepEqual(SETTINGS_CATEGORIES.map(item => item.label), ['General', 'Thinking', 'Tools & Diff', 'Agents', 'Images', 'DSH', 'Keyboard'])
 
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'thinking')
-  assert.deepEqual(dialog.rows().map((row: { id: string }) => row.id), ['thinking', 'preview', 'timer'])
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), ['off', '5', '90ms'])
-
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'tools')
-  assert.deepEqual(dialog.rows().map((row: { id: string }) => row.id), TOOL_SETTING_KEYS)
-  assert.deepEqual(dialog.rows().map((row: { label: string }) => row.label), [
-    'Group tool calls', 'Expand tool details', 'Expanded input lines', 'Expanded output lines',
-    'Tool label clip', 'Diff layout', 'Diff indicator', 'Split min width',
-    'Edit collapsed lines', 'Write collapsed lines', 'Diff word wrap',
+  const rows = dialog.getVisibleRows()
+  assert.deepEqual(rows.map(row => row.id), [
+    'screen', 'copyOnSelect', 'queueCollapsed', 'reducedMotion',
+    'terminalStatus', 'terminalTitle', 'terminalNotifications',
+    'thinking', 'preview', 'timer',
+    ...TOOL_SETTING_KEYS,
+    'showSubagentProgress', 'groupSubagentMessages',
+    'imagePreview',
+    'native:none',
+    'keys',
   ])
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), [
-    'on', 'on', '5', '10', 'auto', 'auto', 'bars', '120 cols', '24', '0', 'on',
+  assert.deepEqual(rows.map(row => row.category), [
+    ...new Array(7).fill('general'), ...new Array(3).fill('thinking'),
+    ...TOOL_SETTING_KEYS.map(() => 'tools'), ...new Array(2).fill('agents'),
+    'images', 'dsh', 'keyboard',
   ])
+  assert.deepEqual(dialog.allRows.map(row => row.id), rows.map(row => row.id), 'the unfiltered roster is the same page')
+  assert.equal(dialog.activeCategory, 'general')
+  assert.equal(dialog.activeTab, 'general', 'the old tab getter stays as a section alias')
+  assert.equal(dialog.activeRowIndex, 0, 'row numbers index the continuous roster')
 
-  // The flat roster order is preserved tab by tab, with no duplicated key.
-  assert.deepEqual(dialog.allRows.map((row: { id: string }) => row.id), [
-    'autoTitle', 'screen', 'keys', 'thinking', 'preview', 'timer', ...TOOL_SETTING_KEYS,
-  ])
-  assert.equal(new Set(dialog.allRows.map((row: { id: string }) => row.id)).size, dialog.allRows.length)
+  assert.deepEqual(sectionRows(dialog, 'general'), [
+    'screen', 'copyOnSelect', 'queueCollapsed', 'reducedMotion',
+    'terminalStatus', 'terminalTitle', 'terminalNotifications',
+  ], 'terminal rows come last in General and keep the old row ids first')
+  assert.deepEqual(sectionRows(dialog, 'thinking'), ['thinking', 'preview', 'timer'])
+  assert.deepEqual(sectionRows(dialog, 'tools'), TOOL_SETTING_KEYS)
+  assert.deepEqual(sectionRows(dialog, 'agents'), ['showSubagentProgress', 'groupSubagentMessages'])
+  assert.deepEqual(sectionRows(dialog, 'images'), ['imagePreview'])
+  assert.equal(sectionRows(dialog, 'images')[0] === 'imagePreview' && dialog.allRows.find(row => row.id === 'imagePreview')?.value, 'Automatic')
 
-  const rendered = text(dialog)
-  assert.match(rendered, /Settings · \/tmp\/settings\.json/)
-  assert.match(rendered, /General/)
-  assert.match(rendered, /Thinking/)
-  assert.match(rendered, /Tools/)
-  assert.match(rendered, /Diff word wrap/)
-  assert.match(rendered, /←\/→ switch tab/)
+  // All sections are painted in one body at once: no page/tab switch required.
+  const painted = text(dialog, 100)
+  for (const header of ['General', 'Thinking', 'Tools & Diff', 'Agents', 'Images', 'DSH', 'Keyboard']) {
+    assert.ok(painted.includes(header), `${header} is a painted group header`)
+  }
+  assert.match(painted, /Reduced motion/, 'first section rows are painted')
+  assert.match(painted, /Keyboard shortcuts/, 'last section rows are painted in the same viewport')
+
+  const ids = dialog.allRows.map(row => row.id)
+  assert.equal(new Set(ids).size, ids.length)
+  const existingIds = [...TOOL_SETTING_KEYS, 'screen', 'thinking', 'preview', 'timer', 'keys']
+  for (const id of existingIds) assert.ok(ids.includes(id), `${id} remains addressable`)
+  for (const key of ['showThinking', 'thinkingPreviewLines', 'thinkingLiveTimerMs', 'screen']) {
+    assert.equal(dialog.allRows.filter(row => row.key === key).length, 1, `${key} is the key of exactly one row`)
+  }
+  for (const key of ['showSubagentProgress', 'groupSubagentMessages', 'imagePreview', 'copyOnSelect', 'queueCollapsed', 'reducedMotion']) {
+    assert.ok(ids.includes(key), `${key} is present exactly once`)
+  }
+  assert.equal(dialog.allRows.length, 18 + 6 + 1 + 1, '15 existing + 3 terminal rows + 6 display keys + shortcut row + DSH empty row')
 })
 
-test('arrows, Tab and Shift+Tab switch tabs and keep a valid row selection', () => {
-  const { dialog, renders } = harness()
-  dialog.handleInput(DOWN)
-  dialog.handleInput(DOWN)
-  const before = renders()
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'thinking')
-  assert.ok(renders() > before, 'switching tabs asks for a repaint')
-  assert.ok(dialog.activeRowId === 'timer', 'the row index is clamped into the new tab')
+test('there is no segmented/tab header: group headers are inert page chrome', () => {
+  const { dialog, renders } = harness({ rows: 40 })
+  const painted = text(dialog, 100)
+  assert.doesNotMatch(painted, /‹|›/, 'no previous/next tab chrome')
+  assert.doesNotMatch(painted, /\b1\/7\b/, 'no page counter')
+  const rows = lines(dialog, 100)
+  const searchRow = rows.findIndex(line => stripTerminalSequences(line).includes('Search settings'))
+  assert.ok(searchRow >= 0)
+  assert.doesNotMatch(stripTerminalSequences(rows[searchRow + 1] ?? ''), /General|Thinking/, 'the old category chip row is gone')
+  // The group header is a separate, non-selectable body line above its rows.
+  const paintedLines = rows.map(line => stripTerminalSequences(line))
+  const thinkingHeader = paintedLines.findIndex(line => /Thinking ─/.test(line))
+  assert.ok(thinkingHeader >= 0, 'group headers separate sections')
+  const before = dialog.activeRowId
+  const rendersBefore = renders()
+  const rowOfHeader = harness({ rows: 40 })
+  const headerLine = rowOfHeader.dialog.render(100).findIndex(line => /Thinking ─/.test(stripTerminalSequences(line)))
+  assert.ok(headerLine >= 0)
+  // Clicking a group header must not select a row, write, or repaint.
+  const headerDialog = rowOfHeader.dialog
+  const headerRenders = rowOfHeader.renders()
+  const headerCol = 4
+  for (const type of ['press', 'click'] as const) {
+    const result = headerDialog.handleMouse({
+      type, button: 'left', x: headerCol, y: headerLine, screenX: headerCol, screenY: headerLine,
+      width: 100, height: headerLine + 1, shift: false, alt: false, ctrl: false,
+      ...(type === 'click' ? { clickCount: 1 } : {}),
+    })
+    assert.equal(result?.handled, true, 'the group header claims its own gesture')
+    assert.equal(result?.render, false, 'an inert header gesture never repaints')
+  }
+  assert.equal(headerDialog.activeRowId, 'screen')
+  assert.equal(headerDialog.activeCategory, 'general')
+  assert.equal(rowOfHeader.renders(), headerRenders)
+  assert.equal(dialog.activeRowId, before)
+  assert.ok(renders() >= rendersBefore)
+})
 
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'tools', 'right on the second tab moves to Tools')
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'general', 'right on the last tab wraps to the first')
-  dialog.handleInput(LEFT)
-  assert.equal(dialog.activeTab, 'tools', 'left on the first tab wraps to the last')
+test('section jumps keep the same roster and preserve search with Tab, Shift+Tab and arrows', () => {
+  const { dialog, patches, events } = harness({ initialState: { category: 'tools', rowId: 'groupTools', query: 'group' } })
+  const ids = dialog.getVisibleRows().map(row => row.id)
+  assert.deepEqual(ids, ['groupTools', 'groupSubagentMessages', 'keys'], 'search includes the grouped shortcut editor description')
+  for (const [key, section] of [['\t', 'agents'], ['\x1b[Z', 'tools'], [RIGHT, 'agents'], [LEFT, 'tools']] as const) {
+    dialog.handleInput(key)
+    assert.equal(dialog.activeCategory, section)
+    assert.equal(dialog.query, 'group', 'section navigation must not clear the filter')
+    assert.deepEqual(dialog.getVisibleRows().map(row => row.id), ids)
+  }
+  assert.deepEqual(patches, [])
+  assert.deepEqual(events, [])
+})
+
+test('one painted frame reads native metadata once and section jumps use the painted snapshot', () => {
+  let reads = 0
+  const { dialog } = harness({ rows: 80, nativeEntries: () => [{ id: 'state', label: 'Native state', value: String(++reads) }] })
+  reads = 0
+  dialog.render(100)
+  assert.equal(reads, 1, 'measure and paint share one roster projection')
   dialog.handleInput('\t')
-  assert.equal(dialog.activeTab, 'general')
-  dialog.handleInput('\x1b[Z')
-  assert.equal(dialog.activeTab, 'tools')
-  assert.match(text(dialog), /Diff word wrap/)
+  assert.equal(reads, 1, 'navigation has no eager native getter read')
+  dialog.render(100)
+  assert.equal(reads, 2, 'the next frame refreshes native metadata once')
+  assert.equal(dialog.allRows.find(row => row.id === 'native:state')?.value, '2')
+  assert.equal(reads, 2)
 })
 
-test('Enter cycles Preview lines through the documented values', () => {
+test('every section row keeps one flat patch per write and no duplicated row', () => {
+  const { dialog, patches } = harness({ settings: { expandedInputMaxLines: 5 } })
+  jumpToSection(dialog, 'tools')
+  selectRow(dialog, 'groupTools')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(patches.at(-1), { groupTools: false })
+  assert.equal(dialog.settings.groupTools, false)
+  assert.match(text(dialog), /Group tool calls\s+│ off/)
+})
+
+// ---------------------------------------------------------------------------
+// Typed editing
+
+test('booleans toggle directly, enums open an explicit picker, integers offer custom values', () => {
   const { dialog, patches } = harness()
-  dialog.handleInput(RIGHT)
-  selectRow(dialog, 'preview')
-  const seen: number[] = []
-  for (let step = 0; step < THINKING_PREVIEW_LINES_VALUES.length; step += 1) {
-    dialog.handleInput(ENTER)
-    seen.push(patches.at(-1)?.thinkingPreviewLines ?? -1)
-  }
-  // Starting at 3, the roster is 5, 10, 0, 1 and wraps back to 3.
-  assert.deepEqual(seen, [5, 10, 0, 1, 3])
-  assert.deepEqual(patches.map(patch => patch.thinkingPreviewLines), [5, 10, 0, 1, 3])
-  assert.equal(dialog.settings.thinkingPreviewLines, 3)
-  assert.equal(dialog.rows().find((row: { id: string }) => row.id === 'preview')?.value, '3')
-})
-
-test('Live timer cycles 90/250/500ms and off, and Show thinking toggles', () => {
-  const { dialog, patches } = harness({ settings: { thinkingLiveTimerMs: 250 } })
-  dialog.handleInput(RIGHT)
-  selectRow(dialog, 'timer')
-  const values: string[] = []
-  for (let step = 0; step < THINKING_LIVE_TIMER_MS_VALUES.length; step += 1) {
-    dialog.handleInput(ENTER)
-    values.push(dialog.rows().find((row: { id: string }) => row.id === 'timer')?.value ?? '')
-  }
-  assert.deepEqual(values, ['500ms', 'off', '90ms', '250ms'])
-  assert.deepEqual(patches.map(patch => patch.thinkingLiveTimerMs), [500, 0, 90, 250])
-
-  selectRow(dialog, 'thinking')
+  // boolean
+  selectRow(dialog, 'copyOnSelect')
   dialog.handleInput(ENTER)
-  assert.deepEqual(patches.at(-1), { showThinking: true })
-  assert.equal(dialog.rows().find((row: { id: string }) => row.id === 'thinking')?.value, 'on')
+  assert.deepEqual(patches.at(-1), { copyOnSelect: false })
   dialog.handleInput(ENTER)
-  assert.deepEqual(patches.at(-1), { showThinking: false })
-})
+  assert.deepEqual(patches.at(-1), { copyOnSelect: true })
+  assert.equal(dialog.settings.copyOnSelect, true)
 
-test('General rows change local preferences and defer native surfaces to the parent', () => {
-  const { dialog, patches, events } = harness({ settings: { screen: 'inline' } })
+  // enum: Enter opens a picker instead of cycling blindly
   selectRow(dialog, 'screen')
   dialog.handleInput(ENTER)
-  assert.deepEqual(patches.at(-1), { screen: 'fullscreen' })
-  assert.match(text(dialog), /fullscreen \(next launch\)/)
+  assert.match(text(dialog), /Settings › Default screen/)
+  assert.match(text(dialog), /fullscreen\s+· current/)
+  dialog.handleInput(DOWN)
   dialog.handleInput(ENTER)
   assert.deepEqual(patches.at(-1), { screen: 'inline' })
+  assert.match(text(dialog), /Saved/)
 
-  selectRow(dialog, 'autoTitle')
+  // integer: the picker lists the roster and a Custom… field; a legal number
+  // outside the roster is still accepted.
+  jumpToSection(dialog, 'tools')
+  selectRow(dialog, 'expandedInputMaxLines')
   dialog.handleInput(ENTER)
-  assert.deepEqual(events, ['autoTitle'], 'the native auto-title round trip stays parent-owned')
-  assert.equal(patches.length, 2, 'the native command is not turned into a local preference write')
-
-  selectRow(dialog, 'keys')
+  assert.match(text(dialog), /Custom…/)
+  for (let step = 0; step < EXPANDED_INPUT_MAX_LINES_VALUES.length; step += 1) dialog.handleInput(DOWN)
   dialog.handleInput(ENTER)
-  assert.deepEqual(events, ['autoTitle', 'keybindings'])
-})
-
-test('the native auto-title label and refreshed snapshots are shown verbatim', () => {
-  const { dialog } = harness({ autoTitleLabel: 'inherit · native on' })
-  assert.equal(dialog.rows().find((row: { id: string }) => row.id === 'autoTitle')?.value, 'inherit · native on')
-  dialog.setSettings({ ...defaults, thinkingPreviewLines: 10, thinkingLiveTimerMs: 0 })
-  dialog.handleInput(RIGHT)
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), ['off', '10', 'off'])
-})
-
-test('list navigation and cancellation follow the shared keymap', () => {
-  const keymap = input.createCcKeymap({ bindings: { 'list.next': 'alt+j', 'list.previous': 'alt+k' } })
-  const { dialog, events } = harness({ keymap })
-  assert.equal(dialog.keymap, keymap)
-  // The default Ctrl+N no longer moves once list.next is remapped.
-  dialog.handleInput(DOWN)
-  assert.equal(dialog.activeRowId, 'autoTitle', 'the default binding is gone')
-  dialog.handleInput('\x1bj')
-  assert.equal(dialog.activeRowId, 'screen')
-
-  dialog.handleInput(ESC)
-  assert.equal(dialog.isDone, true)
-  assert.deepEqual(events, ['cancel'])
-})
-
-test('Ctrl+C interrupts the turn instead of closing the surface', () => {
-  const { dialog, events } = harness({ withInterrupt: true })
-  dialog.handleInput(CTRL_C)
-  assert.deepEqual(events, ['interrupt'])
-  assert.equal(dialog.isDone, false, 'an interrupt is not a local close')
-
-  const local = harness()
-  local.dialog.handleInput(CTRL_C)
-  assert.deepEqual(local.events, ['cancel'], 'without a handler the surface still closes')
-})
-
-test('a rejected write is reported instead of silently pretending it saved', async () => {
-  const { dialog } = harness({
-    onChange: () => Promise.reject(new Error('Refusing to overwrite invalid settings file')),
-  })
-  dialog.handleInput(RIGHT)
-  selectRow(dialog, 'preview')
+  assert.match(text(dialog), /whole number · 1 to 5000/)
+  dialog.handleInput('\x15')
+  for (const char of '37') dialog.handleInput(char)
   dialog.handleInput(ENTER)
-  await new Promise(resolve => setImmediate(resolve))
-  assert.match(text(dialog), /Refusing to overwrite invalid settings file/)
+  assert.deepEqual(patches.at(-1), { expandedInputMaxLines: 37 })
+  assert.equal(dialog.settings.expandedInputMaxLines, 37)
+  assert.match(text(dialog), /Expanded input lines\s+│ 37/)
 })
 
-test('every line stays inside the render width, including the narrow stacked layout', () => {
-  const { dialog } = harness({ screen: 'fullscreen', rows: 48 })
-  const tabs = ['general', 'thinking', 'tools']
-  for (const [index, tab] of tabs.entries()) {
-    assert.equal(dialog.activeTab, tab)
-    for (const width of [1, 20, 24, 32, 46, 60, 80, 120]) {
-      for (const line of dialog.render(width)) {
-        assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
-      }
-    }
-    const narrow = stripTerminalSequences(dialog.render(24).join('\n'))
-    assert.ok(narrow.includes('General') || narrow.includes('Thinking') || narrow.includes('Tools'), `${tab} tab header is visible at width 24`)
-    if (index < tabs.length - 1) dialog.handleInput(RIGHT)
-  }
-})
-
-test('the Tools tab cycles every shared tool preference through one patch', () => {
+test('an invalid typed integer is rejected in place without writing', () => {
   const { dialog, patches } = harness()
-  dialog.handleInput(RIGHT)
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'tools')
-
-  const seen: Array<Record<string, unknown>> = []
-  const cycle = (id: string, times: number): void => {
-    selectRow(dialog, id)
-    for (let step = 0; step < times; step += 1) {
-      dialog.handleInput(ENTER)
-      seen.push({ ...patches.at(-1) })
-    }
-  }
-
-  cycle('groupTools', 1)
-  cycle('expandTools', 1)
-  cycle('expandedInputMaxLines', EXPANDED_INPUT_MAX_LINES_VALUES.length)
-  cycle('expandedOutputMaxLines', EXPANDED_OUTPUT_MAX_LINES_VALUES.length)
-  cycle('toolLabelClip', TOOL_LABEL_CLIP_VALUES.length)
-  cycle('diffViewMode', DIFF_VIEW_MODE_VALUES.length)
-  cycle('diffIndicatorMode', DIFF_INDICATOR_MODE_VALUES.length)
-  cycle('diffSplitMinWidth', DIFF_SPLIT_MIN_WIDTH_VALUES.length)
-  cycle('editDiffCollapsedLines', EDIT_DIFF_COLLAPSED_LINES_VALUES.length)
-  cycle('writeDiffCollapsedLines', WRITE_DIFF_COLLAPSED_LINES_VALUES.length)
-  cycle('diffWordWrap', 1)
-
-  // Each write stays one flat settings object with exactly one changed key.
-  for (const patch of seen) assert.equal(Object.keys(patch).length, 1)
-  assert.deepEqual(seen[0], { groupTools: false })
-  assert.deepEqual(seen[1], { expandTools: true })
-  assert.deepEqual(seen.filter(patch => 'expandedInputMaxLines' in patch).map(patch => patch.expandedInputMaxLines), [10, 20, 40, 80, 5])
-  assert.deepEqual(seen.filter(patch => 'expandedOutputMaxLines' in patch).map(patch => patch.expandedOutputMaxLines), [20, 40, 80, 120, 10])
-  assert.deepEqual(seen.filter(patch => 'toolLabelClip' in patch).map(patch => patch.toolLabelClip), [40, 60, 80, 100, 120, 160, 0])
-  assert.deepEqual(seen.filter(patch => 'diffViewMode' in patch).map(patch => patch.diffViewMode), ['split', 'unified', 'auto'])
-  assert.deepEqual(seen.filter(patch => 'diffIndicatorMode' in patch).map(patch => patch.diffIndicatorMode), ['classic', 'none', 'bars'])
-  assert.deepEqual(seen.filter(patch => 'diffSplitMinWidth' in patch).map(patch => patch.diffSplitMinWidth), [140, 160, 180, 80, 100, 120])
-  assert.deepEqual(seen.filter(patch => 'editDiffCollapsedLines' in patch).map(patch => patch.editDiffCollapsedLines), [36, 48, 80, 120, 0, 12, 24])
-  assert.deepEqual(seen.filter(patch => 'writeDiffCollapsedLines' in patch).map(patch => patch.writeDiffCollapsedLines), [4, 8, 12, 24, 36, 0])
-  assert.deepEqual(seen.at(-1), { diffWordWrap: false })
-
-  // The local snapshot and rendered values follow every accepted cycle.
-  assert.equal(dialog.settings.writeDiffCollapsedLines, 0)
-  assert.equal(dialog.settings.diffWordWrap, false)
-  assert.equal(dialog.rows().find((row: { id: string }) => row.id === 'toolLabelClip')?.value, 'auto')
-})
-
-test('Tools values and rosters follow a hot-refreshed snapshot', () => {
-  const { dialog, renders } = harness({
-    settings: {
-      groupTools: false, expandTools: true, expandedInputMaxLines: 20, expandedOutputMaxLines: 40,
-      toolLabelClip: 60, diffViewMode: 'split', diffIndicatorMode: 'none', diffSplitMinWidth: 160,
-      editDiffCollapsedLines: 48, writeDiffCollapsedLines: 12, diffWordWrap: false,
-    },
-  })
-  dialog.handleInput(RIGHT)
-  dialog.handleInput(RIGHT)
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), [
-    'off', 'on', '20', '40', '60 cols', 'split', 'none', '160 cols', '48', '12', 'off',
-  ])
-
-  const before = renders()
-  dialog.setSettings({
-    ...defaults,
-    groupTools: true, expandTools: false, expandedInputMaxLines: 10, expandedOutputMaxLines: 20,
-    toolLabelClip: 0, diffViewMode: 'unified', diffIndicatorMode: 'classic', diffSplitMinWidth: 100,
-    editDiffCollapsedLines: 12, writeDiffCollapsedLines: 4, diffWordWrap: true,
-  })
-  assert.ok(renders() > before)
-  assert.deepEqual(dialog.rows().map((row: { value: string }) => row.value), [
-    'on', 'off', '10', '20', 'auto', 'unified', 'classic', '100 cols', '12', '4', 'on',
-  ])
-  // The cycle continues from the refreshed value, not the old snapshot.
+  jumpToSection(dialog, 'tools')
   selectRow(dialog, 'toolLabelClip')
   dialog.handleInput(ENTER)
-  assert.equal(dialog.settings.toolLabelClip, 40)
-})
-
-test('digit selection activates a Tools row and disabled navigation stays inert', () => {
-  const keymap = input.createCcKeymap({ bindings: { 'list.select-digit': null } })
-  const { dialog, patches } = harness({ keymap })
-  dialog.handleInput(RIGHT)
-  dialog.handleInput(RIGHT)
-  dialog.handleInput('2')
-  assert.equal(dialog.activeRowId, 'groupTools', 'digit shortcuts are disabled with the shared action')
-  assert.equal(patches.length, 0)
-
-  const defaultsKeymap = harness()
-  defaultsKeymap.dialog.handleInput(RIGHT)
-  defaultsKeymap.dialog.handleInput(RIGHT)
-  defaultsKeymap.dialog.handleInput('2')
-  assert.equal(defaultsKeymap.dialog.activeRowId, 'expandTools')
-  assert.deepEqual(defaultsKeymap.patches.at(-1), { expandTools: true }, 'digit 2 activates the second Tools row directly')
-  defaultsKeymap.dialog.handleInput(ENTER)
-  assert.deepEqual(defaultsKeymap.patches.at(-1), { expandTools: false })
-})
-
-test('Tools rows respect shared keymap remaps for navigation and activation', () => {
-  const keymap = input.createCcKeymap({
-    bindings: { 'list.next': 'alt+j', 'list.previous': 'alt+k', 'list.select': null, 'dialog.confirm': 'alt+enter' },
-  })
-  const { dialog, patches } = harness({ keymap })
-  dialog.handleInput(RIGHT)
-  dialog.handleInput(RIGHT)
-  dialog.handleInput(DOWN)
-  assert.equal(dialog.activeRowId, 'groupTools', 'default Ctrl+N is disabled by the remap')
-  dialog.handleInput('\x1bj')
-  assert.equal(dialog.activeRowId, 'expandTools')
+  for (let step = 0; step < TOOL_LABEL_CLIP_VALUES.length; step += 1) dialog.handleInput(DOWN)
   dialog.handleInput(ENTER)
-  assert.equal(patches.length, 0, 'Enter no longer activates once list/dialog select is remapped away')
+  dialog.handleInput('\x15')
+  for (const char of '3') dialog.handleInput(char)
+  dialog.handleInput(ENTER)
+  assert.equal(patches.length, 0)
+  assert.match(text(dialog), /must be a whole number \(8 to 500, or 0 for auto\)/)
+
+  dialog.handleInput('\x15')
+  for (const char of '0') dialog.handleInput(char)
+  dialog.handleInput(ENTER)
+  assert.deepEqual(patches.at(-1), { toolLabelClip: 0 }, '0 stays the documented auto value')
+  assert.match(text(dialog), /Tool label clip\s+│ auto/)
 })
 
-test('a SettingsDialog works without an explicit keymap', () => {
+test('every enum roster value is reachable from the picker', () => {
+  const { dialog, patches } = harness()
+  const cases: Array<{ key: keyof Settings; roster: readonly (string | number | boolean)[]; section: string; id?: string }> = [
+    { key: 'diffViewMode', roster: DIFF_VIEW_MODE_VALUES, section: 'tools' },
+    { key: 'diffIndicatorMode', roster: DIFF_INDICATOR_MODE_VALUES, section: 'tools' },
+    { key: 'thinkingPreviewLines', roster: THINKING_PREVIEW_LINES_VALUES, section: 'thinking', id: 'preview' },
+    { key: 'thinkingLiveTimerMs', roster: THINKING_LIVE_TIMER_MS_VALUES, section: 'thinking', id: 'timer' },
+  ]
+  for (const item of cases) {
+    jumpToSection(dialog, item.section)
+    selectRow(dialog, item.id ?? item.key)
+    const seen: unknown[] = []
+    for (let step = 0; step < item.roster.length; step += 1) {
+      const current = dialog.settings[item.key] as string | number | boolean
+      const index = item.roster.indexOf(current)
+      assert.ok(index >= 0, `${String(item.key)} current value is in its roster`)
+      dialog.handleInput(ENTER)
+      dialog.handleInput(DOWN)
+      dialog.handleInput(ENTER)
+      seen.push(patches.at(-1)?.[item.key])
+      assert.equal(patches.at(-1)?.[item.key], item.roster[(index + 1) % item.roster.length], String(item.key))
+    }
+    assert.equal(new Set(seen).size, item.roster.length, `${String(item.key)} reaches every documented value`)
+  }
+})
+
+test('the Tools rosters preserve their exact documented order through the picker', () => {
+  const { dialog, patches } = harness()
+  jumpToSection(dialog, 'tools')
+  const cases: Array<{ id: string; key: keyof Settings; roster: readonly number[] }> = [
+    { id: 'expandedInputMaxLines', key: 'expandedInputMaxLines', roster: EXPANDED_INPUT_MAX_LINES_VALUES },
+    { id: 'expandedOutputMaxLines', key: 'expandedOutputMaxLines', roster: EXPANDED_OUTPUT_MAX_LINES_VALUES },
+    { id: 'toolLabelClip', key: 'toolLabelClip', roster: TOOL_LABEL_CLIP_VALUES },
+    { id: 'diffSplitMinWidth', key: 'diffSplitMinWidth', roster: DIFF_SPLIT_MIN_WIDTH_VALUES },
+    { id: 'editDiffCollapsedLines', key: 'editDiffCollapsedLines', roster: EDIT_DIFF_COLLAPSED_LINES_VALUES },
+    { id: 'writeDiffCollapsedLines', key: 'writeDiffCollapsedLines', roster: WRITE_DIFF_COLLAPSED_LINES_VALUES },
+  ]
+  for (const item of cases) {
+    selectRow(dialog, item.id)
+    const start = item.roster.indexOf(dialog.settings[item.key] as number)
+    assert.ok(start >= 0, `${item.id} starts inside its roster`)
+    for (let step = 0; step < item.roster.length; step += 1) {
+      const next = (start + step + 1) % item.roster.length
+      dialog.handleInput(ENTER)
+      dialog.handleInput(DOWN)
+      // Integer pickers append a Custom… row; wrapping past the last roster
+      // value passes through it, so one extra Down reaches the first value.
+      if (next === 0) dialog.handleInput(DOWN)
+      dialog.handleInput(ENTER)
+      assert.equal(patches.at(-1)?.[item.key], item.roster[next], item.id)
+    }
+    assert.equal(dialog.settings[item.key], item.roster[start], `${item.id} wraps back to its start`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Persistence / reset state
+
+test('a pending write blocks double submission and adopts the confirmed snapshot', async () => {
+  const gate = deferred<void | Settings>()
+  const { dialog, patches } = harness({ onChange: () => gate.promise })
+  selectRow(dialog, 'copyOnSelect')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.isSaving, true)
+  assert.match(text(dialog), /Saving…/)
+  dialog.handleInput(ENTER)
+  assert.equal(patches.length, 1, 'the same row is not submitted twice')
+  const confirmed: Settings = { ...defaults, copyOnSelect: false, reducedMotion: true }
+  gate.resolve(confirmed)
+  await tick()
+  assert.equal(dialog.isSaving, false)
+  assert.match(text(dialog), /Saved/)
+  assert.deepEqual(dialog.settings, confirmed, 'the parent snapshot becomes the new truth')
+})
+
+test('a rejected write reverts only that value and reports the failure', async () => {
+  const { dialog, patches } = harness({
+    settings: { copyOnSelect: true, queueCollapsed: false },
+    onChange: patch => (patch.copyOnSelect === undefined ? Promise.resolve() : Promise.reject(new Error('Refusing to overwrite invalid settings file'))),
+  })
+  selectRow(dialog, 'copyOnSelect')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.settings.copyOnSelect, false, 'optimistic value is applied for the frame')
+  await tick()
+  assert.equal(dialog.settings.copyOnSelect, true, 'a failed write restores the previous value')
+  assert.match(text(dialog), /Refusing to overwrite invalid settings file/)
+
+  // A different row still writes successfully.
+  selectRow(dialog, 'queueCollapsed')
+  dialog.handleInput(ENTER)
+  await tick()
+  assert.deepEqual(patches.at(-1), { queueCollapsed: true })
+  assert.equal(dialog.settings.queueCollapsed, true)
+  assert.equal(dialog.settings.copyOnSelect, true)
+})
+
+test('a late failure does not overwrite a newer confirmed snapshot', async () => {
+  const first = deferred<void | Settings>()
+  const second = deferred<void | Settings>()
+  let call = 0
+  const { dialog } = harness({
+    onChange: () => (call++ === 0 ? first.promise : second.promise),
+  })
+  dialog.handleInput(RIGHT)
+  selectRow(dialog, 'thinking')
+  dialog.handleInput(ENTER)
+  jumpToSection(dialog, 'agents')
+  selectRow(dialog, 'showSubagentProgress')
+  dialog.handleInput(ENTER)
+  second.resolve({ ...defaults, showThinking: true, showSubagentProgress: false })
+  await tick()
+  first.reject(new Error('stale write failed'))
+  await tick()
+  assert.equal(dialog.settings.showThinking, true, 'the confirmed snapshot stays authoritative')
+  assert.equal(dialog.settings.showSubagentProgress, false)
+  assert.doesNotMatch(text(dialog), /stale write failed/)
+})
+
+test('reset removes one local override through the parent callback', async () => {
+  const { dialog, patches, resets } = harness({ settings: { diffWordWrap: false }, onReset: () => Promise.resolve() })
+  jumpToSection(dialog, 'tools')
+  selectRow(dialog, 'diffWordWrap')
+  dialog.handleInput(CTRL_R)
+  assert.deepEqual(resets, ['diffWordWrap'])
+  assert.equal(patches.length, 0, 'reset is not turned into a normal set when onReset exists')
+  await tick()
+  assert.equal(dialog.settings.diffWordWrap, true)
+  assert.match(text(dialog), /Default restored/)
+
+  const fallback = harness({ settings: { diffWordWrap: false } })
+  jumpToSection(fallback.dialog, 'tools')
+  selectRow(fallback.dialog, 'diffWordWrap')
+  fallback.dialog.handleInput(CTRL_R)
+  assert.deepEqual(fallback.patches.at(-1), { diffWordWrap: defaults.diffWordWrap })
+})
+
+test('reset on an action/information row writes nothing', () => {
+  const { dialog, patches, resets } = harness()
+  jumpToSection(dialog, 'keyboard')
+  selectRow(dialog, 'keys')
+  dialog.handleInput(CTRL_R)
+  assert.equal(patches.length, 0)
+  assert.equal(resets.length, 0)
+  assert.match(text(dialog), /no local default/)
+})
+
+// ---------------------------------------------------------------------------
+// Native rows / auto title / keyboard
+
+test('native DSH rows are parent-supplied navigation or information only', () => {
+  const events: string[] = []
+  const { dialog } = harness({
+    nativeEntries: () => [
+      { id: 'model', label: 'Current model', value: 'deepseek-chat', description: 'Native session route', onActivate: () => events.push('model') },
+      { id: 'permission', label: 'Current permission', value: 'default', description: 'Native preset', available: false },
+      { id: 'skills', label: 'Skills', value: '2 available' },
+    ],
+  })
+  jumpToSection(dialog, 'dsh')
+  assert.deepEqual(sectionRows(dialog, 'dsh'), ['native:model', 'native:permission', 'native:skills'])
+  assert.ok(dialog.getVisibleRows().some(row => row.category === 'general'), 'jumping to DSH does not hide other sections')
+  assert.match(text(dialog), /Current model/)
+  assert.match(text(dialog), /default · unavailable/)
+  assert.match(text(dialog), /Skills/)
+  selectRow(dialog, 'native:model')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(events, ['model'])
+  selectRow(dialog, 'native:permission')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(events, ['model'], 'an unavailable capability is not activated')
+  assert.match(text(dialog), /not available in the current DSH runtime/)
+  selectRow(dialog, 'native:skills')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(events, ['model'], 'information rows do not invent an action')
+})
+
+test('auto title is a read-only native row with no local write or picker', () => {
+  const { dialog, patches, events } = harness({
+    nativeEntries: () => [{ id: 'autoTitle', label: 'Auto title', value: 'On · read-only', description: 'DSH profile composition owns it; native titles may use the model' }],
+  })
+  jumpToSection(dialog, 'dsh')
+  selectRow(dialog, 'native:autoTitle')
+  assert.match(text(dialog), /On · read-only/)
+  assert.match(text(dialog), /may use the model/)
+  dialog.handleInput(ENTER)
+  assert.doesNotMatch(text(dialog), /Settings › Auto title/)
+  assert.equal(dialog.activeCategory, 'dsh')
+  assert.deepEqual(patches, [])
+  assert.deepEqual(events, [])
+})
+
+test('the keyboard category opens the parent shortcut editor', () => {
+  const { dialog, events } = harness()
+  dialog.handleInput(LEFT)
+  assert.equal(dialog.activeCategory, 'keyboard')
+  selectRow(dialog, 'keys')
+  dialog.handleInput(ENTER)
+  assert.deepEqual(events, ['keybindings'])
+})
+
+// ---------------------------------------------------------------------------
+// Search / remap / cancellation
+
+test('search covers label/description/keywords across categories and preserves the selection', () => {
+  const { dialog } = harness()
+  dialog.handleInput(CTRL_F)
+  assert.equal(dialog.searchFocusedState, true)
+  for (const char of 'group agent') dialog.handleInput(char)
+  assert.equal(dialog.query, 'group agent')
+  assert.deepEqual(dialog.rows().map(row => row.id), ['groupSubagentMessages'])
+  assert.match(text(dialog), /Agents/)
+
+  dialog.handleInput(ESC)
+  assert.equal(dialog.searchFocusedState, false, 'Esc leaves the field first')
+  assert.equal(dialog.isDone, false)
+  assert.equal(dialog.query, 'group agent', 'leaving search keeps the query')
+  dialog.handleInput(ESC)
+  assert.equal(dialog.isDone, true, 'the second Esc closes the surface')
+
+  const keyword = harness()
+  keyword.dialog.handleInput(CTRL_F)
+  for (const char of 'clipboard') keyword.dialog.handleInput(char)
+  assert.ok(keyword.dialog.rows().some(row => row.id === 'copyOnSelect'), 'keywords discover the row')
+  keyword.dialog.handleInput(ENTER)
+  assert.deepEqual(keyword.patches.at(-1), { copyOnSelect: false })
+})
+
+test('no-match search is distinct from an empty category', () => {
+  const { dialog } = harness()
+  dialog.handleInput(CTRL_F)
+  for (const char of 'zzzz') dialog.handleInput(char)
+  assert.deepEqual(dialog.rows(), [])
+  assert.match(text(dialog), /No settings match “zzzz”/)
+  assert.equal(dialog.isDone, false)
+})
+
+test('remapped and disabled modal actions are respected; Ctrl+C keeps interrupt priority', () => {
+  const keymap = input.createCcKeymap({
+    bindings: {
+      'list.next': 'alt+j',
+      'list.previous': 'alt+k',
+      'settings.next-category': 'alt+]',
+      'settings.previous-category': 'alt+[',
+      'settings.reset': null,
+      'modal.search': null,
+    },
+  })
+  const { dialog, patches, resets, events } = harness({ keymap, withInterrupt: true })
+  dialog.handleInput(DOWN)
+  assert.equal(dialog.activeRowId, 'screen', 'the default Ctrl+N binding is gone')
+  dialog.handleInput('\x1bj')
+  assert.equal(dialog.activeRowId, 'copyOnSelect')
+  dialog.handleInput(RIGHT)
+  assert.equal(dialog.activeCategory, 'general', 'the default right binding is gone')
+  dialog.handleInput('\x1b]')
+  assert.equal(dialog.activeCategory, 'thinking')
+
+  dialog.handleInput(CTRL_F)
+  assert.equal(dialog.searchFocusedState, false, 'a disabled search action does not focus the field')
+  dialog.handleInput(CTRL_R)
+  assert.equal(resets.length, 0, 'a disabled reset action is inert')
+  dialog.handleInput(CTRL_C)
+  assert.deepEqual(events, ['interrupt'])
+  assert.equal(dialog.isDone, false)
+  assert.equal(patches.length, 0)
+})
+
+test('digit selection uses the continuous roster index and stays inert when disabled', () => {
+  const defaultsKeymap = harness()
+  jumpToSection(defaultsKeymap.dialog, 'tools')
+  defaultsKeymap.dialog.handleInput('2')
+  assert.equal(defaultsKeymap.dialog.activeRowId, 'copyOnSelect', '2 selects the second row of the page, not the second row of a tab')
+  assert.deepEqual(defaultsKeymap.patches.at(-1), { copyOnSelect: false })
+
+  const disabled = harness({ keymap: input.createCcKeymap({ bindings: { 'list.select-digit': null } }) })
+  jumpToSection(disabled.dialog, 'tools')
+  disabled.dialog.handleInput('2')
+  assert.equal(disabled.dialog.activeRowId, 'groupTools')
+  assert.equal(disabled.patches.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// View state
+
+test('captureView/initialState restore category, row, query and scroll', () => {
+  const source = harness({ maxHeight: 11 })
+  jumpToSection(source.dialog, 'tools')
+  for (let step = 0; step < TOOL_SETTING_KEYS.length - 1; step += 1) source.dialog.handleInput(DOWN)
+  source.dialog.render(64)
+  const view = source.dialog.captureView()
+  assert.equal(view.category, 'tools')
+  assert.equal(view.rowId, TOOL_SETTING_KEYS.at(-1))
+  assert.equal(view.query, '')
+  assert.ok(view.scroll !== undefined && view.scroll > 0, 'a long roster keeps its scroll offset')
+
+  const restored = harness({ maxHeight: 11, initialState: view })
+  restored.dialog.render(64)
+  assert.equal(restored.dialog.activeCategory, 'tools')
+  assert.equal(restored.dialog.activeRowId, view.rowId)
+  assert.equal(restored.dialog.captureView().scroll, view.scroll)
+
+  const searched = harness()
+  searched.dialog.handleInput(CTRL_F)
+  for (const char of 'diff') searched.dialog.handleInput(char)
+  searched.dialog.render(64)
+  const searchView = searched.dialog.captureView()
+  assert.equal(searchView.query, 'diff')
+  const searchRestored = harness({ initialState: searchView })
+  assert.equal(searchRestored.dialog.query, 'diff')
+  assert.deepEqual(searchRestored.dialog.rows().map(row => row.id), searched.dialog.rows().map(row => row.id))
+})
+
+test('the parent snapshot refresh updates values and cycles from the new truth', () => {
+  const { dialog, renders } = harness()
+  jumpToSection(dialog, 'tools')
+  const before = renders()
+  dialog.setSettings({ ...defaults, expandedInputMaxLines: 40, diffViewMode: 'unified' })
+  assert.ok(renders() > before)
+  assert.equal(dialog.rows().find(row => row.id === 'expandedInputMaxLines')?.value, '40')
+  assert.equal(dialog.rows().find(row => row.id === 'diffViewMode')?.value, 'unified')
+})
+
+test('a SettingsDialog works without an explicit keymap and supports dispose', () => {
   const tui = createFakeTui(24, 80)
   const dialog = new SettingsDialog(asTui(tui), {
     settings: { ...defaults },
     onChange: () => {},
-    onAutoTitle: () => {},
     onKeybindings: () => {},
     onCancel: () => {},
   })
-  dialog.handleInput(RIGHT)
-  assert.equal(dialog.activeTab, 'thinking')
   assert.ok(dialog.keymap !== undefined)
+  dialog.handleInput(RIGHT)
+  assert.equal(dialog.activeCategory, 'thinking')
+  dialog.dispose()
+  assert.equal(dialog.isDisposed, true)
+  dialog.handleInput(RIGHT)
+  assert.equal(dialog.activeCategory, 'thinking', 'a disposed dialog consumes input')
 })

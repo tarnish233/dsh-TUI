@@ -120,10 +120,17 @@ declare module "#pi-tui" {
     ccTransposeChars(): boolean
     ccHasAutocompleteProvider(): boolean
     ccTriggerCompletion(): void
+    /** Re-request candidates for the current draft without accepting or submitting. */
+    ccRefreshAutocomplete(): void
     ccCancelAutocomplete(): void
     ccAutocompleteStep(delta: -1 | 1): boolean
     ccAutocompletePage(direction: -1 | 1): boolean
-    ccAutocompleteAccept(trigger?: "tab" | "confirm"): boolean
+    /**
+     * Accept the highlighted completion. `confirm` submits a slash completion:
+     * `onConfirmSubmit` runs after the candidate is applied (so the app can
+     * capture the completed payload), otherwise Pi's `submitValue()` is used.
+     */
+    ccAutocompleteAccept(trigger?: "tab" | "confirm", onConfirmSubmit?: () => void): boolean
   }
 
   interface SelectList {
@@ -152,6 +159,7 @@ const SEAM_METHODS = [
   "ccJumpToChar",
   "ccAutocompleteStep",
   "ccAutocompleteAccept",
+  "ccRefreshAutocomplete",
 ] as const
 
 /** True when the loaded Pi TUI editor exposes the CC seam. */

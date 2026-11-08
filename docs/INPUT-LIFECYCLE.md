@@ -42,6 +42,54 @@ No model, backend, real profile, clipboard or terminal query reply was
 involved. The existing private-PTY lifecycle cases (`script -q`) exercise the
 same non-answering terminal path for `ProcessTerminal` start/stop.
 
+### OSC 7501, focus and title seams
+
+`Terminal` exposes the negotiated terminal-presentation seam. Every new member
+is optional, so a fake/alternate `Terminal` implementation stays valid:
+
+| member | purpose |
+| --- | --- |
+| `setProgramStatus(record)` | one complete OSC 7501 record; `id`/`title`/`progress` supported, an invalid id drops the report instead of addressing the root record |
+| `programStatusSupported` | reply (or `PI_PROGRAM_STATUS=1`) confirmed support |
+| `onProgramStatusSupportChange(listener)` | transition notifications; the listener is called with the current value on subscribe |
+| `terminalFocused` / `onFocusChange(listener)` | last `CSI I` / `CSI O` report and later transitions |
+| `setFocusReporting(enabled)` | DECSET 1004, written only while the instance owns the terminal |
+| `saveTitle()` / `restoreTitle()` | xterm title stack (`CSI 22;0t` / `23;0t`); balanced, popped on stop and on the emergency exit path |
+| `setProgressFallback(enabled)` | `true` keeps legacy OSC 9;4 after 7501 negotiated, `false` suppresses it, absent = automatic (suppressed once negotiated) |
+
+Record policy: at most 64 complete snapshots (least-recently-updated evicted),
+a parent `clear` removes its descendants, `stop()` emits exactly one root
+`state=clear`, and `start()` replays only records that are still current once
+support is confirmed again. There is no status heartbeat; a record is replaced,
+never refreshed on a timer. The reply's `states`/`kinds` lists are honoured and
+an unadvertised state degrades (`blocked`→`working`→`idle`, `done`/`error`→
+`idle`) instead of reporting a false success.
+
+Legacy `OSC 9;4` progress stays idempotent (repeated frame-path calls write
+nothing), keeps its bounded 1 s keepalive, and is suppressed once a terminal
+negotiated rich 7501 presentation. `PI_PROGRAM_STATUS=0` disables the query and
+all status writes; `=1` declares support without waiting for a reply (used by
+the writer-injection test) and keeps the legacy progress path.
+
+Focus reports and capability replies are consumed inside the single stdin
+consumer, before key dispatch; a bracketed paste never produces them. A reply
+that is split inside its header is held by `StdinBuffer` for a bounded window
+(`expectedReplyPrefixes` plus the short `expectedReplyTimeout` for the OSC 7501
+query, `replyTimeout` for other recognized replies) instead of being flushed as
+`Alt+]` text.
+
+A recognized reply **fails closed**: if it does not terminate inside its
+deadline, or grows past `maxReplyBytes`, the payload is discarded and incoming
+bytes stay discarded until that reply's terminator arrives or the same finite
+deadline passes. Payload bytes are therefore never reparsed as editor keys; the
+quarantine accumulates nothing, a bracketed paste ends it immediately, and
+ordinary typing, lone `Escape` and legacy `Alt+key` timing are unchanged after a
+completed or discarded reply.
+
+`stop()` after `restoreOnExit()` still detaches the stdin handler, timers and raw
+mode, but writes nothing visible: the emergency path already restored the
+terminal through the real fd.
+
 ## Injected terminal writer
 
 `new ProcessTerminal({ write })` (vendor local deviation 4) routes every

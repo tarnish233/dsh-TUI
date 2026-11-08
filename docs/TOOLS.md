@@ -48,7 +48,8 @@ fullscreen：标题点击展开/收起；展开正文单击收起，拖动仍是
 
 ## 详情 Inspector
 
-两种 renderer 共用公共 `TUI.showOverlay`，不另起编辑器：
+两种 renderer 共用共享 `ModalFrame` 与公共 `TUI.showOverlay`（wide），不另起编辑器。标题为
+`Tools`，副标题保留当前调用／总数；body 先按实测尺寸布局，再绘制调用栏、Input/Output、图片 chip 与正文窗口。
 
 | 默认键 | 行为 |
 | --- | --- |
@@ -57,11 +58,17 @@ fullscreen：标题点击展开/收起；展开正文单击收起，拖动仍是
 | Tab / Shift+Tab、Right / Left | Input / Output 切换 |
 | Up / Down、Ctrl+P / Ctrl+N | 滚动当前段 |
 | PageUp / PageDown、Home / End | 分页、首尾 |
+| Ctrl+F | 在当前 Input/Output 内查找；Esc 先清查询再关闭 |
+| Ctrl+L | 宽屏显示／隐藏调用列表（需真实多调用与父级导航） |
+| Ctrl+W | 浏览态切换长行 wrap；复制始终使用原始完整源 |
 | c | 复制当前段的原始可得内容 |
 | Esc | 关闭；返回同一个主编辑器和原草稿 |
 | Ctrl+C | 忙碌时交给 DSH 取消；空闲时只关闭 Inspector，不清主草稿 |
 
-以上均在现有 `/settings → General → Keyboard shortcuts` 中重绑定/禁用。
+以上均在现有 `/settings → Keyboard` 中重绑定/禁用；没有写死的旧提示。调用列表选择只传递稳定
+`callId` 给父级 `setTool`，不重跑工具、不读路径、不从当前文件猜测 diff。Input/Output 各自保留查询，
+切换调用时活动 section 与滚动尽量保留；嵌套 Image viewer 返回同一个 Tool Inspector 的原 section／scroll。
+禁用 section 绑定后，Shift+Tab 等全局 fallback 不会切 DSH 权限。
 Inspector 使用只读 `toolDetails` context，不穿透编辑器词移动/kill/undo；
 禁用 section 绑定后，Shift+Tab 等全局 fallback 不会切 DSH 权限。
 
@@ -71,10 +78,11 @@ inline 不启用额外 SGR 鼠标解析。其溢出提示为真实键位 + `to i
 fullscreen 的 Copy / Close / Prev / Next / section 按钮和溢出入口统一使用
 `HitboxRegistry`。正文选区、滚轮和点击合成由 vendored Pi TUI 负责。
 
-## `/settings → Tools`
+## `/settings → Tools & Diff`
 
-Tab 顺序为 `General | Thinking | Tools`；原 General 的 Tool details 已移入
-Tools，复用既有 `expandTools` 键，不迁移或创建第二层配置。
+Settings 是统一的分类搜索弹窗；Tools & Diff 分类保留下列 11 个键，原 General 的 Tool
+details 已移入此分类，复用既有 `expandTools` 键，不迁移或创建第二层配置。搜索、布尔开关、
+枚举／数字选择与单项 reset 使用同一设置文件；即时生效与核心源码仍需重启的边界不变。
 
 | 键 | 默认 | 含义 |
 | --- | --- | --- |

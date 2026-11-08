@@ -24,6 +24,11 @@ export type CcContext =
   | "imageDetails"
   | "subagentList"
   | "subagentSession"
+  | "settingsList"
+  | "keybindingsList"
+  | "modalList"
+  | "queueList"
+  | "modalSearch"
   | "global"
 
 export const CC_CONTEXTS: readonly CcContext[] = [
@@ -38,6 +43,11 @@ export const CC_CONTEXTS: readonly CcContext[] = [
   "imageDetails",
   "subagentList",
   "subagentSession",
+  "settingsList",
+  "keybindingsList",
+  "modalList",
+  "queueList",
+  "modalSearch",
   "global",
 ]
 
@@ -106,10 +116,44 @@ const imageDetailsContext = ["imageDetails"] as const
 /**
  * Native Agents overlay (agent list and one child's session view). Same
  * read-only shape as `toolDetails`/`imageDetails`: list/dialog/global fallback,
- * never the editor layer. The two overlay-local actions below are the only
- * additions, so plain `r`/`s` stay ordinary text everywhere else.
+ * never the editor layer. The overlay-local actions below are the only
+ * additions, so plain `r`/`s`/Tab stay ordinary input everywhere else.
  */
 const subagentContexts = ["subagentList", "subagentSession"] as const
+const subagentListContext = ["subagentList"] as const
+/**
+ * Settings browse list (categories + typed rows). Same read-only shape as the
+ * details modals: shared list/dialog/global keys, never the editor layer, so
+ * editor movement/kill/undo cannot type into a settings surface. The search
+ * field is a real text field and uses `modalSearch` instead.
+ */
+const settingsListContext = ["settingsList"] as const
+/**
+ * Settings → Keyboard shortcuts list. Same read-only shape; Enter edits the
+ * selected row (`keybindings.edit`) instead of the shared `list.select`, which
+ * stays the documented fallback if the edit action is disabled/remapped.
+ */
+const keybindingsListContext = ["keybindingsList"] as const
+/**
+ * Generic modal list (session picker and similar), plus the native queue list.
+ * Both are read-only browsing surfaces with no editor fallback.
+ */
+const modalListContext = ["modalList"] as const
+const queueListContext = ["queueList"] as const
+/**
+ * Browse surfaces that offer `modal.search` (Ctrl+F). `imageDetails` is
+ * intentionally absent: the image viewer has no search field.
+ */
+const modalSearchContexts = [
+  "settingsList",
+  "keybindingsList",
+  "modalList",
+  "toolDetails",
+  "subagentList",
+  "subagentSession",
+  "queueList",
+] as const
+
 /** Browse mode of the provider-grouped /model picker (list + provider keys). */
 const modelPickerListContext = ["modelPickerList"] as const
 const modelPickerBothContexts = ["modelPickerList", "modelPickerSearch"] as const
@@ -127,13 +171,32 @@ const listAndModelPickerSearchContexts = ["list", "modelPickerSearch"] as const
  * `subagentList` / `subagentSession` are the read-only native Agents overlay:
  * the agent list and one agent's session view. They share the read-only shape
  * of `toolDetails`/`imageDetails` (list navigation, dialog and global app keys,
- * no `editor` fallback) and add exactly two app-implemented, overlay-local
- * actions: `subagent.reply` (default `r`, set the App-owned reply target) and
+ * no `editor` fallback) and add app-implemented, overlay-local actions:
+ * `subagent.reply` (default `r`, set the App-owned reply target),
  * `subagent.interrupt` (default `s`, stop the focused child inside the
- * overlay). Both are ordinary registry rows (remap/disable/reset in the one
- * grouped Settings list); the input layer only emits/returns the action, the
- * App performs the backend operation. There is no second target/mode action in
- * the root editor: leaving a reply target stays `app.cancel`.
+ * overlay) and `subagent.filter.toggle` (default Tab, the overlay's
+ * Active/All filter). They are ordinary registry rows (remap/disable/reset in
+ * the one grouped Settings list); the input layer only emits/returns the
+ * action, the App performs the backend operation. There is no second
+ * target/mode action in the root editor: leaving a reply target stays
+ * `app.cancel`.
+ *
+ * `settingsList`, `keybindingsList`, `modalList` and `queueList` are the
+ * unified modal browse surfaces. They follow the same read-only shape (shared
+ * list/dialog/global keys, no `editor` fallback). Their context-local actions
+ * are `modal.search`, `settings.*`, `keybindings.*`, `session.scope.toggle` and
+ * `queue.*`. `modalSearch` is the one text field inside these modals (editor,
+ * dialog, global) so typing, word/whitespace deletion, kill/yank and undo work
+ * through the one Pi editor state; list navigation is passed by the UI, not by
+ * editor keybindings.
+ *
+ * `/settings` is one continuous grouped list, so `settings.previous-category` /
+ * `settings.next-category` mean previous/next *group (section)* and are the two
+ * group-navigation rows bound to Left + Shift+Tab and Right + Tab. Both are
+ * context-local to `settingsList`, so they are resolved before the `dialog` and
+ * `global` fallback layers: a generic dialog Tab/focus binding or the global
+ * `app.mode.cycle` (Shift+Tab) can never swallow them there, and the root
+ * prompt keeps Tab = completion and Shift+Tab = native `/permission`.
  *
  * Ordering matters when one byte matches several identifiers (^M = enter,
  * ^J = ctrl+j): the first matching definition in this array wins.
@@ -620,6 +683,26 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     note: "Agents overlay only (subagentList/subagentSession), so plain `s` stays text in the prompt. Stops the focused child inside the overlay; the global Ctrl+C app.interrupt priority is unchanged. DSH TUI capability, not a verified CC default.",
   },
   {
+    id: "subagent.filter.toggle",
+    family: "list",
+    contexts: subagentListContext,
+    defaultBindings: ["tab"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Toggle the Agents overlay Active / All filter",
+    note: "Agent list only (subagentList), so Tab keeps editor completion in the prompt and the session view keeps its read-only list keys. Filters the current native catalog; it never starts, follows or stops a child. DSH TUI capability, not a verified CC default.",
+  },
+  {
+    id: "app.queue.open",
+    family: "app",
+    contexts: appContext,
+    defaultBindings: ["ctrl+x ctrl+q"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Open the native message queue",
+    note: "DSH TUI capability, not a verified CC default. The chord keeps Ctrl+Q free for the prompt and reuses the existing Ctrl+X prefix. The queue is an operational view of DSH's native inbox; the TUI keeps no local queue.",
+  },
+  {
     id: "app.todo",
     family: "app",
     contexts: appContext,
@@ -885,6 +968,148 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     status: "tui-extension",
     description: "Close the image details viewer",
     note: "Context-local close wins over list.cancel for Esc. The configured app.interrupt key (Ctrl+C) always keeps priority in this context.",
+  },
+  {
+    id: "image.details.toggle-preview",
+    family: "dialog",
+    contexts: imageDetailsContext,
+    defaultBindings: ["p"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Switch the image viewer between automatic and text-only display",
+    note: "Image viewer only, so `p` stays ordinary text in the prompt and in modal text fields. A renderer-only display toggle: text-only mode must not start a read/decode or change attachments/facts. DSH TUI capability, not a verified CC default.",
+  },
+
+  // --- unified modal navigation (settings / keyboard / queue) ----------
+  {
+    id: "modal.search",
+    family: "dialog",
+    contexts: modalSearchContexts,
+    defaultBindings: ["ctrl+f"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Search the focused modal list or inspector",
+    note: "Browse surfaces only (Settings, Keyboard shortcuts, generic modal lists, queue, tools inspector, Agents overlay; not the image viewer). Modal-local, so Ctrl+F stays editor char-right in the prompt, and in a modal text field (modalSearch) it stays char-right while typing.",
+  },
+  {
+    id: "settings.reset",
+    family: "dialog",
+    contexts: settingsListContext,
+    defaultBindings: ["ctrl+r"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Reset the selected setting to its default",
+    note: "Settings list only; removes that one local override and never writes unrelated settings. Modal-local, so Ctrl+R keeps its history-search meaning in the prompt.",
+  },
+  {
+    id: "settings.previous-category",
+    family: "dialog",
+    contexts: settingsListContext,
+    defaultBindings: ["left", "shift+tab"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Jump to the previous Settings group (section)",
+    note: "Settings browse list only. Left/Shift+Tab move to the previous group/section of the one continuous grouped list; there are no category tabs. The legacy ID is kept for existing keybindings.json overrides. In a settings text field (modalSearch) Left/Shift+Tab keep their editing/fallback meaning, and in the prompt Shift+Tab stays the native permission preset.",
+  },
+  {
+    id: "settings.next-category",
+    family: "dialog",
+    contexts: settingsListContext,
+    defaultBindings: ["right", "tab"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Jump to the next Settings group (section)",
+    note: "Settings browse list only. Right/Tab move to the next group/section of the one continuous grouped list; there are no category tabs. The legacy ID is kept for existing keybindings.json overrides. Legacy terminals send the same byte for Tab and Ctrl+I, so this context-local binding also sees Ctrl+I; the prompt keeps Tab for completion and a settings text field (modalSearch) keeps its own keys.",
+  },
+  {
+    id: "keybindings.edit",
+    family: "dialog",
+    contexts: keybindingsListContext,
+    defaultBindings: ["enter"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Edit the selected shortcut",
+    note: "Keyboard shortcuts list only; it deliberately wins over the shared list.select (both default to Enter) in this one context, so Enter edits a row instead of activating a hidden list. Disabling/remapping it falls back to list.select as documented in docs/INPUT.md.",
+  },
+  {
+    id: "keybindings.reset",
+    family: "dialog",
+    contexts: keybindingsListContext,
+    defaultBindings: ["ctrl+r"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Reset the selected shortcut to its default",
+    note: "Keyboard shortcuts list only; deletes exactly one keybindings.json override and never rewrites the rest. Modal-local, so Ctrl+R keeps its history-search meaning in the prompt.",
+  },
+  {
+    id: "keybindings.disable",
+    family: "dialog",
+    contexts: keybindingsListContext,
+    defaultBindings: ["ctrl+d"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Disable the selected shortcut",
+    note: "Keyboard shortcuts list only: Ctrl+D disables one row here and never exits the app (global app.exit only wins outside this list), while the editor keeps forward-delete.",
+  },
+  {
+    id: "session.scope.toggle",
+    family: "list",
+    contexts: modalListContext,
+    defaultBindings: ["ctrl+a"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Toggle the modal list scope (sessions: current workspace / all)",
+    note: "Generic modal list only; Ctrl+A keeps line-start in the prompt and in modal text fields, and browsing never changes the session itself.",
+  },
+  {
+    id: "queue.edit",
+    family: "dialog",
+    contexts: queueListContext,
+    defaultBindings: ["e"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Edit the selected queued message in the composer",
+    note: "Queue list only, so `e` stays ordinary text in the prompt. The App keeps the single composer and the native inbox entry/id; the queue list never owns message text.",
+  },
+  {
+    id: "queue.cancel-entry",
+    family: "dialog",
+    contexts: queueListContext,
+    defaultBindings: ["d"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Cancel the selected queued message",
+    note: "Queue list only, so `d` stays ordinary text and forward-delete in the prompt. Cancels exactly one native inbox entry through the App's existing operation; no local queue exists.",
+  },
+  {
+    id: "queue.send-now",
+    family: "dialog",
+    contexts: queueListContext,
+    defaultBindings: ["ctrl+enter"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Cancel the current turn and send the selected queued message now",
+    note: "Queue list only. Requires a terminal that reports Ctrl+Enter (Kitty protocol / xterm modifyOtherKeys); legacy terminals send plain Enter, which stays list.select there, so remap if needed.",
+  },
+  {
+    id: "tool.details.toggle-calls",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["ctrl+l"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Show or hide the tool call list in the tools inspector",
+    note: "Modal-only, so Ctrl+L keeps its redraw meaning in the prompt; selecting a call is metadata only and never re-runs a tool.",
+  },
+  {
+    id: "tool.details.wrap",
+    family: "dialog",
+    contexts: toolDetailsContext,
+    defaultBindings: ["ctrl+w"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Toggle line wrapping in the tools inspector",
+    note: "Browse mode only, so Ctrl+W keeps its CC whitespace-kill meaning; a tool text field uses modalSearch where Ctrl+W stays editor whitespace-kill.",
   },
 
   // --- /model picker navigation ----------------------------------------

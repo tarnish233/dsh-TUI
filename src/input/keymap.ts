@@ -94,9 +94,22 @@ const MODIFIER_NAMES = ["ctrl", "shift", "alt", "super"] as const
  * `subagentList` and `subagentSession` are the read-only native Agents overlay
  * (agent list and one agent's session view). They follow the same read-only
  * shape: shared list navigation, dialog and app keys, never the editor layer.
- * The only context-local actions are `subagent.reply` (`r`) and
- * `subagent.interrupt` (`s`); both come from this one registry, so they are
- * remappable/disableable and plain `r`/`s` stay text in the prompt.
+ * The context-local actions are `subagent.reply` (`r`),
+ * `subagent.interrupt` (`s`) and `subagent.filter.toggle` (Tab); all come from
+ * this one registry, so they are remappable/disableable and plain `r`/`s`/Tab
+ * stay ordinary input in the prompt.
+ *
+ * `settingsList`, `keybindingsList`, `modalList` and `queueList` are the unified
+ * modal browse surfaces: shared list navigation, dialog and app keys, and **no
+ * editor fallback**, so editor movement/kill/undo can never edit or type into a
+ * read-only modal. `modalSearch` is the modal text field: the editor layer is
+ * present (typing, word/whitespace deletion, kill/yank, undo in one Pi editor
+ * state), Esc/app keys still fall through, and list navigation is passed by the
+ * owning UI rather than resolved from editor bindings. Because `modal.search`
+ * is not registered in `modalSearch`, Ctrl+F stays editor char-right there.
+ * Context-local rows are resolved before every fallback layer, which is why the
+ * `settingsList` group jumps (Left/Shift+Tab, Right/Tab) cannot be swallowed by
+ * a generic `dialog` Tab binding or by the global `app.mode.cycle` (Shift+Tab).
  */
 const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>> = {
   editor: ["editor", "global"],
@@ -110,6 +123,11 @@ const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>>
   imageDetails: ["imageDetails", "list", "dialog", "global"],
   subagentList: ["subagentList", "list", "dialog", "global"],
   subagentSession: ["subagentSession", "list", "dialog", "global"],
+  settingsList: ["settingsList", "list", "dialog", "global"],
+  keybindingsList: ["keybindingsList", "list", "dialog", "global"],
+  modalList: ["modalList", "list", "dialog", "global"],
+  queueList: ["queueList", "list", "dialog", "global"],
+  modalSearch: ["modalSearch", "editor", "dialog", "global"],
   global: ["global"],
 }
 
@@ -117,8 +135,9 @@ const CONTEXT_FALLBACK_CHAINS: Readonly<Record<CcContext, readonly CcContext[]>>
  * Contexts where the configured simple `app.interrupt` key always wins over
  * a local binding (list.cancel also binds Ctrl+C) *and* over a pending chord.
  * That makes Ctrl+C an unconditional escape hatch from a read-only details
- * modal, a read-only Agents surface or /model picker without changing
- * `list`/`dialog` semantics.
+ * modal, the read-only Agents surface, the /model picker and the unified modal
+ * surfaces (Settings, Keyboard shortcuts, generic modal lists, queue and their
+ * `modalSearch` text field) without changing `list`/`dialog` semantics.
  */
 const INTERRUPT_PRIORITY_CONTEXTS: ReadonlySet<CcContext> = new Set<CcContext>([
   "modelPickerList",
@@ -127,6 +146,11 @@ const INTERRUPT_PRIORITY_CONTEXTS: ReadonlySet<CcContext> = new Set<CcContext>([
   "imageDetails",
   "subagentList",
   "subagentSession",
+  "settingsList",
+  "keybindingsList",
+  "modalList",
+  "queueList",
+  "modalSearch",
 ])
 
 const SPECIAL_KEYS = new Set([

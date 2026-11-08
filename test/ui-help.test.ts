@@ -50,6 +50,13 @@ function render(panel: Panel, width: number): { lines: string[]; text: string } 
   return { lines, text: stripTerminalSequences(lines.join('\n')) }
 }
 
+/** Frame body text: border columns removed so section order can be asserted. */
+function body(panel: Panel, width: number): string[] {
+  return stripTerminalSequences(panel.render(width).join('\n'))
+    .split('\n')
+    .map(line => line.replace(/^│\s?/, '').replace(/\s*│$/, ''))
+}
+
 function assertWidths(panel: Panel, widths: readonly number[] = [20, 40, 80, 120]): void {
   for (const width of widths) {
     for (const line of panel.render(width)) {
@@ -89,7 +96,7 @@ test('wide terminals show Commands and Custom commands side by side; narrow ones
     assert.match(text, /\/deploy <env>/)
     assert.doesNotMatch(text, /❯/, 'a read-only panel has no selection pointer')
     assert.doesNotMatch(text, /Enter to select/)
-    assert.match(text, /^\s*Help$/m)
+    assert.match(stripTerminalSequences(lines[0] ?? ''), /^┌─ Help/, 'the frame title names the surface')
     assert.equal(panel.capturesViewportInput, true)
   }
 
@@ -98,19 +105,22 @@ test('wide terminals show Commands and Custom commands side by side; narrow ones
     const { lines, text } = render(panel, width)
     for (const line of lines) assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(line)}`)
     const plain = lines.map(line => stripTerminalSequences(line))
-    assert.ok(!plain.some(line => line.includes('Commands') && line.includes('Custom commands')), `width ${width} must stack`)
-    const commandsAt = plain.findIndex(line => /^\s*Commands\b/.test(line))
-    const customAt = plain.findIndex(line => /^\s*Custom commands\b/.test(line))
-    assert.ok(commandsAt >= 0 && customAt > commandsAt)
+    assert.ok(!plain.some(line => /Commands.*Custom commands/.test(line)), `width ${width} must stack`)
+    const stacked = body(panel, width)
+    const commandsAt = stacked.findIndex(line => /^\s*Commands\b/.test(line))
+    const customAt = stacked.findIndex(line => /^\s*Custom comman/.test(line))
+    assert.ok(commandsAt >= 0 && customAt > commandsAt, `stacked order at width ${width}: ${JSON.stringify(stacked)}`)
     assert.match(text, /\/deploy <env>/)
   }
 })
 
-test('slashes in the hints never claim Enter/choose/select behavior', () => {
+test('the footer prints real bindings and never claims Enter/choose/select behavior', () => {
   const { panel } = makePanel({ commands: catalog(), customCommands: customCatalog(), rows: 20 })
-  const hints = stripTerminalSequences(panel.render(80).at(-1) ?? '')
-  assert.match(hints, /close/)
-  assert.doesNotMatch(hints, /Enter|choose|select/i)
+  const lines = panel.render(80).map(stripTerminalSequences)
+  const footer = lines.slice(-3).join('\n')
+  assert.match(footer, /\[escape Close\]/, 'the close affordance uses the effective binding')
+  assert.match(footer, /\[ctrl\+f Search\]/, 'search is discoverable with its real key')
+  assert.doesNotMatch(footer, /enter (select|choose)|Enter to select/i)
 })
 
 test('names, descriptions and hints stay width-safe with CJK, emoji, ANSI/OSC and long text', () => {
@@ -156,6 +166,24 @@ test('empty custom commands and fully empty catalogs render explicit empty text'
   assertWidths(empty.panel, [4, 10, 20, 40, 80, 120])
 })
 
+test('no Skills section exists unless the parent supplies a native snapshot', () => {
+  // The historical two-section body is untouched: omitting the option (or
+  // passing undefined) adds no heading, separator, count or empty sentence.
+  for (const width of [40, 80, 120]) {
+    const omitted = render(makePanel({ commands: catalog(), customCommands: customCatalog() }).panel, width)
+    const explicit = new HelpPanel(fakeTui(30, 80), {
+      commands: catalog(),
+      customCommands: customCatalog(),
+      keymap: keymap(),
+      onClose: () => {},
+      onInterrupt: () => {},
+      skills: undefined,
+    })
+    assert.deepEqual(omitted.lines, explicit.render(width))
+    assert.doesNotMatch(omitted.text, /Skills/i)
+  }
+})
+
 test('an optional note renders compactly, sanitized and inside the height budget', () => {
   const note = 'Custom commands includes plugin and unattributed native registrations. \x1b[31mred\x1b[0m \x1b]0;pwned\x07'
   const { panel } = makePanel({
@@ -173,7 +201,14 @@ test('an optional note renders compactly, sanitized and inside the height budget
   const narrow = render(panel, 20)
   for (const line of narrow.lines) assert.ok(visibleWidth(line) <= 20, JSON.stringify(line))
   assert.ok(narrow.lines.length <= 10, `note panel rendered ${narrow.lines.length} lines for 10 rows`)
-  assert.match(narrow.text, /…/, 'a note longer than two lines is capped')
+
+  // On a short terminal the note is frame chrome: the frame trims it (and then
+  // the status line) before it would eat the body, and the panel never grows
+  // past the measured height. With room, it is capped at two painted rows.
+  const roomy = makePanel({ commands: catalog(), customCommands: customCatalog(), note: 'Custom commands includes plugin and unattributed native registrations.' })
+  const roomyRows = body(roomy.panel, 80).filter(line => /Custom commands includes|registrations/.test(line))
+  assert.ok(roomyRows.length > 0, 'the note is shown when there is room')
+  assert.ok(roomyRows.length <= 2, `the note took ${roomyRows.length} rows`)
 
   const emptyNote = makePanel({ commands: catalog(), note: '' })
   assert.equal(emptyNote.panel.render(80).length, makePanel({ commands: catalog() }).panel.render(80).length)
@@ -191,7 +226,8 @@ test('a long catalog is windowed to the dialog row budget and scrolls with list 
   assert.doesNotMatch(first.text, /\/cmd39/)
 
   panel.handleInput('\x1b[6~') // PageDown
-  assert.equal(panel.scrollTop, 4)
+  const pageSize = panel.scrollTop
+  assert.ok(pageSize > 0, 'PageDown scrolls by the measured body height')
   const paged = render(panel, 80)
   assert.ok(paged.lines.length <= 12)
   assert.doesNotMatch(paged.text, /\/cmd00/)
@@ -401,4 +437,60 @@ test('focus changes and disposal own only this surface\'s chord', () => {
   focused.panel.handleInput('\x1b')
   assert.equal(focused.calls.close, 0)
   assert.equal(render(focused.panel, 80).text, before)
+})
+// ---------------------------------------------------------------------------
+// Browse stays inert until modal.search (on-demand search design)
+
+test('browse printables, digits, Enter and clicks never execute, filter or trap the panel', () => {
+  const { panel, calls } = makePanel({ commands: manyCommands(12), customCommands: [], rows: 24 })
+  panel.focused = true
+  const before = render(panel, 80).text
+  const scrollBefore = panel.scrollTop
+  // A regular key sequence in the read-only list: nothing may filter, execute,
+  // select or change the surface.
+  for (const key of ['x', '1', '9', '?', ' ', '\r', '\n', '\t', '\x0f']) panel.handleInput(key)
+  assert.equal(panel.searching, false, 'the search field is on demand only')
+  assert.equal(panel.scrollTop, scrollBefore)
+  assert.equal(render(panel, 80).text, before, 'browse keys are inert and no caret is painted')
+  assert.equal(calls.close, 0)
+  assert.equal(calls.interrupt, 0)
+
+  // A click on a catalog row is not claimed: it stays native text selection.
+  const row = stripTerminalSequences(panel.render(80).join('\n'))
+    .split('\n')
+    .findIndex(line => /\/cmd0[0-9]/.test(line))
+  assert.ok(row > 0)
+  const press = panel.handleMouse({
+    type: 'press', button: 'left', x: 8, y: row, screenX: 8, screenY: row,
+    width: 80, height: panel.render(80).length, shift: false, alt: false, ctrl: false,
+  })
+  assert.equal(press, undefined, 'catalog rows own no mouse target')
+  assert.equal(render(panel, 80).text, before)
+
+  // Even a stale chord prefix must not swallow the next Esc.
+  panel.handleInput('\x18') // Ctrl+X prefix from the shared prompt keymap
+  assert.equal(panel.searching, false)
+  // The next Esc still closes the panel exactly once: no stuck search layer.
+  panel.handleInput('\x1b')
+  assert.equal(calls.close, 1, 'one Esc closes the read-only panel')
+  assert.equal(calls.interrupt, 0, 'and never interrupts the turn')
+})
+
+test('the search layer activates only through modal.search, and then Esc leaves it first', () => {
+  const { panel, calls } = makePanel({ commands: manyCommands(6), customCommands: [], rows: 24 })
+  panel.focused = true
+  panel.handleInput('\x06') // Ctrl+F = modal.search
+  assert.equal(panel.searching, true)
+  for (const char of 'cmd0') panel.handleInput(char)
+  assert.match(render(panel, 80).text, /\/cmd0\d/, 'the field really filters')
+  assert.equal(calls.close, 0)
+
+  panel.handleInput('\r') // Enter stays inert inside the field
+  assert.match(render(panel, 80).text, /\/cmd0\d/, 'Enter neither executes nor clears the query')
+  panel.handleInput('\x1b')
+  assert.equal(panel.searching, false, 'Esc leaves the search layer')
+  assert.equal(calls.close, 0, 'and the surface stays open')
+  assert.match(render(panel, 80).text, /\/cmd0[0-9]/, 'the full catalog is listed again')
+  panel.handleInput('\x1b')
+  assert.equal(calls.close, 1, 'the second Esc closes')
 })

@@ -5,18 +5,19 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import {
-  CombinedAutocompleteProvider, Container, getNativeClipboard, isViewportTUI,
+  Container, getNativeClipboard, isViewportTUI,
   matchesKey, ProcessTerminal, ScrollView, Spacer, Text, truncateToWidth, visibleWidth,
   type Component, type Focusable, type KeyId, type NativeClipboard, type Terminal, type TUI,
   type TuiInputListenerResult,
   TuiAltScreen, TuiMainScreen, VStack,
 } from '#pi-tui'
 import type {
-  Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, StatsSnapshot, SubagentEntry, TranscriptCodec, UsageSnapshot,
+  Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, SkillCatalogSnapshot, StatsSnapshot, SubagentEntry, TranscriptCodec, UsageSnapshot,
 } from './backend/types.ts'
 import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore, type Settings } from './config.ts'
 import { HistorySearch } from './history-search.ts'
-import { CcEditor, createCcKeymap, type CcActionEvent, type CcDraftSnapshot, type CcKeymap, type CcKeymapConfig, type CcSubmitPayload } from './input/index.ts'
+import { CcEditor, createCcKeymap, NativeAutocompleteProvider, type CcActionEvent, type CcDraftSnapshot, type CcKeymap, type CcKeymapConfig, type CcSubmitPayload } from './input/index.ts'
+import { leadingSkillGestureName, readSkillCatalog } from './skills.ts'
 import { formatElapsed, formatOutputRate, formatOutputTokens, OutputTracker } from './state/output-stats.ts'
 import type { TodoItem } from './backend/types.ts'
 import { createGitStatsRefresher, readGitStats, type GitStats } from './state/git-stats.ts'
@@ -26,12 +27,14 @@ import { HelpPanel, type HelpCommand } from './ui/help.ts'
 import { KeybindingsDialog } from './ui/keybindings.ts'
 import { ModelPickerDialog, type ModelPickerItem } from './ui/model-picker.ts'
 import { SessionPickerDialog } from './ui/session-picker.ts'
-import { SettingsDialog } from './ui/settings.ts'
+import { SettingsDialog, type SettingsViewState, type NativeSettingsEntry } from './ui/settings.ts'
+import { modalHeight, modalOverlayOptions, type ModalSize } from './ui/modal.ts'
+import { QueueDialog } from './ui/queue-dialog.ts'
 import { HitboxRegistry } from './ui/mouse.ts'
 import { QueueList } from './ui/queue-list.ts'
 import { ToolDetailsDialog } from './ui/tool-details.ts'
 import { ImageDetailsDialog } from './ui/image-details.ts'
-import { AgentsOverlay } from './ui/agents-overlay.ts'
+import { AgentsOverlay, type AgentsViewState } from './ui/agents-overlay.ts'
 import { ChildSessionView } from './ui/child-session-view.ts'
 import { SubagentProgress } from './ui/subagent-progress.ts'
 import { subagentCanReply, subagentCanStop, subagentLabel } from './ui/subagent-format.ts'
@@ -44,6 +47,7 @@ import { toolPreferences, type ToolDetailsRequest } from './ui/tool-view.ts'
 import { TranscriptView, transcriptHints, type TranscriptViewHints, type TranscriptViewOptionsShape } from './ui/transcript.ts'
 import { dim, editorTheme, t } from './ui/theme.ts'
 import { WelcomeHeader } from './ui/welcome.ts'
+import { TerminalIntegration, type TerminalEnvironment } from './ui/terminal-integration.ts'
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
 
@@ -153,6 +157,7 @@ const UI_COMMANDS = [
   { name: 'reload', description: 'Reload TUI settings/keybindings and DSH configuration/plugins' },
   { name: 'exit', description: 'Exit' },
 ]
+const UI_COMMAND_NAMES = new Set([...UI_COMMANDS.map(command => command.name), 'quit', 'config', 'clear'])
 
 class PromptEditor extends CcEditor {
   private workingStatus = ''
@@ -203,6 +208,8 @@ export interface AppOptions {
   screen?: 'inline' | 'fullscreen'
   configDir?: string
   terminal?: Terminal
+  /** Terminal/multiplexer hints only; offline acceptance injects these without native configuration. */
+  terminalEnvironment?: TerminalEnvironment
   demo?: boolean
   initialPrompt?: string
   registerSignals?: boolean
@@ -300,8 +307,15 @@ export class App {
   private closing = false
   private started = false
   private terminalPaused = false
+  private readonly terminalIntegration: TerminalIntegration
   private off?: () => void
   private dialog?: Component
+  private dialogOverlay?: ReturnType<TUI['showOverlay']>
+  private settingsReturnState?: { view: SettingsViewState; context: UiContext }
+  private appliedQueueCollapsed = false
+  private imagePreviewIntent?: Settings['imagePreview']
+  private imagePreviewGeneration = 0
+  private settingsFeedback?: { message: string; error: boolean; context: UiContext }
   private toolDetailsOverlay?: {
     request: ToolDetailsRequest
     dialog: ToolDetailsDialog
@@ -325,6 +339,7 @@ export class App {
     dialog: ChildSessionView
     handle: ReturnType<TUI['showOverlay']>
     returnToList: boolean
+    returnState?: AgentsViewState
   }
   /** Frames observed while native follow/read establishes the child durable cut. */
   private pendingChildFollow?: {
@@ -343,6 +358,14 @@ export class App {
   private readonly activeCommands = new Map<string, string>()
   private nativeCommands: CommandCatalogEntry[] = []
   private catalogRequest?: { sessionId: string; attachmentId: string | undefined; promise: Promise<void> }
+  private autocomplete?: { editor: CcEditor; basePath: string; provider: NativeAutocompleteProvider }
+  private skillCatalog?: SkillCatalogSnapshot
+  private skillsDirty = true
+  private skillRevision = 0
+  private skillsRequest?: { context: UiContext; revision: number; dirty: boolean; promise: Promise<void> }
+  /** UI intent only: late metadata may refresh an open query, never revive an Esc/focus-dismissed one. */
+  private skillAutocompleteIntent?: { context: UiContext; surface: number; generation: number; text: string; signal?: AbortSignal }
+  private inputGeneration = 0
   /** The startup connect() task; the resume overlay awaits it before listing. */
   private connecting?: Promise<SessionInfo>
   /** Confirmed per-session titles (null = no title) within this launch. */
@@ -403,7 +426,7 @@ export class App {
   private surfaceGeneration = 0
   private terminalRestored = false
   private editorChild?: ChildProcess
-  private nativeAutoTitle?: { available: boolean; enabled?: boolean; effective?: string }
+  private nativeAutoTitle?: { available: boolean; enabled?: boolean; detail?: string }
 
   constructor(options: AppOptions) {
     this.options = options
@@ -426,6 +449,7 @@ export class App {
     this.keymap = createCcKeymap({ bindings: this.modeBindings, chordTimeoutMs: 3000 })
     this.viewOptions = {
       ...toolPreferences(settings),
+      groupSubagentMessages: settings.groupSubagentMessages,
       showThinking: settings.showThinking, hints: this.viewHints(),
       thinkingPreviewLines: settings.thinkingPreviewLines,
       screen: this.screen,
@@ -440,8 +464,11 @@ export class App {
     }
     const terminal = options.terminal ?? new ProcessTerminal()
     this.tui = this.screen === 'fullscreen'
-      ? new TuiAltScreen(terminal, false, undefined, { copyOnSelect: true })
+      ? new TuiAltScreen(terminal, false, undefined, { copyOnSelect: settings.copyOnSelect })
       : new TuiMainScreen(terminal)
+    this.terminalIntegration = new TerminalIntegration({
+      terminal, cwd: options.cwd, env: options.terminalEnvironment ?? process.env,
+    })
     this.prompt = new Prompt(this.tui, this.keymap)
     this.welcome = new WelcomeHeader({ demo: options.demo })
     this.transcript = new TranscriptView(this.store, this.viewOptions)
@@ -506,7 +533,7 @@ export class App {
    */
   private globalInput(data: string): TuiInputListenerResult {
     if (this.closing || this.terminalPaused || this.dialog === undefined) return undefined
-    if (this.editor.isPasting() || (this.dialog instanceof ModelPickerDialog && this.dialog.isPasting) || data.startsWith('\x1b[200~')) return undefined
+    if (this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean }).isPasting === true || data.startsWith('\x1b[200~')) return undefined
     if (!this.bound(data, 'app.interrupt')) return undefined
     if (this.decisionId === undefined && !this.isBusy) return undefined
     void this.interrupt()
@@ -601,10 +628,16 @@ export class App {
     } else { this.tui.addChild(document); this.tui.addChild(this.bottom) }
     this.store.onChange = () => this.render()
     this.off = this.options.backend.onEvent(event => this.onEvent(event))
-    this.offInput = this.tui.addInputListener(data => this.globalInput(data))
+    this.offInput = this.tui.addInputListener(data => {
+      const pasting = this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean } | undefined)?.isPasting === true
+      if (this.terminalIntegration.handleInput(data, pasting)) return { consume: true }
+      return this.globalInput(data)
+    })
     this.tui.setFocus(this.prompt)
+    this.syncTerminalPresentation()
     this.tui.start()
-    this.tui.terminal.setTitle('dsh-tui · ' + basename(this.options.cwd))
+    this.terminalIntegration.start()
+    this.applyDisplayPreferences(this.settings.get())
     if (this.options.registerSignals !== false) {
       const handlers: Array<[NodeJS.Signals, number]> = [['SIGINT', 130], ['SIGTERM', 0], ['SIGHUP', 0]]
       for (const [signal, code] of handlers) {
@@ -639,7 +672,7 @@ export class App {
       if (this.options.resumePicker) void this.refreshCommands()
       else await this.refreshCommands()
       this.refreshQueue()
-      void this.syncAutoTitle()
+      void this.queryAutoTitle()
       for (const warning of [...this.warnings, ...this.settings.warnings, ...this.history.warnings]) this.store.report(warning, 'error')
       if (!this.options.resumePicker && this.options.initialPrompt) await this.submit(this.options.initialPrompt)
     } catch (error) {
@@ -657,7 +690,24 @@ export class App {
   }
 
   private updateAutocomplete(): void {
-    this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(this.commands(), this.info?.cwd ?? this.options.cwd))
+    const editor = this.editor
+    const basePath = this.info?.cwd ?? this.options.cwd
+    if (this.autocomplete?.editor === editor && this.autocomplete.basePath === basePath) return
+    this.autocomplete?.provider.dispose()
+    const provider = new NativeAutocompleteProvider({
+      commands: () => this.commands(),
+      // A child reply is plain child text, not a promise about the root's skill scope.
+      skills: () => this.subagentReplyTarget === undefined && this.connected && this.skillCatalog?.available
+        ? this.skillCatalog.entries : [],
+      basePath,
+      refreshSkills: signal => {
+        if (signal.aborted || this.subagentReplyTarget !== undefined) return Promise.resolve()
+        this.rememberSkillAutocomplete(signal)
+        return this.refreshSkills()
+      },
+    })
+    this.autocomplete = { editor, basePath, provider }
+    editor.setAutocompleteProvider(provider)
   }
 
   private refreshCommands(force = false): Promise<void> {
@@ -695,11 +745,119 @@ export class App {
     return request.promise
   }
 
+  private invalidateSkills(): void {
+    this.skillRevision += 1
+    this.skillCatalog = undefined
+    this.skillsDirty = true
+    if (this.skillsRequest !== undefined) this.skillsRequest.dirty = true
+  }
+
+  /** Single-flight native metadata observation. No menu/query materializes an Agent. */
+  private refreshSkills(force = false): Promise<void> {
+    if (this.closing || !this.connected || this.info?.capabilities.includes('skills') !== true) {
+      this.skillCatalog = undefined
+      this.skillsDirty = false
+      return Promise.resolve()
+    }
+    if (force) this.invalidateSkills()
+    const context = this.context()
+    const current = this.skillsRequest
+    if (current !== undefined && this.sameAttachment(current.context)) {
+      // A native invalidation during discovery gets one trailing current-scope read.
+      return current.dirty ? current.promise.then(() => this.refreshSkills()) : current.promise
+    }
+    if (!this.skillsDirty) return Promise.resolve()
+    const request = { context, revision: this.skillRevision, dirty: false, promise: Promise.resolve() }
+    this.skillsRequest = request
+    this.skillsDirty = false
+    request.promise = (async () => {
+      try {
+        const raw = await this.options.backend.command('skills')
+        if (this.skillsRequest !== request || request.revision !== this.skillRevision || !this.sameAttachment(context)) return
+        const snapshot = readSkillCatalog(raw)
+        if (snapshot === undefined) throw new Error('DSH returned an invalid skill metadata envelope.')
+        this.skillCatalog = snapshot
+        // Unavailable/incomplete is not a permanent empty catalog. Retry on
+        // the next actual menu query; never create an idle polling loop.
+        this.skillsDirty = !snapshot.available || !snapshot.complete
+        this.refreshSkillAutocomplete()
+        this.render()
+      } catch (error) {
+        if (this.skillsRequest === request && request.revision === this.skillRevision && this.sameAttachment(context)) {
+          this.skillsDirty = true
+          this.store.report('Could not read DSH skills: ' + errorText(error), 'error')
+        }
+      } finally {
+        if (this.skillsRequest === request) {
+          this.skillsRequest = undefined
+          if (request.dirty && this.sameAttachment(context)) void this.refreshSkills()
+        }
+      }
+    })()
+    return request.promise
+  }
+
+  private skillAutocompletePrefix(): boolean {
+    return this.editor.focused && !this.editor.isPasting() && this.dialog === undefined &&
+      !this.terminalPaused && this.subagentReplyTarget === undefined && /^\/[a-zA-Z0-9-]*$/.test(this.editor.getText())
+  }
+
+  private rememberSkillAutocomplete(signal?: AbortSignal): void {
+    if (signal?.aborted || !this.skillAutocompletePrefix()) return
+    this.skillAutocompleteIntent = {
+      context: this.context(), surface: this.surfaceGeneration,
+      generation: this.inputGeneration, text: this.editor.getText(),
+      ...(signal === undefined ? {} : { signal }),
+    }
+  }
+
+  /** Re-query Pi without accepting a candidate, moving the cursor or changing undo/draft state. */
+  private refreshSkillAutocomplete(): void {
+    const intent = this.skillAutocompleteIntent
+    this.skillAutocompleteIntent = undefined
+    if (intent === undefined || intent.signal?.aborted || !this.sameAttachment(intent.context) ||
+      intent.surface !== this.surfaceGeneration || intent.generation !== this.inputGeneration ||
+      intent.text !== this.editor.getText() || !this.skillAutocompletePrefix()) return
+    this.editor.ccRefreshAutocomplete()
+  }
+
+  private skillPromptCandidate(text: string): boolean {
+    const name = leadingSkillGestureName(text)
+    return name !== undefined && !UI_COMMAND_NAMES.has(name) && this.connected &&
+      this.info?.capabilities.includes('skills') === true
+  }
+
+  /** Native scope is consulted only after an explicit submission, so first-input commands win too. */
+  private async isSkillPrompt(text: string, context: UiContext, hasImages = false): Promise<boolean | undefined> {
+    const name = leadingSkillGestureName(text)
+    if (name === undefined || !this.skillPromptCandidate(text)) return false
+    if (this.info?.capabilities.includes('input-route')) {
+      // The submission-time lookup may create the pending native scope. Do not
+      // do that for an image when its native admission service is not mounted.
+      if (hasImages && !this.info.capabilities.includes('prompt-content')) {
+        throw new Error('This runtime has no native image prompt admission; your image draft was kept.')
+      }
+      const raw = object(await this.options.backend.command('input-route', { name }))
+      if (!this.sameAttachment(context)) return undefined
+      if ((raw?.kind !== 'command' && raw?.kind !== 'prompt') || typeof raw.sessionId !== 'string' ||
+        (raw.attachmentId !== undefined && typeof raw.attachmentId !== 'string')) {
+        throw new Error('DSH returned an invalid native input route.')
+      }
+      if (raw.sessionId !== this.info?.sessionId || raw.attachmentId !== this.info?.attachmentId) return undefined
+      return raw.kind === 'prompt'
+    }
+    // Smaller/fixture backends can expose an already-readable catalog without a native pending scope.
+    await this.refreshSkills()
+    if (!this.sameAttachment(context)) return undefined
+    if (this.nativeCommands.some(command => command.name === name)) return false
+    return this.skillCatalog?.available === true && this.skillCatalog.entries.some(skill => skill.name === name)
+  }
+
   /** Read-only command discovery; Help never changes the prompt or runs a command. */
   private async openHelp(): Promise<void> {
     const context = this.context()
     const surface = this.surfaceGeneration
-    await this.refreshCommands(true)
+    await Promise.all([this.refreshCommands(true), this.refreshSkills(true)])
     if (!this.sameContext(context) || surface !== this.surfaceGeneration) return
     const localNames = new Set(UI_COMMANDS.map(command => command.name))
     const commands: HelpCommand[] = []
@@ -714,9 +872,12 @@ export class App {
     }
     this.showDialog(new HelpPanel(this.tui, {
       commands, customCommands, keymap: this.keymap,
+      // Missing capability must remain visible as unavailable, not silently
+      // erase the section and leave the user unable to distinguish failures.
+      skills: this.skillCatalog ?? { entries: [], available: false, complete: false },
       ...(customCommands.length ? { note: 'Custom commands includes plugin and unattributed native registrations.' } : {}),
-      onClose: () => this.dismissDialog(),
-      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else this.dismissDialog() },
+      onClose: () => { this.dismissDialog(); this.returnToSettings() },
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else { this.dismissDialog(); this.returnToSettings() } },
     }))
   }
 
@@ -746,8 +907,10 @@ export class App {
     const selected: ToolDetailsRequest = request ?? { callId: tool.callId, section: 'output' }
     const dialog = new ToolDetailsDialog(tui, {
       tool, section: selected.section, keymap: this.keymap,
-      get maxHeight() { return Math.max(1, Math.floor(tui.terminal.rows * 0.8)) },
+      get maxHeight() { return modalHeight(tui, 'wide') },
       getToolNavigation: () => this.toolDetailsNavigation(selected.callId),
+      getTools: () => this.store.items.filter(item => item.kind === 'tool'),
+      onSelectTool: callId => this.selectToolDetails(callId),
       onPreviousTool: () => { this.navigateToolDetails(-1) },
       onNextTool: () => { this.navigateToolDetails(1) },
       onImageDetails: request => this.openImageDetails(request),
@@ -765,7 +928,7 @@ export class App {
       },
       onRenderRequest: () => { this.tui.requestRender() },
     })
-    const handle = tui.showOverlay(dialog, { anchor: 'center', width: '80%', minWidth: 24, maxHeight: '80%', margin: 1 })
+    const handle = tui.showOverlay(dialog, modalOverlayOptions('wide'))
     this.toolDetailsOverlay = { request: selected, dialog, handle }
     this.viewOptions.mouseBlocked = true
     this.render()
@@ -786,6 +949,16 @@ export class App {
     const tools = this.store.items.filter(item => item.kind === 'tool')
     const callId = this.toolDetailsOverlay?.request.callId ?? fallbackCallId
     return { index: Math.max(0, tools.findIndex(item => item.callId === callId)), total: tools.length }
+  }
+
+  private selectToolDetails(callId: string): void {
+    const overlay = this.toolDetailsOverlay
+    if (overlay === undefined || overlay.request.callId === callId) return
+    const tool = this.store.items.find(item => item.kind === 'tool' && item.callId === callId)
+    if (tool?.kind !== 'tool') return
+    overlay.request = { callId, section: overlay.dialog.section }
+    overlay.dialog.setTool(tool)
+    this.tui.requestRender()
   }
 
   /** Navigate declared calls, never completion order or a TUI-owned session policy. */
@@ -844,13 +1017,28 @@ export class App {
     const selected: ImageDetailsRequest = { key: image.key }
     const tui = this.tui
     const dialog = new ImageDetailsDialog(tui, {
-      image, keymap: this.keymap,
+      image, keymap: this.keymap, preview: this.settings.get().imagePreview,
+      setPreview: value => {
+        if ((this.imagePreviewIntent === undefined && this.settings.get().imagePreview === value) || this.imagePreviewIntent === value) return
+        this.imagePreviewIntent = value
+        const generation = ++this.imagePreviewGeneration
+        void this.settings.set({ imagePreview: value }).then(() => {
+          if (generation !== this.imagePreviewGeneration) return
+          this.imagePreviewIntent = undefined
+          if (!this.closing) this.applyDisplayPreferences(this.settings.get())
+        }).catch(error => {
+          if (generation !== this.imagePreviewGeneration) return
+          this.imagePreviewIntent = undefined
+          if (this.imageDetailsOverlay?.dialog === dialog) dialog.setPreview(this.settings.get().imagePreview)
+          if (!this.closing) this.store.report('Image preview preference was not saved: ' + errorText(error), 'error')
+        })
+      },
       readImage: async (attachment, signal) => {
         const read = this.options.backend.readImage
         if (read === undefined) throw new Error('Image attachments are unavailable in this backend.')
         return imageAttachmentValue(await read.call(this.options.backend, attachment, signal), attachment)
       },
-      get maxHeight() { return Math.max(1, tui.terminal.rows - 2) },
+      get maxHeight() { return modalHeight(tui, 'wide') },
       getImageNavigation: () => this.imageDetailsNavigation(selected.key),
       onPreviousImage: () => { this.navigateImageDetails(-1) },
       onNextImage: () => { this.navigateImageDetails(1) },
@@ -862,11 +1050,9 @@ export class App {
       },
       onRenderRequest: () => { if (!this.closing) this.tui.requestRender() },
     })
-    // Native image lines must not be prefixed/cropped horizontally by a tool tree or a padded dialog.
-    const handle = tui.showOverlay(dialog, {
-      anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
-      margin: { top: 1, bottom: 1, left: 0, right: 0 },
-    })
+    // The viewer measures its own inner graphics viewport; the shared frame
+    // preserves APC transfers rather than treating them as ordinary text.
+    const handle = tui.showOverlay(dialog, modalOverlayOptions('wide'))
     this.imageDetailsOverlay = { request: selected, dialog, handle }
     this.viewOptions.mouseBlocked = true
     this.render()
@@ -913,12 +1099,12 @@ export class App {
   // ------------------------------------------------------------- subagents
 
   private syncOverlayMouse(): void {
-    this.viewOptions.mouseBlocked = this.toolDetailsOverlay !== undefined ||
+    this.viewOptions.mouseBlocked = this.dialogOverlay !== undefined || this.toolDetailsOverlay !== undefined ||
       this.imageDetailsOverlay !== undefined || this.agentsOverlay !== undefined ||
       this.childSessionOverlay !== undefined
   }
 
-  private openAgentsOverlay(): void {
+  private openAgentsOverlay(initialState?: AgentsViewState): void {
     if (this.closing || this.terminalPaused || this.dialog !== undefined || this.decisions.length > 0) return
     if (this.store.subagentEntries.length === 0) {
       this.store.report('No native subagents in this session.')
@@ -930,10 +1116,10 @@ export class App {
     this.keymap.cancelChord(); this.chordHint = undefined; this.exitArm = undefined
     this.surfaceGeneration += 1
     const dialog = new AgentsOverlay(this.tui, {
-      entries: this.store.subagentEntries,
+      entries: this.store.subagentEntries, initialState,
       ...(this.store.subagentsTruncated ? { truncated: true } : {}),
       keymap: this.keymap,
-      maxHeight: Math.max(6, Math.floor(this.tui.terminal.rows * 0.8)),
+      maxHeight: modalHeight(this.tui, 'standard'),
       onClose: () => this.closeAgentsOverlay(),
       onOpen: entry => { void this.openSubagentSession(entry.id, true) },
       ...(this.info?.capabilities.includes('subagent-prompt') === true
@@ -944,7 +1130,7 @@ export class App {
       onGlobalAction: id => this.handleSubagentGlobalAction(id),
       onRenderRequest: () => this.render(),
     })
-    const handle = this.tui.showOverlay(dialog, { anchor: 'center', width: '85%', minWidth: 24, maxHeight: '80%', margin: 1 })
+    const handle = this.tui.showOverlay(dialog, modalOverlayOptions('standard'))
     this.agentsOverlay = { dialog, handle }
     this.syncOverlayMouse()
     this.render()
@@ -978,6 +1164,7 @@ export class App {
     const context = this.context()
     const rootSessionId = context.sessionId
     if (rootSessionId === undefined) return
+    const returnState = returnToList ? this.agentsOverlay?.dialog.captureView() : undefined
     this.closeImageDetails()
     this.closeToolDetails()
     this.closeSubagentSurfaces()
@@ -1015,11 +1202,8 @@ export class App {
       onRenderRequest: () => this.render(),
     })
     childStore.onChange = () => { dialog.invalidate(); this.render() }
-    const handle = this.tui.showOverlay(dialog, {
-      anchor: 'top-left', col: 0, width: '100%', maxHeight: '100%',
-      margin: { top: 1, bottom: 1, left: 0, right: 0 },
-    })
-    const overlay: NonNullable<App['childSessionOverlay']> = { childId, context, store: childStore, dialog, handle, returnToList }
+    const handle = this.tui.showOverlay(dialog, modalOverlayOptions('wide'))
+    const overlay: NonNullable<App['childSessionOverlay']> = { childId, context, store: childStore, dialog, handle, returnToList, returnState }
     this.childSessionOverlay = overlay
     this.pendingChildFollow = pending
     const ownsSurface = () => this.childSessionOverlay === overlay && surface === this.surfaceGeneration && this.sameAttachment(context)
@@ -1045,7 +1229,10 @@ export class App {
     } catch (error) {
       if (ownsSurface()) {
         this.closeChildSession(false)
-        if (returnToList) this.openAgentsOverlay()
+        if (returnToList) {
+          this.openAgentsOverlay(returnState)
+          this.agentsOverlay?.dialog.setMessage('Could not open the child session: ' + errorText(error), true)
+        }
         this.store.report('Could not open the child session: ' + errorText(error), 'error')
         this.render()
       } else this.releaseUnownedChildFollow(childId, context)
@@ -1087,13 +1274,17 @@ export class App {
       label: subagentLabel(current),
     }
     this.nextSendMode = undefined
+    this.skillAutocompleteIntent = undefined
+    this.editor.ccCancelAutocomplete()
     this.tui.setFocus(this.prompt)
     this.render()
   }
 
   private clearSubagentReplyTarget(): void {
+    if (this.subagentReplyTarget !== undefined) this.editor.ccCancelAutocomplete()
     this.subagentReplyTarget = undefined
     this.nextSendMode = undefined
+    this.skillAutocompleteIntent = undefined
   }
 
   private syncSubagentReplyTarget(): void {
@@ -1129,7 +1320,12 @@ export class App {
         this.store.report('Interrupt admitted for ' + label + '; waiting for the native status to settle.')
       }
     } catch (error) {
-      if (this.sameAttachment(context)) this.store.report('Could not interrupt ' + label + ': ' + errorText(error), 'error')
+      if (this.sameAttachment(context)) {
+        const message = 'Could not interrupt ' + label + ': ' + errorText(error)
+        this.agentsOverlay?.dialog.setMessage(message, true)
+        this.childSessionOverlay?.dialog.setMessage(message, true)
+        this.store.report(message, 'error')
+      }
     } finally {
       this.pendingSubagentStops.delete(key)
       if (this.sameAttachment(context)) this.render()
@@ -1146,7 +1342,7 @@ export class App {
     overlay.dialog.dispose()
     this.releaseUnownedChildFollow(overlay.childId, overlay.context)
     this.syncOverlayMouse()
-    if (returnToList && overlay.returnToList && !this.closing) this.openAgentsOverlay()
+    if (returnToList && overlay.returnToList && !this.closing) this.openAgentsOverlay(overlay.returnState)
     else this.tui.requestRender()
   }
 
@@ -1255,6 +1451,11 @@ export class App {
     this.updateAutocomplete()
     this.editor.onChange = () => {
       if (!this.updatingDraft && this.restored && this.editor.getExpandedText() !== this.restored.text) this.restored = undefined
+      if (this.skillAutocompleteIntent !== undefined) {
+        const signal = this.skillAutocompleteIntent.signal
+        this.skillAutocompleteIntent = undefined
+        this.rememberSkillAutocomplete(signal)
+      }
       this.exitArm = undefined
       this.render()
     }
@@ -1282,8 +1483,13 @@ export class App {
     // The first info lands while the startup resume overlay may already be
     // open; there is no previous session to tear stale surfaces down from.
     const replacedSession = this.info !== undefined
-    this.info = info; this.connected = true
+    this.info = info; this.connected = true; this.fatal = false
+    if (info.title !== undefined) this.sessionTitles.set(info.sessionId, info.title)
+    this.invalidateSkills()
     if (changed) {
+      if (replacedSession) { this.settingsReturnState = undefined; this.settingsFeedback = undefined }
+      this.skillsRequest = undefined
+      this.skillAutocompleteIntent = undefined
       this.clipboardGeneration += 1; this.clipboardPending = false
       this.queueReadController?.abort(); this.queueReadController = undefined
       this.closeImageDetails()
@@ -1336,6 +1542,11 @@ export class App {
       // Re-read the native command roster without invalidating live UI work.
       void this.refreshCommands(true)
     }
+    if (!changed && this.editor.isShowingAutocomplete() && this.skillAutocompletePrefix()) {
+      this.rememberSkillAutocomplete()
+      this.editor.ccRefreshAutocomplete()
+    }
+    void this.refreshSkills()
     this.render()
   }
 
@@ -1363,7 +1574,31 @@ export class App {
 
   private onEvent(event: BackendEvent): void {
     if (this.closing) return
-    if (event.type === 'ready') { this.applyInfo(event.info); return }
+    if (event.type === 'ready') { this.applyInfo(event.info); this.terminalIntegration.observe(event); return }
+    if (event.type === 'title') {
+      const info = this.info
+      if (info === undefined || event.sessionId !== info.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== info.attachmentId)) return
+      info.title = event.value
+      this.sessionTitles.set(event.sessionId, event.value)
+      if (this.dialog instanceof SessionPickerDialog) this.dialog.setTitles(new Map([[event.sessionId, event.value]]))
+      this.render()
+      return
+    }
+    if (event.type === 'skills_changed') {
+      if (event.sessionId !== this.info?.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId)) return
+      this.invalidateSkills()
+      if (this.editor.isShowingAutocomplete() && this.skillAutocompletePrefix()) {
+        this.rememberSkillAutocomplete()
+        this.editor.ccRefreshAutocomplete()
+      }
+      void this.refreshSkills()
+      return
+    }
+    // Observe authorized native facts before store callbacks render. A durable
+    // turn/end precedes native idle; tentative streams never imply completion.
+    if (!('sessionId' in event) || event.sessionId === this.info?.sessionId) this.terminalIntegration.observe(event)
     this.routeChildEvent(event)
     this.store.handle(event)
     if ('sessionId' in event && event.sessionId !== this.info?.sessionId) return
@@ -1431,6 +1666,8 @@ export class App {
       this.closeSubagentSurfaces()
       this.clearSubagentReplyTarget()
       this.connected = false; this.busy = false; this.decisions.length = 0; this.activeCommands.clear(); this.stopSpinner(); this.output.reset()
+      this.invalidateSkills(); this.skillsRequest = undefined; this.skillAutocompleteIntent = undefined
+      this.editor.ccCancelAutocomplete()
       const oldDialog = this.dialog
       this.hideDialog()
       disposeComponent(oldDialog)
@@ -1524,6 +1761,20 @@ export class App {
     }
   }
 
+  /** One renderer-owned terminal projection; it never calls into native business services. */
+  private syncTerminalPresentation(): void {
+    if (this.closing || this.terminalRestored) return
+    this.terminalIntegration.update({
+      info: this.info,
+      busy: this.isBusy,
+      activeCommandIds: [...this.activeCommands.keys()],
+      connected: this.connected,
+      fatal: this.fatal,
+      decisions: this.decisions.filter(decision => this.decisionBelongsToCurrentAttachment(decision)).map(decision => decision.request),
+      subagents: this.connected ? this.store.subagentEntries : [],
+    }, this.settings.get())
+  }
+
   private startSpinner(): void {
     if (this.spinner) return
     this.spinner = setInterval(() => { this.spinnerStep++; this.render() }, 100)
@@ -1535,7 +1786,7 @@ export class App {
   private syncSpinner(): void {
     const childWorking = this.connected && this.store.subagentEntries.some(entry =>
       entry.status === 'running' || entry.status === 'initializing')
-    if (this.isBusy || childWorking) this.startSpinner()
+    if (!this.settings.get().reducedMotion && (this.isBusy || childWorking)) this.startSpinner()
     else this.stopSpinner()
   }
 
@@ -1547,6 +1798,7 @@ export class App {
    * a short terminal falls back to a header or hides the widget altogether.
    */
   private subagentProgressRowBudget(): number {
+    if (!this.settings.get().showSubagentProgress) return 0
     const width = Math.max(1, this.tui.terminal.columns)
     const siblings = 1 + this.queueList.render(width).length + this.slot.render(width).length +
       this.hint.render(width).length + this.footer.render(width).length
@@ -1554,13 +1806,13 @@ export class App {
   }
 
   private render(): void {
-    if (this.closing || this.terminalPaused) return
+    if (this.closing || this.terminalPaused || this.terminalRestored) return
     this.syncToolDetails()
     this.syncImageDetails()
     this.syncSubagentSurfaces()
     this.syncSubagentReplyTarget()
     this.syncSpinner()
-    const spinner = WORKING_SPINNER_FRAMES[this.spinnerStep % WORKING_SPINNER_FRAMES.length]!
+    const spinner = WORKING_SPINNER_FRAMES[this.settings.get().reducedMotion ? 0 : this.spinnerStep % WORKING_SPINNER_FRAMES.length]!
     const command = this.activeCommands.values().next().value
     this.queueList.rows = this.queueRows
     this.queueList.editingId = this.editingQueueId
@@ -1578,8 +1830,7 @@ export class App {
       : this.chordHint ? this.chordHint.join(' ') + ' …'
       : this.decisionId ? 'Decision · Ctrl+P/N navigate · Enter choose · Esc ' + (this.decisions.find(decision => decision.request.id === this.decisionId)?.request.kind === 'question' ? 'cancel' : 'reject')
       : this.editingQueueId ? 'Editing queued message · Enter saves · Esc leaves the edit'
-      : this.dialog instanceof KeybindingsDialog || this.dialog instanceof HelpPanel || this.dialog instanceof ModelPickerDialog ? ''
-      : this.dialog ? 'Ctrl+P/N navigate · Enter choose · Esc cancel'
+      : this.dialog ? ''
       : ''
     // An empty Text must stay truly empty: dim('') still emits ANSI escapes,
     // which Text treats as content and renders as a visually blank row.
@@ -1654,27 +1905,39 @@ export class App {
       place += dim(' · ') + gitChip
     }
     this.footer.setText(chips.join(dim(' · ')) + dim(staged) + '\n' + place)
-    this.tui.terminal.setProgress(this.isBusy)
+    this.syncTerminalPresentation()
     this.tui.requestRender()
   }
 
   private showDialog(dialog: Component, decision = false): void {
-    if (this.decisionId && !decision) { this.store.report('Resolve the pending DSH decision before opening another dialog.'); return }
+    if (this.decisionId && !decision) {
+      if (this.dialog !== dialog) disposeComponent(dialog)
+      this.store.report('Resolve the pending DSH decision before opening another dialog.')
+      return
+    }
     this.closeImageDetails()
     this.closeToolDetails()
     this.closeSubagentSurfaces()
     this.surfaceGeneration += 1
+    this.dialogOverlay?.hide(); this.dialogOverlay = undefined
     if (this.dialog && this.dialog !== dialog) disposeComponent(this.dialog)
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialog = dialog
-    this.slot.clear(); this.slot.addChild(dialog)
+    // The one composer stays mounted and untouched behind the modal. Only the
+    // active overlay owns input; no draft/undo/image state is copied or reset.
+    this.slot.clear(); this.slot.addChild(this.prompt)
+    const size = (dialog as Component & { modalSize?: ModalSize }).modalSize ?? 'standard'
+    this.dialogOverlay = this.tui.showOverlay(dialog, modalOverlayOptions(size))
+    this.syncOverlayMouse()
     this.tui.setFocus(dialog); this.render()
   }
   private hideDialog(): void {
     this.surfaceGeneration += 1
     this.keymap.cancelChord(); this.chordHint = undefined
+    this.dialogOverlay?.hide(); this.dialogOverlay = undefined
     this.dialog = undefined; this.decisionId = undefined
     this.slot.clear(); this.slot.addChild(this.prompt)
+    this.syncOverlayMouse()
     this.tui.setFocus(this.prompt)
     this.showNextDecision(); this.render()
   }
@@ -1785,6 +2048,7 @@ export class App {
   }
 
   private beforeInput(data: string): boolean {
+    this.inputGeneration += 1
     if (this.editor.isPasting() || data.startsWith('\x1b[200~') || this.keymap.isPendingChord() || this.editor.capturesViewportInput) return false
     const up = this.bound(data, 'editor.move.line-up') || this.bound(data, 'editor.history.previous')
     const down = this.bound(data, 'editor.move.line-down') || this.bound(data, 'editor.history.next')
@@ -1972,6 +2236,7 @@ export class App {
       case 'app.tools.details': this.openToolDetails(); break
       case 'app.images.details': this.openImageDetails(); break
       case 'app.subagents.details': this.openAgentsOverlay(); break
+      case 'app.queue.open': this.openQueue(); break
       case 'app.thinking.toggle': {
         // CC-style cycle: hidden → collapsed summaries → expand/collapse the
         // latest run. The master show/hide switch lives in /settings → Thinking.
@@ -2102,10 +2367,27 @@ export class App {
       return
     }
     if (text.startsWith('/')) {
-      if (hasImages) {
-        restore(); this.store.report('Image attachments cannot be passed to a slash command. Remove them or send a normal prompt.', 'error'); return
+      let skillPrompt: boolean | undefined = false
+      // Keep UI-owned/non-skill command dispatch synchronous until its own
+      // first native await; menu discovery must not delay /model or /settings.
+      if (this.skillPromptCandidate(text)) {
+        try {
+          skillPrompt = await this.isSkillPrompt(text, context, hasImages)
+        } catch (error) {
+          restore()
+          if (this.sameAttachment(context)) this.store.report('Input not accepted: ' + errorText(error), 'error')
+          this.render()
+          return
+        }
       }
-      await this.slash(text); return
+      if (skillPrompt === undefined || !this.sameAttachment(context)) { restore(); return }
+      if (!skillPrompt) {
+        if (hasImages) {
+          restore(); this.store.report('Image attachments cannot be passed to a slash command. Remove them or send a normal prompt.', 'error'); return
+        }
+        await this.slash(text); return
+      }
+      // A native /name gesture is literal user input: reuse normal text/image queue/steer admission.
     }
     if (mode === 'send-now') {
       let accepted = false
@@ -2152,6 +2434,10 @@ export class App {
   private editQueued(messageId: string): void {
     const row = this.queueRows.find(item => item.messageId === messageId)
     if (row === undefined) return
+    if (row.images > 0) {
+      this.store.report('Recover image references with Up on an empty prompt before editing this native queued message.')
+      return
+    }
     this.editingQueueId = messageId
     this.updatingDraft = true
     try { this.editor.replaceDraftText(row.text) } finally { this.updatingDraft = false }
@@ -2159,7 +2445,7 @@ export class App {
     this.render()
   }
 
-  private async sendQueued(messageId: string | undefined): Promise<void> {
+  private async sendQueued(messageId: string | undefined, propagateFailure = false): Promise<void> {
     if (messageId === undefined) return
     if (this.editingQueueId === messageId && this.editor.getText().trim() !== '') {
       this.nextSendMode = 'send-now'
@@ -2171,12 +2457,13 @@ export class App {
       await this.options.backend.command('queue-send-now', { messageId })
     } catch (error) {
       if (this.sameContext(context)) this.store.report('Prompt not accepted: ' + errorText(error), 'error')
+      if (propagateFailure) throw error
     }
     this.refreshQueue()
     this.render()
   }
 
-  private async cancelQueued(messageId: string): Promise<void> {
+  private async cancelQueued(messageId: string, propagateFailure = false): Promise<void> {
     if (this.queueRemovals.has(messageId)) return
     this.queueRemovals.add(messageId)
     const context = this.context()
@@ -2193,6 +2480,7 @@ export class App {
       const text = errorText(error)
       if (this.sameContext(context) && !text.includes('queued message is gone')) {
         this.store.report(text, 'error')
+        if (propagateFailure) { void this.refreshQueue(); throw error }
       }
     } finally {
       this.queueRemovals.delete(messageId)
@@ -2325,6 +2613,7 @@ export class App {
       return result
     } catch (error) {
       if (['new', 'resume'].includes(name) || this.sameContext(context)) this.store.report(errorText(error), 'error')
+      if (this.settingsReturnState !== undefined && this.sameAttachment(context)) this.settingsFeedback = { message: errorText(error), error: true, context }
       return undefined
     }
   }
@@ -2343,9 +2632,23 @@ export class App {
    * submitted once either path settles.
    */
   private openStartupSessionPicker(): void {
+    let initialSettled = false
     const submitInitial = () => {
-      if (this.closing || this.fatal || !this.connected || this.options.initialPrompt === undefined) return
-      void this.submit(this.options.initialPrompt)
+      const prompt = this.options.initialPrompt
+      if (initialSettled || this.closing || this.fatal || prompt === undefined) return
+      initialSettled = true
+      void (async () => {
+        try {
+          // Esc is valid while the native runtime is still starting. Keep the
+          // one-shot positional prompt pending instead of dropping it merely
+          // because applyInfo() has not marked the backend connected yet.
+          if (!this.connected && this.connecting !== undefined) await this.connecting
+          if (this.closing || this.fatal || !this.connected) return
+          await this.submit(prompt)
+        } catch {
+          // start() owns native-connect diagnostics; submit() owns send errors.
+        }
+      })()
     }
     this.pickSessions({
       onSelect: id => {
@@ -2401,16 +2704,13 @@ export class App {
         const item = object(value)
         const id = item?.id ?? item?.sessionId
         if (!item || typeof id !== 'string' || id === '') return []
-        const created = typeof item.activityAt === 'number' ? item.activityAt
-          : typeof item.createdAt === 'number' ? item.createdAt
-            : typeof item.updatedAt === 'number' ? item.updatedAt : undefined
+        const created = typeof item.createdAt === 'number' ? item.createdAt : undefined
         return [{
           id,
           ...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
           cwd: typeof item.cwd === 'string' ? item.cwd : '',
-          // The picker's age column shows the LAST CONVERSATION time: the
-          // bridge orders by the durable artifact's mtime (activityAt) and
-          // only falls back to creation/fixture stamps when absent.
+          // Native header creation time is display-only. The backend preserves
+          // sessionQuery's order; neither layer stats artifacts or re-sorts.
           ...(created !== undefined && Number.isFinite(created) ? { createdAt: created } : {}),
           ...(item.live === true ? { live: true } : {}),
         }]
@@ -2480,9 +2780,22 @@ export class App {
   /** Provider grouping/search are UI projections of DSH's native model DTOs. */
   private async pickModel(): Promise<void> {
     const context = this.context()
+    const dialog = new ModelPickerDialog(this.tui, {
+      models: [], loading: true, currentProvider: this.info?.provider, currentModel: this.info?.model, keymap: this.keymap,
+      onSelect: id => {
+        if (this.dialog !== dialog || !this.sameAttachment(context)) return
+        this.dismissDialog()
+        void this.runRemote('model', { id }).finally(() => this.returnToSettings())
+      },
+      onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else { this.dismissDialog(); this.returnToSettings() } },
+    })
+    this.showDialog(dialog)
     const surface = this.surfaceGeneration
     const result = await this.runRemote('models')
-    if (!this.sameContext(context) || surface !== this.surfaceGeneration || !Array.isArray(result)) return
+    if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
+    if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
+    if (!Array.isArray(result)) { dialog.setError('Could not load native models. Close and reopen to try again.'); return }
     const models: ModelPickerItem[] = result.flatMap(value => {
       const item = object(value)
       if (!item || typeof item.id !== 'string' || !item.id || typeof item.provider !== 'string' || !item.provider || typeof item.model !== 'string' || !item.model) return []
@@ -2493,17 +2806,9 @@ export class App {
         ...(typeof item.isDefault === 'boolean' ? { isDefault: item.isDefault } : {}),
       }]
     })
-    if (!models.length) { this.store.report('No models available'); return }
-    this.showDialog(new ModelPickerDialog(this.tui, {
-      models, currentProvider: this.info?.provider, currentModel: this.info?.model, keymap: this.keymap,
-      onSelect: id => {
-        if (!this.sameContext(context)) return
-        this.dismissDialog()
-        void this.runRemote('model', { id })
-      },
-      onCancel: () => this.dismissDialog(),
-      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else this.dismissDialog() },
-    }))
+    dialog.setModels(models)
+    dialog.setLoading(false)
+    this.render()
   }
 
   /** Read the native preset roster without using generic command-result rendering. */
@@ -2558,9 +2863,24 @@ export class App {
 
   private async pickPreset(existing?: Record<string, unknown>): Promise<void> {
     const context = this.context()
+    let catalog: Record<string, unknown> | undefined
+    const dialog = new SelectDialog(this.tui, {
+      title: 'Choose agent preset', items: [], loading: true, keymap: this.keymap,
+      onSelect: value => {
+        if (this.dialog !== dialog || !this.sameAttachment(context) || typeof value !== 'string' || catalog === undefined) return
+        this.dismissDialog()
+        if (catalog.blank !== true) { this.stagePreset(value); this.returnToSettings(); return }
+        void this.applyPreset(value).finally(() => this.returnToSettings())
+      },
+      onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
+      onInterrupt: () => { void this.interrupt() },
+    })
+    this.showDialog(dialog)
     const surface = this.surfaceGeneration
-    const catalog = existing ?? await this.presetCatalog()
-    if (!catalog || !this.sameContext(context) || surface !== this.surfaceGeneration) return
+    catalog = existing ?? await this.presetCatalog()
+    if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
+    if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
+    if (catalog === undefined) { dialog.setError('Could not load native presets. Close and reopen to try again.'); return }
     const current = typeof catalog.current === 'string' ? catalog.current : undefined
     const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object).filter(item => typeof item?.id === 'string') : []
     const items: DecisionOption[] = entries.filter(item => typeof item?.broken !== 'string').map(item => {
@@ -2570,44 +2890,78 @@ export class App {
       const detail = typeof item!.description === 'string' && item!.description.length > 0 ? item!.description : id
       return { label: label + (marks.length ? ' · ' + marks.join(' · ') : ''), description: detail, value: id }
     })
-    const broken = entries.filter(item => typeof item?.broken === 'string')
-    if (!items.length) { this.store.report('No usable agent presets are available' + (broken.length ? ' (' + broken.length + ' unavailable)' : ''), 'error'); return }
-    if (broken.length) this.store.report('Skipped ' + broken.length + ' unavailable agent preset(s).')
-    const options = {
-      title: 'Choose agent preset', items, keymap: this.keymap,
-      onSelect: (value: unknown) => {
-        if (!this.sameContext(context)) return
-        this.dismissDialog()
-        const id = String(value)
-        if (catalog.blank !== true) { this.stagePreset(id); return }
-        void this.applyPreset(id)
+    dialog.setItems(items)
+    dialog.setLoading(false)
+    if (!items.length) dialog.setError('No usable native agent presets are available.')
+    this.render()
+  }
+
+  private async pickPermission(): Promise<void> {
+    const context = this.context()
+    const dialog = new SelectDialog(this.tui, {
+      title: 'Native permission preset', items: [], loading: true, keymap: this.keymap,
+      onSelect: value => {
+        if (this.dialog !== dialog || !this.sameAttachment(context) || typeof value !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(value)) return
+        this.confirmPermissionSelection(value, context)
       },
-      onCancel: () => this.dismissDialog(),
+      onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
-    } as ConstructorParameters<typeof SelectDialog>[1] & DecisionDialogExtras
-    this.showDialog(new SelectDialog(this.tui, options))
+    })
+    this.showDialog(dialog)
+    const surface = this.surfaceGeneration
+    const result = object(await this.runRemote('permissions'))
+    if (this.dialog !== dialog || !this.sameAttachment(context) || surface !== this.surfaceGeneration) return
+    const items: DecisionOption[] = Array.isArray(result?.options) ? result.options.flatMap(value => {
+      const item = object(value)
+      if (typeof item?.value !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(item.value)) return []
+      return [{ value: item.value, label: (typeof item.label === 'string' ? item.label : item.value) + (item.value === result.currentValue ? ' · current' : ''),
+        ...(typeof item.description === 'string' ? { description: item.description } : {}) }]
+    }) : []
+    dialog.setItems(items); dialog.setLoading(false)
+    if (result === undefined || !items.length) dialog.setError('Native permission choices are unavailable in this composition.')
+    this.render()
+  }
+
+  private confirmPermissionSelection(value: string, context: UiContext): void {
+    const dialog = new SelectDialog(this.tui, {
+      title: 'Confirm native permission change',
+      items: [
+        { label: 'Keep current permissions', value: false },
+        { label: 'Apply ' + value, description: 'This changes the current native permission preset. Tool safety semantics are owned by DSH; plan guidance is unchanged.', value: true },
+      ], keymap: this.keymap,
+      onSelect: accepted => {
+        if (this.dialog !== dialog || !this.sameAttachment(context)) return
+        this.dismissDialog()
+        if (accepted === true) void this.runRemote('execute', { line: '/permission ' + value }, 'status-only').finally(() => this.returnToSettings())
+        else this.returnToSettings()
+      },
+      onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
+      onInterrupt: () => { void this.interrupt() },
+    })
+    this.showDialog(dialog)
   }
 
   private async pickEffort(): Promise<void> {
-    await this.effortCommand('')
-  }
-
-  private async effortCommand(argument: string): Promise<void> {
-    if (argument && argument !== 'status') {
-      await this.runRemote('effort', { id: argument === 'default' ? null : argument })
-      return
-    }
     const context = this.context()
+    const dialog = new SelectDialog(this.tui, {
+      title: 'Choose reasoning effort', items: [], loading: true, keymap: this.keymap,
+      onSelect: value => {
+        if (this.dialog !== dialog || !this.sameAttachment(context) || typeof value !== 'string') return
+        this.dismissDialog()
+        void this.runRemote('effort', { id: value === '' ? null : value }).finally(() => this.returnToSettings())
+      },
+      onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
+      onInterrupt: () => { void this.interrupt() },
+    })
+    this.showDialog(dialog)
     const surface = this.surfaceGeneration
     const data = object(await this.runRemote('efforts'))
-    if (!data || !this.sameContext(context) || surface !== this.surfaceGeneration) return
-    if (argument === 'status') return
-    const levels = Array.isArray(data.efforts) ? data.efforts.map(object).filter(item => typeof item?.id === 'string') : []
+    if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
+    if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
+    const levels = Array.isArray(data?.efforts) ? data.efforts.map(object).filter(item => typeof item?.id === 'string') : []
+    if (data?.available !== true || levels.length === 0) { dialog.setError('This native model exposes no reasoning levels.'); return }
     const selected = typeof data.reasoningEffort === 'string' ? data.reasoningEffort : undefined
     const effective = typeof data.effectiveEffort === 'string' ? data.effectiveEffort : undefined
-    if (data.available !== true || levels.length === 0) {
-      this.store.report('This model exposes no reasoning levels.', 'error'); return
-    }
     const items: DecisionOption[] = [
       { label: 'Default' + (selected === undefined ? ' · current' : ''), description: typeof data.defaultEffort === 'string' ? 'Model default (' + data.defaultEffort + ')' : 'Provider default', value: '' },
       ...levels.map(item => {
@@ -2616,48 +2970,13 @@ export class App {
         return { label: label + (id === selected ? ' · current' : id === effective ? ' · effective' : ''), description: typeof item!.description === 'string' ? item!.description : id, value: id }
       }),
     ]
-    const options = {
-      title: 'Choose reasoning effort', items, keymap: this.keymap,
-      onSelect: (value: unknown) => {
-        if (!this.sameContext(context)) return
-        this.dismissDialog()
-        void this.runRemote('effort', { id: value === '' ? null : value })
-      },
-      onCancel: () => this.dismissDialog(),
-      onInterrupt: () => { void this.interrupt() },
-    } as ConstructorParameters<typeof SelectDialog>[1] & DecisionDialogExtras
-    this.showDialog(new SelectDialog(this.tui, options))
+    dialog.setItems(items); dialog.setLoading(false); this.render()
   }
 
-  /** Query the native state, then apply only an explicit local boolean override. */
-  private async syncAutoTitle(): Promise<void> {
-    await this.queryAutoTitle()
-    await this.applyLocalAutoTitle()
-  }
-
-  /**
-   * A locally saved on/off preference is applied through the native command at
-   * startup and reload. `inherit` never forces false: the profile default owns
-   * the effective value.
-   */
-  private async applyLocalAutoTitle(): Promise<void> {
-    const preference = this.settings.get().autoTitle
-    if (preference === 'inherit') return
-    const context = this.context()
-    try {
-      const result = object(await this.options.backend.command('auto-title', { enabled: preference }))
-      if (!this.sameContext(context)) return
-      if (result?.available === false) throw new Error(typeof result?.limitation === 'string' ? result.limitation : typeof result?.reason === 'string' ? result.reason : 'this DSH runtime does not expose native auto-title configuration')
-      this.nativeAutoTitle = {
-        available: true,
-        ...(typeof result?.enabled === 'boolean' ? { enabled: result.enabled } : {}),
-        ...(typeof result?.effective === 'string' ? { effective: result.effective } : {}),
-      }
-      if (typeof result?.limitation === 'string' && result.limitation !== '') this.store.report(result.limitation)
-      this.render()
-    } catch (error) {
-      if (this.sameContext(context)) this.store.report('Local auto-title preference was not applied by DSH: ' + errorText(error), 'error')
-    }
+  private async effortCommand(argument: string): Promise<void> {
+    if (!argument) { await this.pickEffort(); return }
+    if (argument === 'status') { await this.runRemote('efforts'); return }
+    await this.runRemote('effort', { id: argument === 'default' ? null : argument })
   }
 
   /** Read the native auto-title state without blocking startup or reload. */
@@ -2666,101 +2985,148 @@ export class App {
     try {
       const result = object(await this.options.backend.command('auto-title'))
       if (!this.sameContext(context) || !result) return
-      if (result.available === false) { this.nativeAutoTitle = { available: false }; return }
+      const detail = [result.limitation, result.reason, result.note, result.warning]
+        .find((value): value is string => typeof value === 'string' && value.length > 0)
       this.nativeAutoTitle = {
-        available: true,
+        available: result.available !== false,
         ...(typeof result.enabled === 'boolean' ? { enabled: result.enabled } : {}),
-        ...(typeof result.effective === 'string' ? { effective: result.effective } : {}),
+        ...(detail === undefined ? {} : { detail }),
       }
       this.render()
-    } catch { /* unsupported runtime: Settings shows the local preference and reports on change */ }
-  }
-
-  private autoTitleLabel(preference: Settings['autoTitle']): string {
-    const local = preference === 'inherit' ? 'inherit' : preference ? 'on' : 'off'
-    const native = this.nativeAutoTitle
-    if (native?.available && typeof native.enabled === 'boolean') {
-      return local + (preference === 'inherit' ? ' · native ' + (native.enabled ? 'on' : 'off') : '')
-    }
-    return local
-  }
-
-  /**
-   * Ask DSH's native auto-title capability; this TUI never runs a title LLM.
-   * The core owns inheritance, persistence and the effective value. Null means
-   * "inherit the native default".
-   */
-  private async toggleAutoTitle(): Promise<void> {
-    const context = this.context()
-    const current = this.settings.get().autoTitle
-    const next = current === 'inherit' ? true : current === true ? false : 'inherit'
-    this.dismissDialog()
-    try {
-      // Query first so an unsupported runtime is reported explicitly instead
-      // of looking like a successful local preference change.
-      const query = object(await this.options.backend.command('auto-title'))
+    } catch {
       if (!this.sameContext(context)) return
-      if (query?.available === false) throw new Error(typeof query.reason === 'string' ? query.reason : 'this DSH runtime does not expose native auto-title configuration')
-      const result = object(await this.options.backend.command('auto-title', { enabled: next === 'inherit' ? null : next }))
-      if (!this.sameContext(context)) return
-      if (result?.available === false) throw new Error(typeof result.reason === 'string' ? result.reason : 'this DSH runtime does not expose native auto-title configuration')
-      const enabled = typeof result?.enabled === 'boolean' ? result.enabled : undefined
-      this.nativeAutoTitle = { available: true, ...(enabled === undefined ? {} : { enabled }), ...(typeof result?.effective === 'string' ? { effective: result.effective } : {}) }
-      let localError: string | undefined
-      try { await this.settings.set({ autoTitle: next }) }
-      catch (error) { localError = errorText(error) }
-      const lines: string[] = []
-      if (enabled === undefined) lines.push('DSH did not report the effective auto-title value.')
-      if (typeof result?.note === 'string' && result.note !== '') lines.push(result.note)
-      else if (typeof result?.warning === 'string' && result.warning !== '') lines.push(result.warning)
-      if (typeof result?.limitation === 'string' && result.limitation !== '') lines.push(result.limitation)
-      if (localError !== undefined) lines.push('The local TUI preference was not saved: ' + localError)
-      if (lines.length) this.store.report(lines.join('\n'))
-    } catch (error) {
-      if (this.sameContext(context)) this.store.report('Auto title was not changed: ' + errorText(error), 'error')
-    } finally {
-      if (!this.closing && !this.dialog && this.sameContext(context)) this.openSettings()
+      this.nativeAutoTitle = { available: false, detail: 'Native state is unreadable; the DSH profile composition remains authoritative.' }
+      this.render()
     }
   }
 
-  private openSettings(): void {
+  private applyDisplayPreferences(settings: Settings): void {
+    if (this.viewOptions.expandTools !== settings.expandTools) clearToolExpansion()
+    Object.assign(this.viewOptions, toolPreferences(settings))
+    this.viewOptions.groupSubagentMessages = settings.groupSubagentMessages
+    this.viewOptions.showThinking = settings.showThinking
+    this.viewOptions.thinkingPreviewLines = settings.thinkingPreviewLines
+    this.viewOptions.thinkingLiveTimerMs = settings.thinkingLiveTimerMs
+    if (this.tui instanceof TuiAltScreen) this.tui.setCopyOnSelect(settings.copyOnSelect)
+    if (this.appliedQueueCollapsed !== settings.queueCollapsed) {
+      this.appliedQueueCollapsed = settings.queueCollapsed
+      this.queueList.setDefaultCollapsed(settings.queueCollapsed)
+    }
+    this.imageDetailsOverlay?.dialog.setPreview(settings.imagePreview)
+    this.transcript.invalidate()
+    this.render()
+  }
+
+  private settingsNativeEntries(): NativeSettingsEntry[] {
+    const capabilities = this.info?.capabilities ?? []
+    const navigate = (operation: () => void): (() => void) => () => {
+      if (!(this.dialog instanceof SettingsDialog)) return
+      this.settingsReturnState = { view: this.dialog.captureView(), context: this.context() }
+      this.settingsFeedback = undefined
+      operation()
+    }
+    const skills = this.skillCatalog
+    const autoTitle = this.nativeAutoTitle
+    return [
+      { id: 'native.model', label: 'Current model', value: this.info === undefined ? 'Starting DSH…' : this.info.provider + '/' + this.info.model,
+        description: 'DSH owns the catalog. Selection also submits the native default; profile persistence remains host-owned.', available: capabilities.includes('models'),
+        onActivate: navigate(() => { void this.pickModel() }) },
+      { id: 'native.effort', label: 'Reasoning effort', value: this.info?.reasoningEffort ?? 'Model default',
+        description: 'Available levels come from the selected native model.', available: capabilities.includes('efforts'),
+        onActivate: navigate(() => { void this.pickEffort() }) },
+      { id: 'native.preset', label: 'Agent preset', value: this.nextPreset === undefined ? this.info?.preset ?? 'Native default' : this.nextPreset + ' · staged',
+        description: 'Native composition; the current preset is locked once its conversation starts.', available: capabilities.includes('presets'),
+        onActivate: navigate(() => { void this.pickPreset() }) },
+      { id: 'native.permission', label: 'Current permission', value: this.info?.permissions?.currentValue ?? 'Native default',
+        description: 'Select a mounted native permission preset. Plan remains an independent command.', available: capabilities.includes('permissions') && capabilities.includes('execute'),
+        onActivate: navigate(() => { void this.pickPermission() }) },
+      { id: 'native.skills', label: 'Skills directory', value: skills?.available ? `${skills.entries.length} user-invocable${skills.complete ? '' : ' · incomplete'}` : 'Unavailable',
+        description: 'Read-only native metadata in Help; no instruction-body or directory/path subsystem.', available: capabilities.includes('skills'),
+        onActivate: navigate(() => { void this.openHelp() }) },
+      { id: 'native.plan', label: 'Plan guidance', value: this.planActive === undefined ? 'Native command' : this.planActive ? 'Active' : 'Off',
+        description: 'Independent native /plan; it never changes permission. Use the mounted command explicitly.' },
+      { id: 'native.autoTitle', label: 'Auto title',
+        value: autoTitle === undefined ? 'Reading native state…' : typeof autoTitle.enabled === 'boolean'
+          ? (autoTitle.enabled ? 'On' : 'Off') + ' · read-only' : autoTitle.available ? 'Read-only' : 'Unavailable',
+        description: autoTitle?.detail ?? 'Read-only; the DSH profile composition owns enablement. When enabled, native titles may use the model.',
+        available: autoTitle?.available !== false },
+      { id: 'native.defaults', label: 'Preset / permission defaults', value: 'Managed by DSH',
+        description: 'Profile default editing is not available here until a safe native scalar/revision API is exposed.', available: false },
+      { id: 'native.configuration', label: 'Tools / MCP / credentials', value: 'Managed by DSH',
+        description: 'No tool policy toggles, credential entry or raw profile auto-form in this TUI.', available: false },
+    ]
+  }
+
+  private returnToSettings(): void {
+    const pending = this.settingsReturnState
+    this.settingsReturnState = undefined
+    if (pending !== undefined && !this.closing && this.dialog === undefined && this.sameAttachment(pending.context)) {
+      this.openSettings(pending.view)
+      const feedback = this.settingsFeedback
+      this.settingsFeedback = undefined
+      const dialog = this.dialog as Component | undefined
+      if (feedback !== undefined && this.sameAttachment(feedback.context) && dialog instanceof SettingsDialog) dialog.setMessage(feedback.message, feedback.error)
+    }
+  }
+
+  private openSettings(initialState?: SettingsViewState): void {
     const dialog = new SettingsDialog(this.tui, {
-      settings: this.settings.get(),
+      settings: this.settings.get(), initialState,
       onChange: async patch => {
-        try {
-          await this.settings.set(patch)
-          const settings = this.settings.get()
-          if (patch.expandTools !== undefined) clearToolExpansion()
-          Object.assign(this.viewOptions, toolPreferences(settings))
-          this.viewOptions.showThinking = settings.showThinking
-          this.viewOptions.thinkingPreviewLines = settings.thinkingPreviewLines
-          this.viewOptions.thinkingLiveTimerMs = settings.thinkingLiveTimerMs
-          this.transcript.invalidate(); this.render()
-        } catch (error) {
-          this.store.report(errorText(error), 'error')
-          throw error
-        }
+        await this.settings.set(patch)
+        const settings = this.settings.get()
+        this.applyDisplayPreferences(settings)
+        return settings
       },
-      onAutoTitle: () => { void this.toggleAutoTitle() },
+      onReset: async key => {
+        await this.settings.reset(key)
+        const settings = this.settings.get()
+        this.applyDisplayPreferences(settings)
+        return settings
+      },
       onKeybindings: () => { this.openKeybindings() },
-      autoTitleLabel: this.autoTitleLabel(this.settings.get().autoTitle),
-      keymap: this.keymap,
-      screen: this.screen,
-      path: this.settings.path,
-      onCancel: () => this.dismissDialog(),
+      getNativeEntries: () => this.settingsNativeEntries(),
+      keymap: this.keymap, screen: this.screen, path: this.settings.path,
+      onCancel: () => { this.settingsReturnState = undefined; this.dismissDialog() },
       onInterrupt: () => { void this.interrupt() },
     })
     this.showDialog(dialog)
+    void this.queryAutoTitle()
+    void this.refreshSkills()
   }
 
   private openKeybindings(): void {
+    const previous = this.dialog instanceof SettingsDialog ? this.dialog.captureView() : undefined
+    const context = this.context()
     const dialog = new KeybindingsDialog(this.tui, {
       keymap: this.keymap, path: this.keybindings.path,
       onChange: (id, bindings) => this.saveKeybinding(id, bindings),
-      onBack: () => { if (this.dialog === dialog) this.openSettings() },
+      onBack: () => { if (this.dialog === dialog && this.sameAttachment(context)) this.openSettings(previous) },
       onInterrupt: () => { void this.interrupt() },
     })
     this.showDialog(dialog)
+  }
+
+  private openQueue(): void {
+    if (!this.connected || !this.info?.capabilities.includes('state')) {
+      this.store.report('The native inbox view is unavailable in this runtime.')
+      return
+    }
+    const context = this.context()
+    const dialog = new QueueDialog(this.tui, {
+      getEntries: () => this.sameAttachment(context) ? this.queueRows : [], keymap: this.keymap,
+      onEdit: entry => {
+        if (this.dialog !== dialog || !this.sameAttachment(context)) throw new Error('The native inbox attachment changed.')
+        if (entry.images > 0) throw new Error('Recover image references with Up on an empty prompt before editing this native queued message.')
+        this.dismissDialog(); this.editQueued(entry.messageId)
+      },
+      onCancelEntry: async entry => { if (!this.sameAttachment(context)) throw new Error('The native inbox attachment changed.'); await this.cancelQueued(entry.messageId, true) },
+      onSendNow: async entry => { if (!this.sameAttachment(context)) throw new Error('The native inbox attachment changed.'); await this.sendQueued(entry.messageId, true) },
+      onClose: () => { if (this.dialog === dialog) this.dismissDialog() },
+      onInterrupt: () => { void this.interrupt() }, onRenderRequest: () => this.render(),
+    })
+    this.showDialog(dialog)
+    void this.refreshQueue()
   }
 
   private async saveKeybinding(id: string, bindings: string[] | null | undefined): Promise<void> {
@@ -2794,12 +3160,7 @@ export class App {
     const beforeSettings = this.settings.get()
     const settingsWarnings = this.settings.reload()
     const settings = this.settings.get()
-    if (this.viewOptions.expandTools !== settings.expandTools) clearToolExpansion()
-    Object.assign(this.viewOptions, toolPreferences(settings))
-    this.viewOptions.showThinking = settings.showThinking
-    this.viewOptions.thinkingPreviewLines = settings.thinkingPreviewLines
-    this.viewOptions.thinkingLiveTimerMs = settings.thinkingLiveTimerMs
-    this.transcript.invalidate()
+    this.applyDisplayPreferences(settings)
     const keysApplied = this.reloadKeys()
     const lines: string[] = ['TUI reloaded: settings and keybindings.']
     if (settings.screen !== beforeSettings.screen) lines.push('Screen change applies on the next launch.')
@@ -2834,7 +3195,7 @@ export class App {
         }
         this.catalogRequest = undefined
         await this.refreshCommands()
-        void this.syncAutoTitle()
+        void this.queryAutoTitle()
       }
     } catch (error) {
       failed = true
@@ -2919,6 +3280,7 @@ export class App {
       await writeFile(file, previous.text, { mode: 0o600 })
       if (this.closing) return
       this.terminalPaused = true
+      this.terminalIntegration.pause()
       this.tui.stop({ preserveScreen: true })
       const command = process.env.VISUAL || process.env.EDITOR || 'nano'
       const code = await new Promise<number>((resolve, reject) => {
@@ -2936,15 +3298,25 @@ export class App {
     finally {
       if (directory) await rm(directory, { recursive: true, force: true })
       this.terminalPaused = false
-      if (!this.closing && !this.terminalRestored) { this.tui.start(); this.tui.setFocus(this.dialog ?? this.prompt); this.tui.requestRender(true) }
+      if (!this.closing && !this.terminalRestored) {
+        this.tui.start(); this.syncTerminalPresentation(); this.terminalIntegration.resume()
+        this.tui.setFocus(this.dialog ?? this.prompt); this.render(); this.tui.requestRender(true)
+      }
     }
   }
 
   private suspend(): void {
     if (process.platform === 'win32' || (this.options.registerSignals === false && this.options.allowSuspend !== true)) { this.store.report('Suspend is unavailable in this terminal'); return }
     this.terminalPaused = true
+    this.terminalIntegration.pause()
     this.tui.stop({ preserveScreen: true })
-    const resume = () => { this.terminalPaused = false; if (!this.closing && !this.terminalRestored) { this.tui.start(); this.tui.requestRender(true) } }
+    const resume = () => {
+      this.terminalPaused = false
+      if (!this.closing && !this.terminalRestored) {
+        this.tui.start(); this.syncTerminalPresentation(); this.terminalIntegration.resume()
+        this.render(); this.tui.requestRender(true)
+      }
+    }
     process.once('SIGCONT', resume); this.signals.push(['SIGCONT', resume])
     process.kill(process.pid, 'SIGTSTP')
   }
@@ -2953,6 +3325,7 @@ export class App {
   restoreTerminal(): void {
     if (this.terminalRestored) return
     this.terminalRestored = true
+    try { this.terminalIntegration.dispose() } catch { /* terminal may already be gone */ }
     try { this.tui.terminal.setProgress(false) } catch { /* terminal may already be gone */ }
     if (!this.terminalPaused) {
       try { this.tui.stop() } catch { /* best effort; Pi also registers an exit restore hook */ }
@@ -2992,6 +3365,9 @@ export class App {
     // Detach input before disposing any editor/dialog or awaiting native work.
     this.restoreTerminal()
     this.clipboardGeneration += 1; this.clipboardPending = false
+    this.skillAutocompleteIntent = undefined
+    this.autocomplete?.provider.dispose(); this.autocomplete = undefined
+    this.invalidateSkills(); this.skillsRequest = undefined
     this.queueReadController?.abort(); this.queueReadController = undefined
     this.queueImageRecoveries.clear()
     this.closeImageDetails()

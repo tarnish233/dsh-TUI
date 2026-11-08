@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { nativeProfileFixture } from './native-profile.ts'
+import { nativeProfileFixture, type NativeProfileFixture } from './native-profile.ts'
 import type { App } from '../../src/app.ts'
 import type { DshContextBackend, DshHostContext } from '../../src/backend/context.ts'
 import type { BackendEvent, JsonRecord, SessionEvent } from '../../src/backend/types.ts'
@@ -31,7 +31,16 @@ export interface NativeScene {
 export async function runNativeScene(
   scenario: (scene: NativeScene, params: JsonRecord) => Promise<void>,
   params: JsonRecord = {},
-  options: { screen?: 'inline' | 'fullscreen'; extraPatch?: readonly JsonRecord[]; streamFixture?: string; timeout?: number } = {},
+  options: {
+    screen?: 'inline' | 'fullscreen'
+    extraPatch?: readonly JsonRecord[]
+    /** Public native services required by this synthetic scenario, never a bypass of Cordis injection. */
+    extraInject?: readonly string[]
+    streamFixture?: string
+    timeout?: number
+    /** Prepare synthetic files in the isolated fixture before native services or catalog caches start. */
+    prepare?: (fixture: NativeProfileFixture) => Promise<void>
+  } = {},
 ): Promise<void> {
   const fixture = await nativeProfileFixture()
   const resultPath = join(fixture.directory, 'result.json')
@@ -41,6 +50,7 @@ export async function runNativeScene(
   const library = (path: string) => new URL('../../lib/' + path, import.meta.url).href
   const terminalModule = new URL('./terminal.ts', import.meta.url).href
   try {
+    await options.prepare?.(fixture)
     await writeFile(scenarioPath, `export const run = ${scenario.toString()};\n`)
     await writeFile(runnerPath, `
 import assert from 'node:assert/strict';
@@ -52,7 +62,7 @@ import { installCompactionReasoningEffort } from ${JSON.stringify(library('plugi
 import { VirtualTerminal, until, delay } from ${JSON.stringify(terminalModule)};
 import { run } from ${JSON.stringify(pathToFileURL(scenarioPath).href)};
 export const name = 'parent-native-scene';
-export const inject = ['agents','llm','sessions','sessionPersistence','agentPresets'];
+export const inject = ${JSON.stringify(['agents', 'llm', 'sessions', 'sessionPersistence', 'agentPresets', ...(options.extraInject ?? [])])};
 export function apply(ctx) {
  let app, terminal;
  ctx.effect(() => async () => {app?.restoreTerminal(); await app?.shutdown(); terminal?.dispose()}, 'native-scene.cleanup');

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
-import { defaults, PromptHistory, SettingsStore } from '../src/config.ts'
+import { PromptHistory, SETTINGS_FORMAT_VERSION, SettingsStore } from '../src/config.ts'
 
 const execute = promisify(execFile)
 const configUrl = new URL('../src/config.ts', import.meta.url).href
@@ -31,7 +31,7 @@ test('parent config acceptance: external malformed settings survive save with la
     await writeFile(settings.path, JSON.stringify({ screen: 'fullscreen', showThinking: true }))
     await settings.set({ expandTools: true })
     assert.deepEqual(JSON.parse(await readFile(settings.path, 'utf8')), {
-      ...defaults, screen: 'fullscreen', expandTools: true, showThinking: true,
+      formatVersion: SETTINGS_FORMAT_VERSION, screen: 'fullscreen', expandTools: true, showThinking: true,
     })
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

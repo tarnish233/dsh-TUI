@@ -26,12 +26,15 @@ class SessionBackend implements Backend {
   private readonly titlesCapable: boolean
   private readonly deferredSessions: boolean
   private readonly deferredTitles: boolean
+  private readonly deferredConnect: boolean
   private sessionsGate?: (value: JsonRecord[]) => void
   private titlesRelease?: () => void
-  constructor(cwd: string, titlesCapable = false, deferredSessions = false, deferredTitles = false) {
+  private connectRelease?: () => void
+  constructor(cwd: string, titlesCapable = false, deferredSessions = false, deferredTitles = false, deferredConnect = false) {
     this.titlesCapable = titlesCapable
     this.deferredSessions = deferredSessions
     this.deferredTitles = deferredTitles
+    this.deferredConnect = deferredConnect
     this.info = {
       sessionId: 'startup-fresh-session', attachmentId: 'startup-fresh-attachment', cwd,
       provider: 'fixture-provider', model: 'fixture-model',
@@ -47,9 +50,18 @@ class SessionBackend implements Backend {
   releaseSessions(): void {
     this.sessionsGate?.(this.catalog.map(item => ({ ...item })))
   }
+  /** Resolve native startup after the startup picker has already been cancelled. */
+  releaseConnect(): void {
+    this.connectRelease?.()
+    this.connectRelease = undefined
+  }
   onEvent(listener: (event: BackendEvent) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   emit(event: BackendEvent) { for (const listener of this.listeners) listener(event) }
-  async connect() { this.emit({ type: 'ready', info: this.info }); return this.info }
+  async connect() {
+    if (this.deferredConnect) await new Promise<void>(resolve => { this.connectRelease = resolve })
+    this.emit({ type: 'ready', info: this.info })
+    return this.info
+  }
   async send(text: string) { this.sends.push(text) }
   async respond() { throw new Error('session picker never answers decisions') }
   async close() {}
@@ -90,9 +102,9 @@ class SessionBackend implements Backend {
   }
 }
 
-async function fixture(options: { resumePicker?: boolean; catalog?: JsonRecord[]; titles?: boolean; deferredSessions?: boolean; deferredTitles?: boolean } = {}) {
+async function fixture(options: { resumePicker?: boolean; catalog?: JsonRecord[]; titles?: boolean; deferredSessions?: boolean; deferredTitles?: boolean; deferredConnect?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-parent-resume-picker-'))
-  const backend = new SessionBackend(directory, options.titles === true, options.deferredSessions === true, options.deferredTitles === true)
+  const backend = new SessionBackend(directory, options.titles === true, options.deferredSessions === true, options.deferredTitles === true, options.deferredConnect === true)
   // The native sessionQuery listing arrives newest-first; the picker never
   // re-sorts. The fixture mirrors that order.
   backend.catalog = options.catalog ?? [
@@ -113,8 +125,10 @@ async function fixture(options: { resumePicker?: boolean; catalog?: JsonRecord[]
     ...(options.resumePicker === true ? { resumePicker: true } : {}),
     ...(options.resumePicker === true ? { initialPrompt: 'positional prompt' } : {}),
   })
-  await app.start(); await paint(terminal)
-  return { app, backend, terminal, directory, async close() {
+  const starting = app.start()
+  if (options.deferredConnect !== true) await starting
+  await paint(terminal)
+  return { app, backend, terminal, directory, starting, async close() {
     try { await app.shutdown() } finally { terminal.dispose(); await rm(directory, { recursive: true, force: true }) }
   } }
 }
@@ -171,15 +185,31 @@ for (const picker of [false, true] as const) {
   })
 }
 
-test('parent resume picker: a directory with no sessions shows the empty state and Tab reaches all', async () => {
+test('parent resume picker: Esc before native connect keeps the positional prompt pending', async () => {
+  const f = await fixture({ resumePicker: true, deferredConnect: true })
+  try {
+    await until(() => f.terminal.screen().includes('Loading sessions'), 'the picker is usable before native startup resolves')
+    f.terminal.type('\x1b')
+    await paint(f.terminal)
+    assert.ok(!f.terminal.screen().includes('Resume session'), 'Esc dismisses the startup picker')
+    assert.deepEqual(f.backend.sends, [], 'nothing is sent before the native connection exists')
+    f.backend.releaseConnect()
+    await f.starting
+    await until(() => f.backend.sends.includes('positional prompt'), 'the cancelled picker still submits after connection')
+    assert.deepEqual(f.backend.sends, ['positional prompt'], 'the staged prompt is submitted exactly once')
+    assert.deepEqual(f.backend.commands.filter(call => call.name === 'resume'), [], 'cancelling never switches sessions')
+  } finally { await f.close() }
+})
+
+test('parent resume picker: an empty directory shows the effective scope binding and reaches all', async () => {
   const f = await fixture({ resumePicker: true, catalog: [{ id: 'other-dir', title: 'Elsewhere', cwd: '/definitely/elsewhere', createdAt: Date.now() }] })
   try {
     await until(() => f.terminal.screen().includes('Resume session'), 'the picker opens with the empty directory state')
     await paint(f.terminal)
     assert.ok(f.terminal.screen().includes('No sessions in current folder'), 'the empty state explains the directory scope')
-    assert.ok(f.terminal.screen().includes('Tab'), 'the empty state points at the scope toggle')
-    // Tab switches to the all-scope, where the other directory's session appears.
-    f.terminal.type('\t')
+    assert.ok(/ctrl\+a|Ctrl\+A/.test(f.terminal.screen()), 'the empty state points at the actual scope toggle')
+    // The browse-context scope action exposes sessions from other directories.
+    f.terminal.type('\x01')
     await paint(f.terminal)
     assert.ok(f.terminal.screen().includes('Elsewhere'), 'the all scope lists other directories')
     // Esc keeps the fresh session; the positional prompt still submits.

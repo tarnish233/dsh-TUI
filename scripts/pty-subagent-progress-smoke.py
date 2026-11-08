@@ -65,14 +65,16 @@ def run(mode):
                                              for line in value['lines']))
         # Inspect the actual decoded cells' visible glyph, not raw ANSI bytes.
         # No backend event is needed: the root is ready but child work animates.
+        # The 100ms spinner has a 400ms cycle. Sampling at a fixed ~400ms
+        # cadence can alias onto one frame, so collect over a bounded interval
+        # with short reads until two distinct frames are observed.
         frames = set()
-        for _ in range(5):
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline and len(frames) < 2:
             _, _, _, current = widget_frame(session)
             prefix = current[1].split('Explore repository', 1)[0].rstrip()
             frames.add(prefix[-1])
-            if len(frames) >= 2:
-                break
-            session.read(0.12)
+            session.read(0.05)
         assert len(frames) >= 2 and frames <= {'·', '✻', '✶', '✳'}, 'child progress did not reuse the Working animation: ' + repr(frames)
         screen, header, prompt, agent = widget_frame(session)
         opened = len(session.raw)

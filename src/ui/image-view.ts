@@ -20,11 +20,32 @@ export interface ImageViewOptions {
 
 export type ReadImageAttachment = (attachment: ImageAttachmentRef, signal?: AbortSignal) => Promise<ImageAttachmentValue>
 
+/**
+ * Viewer display preference (renderer-only).
+ *
+ * - `auto` lazily reads/decodes the occurrence and paints the native graphics
+ *   when the terminal supports it.
+ * - `text` never starts a read/decode and shows the metadata/ref identity only;
+ *   switching to it aborts and tombstones any pending read.
+ */
+export type ImagePreviewMode = 'auto' | 'text'
+
 export interface ImageDetailsDialogOptions {
   readonly image: ImageViewItem
   readonly keymap: CcKeymap
   readonly readImage: ReadImageAttachment
   readonly maxHeight?: number
+  /**
+   * Display preference supplied by the parent (a live getter is supported).
+   * Viewing never changes model vision/admission and never submits an image.
+   */
+  readonly preview?: ImagePreviewMode
+  /**
+   * The viewer asks the parent to persist a new display preference. The parent
+   * owns the settings write; the viewer applies the mode to its own surface
+   * immediately and never waits for the round-trip to paint text-only.
+   */
+  readonly setPreview?: (value: ImagePreviewMode) => void
   readonly onClose: () => void
   readonly onInterrupt?: () => void
   readonly onRenderRequest?: () => void

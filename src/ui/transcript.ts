@@ -124,6 +124,15 @@ export interface TranscriptViewOptionsShape extends ToolViewOptions {
   /** Real `app.subagents.details` key label for wide row hints. */
   subagentDetailsHint?: string
   /**
+   * Fold consecutive durable subagent records into one display group.
+   *
+   * Independent of `groupTools`: the native facts, declared order, item ids,
+   * Ctrl+O disclosure and every real dialogue boundary are unchanged, only the
+   * record projection is. Standalone rendering defaults to `true`; the parent
+   * passes the migrated `Settings.groupSubagentMessages` value.
+   */
+  groupSubagentMessages?: boolean
+  /**
    * Click-driven viewport anchor for thinking expansion: the parent freezes
    * follow-end before an expanding click so the clicked row stays visible,
    * and restores follow on the collapsing click.
@@ -148,6 +157,14 @@ interface CachedSubagentGroupEntry {
 }
 
 type CacheEntry = CachedItemEntry | CachedGroupEntry | CachedSubagentGroupEntry
+
+/**
+ * View flags plus the one projection-only extra: subagent record grouping is
+ * independent from the tool grouping preference (`groupTools`), so it cannot be
+ * smuggled through `ToolViewOptions`/`TranscriptViewOptions` (both owned by the
+ * shared block contract) and is kept as view-local display state here.
+ */
+type TranscriptFlags = TranscriptViewOptions & { groupSubagentMessages?: boolean }
 
 /** What the frame loop needs from either kind of cached block. */
 interface FrameBlock {
@@ -191,7 +208,7 @@ export class TranscriptView implements Component {
   readonly store: TranscriptStore
   /** Mutable by the parent; assignment of a new object is also supported. */
   options: TranscriptViewOptionsShape
-  private readonly flags: TranscriptViewOptions
+  private readonly flags: TranscriptFlags
   private readonly cache = new Map<string, CacheEntry>()
   /** Item cache keys that were group members in the previous frame. */
   private groupedKeys: ReadonlySet<string> = new Set()
@@ -228,6 +245,10 @@ export class TranscriptView implements Component {
     // holds. Nothing is fetched and no child Session is read or resumed.
     this.flags.subagentEntries = this.store.subagentEntries
     Object.assign(this.flags, toolPreferences(this.options))
+    // Independent from `groupTools`: absent means the standalone default `true`,
+    // and an explicit `false` (the migrated setting) restores one row per
+    // durable record without changing any native fact or shared disclosure.
+    this.flags.groupSubagentMessages = this.options.groupSubagentMessages
     this.flags.onToolDetails = this.options.onToolDetails
     this.flags.onImageDetails = this.options.onImageDetails
     this.flags.imageDetailsHint = this.options.imageDetailsHint
@@ -274,7 +295,9 @@ export class TranscriptView implements Component {
    */
   private frameNodes(): readonly SubagentFrameNode[] {
     const options = this.planOptions()
-    return planSubagentGroupNodes(planTranscriptNodes(this.store.items, options), { groupRecords: options.groupTools })
+    return planSubagentGroupNodes(planTranscriptNodes(this.store.items, options), {
+      groupRecords: options.groupSubagentMessages,
+    })
   }
 
   /** Root disclosure keys of the current projection (groups and ungrouped cards). */
@@ -338,8 +361,14 @@ export class TranscriptView implements Component {
     return count
   }
 
-  private planOptions(): { groupTools: boolean; showThinking: boolean } {
-    return { groupTools: this.flags.groupTools ?? true, showThinking: this.flags.showThinking }
+  private planOptions(): { groupTools: boolean; groupSubagentMessages: boolean; showThinking: boolean } {
+    return {
+      groupTools: this.flags.groupTools ?? true,
+      // Independent display preference: default on for standalone rendering,
+      // parent passes the migrated durable value.
+      groupSubagentMessages: this.flags.groupSubagentMessages ?? true,
+      showThinking: this.flags.showThinking,
+    }
   }
 
   /** Diagnostics/tests: number of item components currently retained. */

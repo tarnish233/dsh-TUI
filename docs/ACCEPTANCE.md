@@ -1,6 +1,121 @@
-# v0.1.3 原生 DSH 边界与交互语义验收
+# v0.1.4 原生 DSH 边界与交互语义验收
 
-## 当前：v0.1.3 发布验收
+## 当前：v0.1.4 本地版本标记
+
+用户明确选择 **v0.1.4**，收录当前已验收的源码／测试／文档，只创建本地版本提交和 annotated tag；没有推送、registry／GitHub release 发布或全局安装替换。生产仍为 native DSH app bundle＋同进程 Cordis 插件，DSH 的模型／工具／权限／Skills／会话所有权不变。
+
+- **最终完整 `pnpm check`：1761/1761**，131 个测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo，tests **345991ms**；`.cache/release-v0.1.4/full-check.log`。包含静态鲸鱼标题、Rex-only terminal 分类、协议 CLI/PTY **8/8**、native DSH terminal fixtures **2/2** 与既有输入／弹窗／Skills／Subagent／终端恢复回归。
+- **版本一致性**：package metadata、`src/version.ts`／`lib/version.js`、alias `--version` 与 welcome 为 **0.1.4**，`private:true`；依赖、lockfile 与 vendored Pi 版本不变。首次完整检查仅两个旧版固定断言失败，更新断言到本次版本、保留原 guard 后完整复跑通过；旧失败证据 `full-check-first.log` 保留，不冒充首轮成功。
+- **启动 identity CLI/PTY 6/6**：inline／fullscreen × Kitty／none 启动页四场景，加两种 renderer 外部 SIGINT；可见 v0.1.4、静态字符 logo、草稿／resize、正常退出 0／SIGINT 130 与 terminal restored 全通过。`.cache/release-v0.1.4/identity-pty.log` 与 `identity-pty/*.ansi`，使用私有 HOME／DSH_HOME／config。
+- **终端实机证据边界**：此前静态标题真实 Rex App **2/2** 和独立原生 `>_` 图标 GUI 对照保留在下面阶段记录，本轮打 tag 没有重新执行 GUI 对照。Ghostty GUI／OS popup、原自定义标题恢复与用户现场退出卡住仍不作成功／已修复声明。
+- **Git／数据边界**：只提交源码、测试、文档、正式图标资产及版本 metadata；构建产物、缓存、运行状态和凭据不进入 Git。源码候选路径／大文件／credential-shaped literal 的脱敏审计通过，测试只用临时 homes/workspaces 与 hermetic streams，零真实 provider 请求，不读取或改写真实 profile／凭据。
+
+以下记录保留各开发阶段当时的版本、未发布状态和测试结果，不替代上面的 v0.1.4 最终验收。
+
+## 打 tag 前：移除鲸鱼前的标题动画（当时未发布）
+
+- 按用户要求，标题仅为 `🐳 <native/fallback title>`；删除星号／工作帧常量、标题状态参数、snapshot 动画 tick、App 传入和标题专用 Reduced-motion 字段。不是暂停或隐藏动画。Rex `app=terminal` 的原生 `>_` 图标、DSH 原生标题／状态／通知、普通 Working／Subagent UI 时钟保留。
+- **当前 build＋strict TypeScript＋专项 111/111**：UI terminal 40、App terminal 25、图标 6、record/URI/reconnect races 4、native DSH 2、App logo 3、App theme 13、UI theme 11、Welcome 7；`.cache/rex-static-title/focused.log`。两 renderer 的工作／审批／结算超过原标题切换周期仍不写标题，native title不被装饰回写、draft／Editor／状态分类不变。
+- **真实 Rex App 2/2**：标题 query 为 `🐳 dsh-tui · workspace`，working 不改变标题，捕获的 app title events 无额外装饰；状态／kinds／独立 child／原生图标分类／终端清理／无重复通知仍通过，零模型调用；`.cache/rex-static-title/rex-live.log` / `rex-live/*-result.json`。**CLI/PTY 8/8** 同时验证静态前缀、Rex terminal 分类、generic dsh-tui 分类、Ghostty 和 opt-out；`.cache/rex-static-title/pty.log`。
+- 本轮未重跑全量；下一节 **1761/1761** 是之前通用图标阶段的完整记录，不冒充本次结果。所有检查使用隔离 homes/workspaces，无真实 provider、配置／凭据改写或全局安装变更；版本和 manifest／lock 不变，没有提交／发布。
+
+## 前次工作树：Rex 原生通用终端图标（未发布）
+
+- 用户明确接受通用终端活动分类，只有 Rex 的 root／child／fatal OSC 7501 app 字段改为 `terminal`；其它终端仍 `dsh-tui`。DSH 应用／进程名／原生会话标题／直接通知名称与模型、工具、权限不变，`🐳` 标题工作帧保留。Terminal status Off／协议不可用时不发布图标专用记录，恢复 Rex 自己的进程图标。
+- **真实 GUI 验证成功**：同一个隔离 Node.js 进程，仅将 `app=dsh-tui` 切为 `app=terminal`，Rex sidebar 与 pane header 从绿色 Node 图标变为内置 `>_`。不是仅看字段：两张应用窗口截图已对照，裁剪图 `.cache/rex-terminal-icon/native-icon-comparison.png`；`.cache/rex-terminal-icon/result.json`。未改程序名、Rex 配置／安装资源／OS 权限；测试 session 删除，原可见 DSH tab 用标题再次确认并恢复。
+- **当前 build＋strict TypeScript＋完整测试 1761/1761**，131 文件，0 fail/cancel/skip/todo，tests **342375ms**；`.cache/rex-terminal-icon/full-test.log`。本次执行 `pnpm build`／`pnpm typecheck`／`pnpm test`，不把历史 `pnpm check` 1759 当作本轮结果。
+- **专项 77/77**：UI terminal 40、App terminal 25、图标 6、record/URI/reconnect races 4、native DSH 2；`.cache/rex-terminal-icon/focused.log`。新增 root/child/fatal 的 Rex-only 分类、Ghostty 显式身份优先于继承 Rex hints、status Off 不强发图标记录、直接通知仍名为 dsh-tui；native title／composition 字节不变。
+- **实际 Rex App fixtures 2/2**：root/child `app=terminal`、状态／审批／问卷／独立 child／`🐳` 两帧、退出模式清理与无重复通知，零模型调用；`.cache/rex-terminal-icon/rex-live.log` 与 `rex-live/*-result.json`。完整测试含 CLI/PTY **8/8** 与 native DSH fixtures **2/2**，PTY 明确断言 Rex 为 terminal、generic 为 dsh-tui。
+- 版本／manifest／lock 不变，没有 commit/push/publish、全局可执行替换、真实 provider 请求或用户配置／凭据改写。自定义像素鲸鱼 SVG/PNG 仍仅为分发资产，未把它们上传给 Rex。
+
+## 前次工作树：Rex `🐳` 动态标题（未发布）
+
+- 用户明确选择标题符号方案与 `🐳`。Rex 正常标题前缀为 `✦ 🐳`，仅原生 root working 使用 `⠂/⠐ 🐳`；按 App 原有 100ms 时钟每十个 tick 切换，不新增 timer。Terminal title Off 停止发送、Reduced motion 固定工作帧、blocked/settled/idle 停止移动，子代理不聚合到 root busy；其它终端保持原有标题。DSH 持久化 title、app id、模型／工具／权限与通知行为不变。
+- **完整 `pnpm check` 1759/1759**，131 文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo，tests **343095ms**；`.cache/rex-title/full-check.log`。包含新增图标资产 6 与标题 9 个回归，不把前阶段计数当作本轮全量。
+- **专项 75/75**：UI terminal 38、App terminal 25、图标 6、record/URI/reconnect races 4、native DSH title/composition 2；`.cache/rex-title/focused.log`。实际 App 两 renderer 的既有时钟驱动两帧，100ms 重绘不逐帧写标题；审批／结算／Reduced motion 停止移动，不重发 program status、不新增 backend calls／prompt、原 Editor/草稿不变。
+- **真实 Rex 2/2**：`scripts/rex-terminal-smoke.py` 自有 session 的 `title_changed` 同时收到 `⠂ 🐳` 与 `⠐ 🐳`，native state/kinds/child/title/workspace/模式清理及无重复通知仍通过，零 model calls；`.cache/rex-title/rex-live/*-result.json` / `*-events.jsonl`。这是协议／server title 事件验收，不冒充 GPU/OS popup 截图验收。标题栈原自定义标题恢复仍明确不支持。
+- **协议 CLI/PTY 8/8**（Rex、generic、Ghostty、opt-out × 两 renderer）通过；全量含同一测试脚本的回归。所有测试使用临时 homes/workspaces／hermetic stream。没有真实 provider、配置／凭据改写、commit/push/publish、版本变更或全局安装替换。
+
+## 前次工作树：应用图标资产（未发布）
+
+- 已生成自包含 SVG、512px 与 64px 透明 PNG；沿用现有鲸鱼 grid／资产蓝，启动 logo、主题、终端协议和 DSH 业务源码未改变。
+- 专项 **62/62**：新增图标 6、App logo 3、App theme 13、UI theme 11、Welcome 7、App terminal 22；384 几何 sample centers、透明角、512／64px 尺寸、白色主体、package assets 包含、只读生成器一致性均通过。`pnpm typecheck` 与生成器独立 strict TypeScript 检查通过，`git diff --check` 通过。所有执行使用临时 homes，无真实 provider 请求。
+- 本轮只新增资产／开发脚本／测试／文档，**未重新运行全量**；下一节的 1744/1744 是终端适配阶段的完整记录，不冒充新增图标后的全量结果。
+- 当前 Rex 未发现公开项目级自定义程序图标接口；图标资产完成 **不等于原生 tab／pane 图标显示接入**。未改用户 Rex 配置／资源／tab，也没有冒充其它 app id 或加标题 emoji。边界见 [APP-ICON](APP-ICON.md)。
+
+## 前次工作树：Rex / Ghostty 终端协议（未发布）
+
+用户要求深度对照 Grok Build / Claude Code 对 Rex 的通知、状态和 tab 信息，适配 Rex 与 Ghostty，并保持 DSH 原生特性。生产仍为 native DSH app bundle＋同进程薄适配，版本 **0.1.3/private**；没有 commit/push/publish、全局可执行替换、真实 profile/凭据改写或真实 provider 请求。
+
+- **最终完整 `pnpm check`：1744/1744**，130 文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo，tests **332664ms**；`.cache/terminal-integration/full-check.log`。复核补齐 reply quarantine（整条/多块超长均不漏入 Editor）、emergency 后 stop、native ready 恢复、65 并行 command activity 等边界后最终复跑通过。首轮 **1731/1731** / 129 文件保留在 `full-check-first.log`，不替代最终结果。
+- **真实 Rex 2/2**：`scripts/rex-terminal-smoke.py` 只创建自己的 session，public CLI 查询 program_status/title/pwd/modes/process。idle→working→done、approval permission、question、whole-turn cancel idle、native error、root done＋child working 均正确；Automatic 无额外 OSC 777 request，exit 0，paste/focus/mouse/alt/sync modes 与记录清理。`.cache/terminal-integration/rex-live.log`、`rex-live/*-result.json` / `*-events.jsonl`。未捕获用户现有 pane，OS 通知授权/弹窗未被假设。
+- **标题栈限制的真实负证据**：owned Rex probe 先设 synthetic 原标题、CSI 21 查询，再 CSI 22/23 保存/恢复。查询零回复，最终仍为临时标题；CLI 两模式同样不能恢复原 synthetic 自定义标题。因此结果明确 `titleStackRestored:false`，不以 terminal mode restored 冒充 title restored。`.cache/terminal-integration/title-query/`。Ghostty 匹配版本 GUI 源码也忽略标题栈；最终由 shell integration 重设，不修改终端配置来绕过。
+- **新 CLI/PTY 8/8**：Rex-compatible reply、其他支持者 reply（证明非品牌 gating）、Ghostty DA-only/focus/OSC777 fallback、PI_PROGRAM_STATUS=0 × inline/fullscreen。完成/待审批/待回答、whole-turn cancel、真实焦点与 pasted CSI I 隔离、focused completion 无通知、进度/退出恢复通过；零 model calls，独立临时 homes/workspaces。`.cache/terminal-integration/pty-terminal.log`，`test/acceptance-terminal-integration-pty.test.ts` 纳入完整检查。
+- **真实 native DSH 2/2**：两 renderer 使用真实 composition 和 hermetic stream，确认 durable turn/end→Turn complete、原生 SessionTitleService.rename 的 title projection/change 传播、/new 后显式 /resume 的 title baseline、历史不生成新 completion、provider 保持 disabled/read-only、合成 profile patch 逐字节不变，没有多发 user prompt。`.cache/terminal-integration/native-terminal.log`，`test/acceptance-terminal-native.test.ts`；没有 live provider 请求。
+- **独立 parent 回归**：App/VT：通知隐私、同一主草稿/Settings、原生 title/null/attachment 守卫、命令成功/失败≠turn、其他工作防止提前完成、65 command activity map 不受小 correlation cache 淘汰、fatal/normal close、ready/重复失败恢复。协议 races：DA 后迟到 reply、支撑回调重入、emergency late clear/title/heartbeat、分片 focus、旧 child 先清后增避免 root 瞬时淘汰、Unicode joiner/非法 UTF-16、整条及多块超长 reply 不进入 Editor。
+- **Ghostty 证据限度**：安装版 1.4.0 的匹配源码/公开 VT 参考和协议 PTY已验证。尝试 `config-default-files=false`、私有 HOME/config、window-save-state=never 的 owned 新实例，未得到有效窗口，激活观察遇到 CoreGraphics deadline；按 unsafe retry 规则未盲目重复或物理注入，已只清理自己启动的实例。没有截图/GPU/IME或 OS popup 成功声明，也没有授予或修改系统通知权限。
+- **最终独立专项 41/41**：App terminal 22、parent record/URI/reconnect races 4、terminal protocol races 6、reply recovery 7、native DSH 2，`.cache/terminal-integration/final-focused.log`。此后完整 1744/1744 包含相同当前代码的所有回归；实际 Rex **2/2** 与协议 CLI/PTY **8/8** 又在最终全量运行期间复跑通过，`rex-live.log` / `pty-terminal.log`，零 model calls。
+- **保留的设置回归 17/17**：当前新 General 行下的 App modal／单页 Settings CLI/PTY、Tab/Shift+Tab/左右、鼠标 press-no-frame、Keyboard 返回与 typed enum/reset 保留；脚本不再硬编码 General 四行。`.cache/terminal-integration/settings-regression.log`。
+- **DSH 边界**：Terminal integration 只消费原生事实和现有 activity map，不创建第二 Harness、Agent loop、调度器、模型 catalog/auth、标题 provider 或 Rex socket/CLI生产依赖。`/permission` 和 `/plan` 独立，显式 resume 不变；CLI/PTY 只是 fixtures。指南：[TERMINALS](TERMINALS.md)；对照：[研究](TERMINAL-RESEARCH.zh-CN.md)；映射：[Native mapping](TERMINAL-NATIVE-MAPPING.md)。
+
+## 前次工作树：弹窗与设置重设计（未发布）
+
+按用户确认的 Grok Build / OpenCode 方案，统一 prompt-slot 弹窗为真实 overlay，保留唯一主 Editor 挂载与草稿；Settings 在用户反馈后改为可搜索、可滚动的连续单页分组，不再采用多个 tab 页面，并补齐近期展示能力。应用版本仍为 **0.1.3/private**；本轮未 commit／tag／push／publish，未修改真实 profile／凭据／会话或全局安装。
+
+- **该阶段完整 `pnpm check`：1646/1646**，121 个测试文件，vendor/src build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests **293564ms**；`.cache/settings-single-page/full-check.log`。全量包含新的单页 Settings CLI/PTY 两模式测试。
+- **单页 Settings 收口**：删除 tab/segment 栏和分类过滤，所有分组共享一张列表及其 viewport；Up/Down 跨组，Tab/Shift+Tab 或 Right/Left 只跳分组位置，查询和 roster 不变。保留类型化编辑/单项 reset/异步错误/Keyboard 返回/草稿与图片/只读 native auto-title。`SettingsViewState.category` 只表示当前行所属分组。
+- **输入与鼠标**：证实缺失的 Tab 默认绑定及 Shift+Tab 落入全局 `app.mode.cycle` 后被弹窗忽略；修复只限 Settings context，不改根 `/permission` 或其他 modal Tab。组标题/空白为 inert chrome，pin-only press 显式 `render:false`；parent App 断言 enum click 只有 release 的一帧，native metadata 同帧只读一次。列表/picker 用已有 bracketed-paste filter 拒绝粘贴控制字节，未完成粘贴期间鼠标不能改换输入目标。
+- **本轮 CLI/PTY 12/12**：单页 Settings 两模式 **2/2**（全组/搜索/Tab/Shift+Tab/左右/短 viewport/Keyboard 返回；fullscreen 4 次真实 SGR picker 往返且 press 零输出）、键位编辑/resize **2/2**、取消/退出/Settings 中断 **8/8**（SIGINT 场景预期 exit 130，其余 exit 0），全部 terminal restored、临时 home/workspace、无模型请求。`.cache/settings-single-page/pty-settings.log`、`pty-cli-keyboard.log`、`pty-cancel.log`。旧 busy-Settings PTY 改为先关覆盖层再检查 ready，避免用被弹窗遮住的底栏判断状态，同时断言未自然完成回合。
+- **本轮 native Settings 2/2**：临时原生 DSH composition 的两 renderer 均显示连续单页，Tab/Shift+Tab/左右正常，不发 user message，原生 auto-title 保持 disabled/read-only，会话与草稿保留，profile patch 逐字节不变。`.cache/settings-single-page/native-settings.log`。没有真实 provider 请求。
+- **性能证据限度**：旧离线 fixture 分类鼠标手势是两次重绘、方向键一次；未复现用户真机的严重延迟。新的真实 PTY 4 次鼠标 release 到首个重绘字节 **2.13–2.92ms**，不包含终端实际 GPU 显示延迟，不冒充用户终端现场确认。
+- **legacy auto-title 告警跟进**：旧 `settings.json.autoTitle` 静默忽略，不再在启动或 `/reload` 输出兼容告警；下次正常保存清理旧键。未知键与有效配置错误仍可见，启动／reload 保持文件逐字节不变，也不修改 native title 状态。build＋strict TypeScript 与 config／App／配置验收相关 **103/103** 通过（`.cache/legacy-auto-title/after.log`），两 renderer CLI/PTY **2/2** 验证无告警、exit 0、terminal restored、零 model calls（`.cache/legacy-auto-title/pty.log`）；当时未重跑全量，现已包含在上面的 1646/1646 内。
+- **并行优化阶段完整 `pnpm check`：1624/1624**，119 个测试文件，vendor/src build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests **275724ms**；最终日志 `.cache/dialog-implementation/full-check-optimization.log`（并行优化、父级收口与新增几何回归后的最终构建与全量测试）。
+- **共享 ModalFrame**：统一标题／边框／关闭／实际裁剪后的 action 与键位提示、measure-first body、正文鼠标坐标、ownerKey 目标守卫和 press 失效保护；正常终端保留状态栏可见的页边距，极矮终端降级为紧凑标题＋可操作 footer。没有新增 renderer、rgba backdrop、第二输入系统或竞品代码。
+- **单一 Editor**：Settings／Model／Resume／Help／Decision 等不再替换 prompt slot，而是在冻结的主 Editor 之上打开 overlay。两类 renderer 的 App 测试验证草稿、图片 registry、undo、focus、关闭后恢复同一 Editor；迟到模型／preset／effort 结果不能替换新 surface。
+- **Settings 完整入口**：General / Thinking / Tools & Diff / Agents / Images / DSH / Keyboard；15 个原有本地键 + 6 个新展示键，auto-title 移到 DSH 只读原生状态行。布尔／枚举／数字与自定义数字编辑分开，单项 reset，保存失败只回退该键可见，`captureView` 恢复分组位置／行／查询／滚动；Settings → Keyboard → Back 不再回 General。
+- **Agents 解耦**：`groupSubagentMessages` 独立于 `groupTools`，旧配置首次读取按当时 Tools 值迁移；迁移后 reset 使用 Agents 自身默认。Agents overlay 搜索／Active-All／稳定原生 id／返回状态；Child 错误在当前 surface 显示。进度保持两行与实际活动，新增隐藏开关；hover／选择不 follow、不 stop，不新增调度。
+- **Inspector／图片／队列**：Tools wide frame、I/O 查找、可选调用列表、wrap、真实源 copy；Image wide frame、`auto`／`text`（text 零 `readImage`）、`p` 切换、abort 旧读、迟到结果不绘制；Queue 弹窗按原生 message id 操作，失败留在当前弹窗，图片编辑 fail-closed。Help 增加按需搜索且只读 Skills 语义不变；Resume/Model/Select/Decision 有 loading／empty／no-match／error。
+- **模型实际缺陷修复**：异步 model roster 首次到达时，旧的空 picker 会错误选择名册第一项而不是 session 当前 provider；现在先尊重显式 `currentProvider`／`currentModel`，仅在 provider 不存在时回退。旧 `/effort` 结果在 attachment 已切换后仍可打开窗口的问题也改为关闭并返回 Settings。
+- **审查修复**：`/new` 现在把 app 已 staged 的 preset 传给 native pending session；`queue-send-now` 先完成附件 admission 再移除旧 native entry，失败不再丢队列；Queue 弹窗状态行纳入同一 measure，body hitbox 不再落入 chrome；窄 QueueList 行严格限宽且裁掉的 chip 没有 hitbox；图片队列行禁止直接 Edit；Select/Decision/Model 的 press 不再提前移动窗口；Settings 粘贴中的 Ctrl+C 不触发回合中断、所有 cancel action 禁用时物理 Esc 仍可退出、短 picker 自动滚到选中项；Keybindings 保存中仍可 Esc 返回；Agents 滚轮不再每帧回弹；Tools 查找字段优先拥有按键/chord。均有专项回归。
+- **并行优化已收口**：Settings/Keybindings 迁移到共享 `ModalListSurface`＋`windowList`，删除重复窗口与 mouse 管线；新增短 frame 状态行测量、超高聚焦行回填回归。auto-title 不再调用 Loader entry update，也不再保存/应用本地 on/off；旧 key 只读忽略并在下次无关 TUI 写入时清理。Resume backend 保留 `sessionQuery` 原生顺序，删除逐条 stat/mtime 排序；picker 只过滤不重排。connect 前 Esc 的 positional prompt 通过延迟连接回归验证只发送一次；嵌套 Settings `[×]` 先返回上一级。
+- **前一阶段离线 CLI/PTY 23/23**：Tools 2、Help 2、Model 2、Subagent progress/links/retirement 6、Skills 2、Images 4、Theme 2、Thinking 3，全部 exit 0／terminal restore、临时 home/workspace；日志在 `.cache/dialog-implementation/pty-optimization-*.log`。
+- **真实 DSH 入口**：native model picker **2/2**＋native Skills CLI/PTY **2/2** 单独复跑通过，`.cache/dialog-implementation/native-optimization.log`。另有 auto-title native 探针：disabled provider 的开启请求 fail-closed、状态保持 disabled、profile patch 逐字节不变，生产 Settings 显示 `Off · read-only`，`.cache/dialog-implementation/native-auto-title-smoke.log`。没有真实 provider／vision／GPU／IME 请求，也不以 demo PTY 冒充 native profile。
+- **范围**：原生 model／tool／permission／preset／Skills／session／credential ownership 不变；没有通用 profile schema 自动表单、credential 读取、本地队列／调度器或第二持久化。`/permission` 与 `/plan` 仍独立；用户现场的真实 profile 行为仍需用户实际使用确认。
+
+## 前次工作树：Enter 直接提交选中 slash／skill（未发布）
+
+用户已确认 Skills 目录能显示，随后报告 `/skill-stu` 必须先 Tab 才能使用，Enter 不能直接使用选中项。复现并确认：Enter 外层提前捕获 `CcSubmitPayload`，补全虽然改了 Editor，但 App 的 `onSubmitContent` 收到的仍是旧前缀；旧 text-only 测试与先 Tab 的流程掩盖了这一点。
+
+- **完整 `pnpm check`：1408/1408**，112 个测试文件，build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests **270023ms**；`.cache/autocomplete-enter/full-check.log`。版本仍 `0.1.3/private`，没有提交／推送／发布或改全局安装。
+- **正确提交边界**：同一个 Editor 先应用当前选中项，之后通过 submit callback 捕获完整 payload／snapshot，再清空并交给 App。`/skill-stu` 单次 Enter 发送 `/skill-studio`；普通 native/UI 命令同样发送完整名字。Tab 和文件候选 Enter 仍只编辑，不提交／验证图片内容；没有第二 Editor 或外层 setText。
+- **真实 DSH 回归 14/14**：保留目录／scope／user-only／命令优先 10 条；新增每 renderer 单次 Enter skill 与 native `/plan` 各一条。非 demo 生产 CLI/PTY 两模式不先 Tab，只有原生 canonical `skill-studio` 注入存在时 fixture 才返回专用 marker，因此不能拿旧的截断文字／普通模型响应冒充成功。`native-after.log`，也包含在完整检查里。
+- **修复前实证**：新 direct-Enter native 测试在旧编译代码两模式 **0/2**，错误明确是 content-aware submit 未携带完整名字；修复后两模式通过。`native-before.log` 保留旧失败，不删／弱化断言。
+- **输入／App 273/273**：全 input 套件 212、App Skills 29、native-boundary 7、图片 25。新用例覆盖 `onSubmitContent` 而非仅 legacy `onSubmit`、非首项、native command／UI Settings、单次消费、completed 图片内容／拒绝 snapshot 恢复、文件填入不提交、remap／undo／草稿。图片 registry 与 token/paste state 保留，native business/persistence 不改。
+- **范围**：只修提交捕获时序与 app-specific private Pi seam callback；没有变更 DSH registry／provider／模型／权限／业务模式、依赖／lock／bundle、vendor source 或全局程序。全部使用合成图像／技能与临时 home/workspace、hermetic model stream，无真实 provider 请求；用户实例的 Enter 行为仍待这次重启后复测。
+
+## 前次工作树：用户反馈后的 Skills 桌面对齐修正（未发布，目录显示已由用户确认）
+
+用户确认 TUI 已重启且发送过消息、preset 为 standard，但 `/` 没有技能且 `/help` 没有 Skills；桌面截图可补全 `skill-studio`。只读核对文件名确认原生用户目录有 6 个技能且包含该项，没有读取正文或真实配置／凭据。源码对照确认初版错误地把人类目录绑定到 `tools.get('skill')`，又漏用了公开 preset scope lease；这些与桌面端不同。具体用户 profile 的运行结果仍需用户复测，不能以测试数字代替现场确认。
+
+- **完整 `pnpm check`：1389/1389**，112 个测试文件，build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests **257233ms**；`.cache/skills-followup/full-check.log`。版本仍 `0.1.3/private`，无提交／tag／push／publish，依赖／lock／bundle／vendor source 未改。
+- **原生 Skills 验收 10/10**：保留 canonical 注入／user-only／命令优先 4 条；新增用户目录普通首条消息后直接 `/skill-stu` 2 条，以及未发消息／无 Agent 时直接菜单 2 条（不经 Help 或手工 query 预热）；另有 **非 demo 生产插件／ProcessTerminal／输出 lease CLI/PTY 2 条**，临时用户目录 6 个合成技能，验证启动菜单、普通消息后的同前缀、Help／草稿／exit 0／恢复。全部在完整检查里通过，LLM 仅使用 hermetic fixture，不请求真实 provider。
+- **修复前后证据**：新“未发消息菜单”验收对旧编译代码两模式 **0/2**，确实复现缺目录；新代码同场景 **2/2**。`startup-before.log` 保留旧失败，不删断言。普通消息场景在标准隔离组合原本能通过，不能由此断言用户实例的全部触发原因已确认。
+- **Backend／input／App 加固**：目录只依赖 metadata registry（snapshot／list），不用模型工具门槛；live 优先 preset registry，pending 使用 DSH `acquireScope` 并 finally 释放；未响应 acquire 的 late lease 也释放。Unavailable／incomplete 不作为永久空缓存，相同前缀可再次查询，仍单飞／无 timer／不自动应用。Help 在缺 capability 时也保留 unavailable 区。focused Backend **26**、input **21**、App **21**；实际 VT／旧 Help／设置／异步模型时序专项 **75/75**。
+- **额外 offline CLI/PTY 2/2**：原有 skills demo 再跑两模式成功，仍只是 frozen metadata／明确离线 acknowledgement，不能冒充真实目录；`demo-pty.log`。
+- **架构／数据边界**：使用 DSH 公开已拥有的 preset revision lease，不新建 Agent、私有 Context／Loader／provider、目录扫描器、profile 镜像或模型 transport。没有复制 Skills 正文／实际 provider／凭据／会话。真实远程模型、vision／GPU／IME 和用户现场 profile 未作自动验收；退出卡住问题仍未在本轮修复。
+
+## 前次工作树：原生 Skills 初版（未发布，目录门槛与启动语义已修正）
+
+在 `86061ba`／`v0.1.3` 发布基线上接入 Skills 元数据、原生 `/name` 输入路由和只读 Help。应用版本仍为 **0.1.3/private**；本轮没有提交／tag／push／registry publish，也未修改真实 profile、凭据、技能正文、会话或全局安装。生产仍是 native DSH bundle＋同进程薄适配，Agent／provider／工具／权限／注入归 DSH。
+
+- **完整 `pnpm check`：1370/1370**，110 个测试文件，vendor/src build＋strict TypeScript 通过，0 fail/cancel/skip/todo，tests **248335ms**；`.cache/skills/full-check.log`。初次全量发现 UI-owned 命令被额外 async classification 延迟、以及旧 Help End 断言未覆盖新增 Skills section；保留原生 `/model`／`/effort`／`/settings` 即时调用时序后复跑通过，Help 改为确实检查 End／Home／PageDown 的命令与技能可达性，不删断言。初次日志保留为 `full-check-first.log`。
+- **新增专项 79 条**：backend 19、input 17、App／真实 VT 19、Skills Help 12、demo contract 7、原生 Skills 4、原有 Help omission-regression 1。覆盖 metadata whitelist／无正文 get、resolved user-only／model-only、scope／cwd／不完整与不可用、首次命令优先／部分服务 fail-closed、native invalidation／close／旧读、Tab／Enter／文件参数／undo／图片草稿、Esc tombstone／同 attachment preset／replacement／child 回复范围。
+- **真实 DSH＋hermetic stream 4/4**：两 renderer 各验证首条 literal `/name` 由 DSH pre-step 加载并注入一次 canonical body、user-only 技能原生可用／model-only 不进用户目录、实际 Cordis `skills/change` 传播与候选更新／删除；另各验证 pending global 目录缺 `/plan` 时首条 `/plan off` 仍走 scoped native command、产生日志但不送模型。使用临时 HOME／workspace／合成 SKILL.md，真实 provider 从未调用。脚本为 `test/acceptance-skills.test.ts`＋`test/fixtures/skills-stream.mjs`，也在完整检查内通过。
+- **单独 CLI/PTY 6/6**：新 `pty-skills-smoke.py` inline/fullscreen **2/2**（native-name 补全、Tab 不提交、literal offline skill acknowledgement、user-only、Help readonly／草稿／resize／同名 command／exit 0／终端恢复，私有 home/workspace）；原有 Help 与 model picker 两模式 **4/4** 回归（readonly、query kill／yank／undo、空结果 Enter、草稿、provider keys／resize、退出恢复）。证据 `pty-skills.log`、`pty-regressions.log`、`pty/*.ansi`。
+- **本地编译归档 304 entries**：解压后 App／backend／Skills helper／NativeAutocompleteProvider／Help 导入、private Pi Editor seam 的 `ccRefreshAutocomplete`、native `/name`／user-only／同名 command priority smoke 通过。archive 不含 src/test/cache/runtime/node_modules，依赖只链接已安装项目依赖，不冒充 clean install。`package/import-smoke.log`；归档是未发布工作树产物，不替换 v0.1.3 release artifact/tag。
+- **明确边界**：全新 pending 会话不为填菜单建立 Agent，返回 unavailable；首次可手打 `/name`，目录在原生 Agent 建立后可用。`minimal` 不挂 skill tool；根目录不假冒 child scope。没有新目录扫描器、正文展开器、model transport、timer／Agent loop、配置层或依赖。真实远程模型／vision／GPU／IME 未在本轮验收；之前的用户退出卡住问题仍未修复。
+
+## 前次：v0.1.3 发布验收
 
 用户明确确认按 `0.1.3/private` 提交当前已验收改动，并推送 `main` 与 annotated `v0.1.3` tag；不发布 registry、不改全局安装。版本统一来自 `package.json` 与 `src/version.ts`，功能范围为 Subagent 启动／退场、动态进度、记录分组与名字-only 导航。**用户退出卡住仍未解决**：下面的正向 native 退出场景与 fault probe 只是调查／回归，不是现场修复声明。正式 release 证据集中在 `.cache/release-v0.1.3/`。
 

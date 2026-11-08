@@ -240,11 +240,12 @@ test("toolDetails resolves real bytes for tool/section switching, copy, list scr
 test("read-only toolDetails never falls through to editor operations", () => {
   const keymap = mod.createCcKeymap()
   // Movement, word motion, kill/yank and undo are editor-only in this design.
+  // Ctrl+W and Ctrl+L are contracted inspector browse actions instead (wrap /
+  // tool call list), never editor kill/redraw.
   for (const [data, label] of [
     ["\x01", "Ctrl+A"],
     ["\x05", "Ctrl+E"],
     ["\x02", "Ctrl+B"],
-    ["\x17", "Ctrl+W"],
     ["\x15", "Ctrl+U"],
     ["\x0b", "Ctrl+K"],
     ["\x19", "Ctrl+Y"],
@@ -254,6 +255,13 @@ test("read-only toolDetails never falls through to editor operations", () => {
   ] as const) {
     assert.equal(keymap.resolve(data, "toolDetails").kind, "none", `${label} must not edit the modal`)
   }
+  assert.equal(resolveId(keymap, "\x17", "toolDetails"), "tool.details.wrap")
+  assert.equal(resolveId(keymap, "\x0c", "toolDetails"), "tool.details.toggle-calls")
+  assert.equal(resolveId(keymap, "\x06", "toolDetails"), "modal.search")
+  // The prompt keeps the CC meanings of those bytes.
+  assert.equal(resolveId(keymap, "\x17", "editor"), "editor.kill.whitespace-backward")
+  assert.equal(resolveId(keymap, "\x0c", "editor"), "app.redraw")
+  assert.equal(resolveId(keymap, "\x06", "editor"), "editor.move.char-right")
   // Pi treats legacy ESC-b / ESC-f as Alt+Left / Alt+Right reads (readline word
   // aliases). In the read-only modal those become tool navigation, never editor
   // word movement; the modal does not own any editor state.

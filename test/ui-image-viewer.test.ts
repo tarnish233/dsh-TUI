@@ -58,6 +58,46 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 
 const keymap = (): CcKeymap => createCcKeymap()
 
+/** Border/APC-aware view of the measured image body (frame chrome excluded). */
+function bodyView(dialog: ImageDetailsDialog, width: number): {
+  geometry: ReturnType<ImageDetailsDialog['measure']>
+  lines: string[]
+  body: string[]
+  blankRows: number
+  /** Kitty `r=` rows of the actual APC placement (0 when no graphics). */
+  apcRows: number
+  ipcRows: number
+} {
+  const geometry = dialog.measure(width)
+  const lines = dialog.render(width)
+  const body = lines.slice(geometry.bodyRow, geometry.bodyRow + geometry.bodyHeight)
+  const isBlank = (line: string): boolean => {
+    if (line.includes('\x1b_G') || line.includes('\x1b]1337;File=')) return false
+    return stripTerminalSequences(line).replace(/[│┌┐└┘─]/g, '').trim() === ''
+  }
+  // Kitty carries the real placement size in its APC; padding rows below the
+  // image are indistinguishable from placement rows, so read the geometry from
+  // the native sequence instead of counting blanks.
+  const apcRows = Number(/(?:^|,)r=(\d+)/.exec(lines.find(line => line.includes('\x1b_G')) ?? '')?.[1] ?? 0)
+  const blankRows = body.filter(isBlank).length
+  const ipcRows = lines.filter(line => line.includes('\x1b_G')).length
+  return { geometry, lines, body, blankRows, apcRows, ipcRows }
+}
+
+/** Click a rendered footer action by its visible label text (frame coordinates). */
+function clickLabel(dialog: ImageDetailsDialog, width: number, label: string): boolean | undefined {
+  const lines = dialog.render(width)
+  const row = lines.findIndex(line => stripTerminalSequences(line).includes(label))
+  assert.ok(row >= 0, `${label} is rendered`)
+  const plain = stripTerminalSequences(lines[row]!)
+  const col = visibleWidth(plain.slice(0, plain.indexOf(label)))
+  return dialog.handleMouse({
+    type: 'click', button: 'left', x: col + 1, y: row,
+    screenX: col + 1, screenY: row, width, height: lines.length,
+    shift: false, alt: false, ctrl: false, clickCount: 1,
+  })?.handled
+}
+
 test('renders real APC graphics with blank placement rows and width-safe chrome', async () => {
   await withCapabilities('kitty', async () => {
     const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
@@ -66,20 +106,26 @@ test('renders real APC graphics with blank placement rows and width-safe chrome'
     })
     await settle(dialog)
     assert.equal(dialog.loadStatus, 'ready')
-    const lines = dialog.render(40)
-    const apc = lines.findIndex(line => line.includes('\x1b_G'))
+    const view = bodyView(dialog, 40)
+    const apc = view.lines.findIndex(line => line.includes('\x1b_G'))
     assert.ok(apc >= 0, 'dialog emits a real Kitty APC line')
-    assert.ok(!stripTerminalSequences(lines[apc]!).includes('[Image:'), 'not a marker-only fallback')
-    // Kitty: APC line followed by one empty line per additional pixel row.
-    let blanks = 0
-    for (let index = apc + 1; index < lines.length && lines[index] === ''; index += 1) blanks += 1
-    assert.ok(blanks > 0, 'blank placement rows account for the image height')
-    for (const line of lines) {
+    assert.ok(!stripTerminalSequences(view.lines[apc]!).includes('[Image:'), 'not a marker-only fallback')
+    // Genuine payload: the real PNG bytes travel in the Kitty APC transmission.
+    const apcLine = view.lines[apc]!
+    assert.match(apcLine, /\x1b_Ga=T,f=100/)
+    assert.ok(apcLine.includes(PNG.value.data.slice(32, 96)), 'APC carries the actual PNG payload')
+    // The image area starts at the measured body row and occupies its budget.
+    assert.equal(apc, view.geometry.bodyRow, 'graphics begin at the framed body origin')
+    assert.equal(view.body.length, view.geometry.bodyHeight)
+    assert.ok(view.blankRows > 0, 'blank placement rows account for the image height')
+    assert.ok(view.apcRows <= view.geometry.bodyHeight, 'the declared placement fits the measured body')
+    assert.equal(view.blankRows, view.geometry.bodyHeight - 1, 'the rest of the body is placement/padding rows')
+    for (const line of view.lines) {
       if (line.includes('\x1b_G')) continue
       assert.ok(visibleWidth(line) <= 40, `line exceeds width: ${JSON.stringify(stripTerminalSequences(line))}`)
     }
-    assert.ok(lines.length <= 30, 'stays inside maxHeight')
-    assert.match(lines.map(line => stripTerminalSequences(line)).join('\n'), /Close/)
+    assert.ok(view.lines.length <= 30, 'stays inside maxHeight')
+    assert.match(view.lines.map(line => stripTerminalSequences(line)).join('\n'), /Close/)
     dialog.dispose()
   })
 })
@@ -111,8 +157,10 @@ test('height budget follows maxHeight, falls back compactly, and never slices AP
     }
     const dialog = new ImageDetailsDialog(asTui(createFakeTui(60, 100)), options)
     await settle(dialog)
-    const tall = dialog.render(40)
-    assert.ok(tall.some(line => line.includes('\x1b_G')))
+    const tall = bodyView(dialog, 40)
+    assert.ok(tall.ipcRows > 0)
+    assert.ok(tall.apcRows > 1, 'the APC declares the real placement rows')
+    assert.equal(tall.body.length, tall.geometry.bodyHeight, 'image rows equal the measured body budget')
     const decoded = dialog.decoded
     assert.ok(decoded !== undefined)
 
@@ -127,19 +175,18 @@ test('height budget follows maxHeight, falls back compactly, and never slices AP
 
     // Grow back: the same decoded payload paints real image rows again.
     height = 50
-    const again = dialog.render(40)
-    assert.ok(again.some(line => line.includes('\x1b_G')))
+    const again = bodyView(dialog, 40)
+    assert.ok(again.ipcRows > 0)
     assert.equal(dialog.decoded, decoded, 'decoded bytes stay cached across render-only resizes')
 
     // Cell-geometry change (CSI 16t) invalidates the retained instance and
-    // produces a new row count instead of the old pixel-per-cell frame.
+    // produces fewer placement rows for the same pixel image.
     setCellDimensions({ widthPx: 1, heightPx: 18 })
-    const tallCells = again.filter(line => line.includes('\x1b_G')).length
-    const rowsAfter = dialog.render(40)
-    assert.ok(rowsAfter.some(line => line.includes('\x1b_G')))
-    assert.ok(rowsAfter.filter(line => line === '').length < again.filter(line => line === '').length)
+    const rowsAfter = bodyView(dialog, 40)
+    assert.ok(rowsAfter.ipcRows > 0)
+    assert.ok(rowsAfter.apcRows > 0 && rowsAfter.apcRows < again.apcRows, 'taller cells need fewer placement rows')
+    assert.ok(rowsAfter.body.length <= rowsAfter.geometry.bodyHeight)
     assert.equal(dialog.decoded, decoded)
-    void tallCells
     assert.equal(dialog.invalidate(), undefined)
     dialog.dispose()
   })
@@ -349,7 +396,7 @@ test('invalid readImage response fails cleanly and dispose never calls onClose',
   assert.deepEqual(dialog.render(40), [])
 })
 
-test('header controls click through the hitbox layer and tiny viewports keep close', async () => {
+test('frame actions click through the shared hitbox layer and tiny viewports keep close', async () => {
   await withCapabilities('kitty', async () => {
     let height = 2
     const calls: string[] = []
@@ -369,37 +416,17 @@ test('header controls click through the hitbox layer and tiny viewports keep clo
     assert.ok(!tiny.some(line => line.includes('\x1b_G')))
 
     height = 40
-    const lines = dialog.render(60)
-    const plain = lines.map(line => stripTerminalSequences(line))
-    const row = plain.findIndex(line => line.includes('[‹ Prev]') && line.includes('[Next ›]') && line.includes('[Close]'))
-    assert.ok(row >= 0, plain.join('\n'))
-    const click = (label: string) => {
-      const col = plain[row]!.indexOf(label)
-      assert.ok(col >= 0)
-      return dialog.handleMouse({
-        type: 'click', button: 'left', x: col + 1, y: row,
-        screenX: col + 1, screenY: row, width: 60, height: lines.length,
-        shift: false, alt: false, ctrl: false, clickCount: 1,
-      })
-    }
-    assert.ok(click('Next')?.handled)
-    assert.ok(click('Prev')?.handled)
+    assert.ok(clickLabel(dialog, 60, 'Next'))
+    assert.ok(clickLabel(dialog, 60, 'Prev'))
     assert.deepEqual(calls, ['next', 'prev'])
+
+    // Boundary: the disabled Prev chip has no hitbox at all.
     index = 0
-    // Re-render so the hitboxes reflect the new boundary state.
     dialog.render(60)
-    const currentPlain = dialog.render(60).map(line => stripTerminalSequences(line))
-    const currentRow = currentPlain.findIndex(line => line.includes('[‹ Prev]'))
-    assert.ok(currentRow >= 0)
-    // Disabled boundary control has no hitbox.
-    const disabled = dialog.handleMouse({
-      type: 'click', button: 'left', x: currentPlain[currentRow]!.indexOf('Prev') + 1, y: currentRow,
-      screenX: 0, screenY: 0, width: 60, height: 40,
-      shift: false, alt: false, ctrl: false, clickCount: 1,
-    })
-    assert.equal(disabled, undefined)
-    assert.ok(click('Close')?.handled)
-    assert.deepEqual(calls, ['next', 'prev', 'close'])
+    assert.equal(clickLabel(dialog, 60, 'Prev'), undefined)
+    assert.notEqual(clickLabel(dialog, 60, 'Next'), undefined)
+    assert.ok(clickLabel(dialog, 60, 'Close'))
+    assert.deepEqual(calls, ['next', 'prev', 'next', 'close'])
     dialog.dispose()
   })
 })
@@ -491,4 +518,215 @@ test('decode observes abort and does not start another ladder step', async () =>
     decodeImageForDisplay('image/png', PNG.value.data, IMAGE_DECODE_BUDGET, { signal: preAborted.signal }),
     error => (error as Error).name === 'AbortError',
   )
+})
+
+// ---------------------------------------------------------------------------
+// Preview display preference (renderer-only)
+
+test('text preview never reads/decodes on open and keeps ref identity', async () => {
+  await withCapabilities('kitty', async () => {
+    let reads = 0
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      preview: 'text',
+      readImage: async () => { reads += 1; return PNG.value },
+    })
+    assert.equal(reads, 0, 'constructing in text mode must not read the image')
+    assert.equal(dialog.loadStatus, 'text')
+    assert.equal(dialog.preview, 'text')
+    const view = bodyView(dialog, 200)
+    assert.equal(view.ipcRows, 0, 'no graphics sequence in text preview')
+    const text = view.lines.map(line => stripTerminalSequences(line)).join('\n')
+    assert.match(text, /Text preview/)
+    assert.match(text, /quadrants\.png/)
+    assert.match(text, new RegExp(`id ${PNG.attachment.attachmentId}`))
+    assert.equal(
+      dialog.currentImage.attachment?.attachmentId,
+      PNG.attachment.attachmentId,
+      'the occurrence/ref identity is unchanged',
+    )
+    assert.equal(dialog.decoded, undefined)
+    assert.equal(reads, 0)
+    dialog.dispose()
+  })
+})
+
+test('switching to text aborts and tombstones a pending read; late bytes stay inert', async () => {
+  await withCapabilities('kitty', async () => {
+    const pending = deferred<ImageAttachmentValue>()
+    const signals: AbortSignal[] = []
+    let reads = 0
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      readImage: (ref, signal) => {
+        reads += 1
+        if (signal !== undefined) signals.push(signal)
+        void ref
+        return pending.promise
+      },
+    })
+    assert.equal(reads, 1)
+    dialog.setPreview('text')
+    assert.equal(dialog.loadStatus, 'text')
+    assert.equal(signals[0]?.aborted, true, 'the pending read is aborted')
+    pending.resolve(PNG.value)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(dialog.loadStatus, 'text', 'late bytes never become ready in text mode')
+    assert.equal(dialog.decoded, undefined)
+    assert.equal(imageDisplayCache.size, 0, 'an abandoned read is never cached')
+    assert.equal(reads, 1)
+    assert.equal(bodyView(dialog, 60).ipcRows, 0)
+    dialog.dispose()
+  })
+})
+
+test('preview toggle clicks and the p binding share one mode switch without extra reads', async () => {
+  await withCapabilities('kitty', async () => {
+    let reads = 0
+    const persisted: string[] = []
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      readImage: async () => { reads += 1; return PNG.value },
+      setPreview: value => { persisted.push(value) },
+    })
+    await settle(dialog)
+    assert.equal(reads, 1)
+    assert.equal(dialog.loadStatus, 'ready')
+    const decoded = dialog.decoded
+    assert.ok(decoded !== undefined)
+
+    // Clicking the frame action persists + applies text mode immediately.
+    assert.ok(clickLabel(dialog, 80, 'Text only'))
+    assert.deepEqual(persisted, ['text'])
+    assert.equal(dialog.loadStatus, 'text')
+    assert.equal(bodyView(dialog, 80).ipcRows, 0)
+    assert.equal(dialog.decoded, decoded, 'decoded payload is retained, not discarded')
+
+    // The real key binding (p) switches back and reuses bytes: no second read.
+    assert.deepEqual(createCcKeymap().getBindings('image.details.toggle-preview'), ['p'])
+    dialog.handleInput('p')
+    assert.deepEqual(persisted, ['text', 'auto'])
+    assert.equal(dialog.loadStatus, 'ready')
+    assert.equal(reads, 1, 'switching back never re-reads the decoded occurrence')
+    assert.ok(bodyView(dialog, 80).ipcRows > 0)
+    dialog.dispose()
+  })
+})
+
+test('preview binding remaps/disables while the unbound capability stays clickable', async () => {
+  await withCapabilities('kitty', async () => {
+    const remapped = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: createCcKeymap({ bindings: { 'image.details.toggle-preview': 'x' } }),
+      maxHeight: 24, onClose: () => {}, readImage: async () => PNG.value,
+    })
+    await settle(remapped)
+    remapped.handleInput('p')
+    assert.equal(remapped.preview, 'auto', 'the old key no longer toggles')
+    remapped.handleInput('x')
+    assert.equal(remapped.preview, 'text')
+    remapped.dispose()
+
+    const disabled = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: createCcKeymap({ bindings: { 'image.details.toggle-preview': null } }),
+      maxHeight: 24, onClose: () => {}, readImage: async () => PNG.value,
+    })
+    await settle(disabled)
+    assert.equal(disabled.preview, 'auto')
+    disabled.handleInput('p')
+    assert.equal(disabled.preview, 'auto')
+    // No fake key label, but the capability remains a clickable action.
+    const lines = disabled.render(80).map(line => stripTerminalSequences(line))
+    const footer = lines.find(line => line.includes('Text only'))
+    assert.ok(footer !== undefined)
+    assert.doesNotMatch(footer, /\bp Text only|p  *Text only/)
+    assert.ok(clickLabel(disabled, 80, 'Text only'))
+    assert.equal(disabled.preview, 'text')
+    disabled.dispose()
+  })
+})
+
+test('text mode never reads a newly selected occurrence and keeps its metadata', async () => {
+  await withCapabilities('kitty', async () => {
+    const jpegReads: string[] = []
+    const other: ImageAttachmentRef = { ...JPEG.attachment, attachmentId: 'fixture:other-jpeg' }
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      preview: 'text',
+      readImage: async ref => {
+        jpegReads.push(ref.attachmentId)
+        return { attachment: ref, data: JPEG.value.data }
+      },
+    })
+    dialog.setImage({ key: 'occ-2', label: 'Second occurrence', attachment: other })
+    assert.deepEqual(jpegReads, [], 'text preview never reads a new occurrence')
+    assert.equal(dialog.loadStatus, 'text')
+    assert.equal(dialog.currentImage.key, 'occ-2')
+    const text = dialog.render(100).map(line => stripTerminalSequences(line)).join('\n')
+    assert.match(text, /Second occurrence/)
+    assert.match(text, /photo\.jpg/)
+    assert.match(text, new RegExp(`id ${other.attachmentId}`))
+    dialog.dispose()
+  })
+})
+
+test('a pressed image action never fires for a different occurrence or preview mode', async () => {
+  await withCapabilities('kitty', async () => {
+    const pending = deferred<ImageAttachmentValue>()
+    const other: ImageAttachmentRef = { ...JPEG.attachment, attachmentId: 'fixture:other-jpeg' }
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      readImage: () => pending.promise,
+    })
+    const lines = dialog.render(80)
+    const row = lines.findIndex(line => stripTerminalSequences(line).includes('Text only'))
+    assert.ok(row >= 0)
+    const plain = stripTerminalSequences(lines[row]!)
+    const col = visibleWidth(plain.slice(0, plain.indexOf('Text only')))
+    const press = dialog.handleMouse({
+      type: 'press', button: 'left', x: col + 1, y: row, screenX: col + 1, screenY: row,
+      width: 80, height: lines.length, shift: false, alt: false, ctrl: false,
+    })
+    assert.equal(press?.handled, true)
+    // The occurrence changes between press and release; the repaint that the
+    // host schedules for setImage publishes the new owner identity.
+    dialog.setImage({ key: 'occ-2', label: 'Other', attachment: other })
+    dialog.render(80)
+    const click = dialog.handleMouse({
+      type: 'click', button: 'left', x: col + 1, y: row, screenX: col + 1, screenY: row,
+      width: 80, height: lines.length, shift: false, alt: false, ctrl: false, clickCount: 1,
+    })
+    assert.equal(click?.handled, true)
+    assert.equal(dialog.preview, 'auto', 'the stale press cannot toggle the new occurrence')
+    assert.equal(dialog.currentImage.key, 'occ-2')
+    dialog.dispose()
+  })
+})
+
+test('live parent preference changes apply through invalidate/refreshPreview', async () => {
+  await withCapabilities('kitty', async () => {
+    let preference: 'auto' | 'text' = 'auto'
+    let reads = 0
+    const options = {
+      image: item(), keymap: keymap(), maxHeight: 24, onClose: () => {},
+      readImage: async () => { reads += 1; return PNG.value },
+      get preview(): 'auto' | 'text' { return preference },
+    }
+    const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), options)
+    await settle(dialog)
+    assert.equal(reads, 1)
+    const decoded = dialog.decoded
+
+    preference = 'text'
+    dialog.refreshPreview()
+    assert.equal(dialog.loadStatus, 'text')
+    assert.equal(bodyView(dialog, 80).ipcRows, 0)
+    assert.equal(dialog.decoded, decoded)
+
+    preference = 'auto'
+    dialog.invalidate()
+    assert.equal(dialog.loadStatus, 'ready')
+    assert.equal(reads, 1, 'the cached decode is reused')
+    assert.ok(bodyView(dialog, 80).ipcRows > 0)
+    dialog.dispose()
+  })
 })

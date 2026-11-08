@@ -5,6 +5,18 @@
  * provider strings and opaque model ids come from the caller unchanged; this
  * file never parses an id, invents a provider alias or reads credentials.
  *
+ * The surface is the shared `ModalFrame` (`standard` size): chrome, sizing,
+ * action chips and mouse geometry belong to the frame, the picker supplies the
+ * provider/search chrome lines, the model body and its mouse row ranges. The
+ * frame footer prints the *actual* keymap bindings for provider switching,
+ * selection and cancel, so a remap or a disabled action never shows a fake key.
+ *
+ * Asynchronous rosters: the parent may open the picker before the native catalog
+ * is known and then call `setModels`/`setLoading`/`setError`. Loading, an empty
+ * catalog, a query with no match and a visible native failure are four distinct
+ * states. Late data never selects or submits anything: the selection is
+ * preserved when its model id (or provider) still exists.
+ *
  * Input uses the central CC/readline subsystem:
  * - exactly one `InlineAnswer`/`CcEditor` state for the query field;
  * - the shared `CcKeymap`, switched between the real `modelPickerList` and
@@ -28,17 +40,19 @@ import {
   type KeyId,
   matchesKey,
   type TUI,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
 } from '#pi-tui'
 import {
   BRACKETED_PASTE_START,
   type CcActionEvent,
   type CcContext,
   type CcKeymap,
-  formatBinding,
   printableInput,
 } from '../input/index.ts'
-import { windowRows } from './dialogs.ts'
+import { bodyHitAt, concatPaint, renderModalBody, textPaint, windowRowsWithHits, type BodyPaint, type HitRange, type RowBlock } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
+import { ModalFrame, modalHeight, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { bold, cc, dim, t } from './theme.ts'
 import { fit, oneLine, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 
@@ -57,26 +71,24 @@ export interface ModelPickerItem {
 }
 
 export interface ModelPickerOptions {
-  models: readonly ModelPickerItem[]
+  /**
+   * Native catalog rows, in native order. Omitted or empty is the phase-1
+   * state: the picker renders immediately and `setModels` supplies the catalog.
+   */
+  models?: readonly ModelPickerItem[]
   currentProvider?: string
   currentModel?: string
   keymap: CcKeymap
   onSelect: (id: string) => void
   onCancel: () => void
   onInterrupt?: () => void
+  /** Phase-1 state: the catalog has not arrived yet. */
+  loading?: boolean
+  /** A visible failure from the native catalog read. */
+  error?: string
 }
 
 type PickerMode = 'browse' | 'search'
-
-/**
- * The picker is mounted into the App's bottom stack, next to its own hint and
- * two-line footer (model/permission + cwd). A component that renders the whole
- * terminal height pushes that chrome off-screen in fullscreen mode, so keep a
- * narrow reserve. Very short direct renders still get a usable minimum; the
- * final slice never exceeds the real terminal.
- */
-const APP_CHROME_RESERVE = 6
-const MIN_PICKER_ROWS = 8
 
 const BROWSE_CONTEXT: CcContext = 'modelPickerList'
 const SEARCH_CONTEXT: CcContext = 'modelPickerSearch'
@@ -85,6 +97,9 @@ const PROVIDER_PREVIOUS = 'model.provider.previous'
 const PROVIDER_NEXT = 'model.provider.next'
 const PROVIDER_PREVIOUS_ARROW = 'model.provider.previousArrow'
 const PROVIDER_NEXT_ARROW = 'model.provider.nextArrow'
+
+/** Visible query rows: one line is not a window, an unbounded field eats the body. */
+const MAX_QUERY_ROWS = 4
 
 /**
  * First simple action for `data` in a context chain, without mutating
@@ -140,8 +155,7 @@ function windowQueryLines(lines: readonly string[], budget: number): string[] {
   if (lines.length <= budget) return [...lines]
   let focus = lines.findIndex((line) => line.includes(CURSOR_MARKER))
   if (focus < 0) focus = 0
-  let start = Math.max(0, focus - Math.floor(budget / 2))
-  if (start + budget > lines.length) start = lines.length - budget
+  const start = Math.max(0, Math.min(focus - Math.floor(budget / 2), lines.length - budget))
   return lines.slice(start, start + budget)
 }
 
@@ -183,17 +197,12 @@ function providerTabs(providers: readonly string[], active: number, width: numbe
   return render(start, end)
 }
 
-interface ModelBlock {
-  lines: string[]
-  focused: boolean
-}
-
 function modelBlocks(
   items: readonly ModelPickerItem[],
   selected: number,
   width: number,
   isCurrent: (item: ModelPickerItem) => boolean,
-): ModelBlock[] {
+): RowBlock[] {
   return items.map((item, index) => {
     const focused = index === selected
     const prefix = `${focused ? cc.suggestion('❯') : ' '} `
@@ -217,20 +226,22 @@ function modelBlocks(
         lines.push(indent + dim(line))
       }
     }
-    return { lines, focused }
+    return { lines, focused, index, key: item.id }
   })
 }
 
 export class ModelPickerDialog implements Component, Focusable {
   readonly capturesViewportInput = true
+  readonly modalSize: ModalSize = 'standard'
   readonly keymap: CcKeymap
 
   private readonly tui: TUI
   private readonly onSelect: (id: string) => void
   private readonly onCancel: () => void
   private readonly onInterrupt?: () => void
+  private readonly frame = new ModalFrame()
   private readonly grouped = new Map<string, ModelPickerItem[]>()
-  private readonly providers: string[]
+  private providers: string[]
   private readonly currentProvider?: string
   private readonly currentModel?: string
   private readonly search: InlineAnswer
@@ -239,6 +250,10 @@ export class ModelPickerDialog implements Component, Focusable {
   private visibleModels: ModelPickerItem[] = []
   private selectedIndex = -1
   private mode: PickerMode = 'browse'
+  private loadingState: boolean
+  private errorState: string | undefined
+  private hits: HitRange[] = []
+  private press?: { key: string; owner: string }
   private focusedState = false
   private done = false
   private disposedState = false
@@ -251,15 +266,10 @@ export class ModelPickerDialog implements Component, Focusable {
     this.onInterrupt = options.onInterrupt
     this.currentProvider = options.currentProvider
     this.currentModel = options.currentModel
-
-    // Roster order is the caller's order: providers by first appearance and
-    // models in native order within each provider. No sorting or aliasing.
-    for (const item of options.models) {
-      const group = this.grouped.get(item.provider)
-      if (group) group.push(item)
-      else this.grouped.set(item.provider, [item])
-    }
-    this.providers = [...this.grouped.keys()]
+    this.loadingState = options.loading === true
+    this.errorState = options.error
+    this.providers = []
+    this.applyModels(options.models ?? [])
 
     const requestedIndex = this.currentProvider !== undefined ? this.providers.indexOf(this.currentProvider) : -1
     this.providerIndex = requestedIndex >= 0 ? requestedIndex : 0
@@ -273,12 +283,7 @@ export class ModelPickerDialog implements Component, Focusable {
     this.search.editor.onAction = (event) => this.handleEditorAction(event)
 
     this.refreshVisible()
-    if (this.currentModel !== undefined) {
-      const requested = this.visibleModels.findIndex(
-        (item) => item.model === this.currentModel && (this.currentProvider === undefined || item.provider === this.currentProvider),
-      )
-      if (requested >= 0) this.selectedIndex = requested
-    }
+    this.selectCurrentModel()
   }
 
   // --- public state ------------------------------------------------------
@@ -330,7 +335,79 @@ export class ModelPickerDialog implements Component, Focusable {
   }
 
   invalidate(): void {
+    this.frame.invalidate()
     this.search.invalidate()
+  }
+
+  // --- asynchronous native catalog ---------------------------------------
+
+  /**
+   * Replace the native catalog. Provider grouping follows the caller's order;
+   * the active provider is kept by exact name when it survives, and the current
+   * model's row is re-selected when it is still listed. Never selects, submits,
+   * focuses or changes the query as a side effect of late data.
+   */
+  setModels(models: readonly ModelPickerItem[]): void {
+    const hadProvider = this.providers.length > 0
+    const providerName = hadProvider ? this.providers[this.providerIndex] : undefined
+    const previousId = hadProvider ? this.visibleModels[this.selectedIndex]?.id : undefined
+    this.applyModels(models)
+    this.loadingState = false
+    // A picker opened with no catalog has no previous provider to preserve, so
+    // the caller's explicit native route (`currentProvider`) decides the group.
+    // Falling back to the first provider would silently open on a different
+    // provider than the session is actually using.
+    const preferredProvider = hadProvider ? providerName : this.currentProvider
+    const kept = preferredProvider === undefined ? -1 : this.providers.indexOf(preferredProvider)
+    this.providerIndex = kept >= 0 ? kept : 0
+    this.refreshVisible(previousId)
+    this.selectCurrentModel(previousId)
+  }
+
+  /** Enter/leave the phase-1 loading state. */
+  setLoading(loading: boolean): void {
+    this.loadingState = loading
+  }
+
+  /** Show or clear a visible native failure in the current surface. */
+  setError(message?: string): void {
+    this.errorState = message === undefined || message.trim() === '' ? undefined : message
+  }
+
+  private applyModels(models: readonly ModelPickerItem[]): void {
+    // Roster order is the caller's order: providers by first appearance and
+    // models in native order within each provider. No sorting or aliasing.
+    this.grouped.clear()
+    for (const item of models) {
+      const group = this.grouped.get(item.provider)
+      if (group) group.push(item)
+      else this.grouped.set(item.provider, [item])
+    }
+    this.providers = [...this.grouped.keys()]
+  }
+
+  /**
+   * Prefer an explicit surviving row, then the current native route. This only
+   * moves the highlight; it never selects or submits.
+   */
+  private selectCurrentModel(preferredId?: string): void {
+    if (preferredId !== undefined) {
+      const kept = this.visibleModels.findIndex(item => item.id === preferredId)
+      if (kept >= 0) {
+        this.selectedIndex = kept
+        return
+      }
+    }
+    if (this.currentModel !== undefined) {
+      const requested = this.visibleModels.findIndex(
+        (item) => item.model === this.currentModel && (this.currentProvider === undefined || item.provider === this.currentProvider),
+      )
+      if (requested >= 0) {
+        this.selectedIndex = requested
+        return
+      }
+    }
+    this.selectedIndex = this.visibleModels.length === 0 ? -1 : 0
   }
 
   // --- input routing -----------------------------------------------------
@@ -550,50 +627,55 @@ export class ModelPickerDialog implements Component, Focusable {
     else this.cancel()
   }
 
+  // --- mouse -------------------------------------------------------------
+
+  /**
+   * Content identity: provider group, query and the visible roster decide which
+   * rows exist. The frame and the press tracker both use it, so a stale click
+   * can never select a model that moved in after a roster/query change.
+   */
+  private ownerKey(): string {
+    return `model:${this.providers[this.providerIndex] ?? ''}:${this.queryText()}:${this.visibleModels.length}:${this.visibleModels[0]?.id ?? ''}`
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (this.disposedState) return undefined
+    const chrome = this.frame.handleMouse(event)
+    if (chrome !== undefined) return chrome
+    const body = this.frame.bodyMouse(event)
+    if (body === undefined) return undefined
+    if (event.type === 'wheel') {
+      const delta = event.wheelDelta ?? 0
+      if (delta === 0) return undefined
+      this.moveSelection(delta < 0 ? -1 : 1)
+      return { handled: true, render: true }
+    }
+    const owner = this.ownerKey()
+    const hit = bodyHitAt(this.hits, body.y)
+    const key = hit === undefined ? undefined : hit.key ?? String(hit.index)
+    if (event.type === 'press') {
+      this.press = key === undefined ? undefined : { key, owner }
+      // Do not move selection on press: the release must resolve the same row.
+      return hit === undefined ? undefined : { handled: true, render: false }
+    }
+    if (event.type === 'drag') {
+      this.press = undefined
+      return undefined
+    }
+    if (event.type !== 'click') return undefined
+    const pressed = this.press
+    this.press = undefined
+    if (pressed === undefined || pressed.owner !== owner || key === undefined || pressed.key !== key) {
+      return { handled: true, render: false }
+    }
+    const index = this.visibleModels.findIndex(item => item.id === key)
+    if (index < 0) return { handled: true, render: false }
+    this.selectedIndex = index
+    this.selectCurrent()
+    return { handled: true, render: true }
+  }
+
   // --- rendering ---------------------------------------------------------
-
-  private keyLabel(actionId: string): string | undefined {
-    const first = this.keymap.getBindings(actionId)[0]
-    if (first === undefined) return undefined
-    return formatBinding(first.split(' '))
-  }
-
-  private hintParts(width = Number.POSITIVE_INFINITY): string[] {
-    const next = this.keyLabel(PROVIDER_NEXT)
-    const previous = this.keyLabel(PROVIDER_PREVIOUS)
-    if (width < 32) {
-      // Very narrow terminals keep only the essentials; the search field
-      // placeholder already says that typing filters.
-      const compact: string[] = []
-      if (next !== undefined) compact.push(`${next} provider`)
-      if (previous !== undefined) compact.push(`${previous} provider`)
-      const select = this.keyLabel('list.select')
-      if (select !== undefined) compact.push(`${select} select`)
-      const cancel = this.keyLabel('list.cancel') ?? this.keyLabel('app.cancel')
-      if (cancel !== undefined) compact.push(`${cancel} cancel`)
-      return compact
-    }
-    const parts: string[] = []
-    if (next !== undefined || previous !== undefined) {
-      parts.push(`${[next, previous].filter((key): key is string => key !== undefined).join('/')} provider`)
-    }
-    if (this.mode === 'browse') {
-      const left = this.keyLabel(PROVIDER_PREVIOUS_ARROW)
-      const right = this.keyLabel(PROVIDER_NEXT_ARROW)
-      if (left !== undefined || right !== undefined) {
-        parts.push(`${[left, right].filter((key): key is string => key !== undefined).join('/')} provider`)
-      }
-    }
-    const up = this.keyLabel('list.previous')
-    const down = this.keyLabel('list.next')
-    if (up !== undefined || down !== undefined) parts.push(`${[up, down].filter(Boolean).join('/')} model`)
-    const select = this.keyLabel('list.select')
-    if (select !== undefined) parts.push(`${select} select`)
-    const cancel = this.keyLabel('list.cancel') ?? this.keyLabel('app.cancel')
-    if (cancel !== undefined) parts.push(`${cancel} cancel`)
-    parts.push(this.mode === 'search' ? 'type to filter' : 'type to search')
-    return parts
-  }
 
   private statusText(): string {
     const all = this.itemsForProvider().length
@@ -608,68 +690,89 @@ export class ModelPickerDialog implements Component, Focusable {
     return parts.join(' · ')
   }
 
-  render(width: number): string[] {
-    const safeWidth = Math.max(1, Math.floor(width))
-    const rows = this.tui.terminal.rows
-    const terminalRows = Number.isFinite(rows) && rows > 0 ? Math.floor(rows) : Number.POSITIVE_INFINITY
-    const rowLimit = Number.isFinite(terminalRows)
-      ? Math.min(terminalRows, Math.max(MIN_PICKER_ROWS, terminalRows - APP_CHROME_RESERVE))
-      : Number.POSITIVE_INFINITY
-
-    const out: string[] = [t.border('─'.repeat(Math.max(1, safeWidth)))]
-    for (const line of wrap('Choose model', Math.max(4, safeWidth - 2))) {
-      out.push(` ${bold(cc.permission(line))}`)
+  private baseOptions(): ModalFrameOptions {
+    return {
+      title: 'Choose model',
+      ownerKey: this.ownerKey(),
+      actions: [
+        { id: 'provider-previous', label: 'Provider', action: PROVIDER_PREVIOUS, onActivate: () => this.switchProvider(-1), disabled: this.providers.length < 2 },
+        { id: 'provider-next', label: 'Provider', action: PROVIDER_NEXT, onActivate: () => this.switchProvider(1), disabled: this.providers.length < 2 },
+        { id: 'select', label: 'Select', action: 'list.select', onActivate: () => this.selectCurrent(), disabled: this.visibleModels.length === 0 },
+        { id: 'cancel', label: 'Cancel', action: 'list.cancel', onActivate: () => this.cancel() },
+      ],
+      onClose: () => this.cancel(),
+      maxHeight: modalHeight(this.tui, this.modalSize),
+      keymap: this.keymap,
     }
-    out.push('')
+  }
 
-    const tabs = providerTabs(this.providers, this.providerIndex, safeWidth)
-    if (tabs !== undefined) out.push(fit(tabs, safeWidth))
-
+  /** Provider groups and the one query field, both frame chrome lines. */
+  private chromeLines(bodyWidth: number): string[] {
+    const lines: string[] = []
+    const tabs = providerTabs(this.providers, this.providerIndex, bodyWidth)
+    if (tabs !== undefined) lines.push(fit(tabs, bodyWidth))
     const prefix = ` ${dim('Search')} `
-    const fieldWidth = Math.max(4, safeWidth - visibleWidth(prefix))
-    const hints = this.hintParts(safeWidth).join(' · ')
-    const hintLines = wrap(hints, Math.max(4, safeWidth - 1))
-    // Reserve the bottom blank/status/hints plus at least one model row, then
-    // cap the query view around the cursor. This never rewrites editor text.
-    const footerLines = 1 + 1 + hintLines.length
-    const queryRoom = Number.isFinite(rowLimit) ? Math.max(1, rowLimit - out.length - footerLines - 1) : 4
-    const queryBudget = Math.max(1, Math.min(4, queryRoom))
+    const fieldWidth = Math.max(4, bodyWidth - visibleWidth(prefix))
     const field = windowQueryLines(
       this.search.render(fieldWidth, this.focusedState && this.mode === 'search', 'Type to filter models'),
-      queryBudget,
+      MAX_QUERY_ROWS,
     )
     field.forEach((line, index) => {
       const lead = index === 0 ? prefix : ' '.repeat(visibleWidth(prefix))
-      out.push(fit(lead + line, safeWidth))
+      lines.push(fit(lead + line, bodyWidth))
     })
-    out.push('')
+    lines.push('')
+    return lines
+  }
 
-    if (this.providers.length === 0) {
-      for (const line of wrap('No models are available.', Math.max(4, safeWidth - 2))) {
-        out.push(` ${t.muted(fit(line, Math.max(4, safeWidth - 2)))}`)
-      }
-    } else if (this.visibleModels.length === 0) {
-      const query = oneLine(sanitize(this.queryText().trim()), 40)
-      const message = `No models match "${query}" in ${providerLabel(this.providers[this.providerIndex] ?? '')}.`
-      for (const line of wrap(message, Math.max(4, safeWidth - 2))) {
-        out.push(` ${t.muted(fit(line, Math.max(4, safeWidth - 2)))}`)
-      }
-    } else {
-      const blocks = modelBlocks(this.visibleModels, this.selectedIndex, safeWidth, (item) =>
-        this.currentProvider !== undefined &&
-        this.currentModel !== undefined &&
-        item.provider === this.currentProvider &&
-        item.model === this.currentModel,
-      )
-      const bodyBudget = Number.isFinite(rowLimit) ? Math.max(1, rowLimit - out.length - footerLines) : Number.POSITIVE_INFINITY
-      out.push(...windowRows(blocks, bodyBudget).slice(0, Number.isFinite(bodyBudget) ? bodyBudget : undefined).map((line) => fit(line, safeWidth)))
+  private body(bodyWidth: number, bodyHeight: number): BodyPaint {
+    if (this.errorState !== undefined) {
+      const lines = wrap(this.errorState, Math.max(4, bodyWidth)).map(line => ` ${cc.error(fit(line, Math.max(4, bodyWidth)))}`)
+      const remaining = Math.max(1, bodyHeight - lines.length - 1)
+      const rows = this.visibleModels.length === 0
+        ? textPaint(this.stateLines(bodyWidth))
+        : windowRowsWithHits(this.blocks(bodyWidth), remaining)
+      return concatPaint([textPaint(lines), textPaint(['']), rows])
     }
+    if (this.visibleModels.length === 0) return textPaint(this.stateLines(bodyWidth))
+    return windowRowsWithHits(this.blocks(bodyWidth), bodyHeight)
+  }
 
-    out.push('')
-    out.push(` ${t.subtle(fit(this.statusText(), Math.max(4, safeWidth - 2)))}`)
-    for (const line of hintLines) {
-      out.push(` ${dim(cc.inactive(line))}`)
+  private blocks(bodyWidth: number): RowBlock[] {
+    return modelBlocks(this.visibleModels, this.selectedIndex, bodyWidth, (item) =>
+      this.currentProvider !== undefined &&
+      this.currentModel !== undefined &&
+      item.provider === this.currentProvider &&
+      item.model === this.currentModel,
+    )
+  }
+
+  /**
+   * Honest distinct states: a pending native catalog, an empty catalog and a
+   * query with no match never share a sentence.
+   */
+  private stateLines(width: number): string[] {
+    const safeWidth = Math.max(4, width - 2)
+    if (this.loadingState && this.providers.length === 0) return [` ${t.muted(fit('Loading models…', safeWidth))}`]
+    if (this.providers.length === 0) return [` ${t.muted(fit('No models are available.', safeWidth))}`]
+    const query = oneLine(sanitize(this.queryText().trim()), 40)
+    const message = `No models match "${query}" in ${providerLabel(this.providers[this.providerIndex] ?? '')}.`
+    return wrap(message, safeWidth).map(line => ` ${t.muted(fit(line, safeWidth))}`)
+  }
+
+  render(width: number): string[] {
+    const base = this.baseOptions()
+    // The framed body width is independent of the chrome content, so measure
+    // once for the chrome and let the second measure (with `before`) supply the
+    // body height that is actually left.
+    const bodyWidth = this.frame.measure(width, base).bodyWidth
+    const options: ModalFrameOptions = {
+      ...base,
+      before: this.chromeLines(bodyWidth),
+      after: [fit(` ${t.subtle(this.statusText())}`, bodyWidth)],
     }
-    return Number.isFinite(rowLimit) ? out.slice(0, rowLimit) : out
+    const painted = renderModalBody(this.frame, width, options, (innerWidth, bodyHeight) => this.body(innerWidth, bodyHeight))
+    this.hits = painted.paint.hits
+    return painted.lines
   }
 }

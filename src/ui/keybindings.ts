@@ -1,10 +1,47 @@
-/** A single Settings-owned shortcut list and inline editor; no profiles or command UI. */
-import { matchesKey, type Component, type Focusable, type TUI } from '#pi-tui'
-import { formatBinding, parseBindingSpec, type CcActionDefinition, type CcKeymap } from '../input/index.ts'
-import { isInterruptKey, listAction, rowBudget, windowRows } from './dialogs.ts'
+/**
+ * `/settings` → Keyboard shortcuts: one grouped, filterable shortcut editor.
+ *
+ * There is deliberately no standalone `/hotkeys`, no profile hierarchy and no
+ * second override file: the rows are the existing `CcKeymap` registry, and one
+ * write changes exactly one `keybindings.json` entry through the parent's
+ * `onChange` (which owns the conflict/diagnostic check and the atomic write).
+ * `reset` deletes only that one override; `disable` stores `null` for it.
+ *
+ * The list is a normal `ModalFrame` body (src/ui/modal.ts) with the shared
+ * group order:
+ *
+ *   Navigation · Editing · Application · Completion · Lists & dialogs · History search
+ *
+ * Input is resolved through the shared keymap in the `keybindingsList`
+ * context; the search field is the modal's one text field and reuses
+ * `InlineAnswer`'s CC editor grammar. Hints always come from the real bindings
+ * of `keybindings.edit` / `keybindings.disable` / `keybindings.reset` /
+ * `modal.search` / `list.cancel`, so a disabled action never advertises a dead
+ * key. A narrow set of physical recovery keys (arrows, pages, Home/End, Enter,
+ * Esc) keeps this configuration pane escapable even if a user disables the
+ * shared list actions — they are not advertised as fake bindings.
+ */
+import { matchesKey, type Component, type Focusable, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from '#pi-tui'
+import {
+  formatBinding,
+  parseBindingSpec,
+  type CcActionDefinition,
+  type CcKeymap,
+} from '../input/index.ts'
+import { isInterruptKey, type HitRange } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
+import {
+  isPrintableByte,
+  listStatusLines,
+  ModalListSurface,
+  resolveListAction,
+  windowList,
+  type ListBlock,
+  type ListBody,
+} from './modal-list.ts'
+import { modalBinding, type ModalAction, type ModalSize } from './modal.ts'
+import { fit, oneLine, sanitize, tildePath, visibleWidth, wrap } from './text.ts'
 import { bold, cc, dim, t } from './theme.ts'
-import { fit, sanitize, tildePath, visibleWidth, wrap } from './text.ts'
 
 interface ShortcutRow {
   action: CcActionDefinition
@@ -61,6 +98,15 @@ export function parseShortcutText(text: string): string[] | null {
   return [...new Set(bindings)]
 }
 
+interface ResolvedModalAction {
+  readonly id: string
+  readonly keys: string[]
+}
+
+const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
+
+const errorText = (error: unknown): string => sanitize(error instanceof Error ? error.message : String(error))
+
 export interface KeybindingsDialogOptions {
   keymap: CcKeymap
   path: string
@@ -74,13 +120,24 @@ export interface KeybindingsDialogOptions {
    * (cancel the inline edit, otherwise go back).
    */
   onInterrupt?: () => void
+  /** Bounded modal height (defaults to the shared standard modal budget). */
+  maxHeight?: number
 }
 
 export class KeybindingsDialog implements Component, Focusable {
   readonly capturesViewportInput = true
+  readonly modalSize: ModalSize = 'standard'
+  readonly keymap: CcKeymap
+  private readonly tui: TUI
+  private readonly options: KeybindingsDialogOptions
   private readonly rows: ShortcutRow[]
+  private readonly list: ModalListSurface
   private readonly answer: InlineAnswer
-  private index = 0
+  private readonly search: InlineAnswer
+  private selectedId: string | undefined
+  private selectedIndex = 0
+  private windowStart = 0
+  private searchFocused = false
   private focusedState = false
   private editing = false
   private saving = false
@@ -92,28 +149,78 @@ export class KeybindingsDialog implements Component, Focusable {
   constructor(tui: TUI, options: KeybindingsDialogOptions) {
     this.tui = tui
     this.options = options
+    this.list = new ModalListSurface(tui, {
+      size: this.modalSize,
+      ...(options.maxHeight === undefined ? {} : { maxHeight: options.maxHeight }),
+    })
+    this.keymap = options.keymap
     const actions = options.keymap.getActions()
-    this.rows = GROUPS.flatMap(group => actions.filter(action => groupOf(action) === group).map(action => ({ action, group, label: labelOf(action) })))
+    this.rows = GROUPS.flatMap(group =>
+      actions.filter(action => groupOf(action) === group).map(action => ({ action, group, label: labelOf(action) })),
+    )
+    this.selectedId = this.rows[0]?.action.id
     this.answer = new InlineAnswer(tui, options.keymap)
+    this.search = new InlineAnswer(tui, options.keymap)
+    this.search.onChange = () => { this.reconcile(); this.windowStart = 0; this.tui.requestRender() }
   }
 
-  private readonly tui: TUI
-  private readonly options: KeybindingsDialogOptions
+  // -------------------------------------------------------------------------
+  // State accessors (parent/tests)
 
-  get selectedActionId(): string | undefined { return this.rows[this.index]?.action.id }
-  get isEditing(): boolean { return this.editing }
-  get isSaving(): boolean { return this.saving }
-  get isDisposed(): boolean { return this.disposed }
-  get bindingText(): string { return this.answer.raw }
-  get focused(): boolean { return this.focusedState }
+  get selectedActionId(): string | undefined {
+    return this.visibleRows()[this.currentIndex()]?.action.id
+  }
+
+  get isEditing(): boolean {
+    return this.editing
+  }
+
+  get isSaving(): boolean {
+    return this.saving
+  }
+
+  get isDisposed(): boolean {
+    return this.disposed
+  }
+
+  /**
+   * True while a fragmented bracketed paste is still arriving in the binding or
+   * search field; the parent's global interrupt listener can leave it alone.
+   */
+  get isPasting(): boolean {
+    return (this.editing && this.answer.editor.isPasting())
+      || (this.searchFocused && this.search.editor.isPasting())
+  }
+
+  get isDone(): boolean {
+    return this.done
+  }
+
+  get bindingText(): string {
+    return this.answer.raw
+  }
+
+  get query(): string {
+    return this.search.raw.trim()
+  }
+
+  get focused(): boolean {
+    return this.focusedState
+  }
+
   set focused(value: boolean) {
     if (value === this.focusedState) return
-    this.options.keymap.cancelChord()
+    this.keymap.cancelChord()
     this.focusedState = value
     this.answer.focused = value && this.editing
+    this.search.focused = value && this.searchFocused
   }
 
-  invalidate(): void { this.answer.invalidate() }
+  invalidate(): void {
+    this.list.invalidate()
+    this.answer.invalidate()
+    this.search.invalidate()
+  }
 
   /** Release the inline binding editor and its shared-keymap listeners. Idempotent. */
   dispose(): void {
@@ -123,36 +230,128 @@ export class KeybindingsDialog implements Component, Focusable {
     // focused prompt is still typing.
     if (this.focusedState) this.options.keymap.cancelChord()
     this.answer.dispose()
+    this.search.dispose()
   }
 
-  private keys(row: ShortcutRow): string[] { return this.options.keymap.getBindings(row.action.id) }
+  // -------------------------------------------------------------------------
+  // Rows
+
+  private keys(row: ShortcutRow): string[] {
+    return this.options.keymap.getBindings(row.action.id)
+  }
+
   private keyLabel(row: ShortcutRow): string {
     const keys = this.keys(row)
-    if (keys.length) return keys.map(key => formatBinding(key.split(' ')).replace(/\bAlt\+/g, process.platform === 'darwin' ? 'Option+' : 'Alt+')).join(' / ')
+    if (keys.length) {
+      return keys
+        .map(key => formatBinding(key.split(' ')).replace(/\bAlt\+/g, process.platform === 'darwin' ? 'Option+' : 'Alt+'))
+        .join(' / ')
+    }
     const override = this.options.keymap.getUserConfig()[row.action.id]
     return override === null || (Array.isArray(override) && !override.length) ? 'Disabled' : 'Not bound'
   }
 
+  private visibleRows(): ShortcutRow[] {
+    const terms = this.query.toLowerCase().split(/\s+/).filter(Boolean)
+    if (terms.length === 0) return this.rows
+    return this.rows.filter(row => {
+      const haystack = [
+        row.label,
+        row.action.id,
+        row.action.description,
+        row.action.note ?? '',
+        row.group,
+        this.keyLabel(row),
+      ].join(' ').toLowerCase()
+      return terms.every(term => haystack.includes(term))
+    })
+  }
+
+  private currentIndex(): number {
+    const rows = this.visibleRows()
+    if (rows.length === 0) return 0
+    if (this.selectedId !== undefined) {
+      const found = rows.findIndex(row => row.action.id === this.selectedId)
+      if (found >= 0) return found
+    }
+    return Math.min(this.selectedIndex, rows.length - 1)
+  }
+
+  private reconcile(): void {
+    const rows = this.visibleRows()
+    if (rows.length === 0) {
+      this.selectedIndex = 0
+      this.selectedId = undefined
+      return
+    }
+    const found = this.selectedId === undefined ? -1 : rows.findIndex(row => row.action.id === this.selectedId)
+    if (found >= 0) {
+      this.selectedIndex = found
+      return
+    }
+    this.selectedIndex = Math.min(this.selectedIndex, rows.length - 1)
+    this.selectedId = rows[this.selectedIndex]?.action.id
+  }
+
   private move(delta: number): void {
-    this.options.keymap.cancelChord()
-    if (this.rows.length) this.index = (this.index + delta + this.rows.length) % this.rows.length
+    const rows = this.visibleRows()
+    if (rows.length === 0) return
+    const from = this.currentIndex()
+    const next = ((from + delta) % rows.length + rows.length) % rows.length
+    this.selectedIndex = next
+    this.selectedId = rows[next]?.action.id
+    if (next < this.windowStart) this.windowStart = next
+    this.clearMessage()
+    this.keymap.cancelChord()
+    this.tui.requestRender()
+  }
+
+  private moveTo(index: number): void {
+    const rows = this.visibleRows()
+    if (rows.length === 0) return
+    this.selectedIndex = Math.max(0, Math.min(index, rows.length - 1))
+    this.selectedId = rows[this.selectedIndex]?.action.id
+    if (this.selectedIndex < this.windowStart) this.windowStart = this.selectedIndex
+    this.tui.requestRender()
+  }
+
+  private clearMessage(): void {
     this.message = ''
+    this.failed = false
+  }
+
+  // -------------------------------------------------------------------------
+  // Editing / saving
+
+  private selectedRow(): ShortcutRow | undefined {
+    return this.visibleRows()[this.currentIndex()]
   }
 
   private edit(): void {
-    const row = this.rows[this.index]
-    if (!row) return
-    this.options.keymap.cancelChord()
+    const row = this.selectedRow()
+    if (row === undefined || this.saving) return
+    this.keymap.cancelChord()
     this.editing = true
-    this.message = ''
+    this.searchFocused = false
+    this.search.focused = false
+    this.clearMessage()
     this.answer.editor.setText(this.keys(row).join('\n'))
     this.answer.focused = this.focusedState
+    this.tui.requestRender()
+  }
+
+  private cancelEdit(): void {
+    this.editing = false
+    this.answer.focused = false
+    this.clearMessage()
+    this.keymap.cancelChord()
+    this.tui.requestRender()
   }
 
   private async save(bindings: string[] | null | undefined): Promise<void> {
-    const row = this.rows[this.index]
-    if (!row || this.saving) return
-    this.options.keymap.cancelChord()
+    const row = this.selectedRow()
+    if (row === undefined || this.saving) return
+    this.keymap.cancelChord()
     this.saving = true
     this.message = 'Saving…'
     this.failed = false
@@ -161,9 +360,10 @@ export class KeybindingsDialog implements Component, Focusable {
       this.editing = false
       this.answer.focused = false
       this.message = bindings === undefined ? 'Default restored' : bindings === null ? 'Disabled' : 'Saved'
+      this.failed = false
     } catch (error) {
       this.failed = true
-      this.message = sanitize(error instanceof Error ? error.message : String(error))
+      this.message = errorText(error)
     } finally {
       this.saving = false
       this.tui.requestRender()
@@ -171,61 +371,207 @@ export class KeybindingsDialog implements Component, Focusable {
   }
 
   private saveText(text: string): void {
-    try { void this.save(parseShortcutText(text)) }
-    catch (error) { this.failed = true; this.message = sanitize(error instanceof Error ? error.message : String(error)) }
+    try {
+      void this.save(parseShortcutText(text))
+    } catch (error) {
+      this.failed = true
+      this.message = errorText(error)
+      this.tui.requestRender()
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Input
+
+  private resolve(data: string): ResolvedModalAction | undefined {
+    return resolveListAction(this.options.keymap, data, 'keybindingsList')
   }
 
   handleInput(data: string): void {
-    if (this.done || this.saving || this.disposed) return
-    const pasting = this.editing && this.answer.editor.isPasting()
+    if (this.done || this.disposed) return
+    const pasting = this.isPasting
     if (!pasting && this.options.onInterrupt !== undefined && isInterruptKey(this.options.keymap, data)) {
       this.options.keymap.cancelChord()
       this.options.onInterrupt()
       this.tui.requestRender()
       return
     }
-    // These are recovery controls for this configuration pane only. Editing
-    // them cannot lock the user out; normal dialogs retain the user's keymap.
-    if (!pasting && matchesKey(data, 'escape')) {
-      this.options.keymap.cancelChord()
-      if (this.editing) { this.editing = false; this.answer.focused = false; this.message = '' }
-      else { this.done = true; this.options.onBack() }
-    } else if (this.editing) {
-      if (!pasting && matchesKey(data, 'enter')) this.saveText(this.answer.raw)
-      else if (!pasting && matchesKey(data, 'shift+enter')) this.answer.editor.ccInsertText('\n')
-      else {
-        const before = this.answer.editor.captureDraft()
-        const result = this.answer.handleKey(data)
-        if (result === 'submit') {
-          this.answer.editor.restoreDraft(before)
-          this.saveText(this.answer.lastSubmittedText ?? before.expandedText)
-        } else if (result === 'cancel' || result === 'interrupt') { this.editing = false; this.answer.focused = false; this.message = '' }
+    // A pending save must not trap the keyboard. Esc closes this pane while the
+    // parent-owned write settles; all mutating shortcuts stay gated below.
+    if (this.saving) {
+      if (matchesKey(data, 'escape')) this.back()
+      return
+    }
+    if (this.editing) {
+      this.inputEditing(data)
+      return
+    }
+    if (this.searchFocused) {
+      this.inputSearch(data)
+      return
+    }
+    this.inputBrowse(data)
+  }
+
+  private inputEditing(raw: string): void {
+    if (matchesKey(raw, 'escape')) {
+      this.cancelEdit()
+      return
+    }
+    if (!this.answer.editor.isPasting()) {
+      if (matchesKey(raw, 'enter')) {
+        this.saveText(this.answer.raw)
+        return
       }
-    } else if (matchesKey(data, 'enter')) this.edit()
-    else if (data === 'd' || data === 'D') void this.save(null)
-    else if (data === 'r' || data === 'R') void this.save(undefined)
-    else if (matchesKey(data, 'up')) this.move(-1)
-    else if (matchesKey(data, 'down')) this.move(1)
-    else if (matchesKey(data, 'pageUp')) this.move(-5)
-    else if (matchesKey(data, 'pageDown')) this.move(5)
-    else if (matchesKey(data, 'home')) this.index = 0
-    else if (matchesKey(data, 'end')) this.index = Math.max(0, this.rows.length - 1)
-    else {
-      const action = listAction(this.options.keymap, data)
-      if (action?.id === 'list.previous') this.move(-1)
-      else if (action?.id === 'list.next') this.move(1)
-      else if (action?.id === 'list.page-up') this.move(-5)
-      else if (action?.id === 'list.page-down') this.move(5)
-      else if (action?.id === 'list.first') this.index = 0
-      else if (action?.id === 'list.last') this.index = Math.max(0, this.rows.length - 1)
-      else if (action?.id === 'list.select' || action?.id === 'dialog.confirm') this.edit()
-      else if (action && ['list.cancel', 'dialog.cancel', 'app.cancel', 'app.interrupt'].includes(action.id)) { this.done = true; this.options.onBack() }
+      if (matchesKey(raw, 'shift+enter') || matchesKey(raw, 'ctrl+j')) {
+        this.answer.editor.ccInsertText('\n')
+        this.tui.requestRender()
+        return
+      }
+    }
+    const before = this.answer.editor.captureDraft()
+    const result = this.answer.handleKey(raw)
+    if (result === 'submit') {
+      this.answer.editor.restoreDraft(before)
+      this.saveText(this.answer.lastSubmittedText ?? before.expandedText)
+    } else if (result === 'cancel' || result === 'interrupt') {
+      if (result === 'interrupt' && this.options.onInterrupt !== undefined) this.options.onInterrupt()
+      else this.cancelEdit()
     }
     this.tui.requestRender()
   }
 
-  private rowLines(row: ShortcutRow, index: number, width: number): string[] {
-    const focused = index === this.index
+  private inputSearch(raw: string): void {
+    const action = this.resolve(raw)
+    if (action !== undefined) {
+      switch (action.id) {
+        case 'keybindings.edit':
+        case 'list.select':
+        case 'dialog.confirm':
+          this.searchFocused = false
+          this.search.focused = false
+          this.edit()
+          return
+        case 'list.cancel':
+        case 'dialog.cancel':
+        case 'app.cancel':
+          this.searchFocused = false
+          this.search.focused = false
+          this.tui.requestRender()
+          return
+        case 'list.previous':
+          if (!isPrintableByte(raw)) { this.move(-1); return }
+          break
+        case 'list.next':
+          if (!isPrintableByte(raw)) { this.move(1); return }
+          break
+        case 'list.page-up':
+          if (!isPrintableByte(raw)) { this.move(-5); return }
+          break
+        case 'list.page-down':
+          if (!isPrintableByte(raw)) { this.move(5); return }
+          break
+        case 'list.first':
+          if (!isPrintableByte(raw)) { this.moveTo(0); return }
+          break
+        case 'list.last':
+          if (!isPrintableByte(raw)) { this.moveTo(this.visibleRows().length - 1); return }
+          break
+        default:
+          break
+      }
+    }
+    const result = this.search.handleKey(raw)
+    if (result === 'submit') {
+      this.searchFocused = false
+      this.search.focused = false
+      this.edit()
+    } else if (result === 'cancel') {
+      this.searchFocused = false
+      this.search.focused = false
+      this.tui.requestRender()
+    }
+  }
+
+  private focusSearch(): void {
+    this.searchFocused = true
+    this.search.focused = this.focusedState
+    this.clearMessage()
+    this.keymap.cancelChord()
+    this.tui.requestRender()
+  }
+
+  private inputBrowse(raw: string): void {
+    const action = this.resolve(raw)
+    if (action !== undefined) {
+      switch (action.id) {
+        case 'modal.search': this.focusSearch(); return
+        case 'keybindings.edit':
+        case 'list.select':
+        case 'dialog.confirm': this.edit(); return
+        case 'keybindings.disable': { const row = this.selectedRow(); if (row !== undefined) void this.save(null); return }
+        case 'keybindings.reset': { const row = this.selectedRow(); if (row !== undefined) void this.save(undefined); return }
+        case 'list.previous': this.move(-1); return
+        case 'list.next': this.move(1); return
+        case 'list.page-up': this.move(-5); return
+        case 'list.page-down': this.move(5); return
+        case 'list.first': this.moveTo(0); return
+        case 'list.last': this.moveTo(this.visibleRows().length - 1); return
+        case 'app.interrupt':
+          // Without a parent interrupt hook, the configured interrupt key stays
+          // this pane's escape hatch instead of becoming a dead key.
+          this.back()
+          return
+        default:
+          if (CLOSE_ACTIONS.has(action.id)) this.back()
+          // Any other global/app action is inert inside this configuration pane.
+          return
+      }
+    }
+    // Recovery controls for this configuration pane only. They are not shown as
+    // bindings (no fake hints), but they keep a disabled list action from
+    // locking the user out of the shortcut editor.
+    if (matchesKey(raw, 'escape')) this.back()
+    else if (matchesKey(raw, 'up')) this.move(-1)
+    else if (matchesKey(raw, 'down')) this.move(1)
+    else if (matchesKey(raw, 'pageUp')) this.move(-5)
+    else if (matchesKey(raw, 'pageDown')) this.move(5)
+    else if (matchesKey(raw, 'home')) this.moveTo(0)
+    else if (matchesKey(raw, 'end')) this.moveTo(this.visibleRows().length - 1)
+    else if (matchesKey(raw, 'enter')) this.edit()
+  }
+
+  private back(): void {
+    if (this.done) return
+    this.done = true
+    this.keymap.cancelChord()
+    this.options.onBack()
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering
+
+  private frameActions(): ModalAction[] {
+    if (this.editing) {
+      return [
+        { id: 'save', label: 'save', action: 'list.select', onActivate: () => this.saveText(this.answer.raw) },
+        { id: 'cancel', label: 'cancel', action: 'list.cancel', onActivate: () => this.cancelEdit() },
+      ]
+    }
+    return [
+      { id: 'edit', label: 'edit', action: 'keybindings.edit', onActivate: () => this.edit() },
+      { id: 'disable', label: 'disable', action: 'keybindings.disable', onActivate: () => { void this.save(null) } },
+      { id: 'reset', label: 'reset', action: 'keybindings.reset', onActivate: () => { void this.save(undefined) } },
+      { id: 'search', label: 'search', action: 'modal.search', onActivate: () => this.focusSearch() },
+      { id: 'back', label: 'back', action: 'list.cancel', onActivate: () => this.back() },
+    ]
+  }
+
+  private searchLine(width: number): string {
+    return this.search.render(Math.max(4, width), this.searchFocused, 'Search shortcuts…', '')[0] ?? ''
+  }
+
+  private rowLines(row: ShortcutRow, width: number, focused: boolean): string[] {
     const marker = focused ? cc.suggestion('❯') : ' '
     const style = focused ? cc.suggestion : t.text
     const keys = this.keyLabel(row)
@@ -233,37 +579,114 @@ export class KeybindingsDialog implements Component, Focusable {
     if (width >= 48) {
       const leftWidth = Math.min(32, Math.floor(width * 0.43))
       const rightWidth = Math.max(1, width - leftWidth - 5)
-      const left = wrap(keys, leftWidth), right = wrap(row.label, rightWidth)
-      for (let line = 0; line < Math.max(left.length, right.length); line++) {
+      const left = wrap(keys, leftWidth)
+      const right = wrap(row.label, rightWidth)
+      for (let line = 0; line < Math.max(left.length, right.length); line += 1) {
         const key = left[line] ?? ''
-        lines.push((line === 0 ? marker : ' ') + ' ' + style(key) + ' '.repeat(Math.max(0, leftWidth - visibleWidth(key))) + dim(' │ ') + style(right[line] ?? ''))
+        lines.push(`${line === 0 ? marker : ' '} ${style(key)}${' '.repeat(Math.max(0, leftWidth - visibleWidth(key)))}${dim(' │ ')}${style(right[line] ?? '')}`)
       }
     } else {
-      lines.push(...wrap(row.label, Math.max(1, width - 2)).map((line, offset) => (offset === 0 ? marker : ' ') + ' ' + style(line)))
+      lines.push(...wrap(row.label, Math.max(1, width - 2)).map((line, offset) => `${offset === 0 ? marker : ' '} ${style(line)}`))
       lines.push(...wrap(keys, Math.max(1, width - 2)).map(line => '  ' + dim(style(line))))
     }
-    if (index === 0 || this.rows[index - 1]?.group !== row.group) lines.unshift(' ' + bold(cc.permission(row.group)))
     return lines
   }
 
+  private editLines(width: number): string[] {
+    const row = this.selectedRow()
+    if (row === undefined) return []
+    const lines = [
+      ` ${bold(t.text(oneLine(row.label, 160)))}`,
+      dim(` Current: ${this.keyLabel(row)}`),
+      '',
+    ]
+    const rendered = this.answer.render(Math.max(4, width - 2), this.focusedState, 'ctrl+p')
+    lines.push(...rendered.map(line => '  ' + line))
+    lines.push('')
+    lines.push(...wrap(dim('One binding per line; spaces make chords. Option = Alt.'), width))
+    lines.push(...wrap(dim('Enter save · Shift+Enter another binding · Esc cancel'), width))
+    return lines.map(line => fit(line, width))
+  }
+
+  /** Frame identity: mode plus the action the mutating footer would act on. */
+  private ownerKey(): string {
+    return `${this.editing ? 'keybindings:edit' : 'keybindings:row'}:${this.selectedActionId ?? ''}`
+  }
+
   render(width: number): string[] {
-    const size = Math.max(1, Math.floor(width))
-    const row = this.rows[this.index]
-    const out = [cc.inactive('─'.repeat(size)), bold(cc.permission('Keyboard shortcuts')), dim(sanitize(tildePath(this.options.path)))]
-    if (this.editing && row) {
-      out.push('', t.text(row.label), dim('Current: ' + this.keyLabel(row)), '')
-      out.push(...this.answer.render(Math.max(1, size - 2), this.focusedState, 'ctrl+p').map(line => '  ' + line))
-      out.push('', ...wrap(dim('One binding per line; spaces make chords. Option = Alt.'), size))
-      out.push(...wrap(dim('Enter save · Shift+Enter another binding · Esc cancel'), size))
-    } else {
-      if (size >= 48) out.push(dim('  Key(s)'.padEnd(Math.min(32, Math.floor(size * 0.43)) + 2) + ' │ Action'))
-      const hints = wrap(dim('↑/↓ navigate · Enter edit · d disable · r default · Esc settings'), size)
-      const blocks = this.rows.map((item, index) => ({ lines: this.rowLines(item, index, size), focused: index === this.index }))
-      out.push(...windowRows(blocks, Math.max(1, rowBudget(this.tui) - hints.length + 1)))
-      out.push(dim((row?.group ?? '') + ' · ' + (this.rows.length ? this.index + 1 : 0) + '/' + this.rows.length))
-      out.push(...hints)
+    return this.list.render(width, {
+      title: 'Keyboard shortcuts',
+      ownerKey: this.ownerKey(),
+      beforeRows: this.options.path === '' ? 1 : 2,
+      before: bodyWidth => {
+        const before = [this.searchLine(bodyWidth)]
+        if (this.options.path !== '') before.push(fit(dim(sanitize(tildePath(this.options.path))), bodyWidth))
+        return before
+      },
+      status: bodyWidth => listStatusLines(this.message, this.failed, bodyWidth),
+      actions: this.frameActions(),
+      onClose: () => (this.editing ? this.cancelEdit() : this.back()),
+      keymap: this.keymap,
+    }, (bodyWidth, bodyHeight) => this.buildBody(bodyWidth, bodyHeight))
+  }
+
+  private buildBody(width: number, height: number): ListBody {
+    if (height <= 0) return { lines: [] }
+    if (this.editing) return { lines: this.editLines(width).slice(0, height) }
+    const rows = this.visibleRows()
+    if (rows.length === 0) {
+      return { lines: [fit(` ${t.muted(`No shortcuts match “${oneLine(this.query, 60)}”.`)}`, width)] }
     }
-    if (this.message) out.push(...wrap((this.failed ? t.redSoft : t.muted)(this.message), size))
-    return out.map(line => fit(line, size))
+    const blocks: ListBlock[] = []
+    if (width >= 48) {
+      const leftWidth = Math.min(32, Math.floor(width * 0.43))
+      blocks.push({ lines: [dim(' ' + 'Key(s)'.padEnd(leftWidth + 2) + '│ Action')] })
+    }
+    const selected = this.currentIndex()
+    for (const [index, row] of rows.entries()) {
+      if (index === 0 || rows[index - 1]?.group !== row.group) {
+        blocks.push({ lines: [' ' + bold(cc.permission(row.group))] })
+      }
+      blocks.push({
+        lines: this.rowLines(row, width, index === selected),
+        focused: index === selected,
+        index,
+        key: row.action.id,
+      })
+    }
+    const window = windowList(blocks, height, { start: this.windowStart })
+    this.windowStart = window.start
+    return { lines: window.lines, hits: window.hits }
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (this.done || this.disposed) return undefined
+    const chrome = this.list.chromeMouse(event)
+    if (chrome !== undefined) return chrome
+    const beforeIndex = this.list.beforeIndex(event.y)
+    if (beforeIndex === 0 && !this.editing) {
+      if (event.type === 'press' && event.button === 'left') return { handled: true }
+      if (event.type === 'click' && event.button === 'left') {
+        this.focusSearch()
+        return { handled: true, render: true }
+      }
+    }
+    const body = this.list.bodyMouse(event)
+    if (body === undefined) return undefined
+    if (event.type === 'wheel' && !this.editing) {
+      this.move((event.wheelDelta ?? 0) < 0 ? -3 : 3)
+      return { handled: true, render: true }
+    }
+    return this.list.rowMouse(event, this.ownerKey(), hit => this.activateHit(hit))
+  }
+
+  /** A click selects its row; clicking the selected row edits it. */
+  private activateHit(hit: HitRange): void {
+    const row = this.visibleRows()[hit.index]
+    if (row === undefined) return
+    const wasSelected = this.selectedActionId === row.action.id
+    this.moveTo(hit.index)
+    if (wasSelected) this.edit()
+    this.tui.requestRender()
   }
 }

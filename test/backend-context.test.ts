@@ -478,6 +478,37 @@ test('state, queue recall and dequeue share one recallability rule', async () =>
   await backend.close()
 })
 
+test('/new uses the staged native preset supplied by the UI', async () => {
+  const { backend, agents } = await connected()
+  await backend.command('new', { preset: 'minimal' })
+  await backend.send('go')
+  const created = agents.createCalls.at(-1) as Record<string, unknown> | undefined
+  assert.ok(created)
+  assert.equal((created.meta as Record<string, unknown>).agentPreset, 'minimal')
+  await backend.close()
+})
+
+test('queue-send-now keeps the original native entry when attachment admission fails', async () => {
+  const { backend, agents } = await connected((host) => {
+    host.use('attachments', { admitPromptContent: async () => { throw new Error('synthetic admission refusal') } })
+  })
+  await backend.send('prompt')
+  const agent = agents.agents[0]
+  assert.ok(agent)
+  agent.inbox.nextTurn.push({
+    id: 'queued-image', content: [{ type: 'image', attachment: { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 2, height: 2 } }], source: { kind: 'user' },
+  })
+  await assert.rejects(
+    backend.command('queue-send-now', {
+      messageId: 'queued-image',
+      content: [{ type: 'image', mediaType: 'image/png', data: 'AAAA' }],
+    }),
+    /admission|refused|not sent/i,
+  )
+  assert.deepEqual(agent.inbox.nextTurn.map(message => message.id), ['queued-image'], 'a rejected replacement must not remove the original')
+  await backend.close()
+})
+
 test('queue rows can be replaced, removed, or sent now without dropping the rest', async () => {
   const { backend, agents } = await connected()
   await backend.send('prompt')

@@ -17,14 +17,15 @@ permissions, commands, sessions and persistence. The adapter
   scratch profile mirror, second persistence, scheduler, permission rule or
   model transport exists;
 - `close()` releases only adapter-owned listeners, decisions, in-flight
-  command/image operations and the Agent handle it created. It never disposes
+  command/image/skill-discovery operations and the Agent handle it created. It never disposes
   the host root, never calls `appExit`, and never exits the process. The parent
   plugin owns application shutdown and `ctx.effect` lifecycle.
 
 Public services used (all through `ctx.get(name)` with capability validation):
-`agents`, `commands`, `llm`, `attachments`, `sessionQuery`,
-`sessionProjections`, `agentDefaultModel`, `permissionPresets`, `agentPresets`,
-`sessions`, `hmr`, `tools`, `loader`, `sessionTitle`. Native pure helpers are
+`agents`, `commands`, `skills`, `workingDirectory`, `llm`, `attachments`,
+`sessionQuery`, `sessionProjections`, `agentDefaultModel`, `permissionPresets`,
+`agentPresets`, `sessions`, `hmr`, `tools`, `loader`, `sessionTitle`. Native pure
+helpers are
 `createUserMessage` and
 `BlockAssembler` / `expandAssistantStream` / `assembleAssistantStream` /
 surface predicates; `makeTranscriptCodec(llmModule, sessionModule)` is a pure
@@ -112,6 +113,15 @@ function createDshBackend(ctx: DshHostContext, options): DshContextBackend
 `transcriptCodec` is available before the first `ready`; a missing native codec
 fails `connect()` loudly rather than substituting a mirror.
 
+`SessionInfo.title?: string | null` is a read-only native `title` projection
+baseline from `sessionProjections.stateOf(session, 'title')`, independent of the
+bounded transcript suffix. `null` is native no-title; unavailable/invalid data
+is omitted. The existing projection bridge forwards `{type:'title', sessionId,
+attachmentId, value}` only for the exact supplied live session. No title query
+policy, generator, refresh, provider enablement or profile write was added.
+Terminal consumers and native outcome mapping are documented in
+[TERMINALS](TERMINALS.md) and [TERMINAL-NATIVE-MAPPING](TERMINAL-NATIVE-MAPPING.md).
+
 ## Lifecycle and attachments
 
 A plain launch (and `/new`) creates no Agent: `connect` enters a pending session
@@ -122,6 +132,12 @@ event follows. A launch that never sends leaves no durable session.
 `connect({resume})` and `/resume` use `ctx.agents.resume` and return the durable
 snapshot from `sessionQuery.readSession`; a failed read reports
 `snapshotUnavailable` (with a warning) instead of an empty conversation.
+The `sessions` command preserves `sessionQuery.listSessions()`'s deterministic
+native order and header metadata, filters subagent children, then applies the
+requested bound. It does not call `sessionPersistence.list`, `stat` durable
+JSONL files, derive an activity timestamp, or re-sort by creation time. The
+picker's age column is therefore the native header `createdAt`, not a second
+TUI-owned last-activity policy; explicit resume semantics are unchanged.
 
 An explicit resume of the session this adapter is **already attached to** is a
 no-op reattachment: the current attachment is reported (same `attachmentId`,
@@ -212,6 +228,19 @@ DSH's own owners when live:
 - commands: `ctx.commands.list(agent)` descriptors and
   `ctx.commands.execute(agent, line, [], signal)`; DSH mints
   `command/run`/`command/done` and owns validation/audit;
+- input route: `command('input-route', {name})` classifies one **explicit user
+  submission** after the ordinary lazy Agent path, so the preset-scoped command
+  roster exists. It asks `ctx.commands.find(agent, name)` (with a `list`
+  fallback for hosts that mount only the catalog read) and returns
+  `{kind, sessionId, attachmentId}` for the parent's own guard. A mounted
+  command always wins; with no command resolved, `prompt` is possible only when
+  a native skill registry is readable — it means literal user input, never a
+  claim that a skill exists. Tool-schema visibility is not consulted. It never
+  executes, sends, materializes without a submission, or reads skill metadata.
+  The token grammar is the lower-kebab `/name` gesture; anything else rejects
+  before the lazy path. A missing command registry cannot resolve a command, so
+  a skill-enabled scope still answers `prompt`; an unreadable or partial command
+  lookup keeps the command error path.
 - model catalog: the mounted native `ctx.llm.listProviders()` /
   `listModels(provider)` / `resolveModelInfo(provider, model)` plus
   `agentDefaultModel.currentSelection()`. `src/backend/model-view.ts` is a
@@ -233,15 +262,119 @@ DSH's own owners when live:
   selection itself still works and `efforts` retains its existing capability
   semantics.
 
+## Skills metadata
+
+Skills are DSH-owned. The adapter never owns a catalog, loads a skill body or
+injects instructions. `command('skills')` is a read-only projection of the
+native registry, and the registry has already resolved `invocation`. Only
+`name/description/whenToUse/modelInvocable` cross the boundary; `path`,
+`resourceBase`, `metadata`, `locator`, `rank` and `content` never do. Entries
+whose resolved `invocation.userInvocable` is false are dropped, and any
+structurally invalid entry is skipped while `complete` is forced to false, so a
+partial observation is never presented as authoritative. `snapshot()` supplies
+the native `complete` fact; a public `list()`-only registry is projected with
+`complete:false` because list carries no completeness claim (no TUI default is
+invented). A malformed envelope rejects as `RUNTIME_REQUEST_FAILED`.
+
+Registry readability is the native metadata API alone — `ctx.skills.snapshot`
+or `ctx.skills.list`. Tool-schema visibility is never consulted: the human
+`/name` entry point is the `tool-skill` `agent/pre-step` injection, which runs
+whether or not the model-facing `skill` tool schema is visible. The `skills`
+and `input-route` capabilities therefore no longer depend on
+`ctx.tools.get('skill', agent)`. A preset that mounts no provider naturally
+returns an empty, complete observation; it is not rejected as a fake tool
+failure.
+
+Live resolution mirrors the desktop Remote: the preset-isolated instance from
+`agentPresets.serviceFor(agent,'skills')` first, then the host `ctx.skills`
+row. A failing preset lookup stays visible as a redacted warning and falls back
+to the host registry. The live read uses
+`ctx.workingDirectory.ensure(agent, signal)` when that service is mounted; only
+a missing service falls back to the native session header `cwd`, then the
+adapter's configured cwd. A mounted service that fails or returns no directory
+rejects instead of silently scanning a different workspace.
+
+A pending session is a real native viewing scope without an Agent: the adapter
+calls the public `agentPresets.acquireScope(pending preset)` (`undefined` asks
+for the native current default), reads the host registry with that lease's
+`scope` key and the configured pending cwd, and always releases the lease in a
+`finally` — including when it is acquired after close, a switch or another
+preset selection. No Agent, Session, private Context, second Loader or global
+provider is created. A refused lease preserves its redacted native diagnostic
+rather than trying another preset. Without an `acquireScope` API the mounted
+global registry is read as an explicitly incomplete/global observation; a
+missing registry returns `available:false` with empty entries.
+
+`ctx.on('skills/change')` is an unfiltered native invalidation with no payload.
+The adapter emits `{type:'skills_changed', sessionId, attachmentId}` for the
+current root observation: the live attachment when present, otherwise the
+pending attachment whose preset leases are legitimate. An event observed before
+the pending Agent commits sets a dirty flag and is replayed once immediately
+after the `ready` for the committed attachment, so a consumer that cached the
+pending observation is told to refetch. The adapter's own metadata read and
+lease disposal cause no invalidation loop.
+
+The metadata read is deliberately not a routing decision. `command('skills')`
+is menu/catalog data and never materializes an Agent, while
+`command('input-route', {name})` is submission-time only: the ordinary lazy path
+first materializes the current Agent (one `ensureCurrent`), then native command
+precedence is decided against that exact agent scope via
+`ctx.commands.find(agent,name)` (with a `list` fallback). A pending `commands`
+list shows only global definitions, which is why the pre-Agent catalog cannot
+answer whether `/compact` is a native command. With no command resolved, the
+decision is `prompt` only when a native skill registry is readable — it means
+literal user input, not a claim that a skill exists; a missing registry or an
+unreadable/partial command lookup keeps the command error path. The route
+executes and sends nothing; the parent applies the returned kind to the existing
+`execute`/`send`/`sendContent`/`send-now` primitives with the exact original
+line.
+
+Each query owns an adapter `AbortController` and a captured observation
+identity (live Agent, or the exact pending object plus preset id).
+Session/attachment retirement, pending-to-live materialization, preset change,
+`/reload` and `close()` abort an in-flight query; every late result is
+re-checked against the abort signal, `closed`, and that captured identity, so a
+stale catalog or a late lease can never be delivered un-released. `close()`
+aborts and drops metadata reads without joining them — the same policy as image
+reads — so an uncooperative provider or directory scan cannot extend shutdown.
+Native failures keep one redacted diagnostic; no credential text, stack or
+native object is serialized.
+
 ## Auto-title
 
-No new title service or persistence rule. The adapter toggles the existing
-native Loader entries (`@deepseek-ai/dsh-session-title-*-llm`) through
-`entry.update({disabled})`. The `inherit` baseline is the first native state the
-adapter observed at runtime (the host composition is original, so there is no
-scratch-profile comparison). `enabled:null` restores that baseline; title
-generation remains DSH-owned and may issue model requests only when a native
-provider is enabled.
+No title service, scheduler or persistence rule, and now no composition write
+either. `auto-title` is a **read-only** report of the native session-title
+state: `available` says whether the state is readable (a mounted `sessionTitle`
+service plus at least one `@deepseek-ai/dsh-session-title-*-llm` Loader entry),
+`editable` is always false, and `enabled`/`effectiveEnabled`/
+`mayIssueModelRequests`/`plugins` describe the live profile composition. A
+request carrying `enabled` is refused fail-closed with `available:false`,
+`changed:false`, a `reason` and a `limitation`: nothing is mutated, and the
+current native state is still reported.
+
+Why not a runtime toggle: DSH owns session-title composition. The only public
+mutation surfaces persist it — `EntryTree.update()`/`Loader.update()` report to
+the owning `Include`, which rewrites the profile, and
+`pluginManager.setPluginEnabled()` saves a profile patch. A bare
+`Entry.update({disabled})` (the previous implementation) does not commit in
+`@deepseek-ai/cordis-plugin-loader` 1.1.0 (verified against the installed DSH
+0.2.2-rc.1: the config file stays byte-identical), but it mutates a live DSH
+entry's options outside the tree's journal/reconcile path, disappears on the
+next file-driven reconcile, and the Loader itself persists `disabled` when an
+enabled fiber unloads. Treating a TUI display preference as a hidden Loader
+mutation therefore crosses the ownership boundary even though it usually skips
+the write. The adapter reads `entry.options`/`entry.disabled` only, never calls
+`entry.update` or any tree mutation, and never invents a second title path;
+title generation remains DSH-owned and may issue model requests only while a
+native provider is composed in.
+
+Changing the effective value belongs to DSH: toggle the provider through the
+native plugin manager or the profile patch (`disabled`), then reload/restart.
+Settings exposes only a native read-only row and never sends `enabled`. The
+former local `Settings.autoTitle` override has been removed: an existing disk
+key is silently ignored on read/reload and is dropped by the next normal TUI
+settings write, without touching DSH composition. `terminalTitle` controls only
+window/tab presentation of the native title, never this provider state.
 
 ## Projections and footer metrics
 

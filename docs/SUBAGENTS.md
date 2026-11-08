@@ -142,9 +142,11 @@ order.
 - Collapsed member names and expanded member names are the same name-only links
   described above (catalog label, or the honest durable sender id with no link
   when the catalog does not know that child).
-- Grouping follows the existing `groupTools` preference: `false` restores one
-  row per record. No new setting, shortcut, backend field or stored synthetic
-  fact exists.
+- Grouping follows the independent `groupSubagentMessages` preference: `false` restores one
+  row per record. It no longer reuses `groupTools`; a legacy file is snapshotted once from its old
+  Tools value, then Agents reset uses the Agents default and never reads Tools again. Ctrl+O and
+  single-expand still share only the temporary disclosure state. No backend field or stored
+  synthetic fact exists.
 
 ## 3. Durable settlement / trigger rows
 
@@ -176,37 +178,47 @@ The store keeps a real item:
 
 ## 4. Agents overlay
 
-`AgentsOverlay` is a temporary modal, not a permanent pane. It holds no timer
+`AgentsOverlay` is a temporary shared-`ModalFrame` modal (standard), not a permanent pane. It holds no timer
 and never polls.
 
 ```ts
 new AgentsOverlay(tui, {
-  entries, truncated?, keymap?, onClose, onOpen?, onReply?, onStop?, onInterrupt?,
-  onGlobalAction?, onRenderRequest?, maxHeight?, now?,
+  entries, truncated?, initialState?: AgentsViewState, keymap?, onClose, onOpen?,
+  onReply?, onStop?, onInterrupt?, onGlobalAction?, onRenderRequest?, maxHeight?, now?,
 })
 
-overlay.setEntries(entries, { truncated? }) // omitted truncated preserves the current flag
-overlay.setSnapshot(snapshot)               // a snapshot owns the flag explicitly
+overlay.setEntries(entries, { truncated? })
+overlay.setSnapshot(snapshot)
 overlay.setEntry(entry)
 overlay.update({ entry?, entries?, truncated?, snapshot? })
-overlay.invalidate()
-overlay.dispose()
-overlay.focused
+overlay.setMessage(message, error?)    // visible current-surface native failure
+overlay.captureView(): AgentsViewState // query/filter/selected native id/scroll
+overlay.invalidate(); overlay.dispose(); overlay.focused
 ```
 
+- Search is an on-demand `modal.search` field over native label/description/metadata; browse-mode
+  printable keys and digits are inert. `subagent.filter.toggle` (Tab) switches Active/All in browse.
+  Filtering never mutates the catalog; selection reconciles by native child id when rows reorder,
+  disappear or the query changes. A removed id is replaced by the nearest visible row, never
+  resurrected.
 - Tree: roots are rows whose `parentSessionId` is not itself a known row; nested
   children follow their parent. Sibling order is native catalog seq, then
   creation time, then id. Cycles/orphans are shown rather than hidden.
 - Rows show native label, mode, status, current activity, session-total tokens
-  and session-total timing. Missing numbers paint nothing.
+  and session-total timing. Missing numbers paint nothing. Selecting or hovering
+  a row reads only this metadata: no follow, transcript read, stop or model call.
 - External tasks are selectable leaves and never call `onOpen`.
 - Input resolves in the `subagentList` context (`subagentList → list → dialog →
   global`, no editor fallback). Up/Down/PageUp/PageDown/Home/End navigate,
-  Enter opens a local child and Esc closes. `subagent.reply` (default `r`) is
-  offered only for a local continuable row with `onReply`; `subagent.interrupt`
-  (default `s`) only for a local running/initializing row with `onStop`.
-  Ctrl+C prefers that same gated Stop, otherwise it uses `onInterrupt`/closes.
-  `app.exit` is forwarded to `onGlobalAction`; every other parent action is inert.
+  Enter opens a local child and Esc closes. `modal.search` (Ctrl+F) focuses the
+  search field; `subagent.filter.toggle` (Tab) switches Active/All. `subagent.reply`
+  (default `r`) is offered only for a local continuable row with `onReply`;
+  `subagent.interrupt` (default `s`) only for a local running/initializing row
+  with `onStop`. Ctrl+C prefers that same gated Stop, otherwise it uses
+  `onInterrupt`/closes. `app.exit` is forwarded to `onGlobalAction`; every other
+  parent action is inert. The search field uses the shared CC editor grammar,
+  so `r`/`s` are ordinary text while typing and no unknown action leaks into
+  the hidden root editor.
 - Mouse: rows select/open with a claimed press; the wheel scrolls. Visible
   Reply/Stop footer chips use the same gating and pinned hitboxes as the keys.
   Narrow widths drop metrics and chips before truncating identity; invisible
@@ -227,7 +239,7 @@ full native catalog (settled, nested and external rows).
 ## 5. Child Session view
 
 `ChildSessionView` frames a parent-supplied child `TranscriptStore` +
-`TranscriptView`; it does not own child lifecycle or backend transport.
+`TranscriptView` in a shared `ModalFrame` (wide); it does not own child lifecycle or backend transport.
 
 ```ts
 new ChildSessionView(tui, {
@@ -236,12 +248,13 @@ new ChildSessionView(tui, {
   follow?, ownsView?, loading?,
 })
 
-childView.setEntry(entry)          // header refresh, same/new child id
-childView.setEntries(entries)      // pick this child's row from a snapshot
+childView.setEntry(entry)             // header refresh, same/new child id
+childView.setEntries(entries)         // pick this child's row from a snapshot
 childView.update({ entry?, entries?, info? })
-childView.setLoading(loading)      // loading shell on/off; display only
+childView.setLoading(loading)         // loading shell on/off; display only
+childView.setMessage(message, error?) // native stop/reply failure in this surface
 childView.invalidate()
-childView.dispose()                // idempotent; calls view.dispose() by default
+childView.dispose()                   // idempotent; calls view.dispose() by default
 childView.focused
 ```
 
@@ -373,6 +386,10 @@ draft preservation and terminal restore through the actual CLI.
 
 ## 8. Pi-style progress above the Editor
 
+Progress is hidden when `Settings → Agents → Progress above input` is off and uses a static
+frame when reduced motion is on; both are renderer preferences and never change the native
+catalog, child status or lifecycle. The remaining visual/action contract is unchanged.
+
 The visual reference is the user's installed `@tintinweb/pi-subagents` 0.23.1
 (MIT), `src/ui/agent-widget.ts` / `renderWidget()`, and the supplied Pi
 screenshot. Grok supplies the **navigation behavior**, not the table styling:
@@ -430,6 +447,9 @@ only its **active** children:
   shift the name columns; assignment alone never renders and never resets a
   hitbox (the two-line summary + activity layout is unchanged). Leaving the
   field `undefined` restores the static marker for standalone hosts.
+  `Settings → Agents → Progress above input` hides the widget; `Reduced motion`
+  freezes the shared clock's glyph while keeping the live row and native status.
+  Neither setting stops early, retires a child or mutates the native catalog.
 - The active reply target comes first (marked), then every other active row
   **with its activity**, in native catalog order. The hard budget includes the
   heading, every row, activity, overflow and separator. App caps it at eight

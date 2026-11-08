@@ -65,9 +65,9 @@ def wait_screen(session, predicate, timeout=5):
 
 
 def agents_overlay_visible(screen):
-    # The persistent Pi-style widget is “● Agents · …”; a bare title belongs
-    # to the temporary Agents overlay, even when background edges show through.
-    return any(re.search(r'(?<!● )Agents ·', line) for line in screen['lines'])
+    # The persistent widget is “● Agents · …”; the temporary overlay now uses
+    # the shared modal frame (“┌─ Agents …”), even when background edges show.
+    return any('┌─ Agents' in line for line in screen['lines'])
 
 
 def click_text(session, marker):

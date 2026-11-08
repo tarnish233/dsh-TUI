@@ -190,6 +190,14 @@ async function click(terminal: VirtualTerminal, x: number, y: number): Promise<v
   await paint(terminal)
 }
 const notice = (app: App) => app.store.items.filter(item => item.kind === 'notice').at(-1)?.text ?? ''
+async function showAutoTitle(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  await f.app.submit('/settings'); await paint(f.terminal)
+  f.terminal.type('\x06')
+  for (const char of 'auto title') f.terminal.type(char)
+  await paint(f.terminal)
+  await until(() => f.terminal.screen().includes('Auto title'), 'native read-only row is visible')
+    .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+}
 
 test('queue badge uses recallable human input, not native permission context or raw inbox length', async () => {
   const f = await fixture()
@@ -526,56 +534,41 @@ test('late catalog results after attachment or route change cannot open a stale 
   } finally { await f.close() }
 })
 
-test('Settings auto title uses only the native command and preserves inherit at startup', async () => {
-  const inherited = await fixture()
-  try {
-    assert.equal(inherited.backend.commands.some(command => command.name === 'auto-title'), true, 'startup queries the native capability')
-    assert.equal(inherited.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled !== undefined), false, 'inherit never forces false/true')
-    await inherited.app.submit('/settings')
-    await paint(inherited.terminal)
-    inherited.terminal.type('\x1b[H'); await paint(inherited.terminal)
-    assert.ok(inherited.terminal.screen().split('\n').some(line => line.includes('Auto title') && line.includes('inherit')))
-    assert.match(inherited.terminal.screen(), /may use the model/)
-    inherited.terminal.type('\x1b')
-  } finally { await inherited.close() }
-
+test('Settings auto title is native read-only and never persists a local override', async () => {
   const f = await fixture()
   try {
-    await f.app.submit('/settings')
-    await paint(f.terminal)
-    f.terminal.type('1')
-    await until(() => f.backend.autoTitleEnabled === true, 'native auto-title changed to on')
-    const set = f.backend.commands.filter(command => command.name === 'auto-title' && command.args.enabled !== undefined).at(-1)
-    assert.deepEqual(set?.args, { enabled: true })
-    let persisted = false
-    for (let attempt = 0; attempt < 100 && !persisted; attempt++) {
-      try { persisted = JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')).autoTitle === true } catch { /* write not yet visible */ }
-      if (!persisted) await delay(10)
-    }
-    assert.equal(persisted, true, 'local preference persisted')
-    assert.equal(f.backend.info.attachmentId, 'cancel-fixture-attachment-1', 'title setting never resets the Agent/attachment')
-    assert.equal(f.app.editor.getText(), '')
+    assert.equal(f.backend.commands.some(command => command.name === 'auto-title'), true, 'startup queries the native capability')
+    await showAutoTitle(f)
+    await until(() => f.terminal.screen().split('\n').some(line => line.includes('Auto title') && line.includes('On · read-only')), 'native on state is visible')
+    assert.match(f.terminal.screen(), /native titles may[\s\S]*use the model/)
+    f.terminal.type('\r'); await paint(f.terminal)
+    assert.equal(f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled !== undefined), false, 'no native composition write is requested')
+    await assert.rejects(readFile(join(f.directory, 'settings.json'), 'utf8'), /ENOENT/)
+    assert.equal(f.backend.info.attachmentId, 'cancel-fixture-attachment-1', 'the native Agent/attachment is untouched')
   } finally { await f.close() }
 })
 
-test('an explicit local auto-title override is applied at startup through the native command', async () => {
+test('a legacy local auto-title override is silently ignored at startup', async () => {
   const f = await fixture({ settings: { autoTitle: false } })
   try {
-    await until(() => f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled === false), 'startup applies the local override')
-    assert.equal(f.backend.autoTitleEnabled, false)
+    await until(() => f.backend.commands.some(command => command.name === 'auto-title'), 'startup queries native state')
+    assert.equal(f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled !== undefined), false)
+    assert.equal(f.backend.autoTitleEnabled, true, 'the old false override is never applied')
+    assert.equal(notice(f.app), '', 'a retired preference must not add a startup error')
+    assert.doesNotMatch(f.terminal.document(), /Legacy autoTitle|Unknown setting: autoTitle/)
+    assert.equal(await readFile(join(f.directory, 'settings.json'), 'utf8'), JSON.stringify({ autoTitle: false }), 'startup remains read-only')
     assert.equal(f.backend.info.attachmentId, 'cancel-fixture-attachment-1', 'no Agent reset')
   } finally { await f.close() }
 })
 
-test('unsupported native auto-title is reported explicitly and no local preference is written', async () => {
+test('unreadable native auto-title is shown unavailable without a local write', async () => {
   const f = await fixture()
   try {
     f.backend.autoTitleAvailable = false
-    await f.app.submit('/settings')
-    await paint(f.terminal)
-    f.terminal.type('1')
-    await until(() => notice(f.app).includes('Auto title was not changed'), 'unsupported capability reported')
-    assert.match(notice(f.app), /unavailable/)
+    await showAutoTitle(f)
+    await until(() => /Unavailable|unavailable/.test(f.terminal.screen()), 'unavailable native state is visible')
+    assert.match(f.terminal.screen(), /Native state is unreadable|profile composition/)
+    assert.equal(f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled !== undefined), false)
     await assert.rejects(readFile(join(f.directory, 'settings.json'), 'utf8'), /ENOENT/)
   } finally { await f.close() }
 })
@@ -659,15 +652,19 @@ test('an external SIGINT handler exits 130 after restoring the terminal', async 
     assert.equal(f.backend.closes, 1)
   } finally { await f.close() }
 })
-test('reload reapplies an explicit local auto-title override without resetting the Agent', async () => {
+test('reload re-reads native auto-title without reapplying a legacy override or resetting the Agent', async () => {
   const f = await fixture({ settings: { autoTitle: false } })
   try {
-    await until(() => f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled === false), 'startup override applied')
     const attachment = f.backend.info.attachmentId
     await writeFile(join(f.directory, 'settings.json'), JSON.stringify({ autoTitle: true }))
     f.backend.autoTitleEnabled = false
     await f.app.submit('/reload')
-    await until(() => f.backend.commands.filter(command => command.name === 'auto-title' && command.args.enabled === true).length > 0, 'reload reapplies the new local override')
+    await until(() => f.backend.commands.filter(command => command.name === 'auto-title').length >= 2, 'reload queries native state again')
+    assert.equal(f.backend.commands.some(command => command.name === 'auto-title' && command.args.enabled !== undefined), false)
+    assert.equal(f.backend.autoTitleEnabled, false, 'the native value is observed, not overwritten by legacy config')
+    assert.equal(notice(f.app), 'Reloaded settings, keybindings and DSH configuration.', 'reload does not append a legacy preference warning')
+    assert.doesNotMatch(f.terminal.document(), /Legacy autoTitle|Unknown setting: autoTitle/)
+    assert.equal(await readFile(join(f.directory, 'settings.json'), 'utf8'), JSON.stringify({ autoTitle: true }), 'reload remains read-only')
     assert.equal(f.backend.info.attachmentId, attachment, 'reload never recreates the Agent')
   } finally { await f.close() }
 })

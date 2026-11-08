@@ -156,7 +156,7 @@ def fullscreen():
         footer = selected['lines'][footer_row]
         click(session, footer.index('click to show details') + 4, footer_row)
         details = frame(session)
-        assert 'Tool details' in text(details)
+        assert '┌─ Tools' in text(details)
         assert 'bash-one output line 1' in text(details), 'non-last group Output opened the wrong Input/call'
         assert re.search(r'Tool 1\s*/\s*4', text(details)), 'native Edit is a separate fourth inspectable call'
         session.send(b'\t')
@@ -169,7 +169,7 @@ def fullscreen():
         session.send(b'[')
         assert 'bash-one output line 1' in text(frame(session))
         session.send(b'\x1b')
-        assert 'Tool details' not in text(frame(session))
+        assert '┌─ Tools' not in text(frame(session))
 
         offscreen = wheel_until(session, 65, lambda s: not group_rows(s) and any('bash-two output line' in line for line in s['lines']))
         target_row = next(i for i, line in enumerate(offscreen['lines']) if 'bash-two output line' in line)
@@ -186,7 +186,7 @@ def fullscreen():
         assert re.search(r'Tool 4\s*/\s*4', text(frame(session)))
         resize(session, 40, 24)
         narrow = frame(session, 40, 24)
-        assert 'Tool details' in text(narrow)
+        assert '┌─ Tools' in text(narrow)
         session.send(b'\x1b')
         assert 'PTY tools retained draft' in text(frame(session, 40, 24))
         session.send(b'\x15')  # clear the synthetic draft without submitting it
@@ -219,7 +219,7 @@ def inline():
         session.send(b'\t')
         assert "printf 'bash-one line" in text(frame(session))
         resize(session, 40, 24)
-        assert 'Tool details' in text(frame(session, 40, 24))
+        assert '┌─ Tools' in text(frame(session, 40, 24))
         session.send(b'\x1b')
         assert 'Inline tools retained draft' in text(frame(session, 40, 24))
         session.send(b'\x15')
