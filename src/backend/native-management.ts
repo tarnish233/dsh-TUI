@@ -1,14 +1,12 @@
 /**
- * Native management seam: explicit current-root session rename, the explicit
- * native `SessionStore.fork` artifact, and the two safe native default-setting
- * fields (`selectedDefault` / `defaultPreset`).
+ * Native management seam: explicit current-root session rename and the two safe
+ * native default-setting fields (`selectedDefault` / `defaultPreset`).
  *
  * DSH remains the owner of titles, sessions, presets, permissions and config.
  * This module is a thin, validating adapter over public services only:
  *
  * - `ctx.sessionTitle.get/rename` for the explicit user title append;
- * - `ctx.sessions.get/fork` for the current root Session and the explicit
- *   session-only fork artifact;
+ * - `ctx.sessions.get` to prove the current root Session live;
  * - `ctx.loader.entries()` to resolve the real profile namespace ids (never a
  *   hardcoded web id) and `ctx.settings.describe/mutate` for the allowlisted
  *   volatile fields, always with the native revision fence;
@@ -18,8 +16,12 @@
  * It never creates, resumes, prompts or switches an Agent; never writes a file;
  * never reads a credential, an unrelated namespace or an unrelated field; and
  * keeps no store, timer, cache or scheduler. Read-only paths materialize
- * nothing. `sessionForkFacts` and `buildInteractiveForkInput` are pure helpers
- * for the parent's own native-controller-parity fork flow.
+ * nothing. `buildInteractiveForkInput` is the pure helper for the parent's own
+ * native `/fork` flow (public `snapshotEvents` + native `buildForkSeed` + native
+ * `agents.create`); this module deliberately exposes no session-only
+ * `SessionStore.fork` adapter, because such a child owns no Agent and no public
+ * API can attach one (native `SessionStore.prepare` rejects the existing id, so
+ * pre-forking would also block the parent's own `agents.create`).
  *
  * @module dsh-tui/backend/native-management
  */
@@ -169,70 +171,9 @@ export type SessionRenameOutcome =
       message?: string
     }
 
-/** Explicit native `SessionStore.fork` request (session-only artifact). */
-export interface SessionForkRequest {
-  readonly sessionId: string
-  readonly attachmentId?: string
-  /** Inclusive native boundary; omitted means the source's current last event. */
-  readonly atSeq?: number
-  /** Optional caller-minted child id; omitted delegates to the native id policy. */
-  readonly childSessionId?: string
-  /** Optional explicit child title written through the native title service. */
-  readonly title?: string
-}
-
-/** Native lineage/inheritance facts of one forked Session. */
-export interface SessionForkFacts {
-  readonly sourceSessionId: string
-  readonly sessionId: string
-  /** Exact inclusive source cut; absent for an empty source fork. */
-  readonly boundary?: number
-  /** Exact native fork-inherited prefix length. */
-  readonly inheritedEventCount: number
-  readonly isSeeded: boolean
-  /** Native header fact: `subagent` for a child, absent for an ordinary fork. */
-  readonly origin?: string
-  /** Native header fact; ordinary forks omit it (presence alone does not imply a subagent). */
-  readonly parentSessionId?: string
-  readonly delegationDepth?: number
-  readonly cwd?: string
-  readonly agentPreset?: string
-  /** Next event position of the child when readable. */
-  readonly nextSeq?: number
-}
-
-export type SessionForkOutcome =
-  | {
-      ok: true
-      facts: SessionForkFacts
-      /**
-       * Folded child title: `null` is the native no-title fact; the field is
-       * omitted when the native title read failed (unknown, never claimed).
-       */
-      title?: string | null
-      /** Redacted failure of an explicitly requested child-title rename; the fork stands. */
-      titleError?: string
-      stillCurrent: boolean
-      /**
-       * Machine-readable honesty marker: the native public API cannot attach an
-       * Agent to an existing live Session, so this artifact must not back an
-       * interactive switch. The parent's approved interactive fork uses
-       * `buildInteractiveForkInput` + native `agents.create`.
-       */
-      agentAcquisition: 'native-create-required'
-      /** The exact native child Session (opaque). */
-      session: unknown
-    }
-  | {
-      ok: false
-      reason: ManagementRejectReason | 'fork-failed'
-      message?: string
-    }
-
 /** Service-level capability report; the per-call gate still applies. */
 export interface NativeManagementCapabilities {
   readonly rename: boolean
-  readonly fork: boolean
   readonly defaultSettingsRead: boolean
   readonly defaultSettingsWrite: boolean
   readonly targets: readonly DefaultSettingTarget[]
@@ -319,7 +260,6 @@ interface LoaderLike {
 
 interface SessionsLike {
   get?(id: string): unknown
-  fork?(source: unknown, boundary?: number, childSessionId?: string): unknown
 }
 
 interface AgentPresetsLike {
@@ -336,11 +276,8 @@ interface SessionIdentity {
   readonly id: string
   readonly header: {
     readonly origin?: string
-    readonly parentSession?: string
     readonly delegationDepth?: number
-    readonly isSeeded?: boolean
     readonly cwd?: string
-    readonly agentPreset?: string
   }
 }
 
@@ -385,21 +322,15 @@ function readSessionIdentity(value: unknown): SessionIdentity | undefined {
     }
   }
   const origin = read('origin')
-  const parentSession = read('parentSession')
   const delegationDepth = read('delegationDepth')
-  const isSeeded = read('isSeeded')
   const cwd = read('cwd')
-  const agentPreset = read('agentPreset')
   return {
     source: value,
     id,
     header: {
       ...(typeof origin === 'string' ? { origin } : {}),
-      ...(typeof parentSession === 'string' ? { parentSession } : {}),
       ...(typeof delegationDepth === 'number' ? { delegationDepth } : {}),
-      ...(typeof isSeeded === 'boolean' ? { isSeeded } : {}),
       ...(typeof cwd === 'string' ? { cwd } : {}),
-      ...(typeof agentPreset === 'string' ? { agentPreset } : {}),
     },
   }
 }
@@ -507,48 +438,6 @@ type RootGate =
   | { readonly ok: false; readonly reason: ManagementRejectReason; readonly message: string }
 
 /**
- * Pure native lineage/inheritance facts of one forked Session.
- *
- * Reads only the documented public Session fields (`header`, `inheritedEventCount`,
- * `seq`); it never folds events and never invents `parentSession`/`origin`.
- *
- * @param session - native Session object (child of a fork, or any Session).
- * @param sourceSessionId - exact native source id the caller forked from.
- * @returns the facts, or undefined when the object is not a readable Session.
- */
-export function sessionForkFacts(session: unknown, sourceSessionId: string): SessionForkFacts | undefined {
-  const identity = readSessionIdentity(session)
-  if (identity === undefined) return undefined
-  const item = record(session)
-  if (item === undefined) return undefined
-  let inheritedValue: unknown
-  let seqValue: unknown
-  try {
-    inheritedValue = item.inheritedEventCount
-    seqValue = item.seq
-  } catch {
-    return undefined
-  }
-  const inheritedEventCount = integer(inheritedValue)
-  if (inheritedEventCount === undefined) return undefined
-  const nextSeq = integer(seqValue)
-  const header = identity.header
-  return {
-    sourceSessionId,
-    sessionId: identity.id,
-    ...(inheritedEventCount > 0 ? { boundary: inheritedEventCount - 1 } : {}),
-    inheritedEventCount,
-    isSeeded: header.isSeeded === true,
-    ...(header.origin === undefined ? {} : { origin: header.origin }),
-    ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
-    ...(header.delegationDepth === undefined ? {} : { delegationDepth: header.delegationDepth }),
-    ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
-    ...(header.agentPreset === undefined ? {} : { agentPreset: header.agentPreset }),
-    ...(nextSeq === undefined ? {} : { nextSeq }),
-  }
-}
-
-/**
  * Prepare the exact native inputs for the parent's approved interactive fork.
  *
  * This is pure: it enumerates the source's **complete** public event log with
@@ -647,7 +536,7 @@ export function buildInteractiveForkInput(request: InteractiveForkInputRequest):
 }
 
 /**
- * Validated direct adapter for rename/fork/default settings.
+ * Validated direct adapter for rename/default settings.
  *
  * Every method re-validates the exact supplied attachment identity and reads
  * live native services on each call; nothing is cached and nothing is polled.
@@ -676,7 +565,6 @@ export class NativeManagement {
   /** Service-level capability report; absent services are never advertised. */
   capabilities(): NativeManagementCapabilities {
     const title = this.service<SessionTitleLike>('sessionTitle')
-    const sessions = this.service<SessionsLike>('sessions')
     const settings = this.service<SettingsLike>('settings')
     const loader = this.service<LoaderLike>('loader')
     const defaultSettingsRead = typeof settings?.describe === 'function' && typeof loader?.entries === 'function'
@@ -685,7 +573,6 @@ export class NativeManagement {
       : []
     return {
       rename: typeof title?.rename === 'function',
-      fork: typeof sessions?.fork === 'function',
       defaultSettingsRead,
       defaultSettingsWrite: defaultSettingsRead && typeof settings?.mutate === 'function',
       targets,
@@ -940,75 +827,6 @@ export class NativeManagement {
       source: 'user',
       ...(previousTitle === undefined ? {} : { previousTitle }),
       stillCurrent: this.stillCurrent(gate.captured),
-    }
-  }
-
-  /**
-   * Explicit native `SessionStore.fork` of the current root: a session-only
-   * artifact. It is deliberately not an interactive switch; see
-   * `buildInteractiveForkInput` for the parent's approved Agent-creating flow.
-   */
-  forkCurrent(request: SessionForkRequest): SessionForkOutcome {
-    if (request === null || typeof request !== 'object') {
-      throw backendError('INVALID_ARGUMENT', 'fork requires one explicit request object')
-    }
-    const atSeq = request?.atSeq === undefined ? undefined : integer(request.atSeq)
-    if (request?.atSeq !== undefined && atSeq === undefined) {
-      throw backendError('INVALID_ARGUMENT', 'atSeq must be a non-negative safe integer')
-    }
-    if (request.childSessionId !== undefined && nonEmpty(request.childSessionId) === undefined) {
-      throw backendError('INVALID_ARGUMENT', 'childSessionId must be a non-empty string when supplied')
-    }
-    if (request.title !== undefined && typeof request.title !== 'string') {
-      throw backendError('INVALID_ARGUMENT', 'title must be a string when supplied')
-    }
-    const gate = this.rootGate(request.sessionId, request.attachmentId)
-    if (!gate.ok) return { ok: false, reason: gate.reason, message: gate.message }
-    const sessions = this.service<SessionsLike>('sessions')
-    if (typeof sessions?.fork !== 'function') {
-      return { ok: false, reason: 'missing-service', message: 'DSH mounts no session store in this profile' }
-    }
-    const source = gate.identity.source
-    let child: unknown
-    try {
-      child = sessions.fork(source, atSeq, request.childSessionId)
-    } catch (error) {
-      this.warn(`native session fork failed: ${diagnostic(error)}`)
-      return { ok: false, reason: 'fork-failed', message: diagnostic(error) }
-    }
-    const facts = sessionForkFacts(child, gate.identity.id)
-    if (facts === undefined) {
-      this.warn('native session fork returned no readable Session')
-      return { ok: false, reason: 'fork-failed', message: 'the native fork returned no readable Session; no interactive switch may use it' }
-    }
-    const titles = this.service<SessionTitleLike>('sessionTitle')
-    let title: string | null | undefined
-    let titleError: string | undefined
-    if (request.title !== undefined) {
-      if (typeof titles?.rename !== 'function') {
-        titleError = 'DSH mounts no session-title service in this profile'
-      } else {
-        try {
-          const accepted = readTitleSnapshot(titles.rename(child, request.title))
-          if (accepted === undefined) titleError = 'the native rename returned no accepted title'
-          else title = accepted.title
-        } catch (error) {
-          const invalid = record(error)?.name === 'SessionTitleInvalidError'
-          titleError = invalid ? 'the title must contain visible characters' : diagnostic(error)
-          if (!invalid) this.warn(`native forked-title rename failed: ${titleError}`)
-        }
-      }
-    } else {
-      title = this.readTitle(titles, child)
-    }
-    return {
-      ok: true,
-      facts,
-      ...(title === undefined ? {} : { title }),
-      ...(titleError === undefined ? {} : { titleError }),
-      stillCurrent: this.stillCurrent(gate.captured),
-      agentAcquisition: 'native-create-required',
-      session: child,
     }
   }
 

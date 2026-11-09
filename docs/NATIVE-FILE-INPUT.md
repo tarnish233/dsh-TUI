@@ -123,6 +123,49 @@ Prompt rules enforced before native admission:
 `stageFile` validates the returned reference against the submitted byte length,
 so a provider that stores different bytes cannot reach a message.
 
+## Admission cancellation and the single wall-clock bound
+
+The installed public entry is, verbatim, `@deepseek-ai/dsh-attachment`
+`0.2.2-rc.1` `lib/types/index.d.ts`:
+
+```ts
+admitPromptContent(content: readonly AttachmentAdmissionPart[]): Promise<AdmittedPromptContentPart[]>
+```
+
+It has **no** `AbortSignal` and no cancellation option. Signals exist only on
+`readImage(ref, signal?)`, `readFileStream(ref, signal?)`,
+`readImageRequest(ref, target, signal?)` and `saveFileStream({ data, signal?,
+name? })`. `admitEncodedFile(input)` and `saveFile(input)` have none either.
+
+Therefore `NativeFileInput.admitPrompt(content, signal?)` is an **adapter-level**
+cancellation contract; no signal is forwarded to native, and no second native
+transport is invented. Layering is deliberate:
+
+1. **Pre-cancellation is ours.** After pure shape validation, `signal.aborted`
+   is checked before the capability probe and before any store call, so a
+   cancelled admission starts no native work and reports `ABORTED` rather than
+   `CAPABILITY_UNAVAILABLE`/`NOT_CONNECTED`. Text-only content is refused the
+   same way, although it reads no store; validation errors remain
+   `INVALID_ARGUMENT` because validation is pure and happens first.
+2. **Mid-flight cancellation cannot interrupt the native await.** Native
+   exposes no signal. When the unabortable call settles, the adapter re-checks
+   the signal (cancellation wins over a changed attachment identity) and
+   rejects `ABORTED`. Admitted parts are never returned, so a late native
+   result is never mistaken for a sendable prompt. A late malformed result is
+   `ABORTED` while cancelled and `RUNTIME_REQUEST_FAILED` otherwise; it is
+   never returned.
+3. **The caller owns the sole wall-clock bound.** `Backend`'s `nativeUiRead`
+   helper supplies `NATIVE_UI_READ_TIMEOUT_MS` and the owned `AbortSignal`,
+   then re-checks the live Agent before `createUserMessage`/`followup`/`steer`;
+   the send path must route admission through it. `native-files.ts` adds no
+   timer of its own: a second bound would double-report one stall and could
+   reject work the caller still owns. A direct caller that wants a bound must
+   supply it, exactly as the native API itself does not.
+
+Context's live guard remains the only send decision: even if an admission
+races an abort, the adapter throws before returning and context re-checks
+`this.live` before creating or sending any native message.
+
 ## Queue recall
 
 `recallableParts` is the read-only projection of one native inbox message. Only
@@ -240,3 +283,14 @@ receipt), `commandOutcome` success/error/undefined, and one offline test against
 the installed `LocalAttachmentStore` in a temporary `DSH_HOME` (durable
 identity, mixed admission, `createUserMessage` blocks, exact `readFileStream`
 bytes). No real profile, credential or provider is touched.
+
+Admission cancellation is pinned by focused tests: pre-cancellation starts no
+service or native work (text-only included, while pure validation still wins),
+mid-flight cancellation stays pending until the unabortable native call settles
+(proving no adapter-owned abort race or second timeout) and then rejects
+`ABORTED` instead of returning a late result, a late malformed result after
+cancellation is `ABORTED` rather than a content error, a native rejection that
+races the abort is reported as cancellation, and the installed
+`@deepseek-ai/dsh-attachment` declaration/prototype is inspected to prove
+`admitPromptContent(content)` has no signal and is called with exactly one
+argument.

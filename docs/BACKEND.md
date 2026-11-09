@@ -66,10 +66,14 @@ SessionManager, transport or domain store.
   confirmed native revision. `plainSchema` removes the volatile flag, so field
   membership in that native projected form is the proof; `mutate/isVolatilePath`
   remains final authority. No secret/config dump, generic editor or direct FS writes.
+  It exposes no session-only `SessionStore.fork` adapter: such a child owns no Agent,
+  `SessionStore.prepare` rejects its live id, and pre-forking would also block the
+  parent's own `agents.create`.
 - Interactive root fork: full public `snapshotEvents`, native `buildForkSeed`,
   native `agents.create` with seed/inherited count/meta/preset setup and existing
-  atomic attachment switch. Never call session-only `SessionStore.fork` first or
-  build from a truncated UI snapshot. Original log/current-root ownership retained.
+  atomic attachment switch (the only fork surface the backend offers). Never call
+  session-only `SessionStore.fork` first or build from a truncated UI snapshot.
+  Original log/current-root ownership retained.
 - `native-files.ts`: explicit frontend bytes go to native admission/staging;
   neutral prompts carry durable FileBlock refs. Native execute admits command
   images; missing receipt owner leaves command files unavailable. Already durable
@@ -197,9 +201,22 @@ event follows. A launch that never sends leaves no durable session.
 `connect({resume})` and `/resume` use `ctx.agents.resume` and return the durable
 snapshot from `sessionQuery.readSession`; a failed read reports
 `snapshotUnavailable` (with a warning) instead of an empty conversation.
+Every root durable read (`readSession`, `listSessions`, `readTitleSnapshots`) is
+adapter-bounded to 5 s. `listSessions`/`readTitleSnapshots` receive the owned
+cancellation signal DSH publishes; `readSession(id)` takes no signal, so the
+adapter abandons only its own wait and discards the late value. `close()` and
+attachment retirement abort the same carrier, and a snapshot that settles after
+`close()` or an attachment switch rejects (`CLOSED`/`ABORTED`/`STALE_SESSION`)
+instead of publishing a stale observation. An uncoded native listing rejection
+becomes one redacted `RUNTIME_REQUEST_FAILED`; a timed-out/failed snapshot stays
+`snapshotUnavailable`, and a timed-out title batch stays unknown with a host
+diagnostic.
 The `sessions` command preserves `sessionQuery.listSessions()`'s deterministic
 native order and header metadata, filters subagent children, then applies the
-requested bound. It does not call `sessionPersistence.list`, `stat` durable
+requested bound. A row without a native header object and non-empty string
+`id` is skipped (counted once in a host diagnostic) instead of being rendered as
+a fabricated `"undefined"` session; valid rows keep native order and title
+enrichment only names real ids. It does not call `sessionPersistence.list`, `stat` durable
 JSONL files, derive an activity timestamp, or re-sort by creation time. The
 picker's age column is therefore the native header `createdAt`, not a second
 TUI-owned last-activity policy; explicit resume semantics are unchanged.
@@ -248,6 +265,25 @@ disposal are contained. It also aborts and boundedly drains its own in-flight
 native commands: a retired attachment must not leave a command carrier that the
 native idle gate would attribute to the *next* session.
 
+`stageFile` and `native-default-update` are registered in that same
+active-command table for their whole native write, so `assertReloadIdle()`
+refuses `/reload` while a native file/default write is in flight and `close()`/
+retirement abort + boundedly drain them. Registration happens once per call and
+is released on every exit path. `stageFile` composes the caller signal with the
+carrier and keeps the existing 8 s `nativeUiRead` bound/identity guard; a
+pre-cancelled call starts no native work. `settings.mutate` takes no signal:
+its carrier is adapter-owned cancellation only, so an aborted write may still
+settle natively and its real outcome is reported rather than fabricated as a
+cancel.
+
+`ensureCurrent()` re-checks `closed` and the exact staged observation after the
+only async factory boundary and again before the `ready` announcement. An Agent
+whose native factory settles after `close()` is discarded and never committed or
+announced; a partially failed commit clears the adapter's publication fields
+before the owned handle is disposed. `close()` joins the serialized create/
+switch chain, so shutdown cannot race a live publication, and only this
+adapter's created/resumed handle is ever disposed.
+
 ## Streaming and durable facts
 
 - `stream_start/chunk/end` mirror native `attemptId`, `revision`, `turn`,
@@ -256,7 +292,16 @@ native idle gate would attribute to the *next* session.
   attempt.
 - `session_event` preserves the complete JSON event envelope including
   `surfaceOp` and `sourceEventSeqs`; a model-only replacement never overwrites
-  the original user output.
+  the original user output. Sequence values are strictly validated against the
+  native definition (`Number.isSafeInteger(v) && v >= 0`, no `-0`):
+  `surfaceOp:'append'` passes through; `{op:'replace',startSeq,endSeq}` is
+  forwarded only when both are real native seqs, otherwise the placement is
+  omitted (the event keeps its native log fact with `surfaceKind:'none'`).
+  Top-level `seq` falls back to the existing `0` default when it is not a native
+  seq, `sourceEventSeqs` keeps only validated entries, and a non-finite `time`
+  is omitted. `Number()` coercion/`NaN`, negative, fractional or unsafe values
+  can never reach a consumer; dropping the whole event is deliberately rejected
+  because it could hide lifecycle facts the transcript needs.
 - `toolPresentation` is ephemeral: `ctx.tools.get(name, agent)` plus only the
   definition's pure `presentCall`/`presentResult`; no tool is re-executed and
   nothing is written back to DSH's log.
@@ -347,9 +392,19 @@ DSH's own owners when live:
   registry hooks/polling. Direct runtime preset registration has no SDK event;
   the next explicit native list remains the correct read.
 - presets: read-only native roster plus `blank`/`current`; `blank` comes from
-  public `agents.turnBoundaryOf(session)` and is omitted if unknown. Pending
-  sessions stage; live selection delegates to native `select(exactAgent,id)`
-  and only its locked refusal becomes `locked`. No guessed lock precheck;
+  public `agents.turnBoundaryOf(session)` and is omitted if unknown. Each roster
+  row is an explicit DTO whitelist — `id`, optional `name`/`description`/
+  `order`/`broken`, plus adapter marks `current`/`isDefault` — never a spread of
+  the native row, so unknown registry fields cannot leak. Native roster order
+  and ids are preserved. Pending sessions stage; live selection delegates to
+  native `select(exactAgent,id)` and only its locked refusal becomes `locked`.
+  No guessed lock precheck;
+- native defaults: `native-defaults` reads both allowlisted fields;
+  `native-default-update` applies one exact-path, revision-fenced
+  `settings.mutate` and returns the native read-back outcome (`ok`, conflict/
+  stale/unavailable outcomes included). The write is an active command for the
+  reload gate as described above. The adapter never writes a profile file,
+  reads a credential, or invents a revision;
 - permissions: `permissionPresets.catalog()/current(session)` passthrough;
   switching executes the mounted native `/permission` command, and native
   `/plan` remains independent. A pending attachment has no native Session, so
@@ -562,13 +617,22 @@ root's own-suffix `subagent/catalog` event seq for transcript anchoring
 catalog parent (`parentSession`, and `origin` when present); a conflicting row
 is omitted and the snapshot is marked `truncated`. External rows are leaves and
 are never observed by the adapter. Bounds: 200 display entries, depth 8, one
-5 s projection read per session, bounded header/run/activity caches. The native
-enumeration itself has no row/depth limit; 15 s listing/deadline and root-epoch
-signals are forwarded to its supported cancellation face. Detailed read budget
-and remaining SDK boundaries: [adapter convergence](ADAPTER-CONVERGENCE.zh-CN.md).
+5 s projection read per session, at most 8 concurrent cold-row reads per tree
+refresh (native catalog order preserved, so a 200-child tree costs
+`ceil(200/8)` read deadlines instead of 200), bounded header/run/activity
+caches. A resident child is answered from the key-scoped
+`sessionProjections.snapshot` cut and never takes an observation lease. The
+native enumeration itself has no row/depth limit; 15 s listing/deadline and
+root-epoch signals are forwarded to its supported cancellation face. Detailed
+read budget and remaining SDK boundaries: [adapter convergence](ADAPTER-CONVERGENCE.zh-CN.md).
 
 `SessionInfo.subagents` carries the cached snapshot on connect/resume and after
-each root switch; the `ready` payload is the first authoritative copy.
+each root switch; the `ready` payload is the first authoritative copy. A
+`snapshotForRoot` caller that joins an in-flight refresh waits for it and then
+returns a freshly derived projection of **its** root: never the pre-join cache
+object, another root's rows, or `undefined` merely because the joined refresh
+could not publish before `ready`. A failed refresh still leaves the tree
+unavailable rather than empty, and a later read retries normally.
 `BackendEvent` publishes `{type:'subagents', sessionId, value}` (full snapshot)
 when membership, truncation or a structural row field changes, and
 `{type:'subagent', sessionId, value}` (upsert) for value-only changes. Both are
@@ -697,7 +761,12 @@ advertises a mutation it cannot perform. If the native service appears only
 after the initial pending/root announcement, `subagent/start`/`subagent/end`
 trigger one coalesced refresh: changed control capabilities are re-announced on
 the **same session and attachment**, without a durable snapshot, Editor reset or
-transcript replay; unchanged capabilities do not re-announce. No new Cordis
+transcript replay; unchanged capabilities do not re-announce. That per-event
+change detection reads only the subagent bridge availability and the two
+optional mutation methods; it does not run the full `capabilities()` audit
+(Loader enumeration and every other service) on every child frame. The full
+audit still runs for each announced `SessionInfo`, so native HMR/service
+replacement remains live; nothing is frozen across a composition change. No new Cordis
 `inject` entries are required — `subagents`, `sessionQuery`,
 `sessionProjections`, `tools` and `agents.get` are resolved optionally through
 `ctx.get`, so a composition without the subagent plugin still loads. Listeners,
@@ -725,6 +794,17 @@ not a Remote caller: it mounts no SessionController, calls no
 base64, media/count/pixel limits, model-vision projection, admission and durable
 promotion; refusals happen before materializing a pending session and keep the
 draft retryable.
+
+Public `attachments.admitPromptContent(content)` takes no signal, and this
+adapter never invents one for DSH. The admission therefore runs inside the
+existing `nativeUiRead` bound (the sole wall-clock deadline, 8 s) with an
+adapter-owned carrier registered in the active-command table. Esc/`cancel()`,
+`close()` and attachment retirement abort that carrier: the adapter stops
+waiting immediately, `NativeFileInput.admitPrompt` post-await discards the
+unabortable native result, and the live-attachment check rejects a late send.
+No message is created or sent after cancellation/close/switch; the UI keeps the
+draft retryable. This is adapter-wait cancellation, not a claim that DSH's
+native store call is abortable.
 
 ## `@file` discovery
 
@@ -919,6 +999,11 @@ session log or provider.
   output and `package.json` peer dependencies. The startup preset mount reads
   the official preset assets/plugin from the host installation; it adds no web
   frontend, copied preset or second preset implementation.
+- DSH's public `sessionQuery.readSession(id)`, `attachments.admitPromptContent
+  (content)` and `settings.mutate(ns, ops, expectedVersion)` take no
+  cancellation signal. The adapter bounds only its own wait, abandons late
+  results, and never presents that as native cancellation; the underlying native
+  read/write can still settle after the UI moved on.
 - `@file` discovery inherits the shared 8 s bounded native-UI read timeout. A
   first query that has to build a very large provider index can therefore be
   abandoned (and the UI shows no candidates), while the provider keeps its own

@@ -219,12 +219,38 @@ interface ListedTree {
   readonly rejected: number
 }
 
+/** One display row planned before any per-row native read. */
+interface PlannedRow {
+  readonly node: ChildNode
+  readonly id: string
+  readonly parentId: string
+  /** True when this readable local child needs its projection facts folded. */
+  readonly readable: boolean
+  /** Set when the resident surface already answered this row (no lease). */
+  readonly resident?: RowFacts
+}
+
+/** Per-row native facts: the immutable header and this row's projection values. */
+interface RowFacts {
+  readonly header?: SubagentHeader
+  readonly values?: Record<string, unknown>
+}
+
 /** Bound on one tree snapshot; beyond it the native data is incomplete. */
 const MAX_TREE_ENTRIES = 200
 const MAX_TREE_DEPTH = 8
 /** Bound on one native listing call; the native walk releases its own leases. */
 const MAX_LISTING_MS = 15_000
 const MAX_SESSION_READ_MS = 5_000
+/**
+ * Parallel per-row native observation leases inside one tree read.
+ *
+ * A serial walk paid one read deadline per child (200 children = 200 × 5s).
+ * Bounded batches keep a cold tree's worst case at
+ * `ceil(children / MAX_CONCURRENT_ROW_READS)` deadlines while never opening an
+ * unbounded number of native leases, Agents or timers at once.
+ */
+const MAX_CONCURRENT_ROW_READS = 8
 const MAX_PENDING_RUNS = 64
 const MAX_RUN_ENDS = 256
 const MAX_FINISHED_RUNS = 128
@@ -636,8 +662,8 @@ export class SubagentBridge {
    * being merely abandoned; the wait bound stays as the second line of defence
    * for reads without a signal parameter.
    */
-  private readSignal(ms: number): AbortSignal {
-    return AbortSignal.any([this.signal(), AbortSignal.timeout(ms)])
+  private readSignal(ms: number, epoch: AbortSignal = this.signal()): AbortSignal {
+    return AbortSignal.any([epoch, AbortSignal.timeout(ms)])
   }
 
   private warnOnce(key: string, message: string): void {
@@ -750,15 +776,25 @@ export class SubagentBridge {
    */
   async snapshotForRoot(rootSessionId: string): Promise<SubagentSnapshot | undefined> {
     if (this.closed || !this.available()) return undefined
-    const root = this.root
-    if (root === undefined || root !== rootSessionId) return undefined
-    if (this.cache !== undefined && this.cacheRoot === root) return this.snapshotEntries()
-    if (this.refreshing !== undefined) {
-      await this.refreshing
-      return this.cacheRoot === root ? this.cache : undefined
+    if (this.root === undefined || this.root !== rootSessionId) return undefined
+    if (this.cache !== undefined && this.cacheRoot === rootSessionId) return this.snapshotEntries()
+    // Join any in-flight refresh. Its eventual cache may belong to another root
+    // or epoch, and a refresh that cannot publish (the ready announcement has
+    // not arrived yet) leaves `cache` unset even though the read succeeded.
+    // Serving that cache object here was a stale/empty answer; waiting only
+    // synchronizes, it never answers for this root.
+    while (this.refreshing !== undefined) await this.refreshing
+    if (this.closed) return undefined
+    if (this.root !== rootSessionId) return undefined
+    if (this.cacheRoot !== rootSessionId) {
+      if (!this.available()) return undefined
+      await this.refresh()
+      if (this.closed || this.root !== rootSessionId) return undefined
     }
-    await this.refresh()
-    return this.cacheRoot === root ? this.snapshotEntries() : undefined
+    // Every success branch returns the same fresh projection of the current
+    // root: `snapshotEntries` re-derives rows from current bridge state and
+    // never hands back the object captured before the joined refresh settled.
+    return this.cacheRoot === rootSessionId ? this.snapshotEntries() : undefined
   }
 
   /** One-off tree read for a child Session transcript (never mutates the root cache). */
@@ -1444,6 +1480,10 @@ export class SubagentBridge {
   private async readTree(rootSessionId: string, seqs: Map<string, number>): Promise<TreeRead | undefined> {
     const query = this.query()
     if (query === undefined || typeof query.observeSession !== 'function') return undefined
+    // The epoch this read belongs to. `this.signal()` is replaced on a root
+    // switch, so every cancellation guard below must keep the captured epoch;
+    // otherwise a detached read would keep draining rows under the new epoch.
+    const epoch = this.signal()
     const listing = await this.listed(rootSessionId)
     let truncated = listing.rejected > 0
     const diagnostics: SubagentBranchDiagnostic[] = []
@@ -1481,11 +1521,16 @@ export class SubagentBridge {
         order.push(row.id)
       }
     }
-    const nodes: ChildNode[] = []
+    // Plan every display row in native order before any per-row native read.
+    // Structure and membership are native facts; the projection facts are read
+    // afterwards in bounded parallel batches so a cold 200-child tree costs
+    // `ceil(children / MAX_CONCURRENT_ROW_READS)` read deadlines instead of one
+    // per child. The resident cut stays synchronous and still owns no lease.
+    const plan: PlannedRow[] = []
     for (const id of order) {
       if (this.closed) return undefined
-      if (this.signal().aborted) throw backendError('ABORTED', 'the native subagent listing was cancelled')
-      if (nodes.length >= MAX_TREE_ENTRIES) {
+      if (epoch.aborted) throw backendError('ABORTED', 'the native subagent listing was cancelled')
+      if (plan.length >= MAX_TREE_ENTRIES) {
         truncated = true
         break
       }
@@ -1507,51 +1552,104 @@ export class SubagentBridge {
         ...(seqs.get(row.id) === undefined ? {} : { catalogSeq: seqs.get(row.id)! }),
         ...(child === undefined ? { diagnostic: row.reason ?? 'unavailable' } : {}),
       }
-      nodes.push(node)
-      if (child === undefined || child.mode === 'external') continue
+      const readable = child !== undefined && child.mode !== 'external'
       // A resident child is read from the public resident surface (no lease,
       // only this row's projection keys); everything else takes the native
       // `observeSession` lease with the epoch/deadline cancellation signal.
-      const observation = this.residentRow(row.id) ?? await this.observe(query, row.id)
-      if (observation === undefined) {
-        // Membership is native and already known; only its projections are missing.
-        truncated = true
-        this.warnOnce(`child:${row.id}`, `the native projections of subagent ${JSON.stringify(row.id)} could not be read`)
-        continue
-      }
-      const header = observation.header
-      if (header !== undefined) {
-        if (header.parentSession !== undefined && header.parentSession !== row.parentId) {
+      const resident = readable ? this.residentRow(row.id) : undefined
+      plan.push({ node, id: row.id, parentId: row.parentId, readable, ...(resident === undefined ? {} : { resident }) })
+    }
+    const facts = await this.readPlannedRows(query, plan, epoch)
+    if (this.closed) return undefined
+    if (epoch.aborted) throw backendError('ABORTED', 'the native subagent row reads were cancelled')
+    // Fold the read facts back in native order, so completion timing can never
+    // reorder rows, reorder diagnostics or change what is reported truncated.
+    const nodes: ChildNode[] = []
+    for (let index = 0; index < plan.length; index += 1) {
+      const planned = plan[index]!
+      const node = planned.node
+      if (planned.readable) {
+        const observation = planned.resident ?? facts[index]
+        if (observation === undefined) {
+          // Membership is native and already known; only its projections are missing.
           truncated = true
-          this.warnOnce(`lineage:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(row.parentId)} but its durable parent is ${JSON.stringify(header.parentSession)}; the inconsistent row was omitted`)
-          nodes.pop()
+          this.warnOnce(`child:${planned.id}`, `the native projections of subagent ${JSON.stringify(planned.id)} could not be read`)
+          nodes.push(node)
           continue
         }
-        if (header.origin !== undefined && header.origin !== 'subagent') {
+        const header = observation.header
+        if (header !== undefined && header.parentSession !== undefined && header.parentSession !== planned.parentId) {
           truncated = true
-          this.warnOnce(`origin:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(row.parentId)} but its session header is not a subagent origin; the inconsistent row was omitted`)
-          nodes.pop()
+          this.warnOnce(`lineage:${planned.id}`, `subagent ${JSON.stringify(planned.id)} is cataloged under ${JSON.stringify(planned.parentId)} but its durable parent is ${JSON.stringify(header.parentSession)}; the inconsistent row was omitted`)
           continue
         }
-        node.header = header
-        if (node.createdAt === undefined && header.createdAt !== undefined) node.createdAt = header.createdAt
-        this.rememberHeader(header)
+        if (header !== undefined && header.origin !== undefined && header.origin !== 'subagent') {
+          truncated = true
+          this.warnOnce(`origin:${planned.id}`, `subagent ${JSON.stringify(planned.id)} is cataloged under ${JSON.stringify(planned.parentId)} but its session header is not a subagent origin; the inconsistent row was omitted`)
+          continue
+        }
+        if (header !== undefined) {
+          node.header = header
+          if (node.createdAt === undefined && header.createdAt !== undefined) node.createdAt = header.createdAt
+          this.rememberHeader(header)
+        }
+        this.applyValues(node, observation.values)
       }
-      this.applyValues(node, observation.values)
+      nodes.push(node)
     }
     return { nodes, diagnostics, truncated }
+  }
+
+  /**
+   * Read the per-row projection facts of one planned tree in bounded batches.
+   *
+   * Resident rows use the already-taken key-scoped cut and never take a lease.
+   * Only cold/failing rows enter the queue, in native order; at most
+   * `MAX_CONCURRENT_ROW_READS` leases are open at once. Each read keeps its own
+   * epoch/deadline signal and observation disposal inside {@link observe}. An
+   * aborted epoch starts no further row and lets the in-flight reads settle
+   * through their own cancellation instead of opening the rest of the tree.
+   */
+  private async readPlannedRows(query: SessionQueryLike, plan: readonly PlannedRow[], epoch: AbortSignal): Promise<Array<RowFacts | undefined>> {
+    const facts = new Array<RowFacts | undefined>(plan.length)
+    const pending: number[] = []
+    for (let index = 0; index < plan.length; index += 1) {
+      const planned = plan[index]!
+      if (!planned.readable) continue
+      if (planned.resident !== undefined) {
+        facts[index] = planned.resident
+        continue
+      }
+      pending.push(index)
+    }
+    if (pending.length === 0) return facts
+    let next = 0
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (this.closed || epoch.aborted) return
+        const position = next
+        next += 1
+        if (position >= pending.length) return
+        const index = pending[position]!
+        facts[index] = await this.observe(query, plan[index]!.id, epoch)
+      }
+    }
+    const workers = Math.min(MAX_CONCURRENT_ROW_READS, pending.length)
+    await Promise.all(Array.from({ length: workers }, () => worker()))
+    return facts
   }
 
   private async observe(
     query: SessionQueryLike,
     sessionId: string,
+    epoch: AbortSignal = this.signal(),
   ): Promise<{ header?: SubagentHeader; values?: Record<string, unknown> } | undefined> {
     if (typeof query.observeSession !== 'function') return undefined
     let observation: ObservationLike | undefined
     try {
       observation = await timeoutAfter(
         query.observeSession(sessionId, {
-          signal: this.readSignal(MAX_SESSION_READ_MS),
+          signal: this.readSignal(MAX_SESSION_READ_MS, epoch),
         }),
         MAX_SESSION_READ_MS,
         'subagent session observation',

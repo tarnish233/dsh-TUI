@@ -1,12 +1,16 @@
-# Native management: explicit rename, root fork, safe defaults
+# Native management: explicit rename, safe defaults, interactive fork preparation
 
-`src/backend/native-management.ts` is the narrow backend adapter for three explicit user
-actions on the **current root attachment**:
+`src/backend/native-management.ts` is the narrow backend adapter for two explicit user
+actions on the **current root attachment**, plus one pure preparation helper:
 
 1. rename the current session through DSH's own title owner;
-2. create the explicit native `SessionStore.fork` artifact and report its native lineage;
-3. read and write exactly two allowlisted native defaults (`selectedDefault`,
-   `defaultPreset`) with the native revision fence.
+2. read and write exactly two allowlisted native defaults (`selectedDefault`,
+   `defaultPreset`) with the native revision fence;
+3. `buildInteractiveForkInput` (pure) prepares the parent's native `/fork` creation.
+
+The seam exposes **no** session-only `SessionStore.fork` adapter: such a child owns no
+Agent and cannot be attached (§ below), and production `/fork` is the parent's native
+`agents.create` flow.
 
 Verified installation: `@deepseek-ai/dsh@0.2.2-rc.1` (public types/source read-only).
 The adapter consumes the supplied native Cordis services through the shared
@@ -19,7 +23,7 @@ DSH owns titles, sessions, forking, presets, permissions, settings documents and
 persistence. This module:
 
 - calls only public service methods: `ctx.sessionTitle.get/rename`,
-  `ctx.sessions.get/fork`, `ctx.settings.describe/mutate`, `ctx.loader.entries()`,
+  `ctx.sessions.get`, `ctx.settings.describe/mutate`, `ctx.loader.entries()`,
   `ctx.agentPresets.list/defaultId`, `ctx.permissionPresets.catalog()`;
 - never creates, resumes, prompts, cancels or switches an Agent, and never touches
   `agentOptions`, `agentPresets.mount`, `agents.create/resume` or the attachment;
@@ -48,16 +52,16 @@ Every root-scoped action validates, in this order, against the exact supplied sc
 6. the native header is not a subagent child (`origin === 'subagent'` or
    `delegationDepth > 0`) — otherwise `child-session`;
 7. when `ctx.sessions.get` is mounted, the exact object must be the live store instance —
-   otherwise `session-not-live` (the native title/fork owner enforces the same rule).
+   otherwise `session-not-live` (native callers resolve the same live-instance rule).
 
 The same scope is re-checked **after** every async step and after the synchronous native
-append/fork. When the attachment moved while a write was in flight, the durable native
+append. When the attachment moved while a write was in flight, the durable native
 result is still reported (`ok: true`) with `stillCurrent: false`; the parent must not paint
 it into the new attachment.
 
-A pending attachment has no native Session yet. Rename and fork are explicit user actions,
-so the parent may materialize the exact pending Agent first through its existing lazy path
-and then call the adapter with the same explicit ids. The adapter itself never does that.
+A pending attachment has no native Session yet. Rename is an explicit user action, so the
+parent may materialize the exact pending Agent first through its existing lazy path and then
+call the adapter with the same explicit ids. The adapter itself never does that.
 
 ## Rename
 
@@ -79,26 +83,25 @@ The outcome carries the **accepted normalized** title and the durable event seq,
 never displays the raw input as if it were accepted. The title also arrives through the
 normal `session/event`/projection feed; the parent must not double-write it.
 
-## Native fork artifact (`SessionStore.fork`)
+## No session-only fork adapter (verified native limit)
 
-`forkCurrent` calls `ctx.sessions.fork(exactLiveSource, atSeq?, childSessionId?)` and
-reports only native facts:
+`SessionStore.fork` is public, but a child it creates is **not usable as an interactive
+fork**, so this seam does not expose it:
 
-- `boundary` (omitted for an empty-source fork) derived as `inheritedEventCount - 1`;
-- `inheritedEventCount`, `isSeeded` from the native Session state/header;
-- `origin`, `parentSessionId`, `delegationDepth`, `cwd`, `agentPreset` **only when the
-  native header carries them** — ordinary forks omit `origin`/`parentSession`, so the
-  adapter never invents lineage;
-- optional child title written through the same native title service; a title refusal is
-  reported as `titleError` while the fork itself stands. `title` is omitted when the
-  native title read failed (unknown), never claimed as no-title.
+- `fork` only calls `store.create` (`dsh-session/lib/index.js:2025-2047`); the child Session
+  is owned by the SessionStore's fiber and, per the store's own contract, "a session
+  published outside that lifecycle persists nothing";
+- no public API attaches an Agent to that existing live Session: `SessionStore.prepare`
+  rejects an id already in the store (`session "<id>" already exists`,
+  `dsh-session/lib/index.js:1814`), the agent factory enters its Session through `prepare`,
+  and `agents.resume` needs a persisted log the child never has;
+- the native API controller's own `session/fork` therefore never calls `SessionStore.fork`;
+  it builds a seed and mints the session through `agents.create`
+  (`dsh-api-session-controller`).
 
-**A `SessionStore.fork` child has no Agent and no public API can attach one.** The native
-fork only creates a Session (owned by the SessionStore's fiber); the agent factory's
-`prepare` rejects an existing id, and `agents.resume` requires a persisted log this child
-never has. The outcome therefore carries `agentAcquisition: 'native-create-required'` and
-is not an interactive switch. The parent's approved interactive fork is the native
-controller parity flow below.
+Pre-forking would also be actively harmful: the live child id makes the parent's own
+`agents.create` for that id fail. `/fork` is therefore exactly the interactive preparation
+below, and there is no "fork artifact" capability to render.
 
 ### Interactive fork preparation (parent-owned creation)
 
@@ -122,8 +125,9 @@ resolves a preset, mints an attachment or calls `agents.create`. The parent then
 preset `setup`, and switches explicitly through its existing flow. `SessionStore.fork` must
 not run first (the id would already exist).
 
-`sessionForkFacts(session, sourceSessionId)` is exported pure and reads only documented
-Session fields, so the parent can report identical facts for a child it created itself.
+The returned `inheritedEventCount`/`boundary`/`meta` are the native creation facts the
+parent reports; no separate lineage reader is exposed, so nothing can re-describe a child
+that this process never created.
 
 ## Safe native defaults
 
@@ -202,17 +206,13 @@ raw config changed since the previous read; that is a native read, not a write.
 
 ## Tests
 
-`test/backend-native-management.test.ts` (19) and
+`test/backend-native-management.test.ts` (12) and
 `test/backend-native-management-settings.test.ts` (17) run offline with synthetic
 native-shaped doubles and no real profile, credential, session log, file or model call:
 
 - rename: exact accepted/normalized title, previous-title fact vs unknown, invalid-title
   refusal with zero appends, foreign/pending/child/non-live/stale/missing-service
   rejections with zero native calls, post-append attachment move reported truthfully;
-- fork: exact live source/boundary/child id, facts derived from native header/inherited
-  state (empty source ⇒ no boundary, no invented parent/origin), native fork error
-  surfaced redacted, child-title success and title refusal with the fork standing,
-  zero calls for rejected scopes;
 - interactive preparation: full-log enumeration, truncated tail/gap/boundary refusals,
   re-derived seed refusal, identity-preserving prefix, cwd override and builder failure;
 - settings: namespace from profile-owned loader ids (not web ids), redaction-only
@@ -230,8 +230,9 @@ native-shaped doubles and no real profile, credential, session log, file or mode
 ## Known limits
 
 - Rename needs a materialized live Session; the adapter never materializes one.
-- `SessionStore.fork` is session-only by native contract; interactive forking stays the
-  parent's atomic `agents.create` parity flow (§ above).
+- Interactive forking stays the parent's atomic `agents.create` parity flow (§ above); the
+  session-only `SessionStore.fork` artifact is deliberately not adapted because its child
+  can never own an Agent.
 - Only the two allowlisted volatile fields are writable. There is no generic settings
   editor, credential/provider/endpoint management or document reconcile.
 - `settings.describe` is the native read authority; an older/partial composition without

@@ -54,6 +54,7 @@
     "demo": "node bin/dsh-tui.mjs --demo",
     "build:pi-tui": "tsc -p vendor/pi-tui/tsconfig.build.json",
     "build": "pnpm build:pi-tui && tsc -p tsconfig.build.json",
+    "prepack": "pnpm build",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 test/*.test.ts",
     "check": "pnpm build && pnpm typecheck && pnpm test"

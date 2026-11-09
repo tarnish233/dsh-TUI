@@ -1,5 +1,16 @@
 # 版本记录
 
+## 未发布：源码打包与 Backend P2 修复（基于 v0.1.5）
+
+- **最终完整门禁**：`pnpm check` **2451/2451**（200 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，513316ms，EXIT 0），证据 `.cache/p2-full-check.log`。
+- **源码打包**：新增 `prepack: pnpm build`，`pnpm pack` 不再依赖工作区里预先存在的 `lib`／`vendor/pi-tui/dist`。`test/package-pack.test.ts` 从无两套构建产物的临时源码副本实际打包，检查应用／native 插件／vendored TUI 的 JS 与声明文件，再解包执行公开 CLI 的 `--version`。旧 manifest 下该测试因缺少 `package/lib/cli.js` 失败，修复后通过；证据 `.cache/package-pack-before.log`、`.cache/package-pack-after.log`。
+- **Wire／DTO**：`surfaceOp.replace`、事件 seq／`sourceEventSeqs` 只接受非负安全整数，不再强转出 `NaN`；会话列表跳过无原生 id 的行而不是制造 `"undefined"`；preset 列表改为显式字段白名单，不再透传整个原生 roster row。
+- **读取与快照**：根 `readSession`／`listSessions`／`readTitleSnapshots` 统一 5 秒 adapter bound 与 close／attachment guard；DSH 不接受 signal 的读取只放弃自身等待，不冒充原生取消。`snapshotForRoot` 的 join 分支返回当前 root 的新投影；冷子会话读取改为最多 8 个并发、保持原生顺序并释放 lease，200 行最坏为 25 个读取窗口而非 200 个。
+- **生命周期与写入**：`stageFile`／`native-default-update` 进入 active-command／reload idle 契约；`ensureCurrent` 在异步物化和 ready 前复检 closed／ownership，失败回滚并只释放自己的 Agent；每个 Subagent 事件不再执行完整 Loader capabilities 枚举，动态能力仍在正式 announcement 重读。
+- **附件 admission**：`sendContent` 通过唯一 8 秒 `nativeUiRead` bound 与 active-command carrier 调用原生 admission；Esc／close／切换会停止 adapter 等待并禁止迟到发送。已核实 DSH `admitPromptContent(content)` 不接受 signal，因此不虚构原生取消或增加第二个 timeout。
+- **Fork 收敛**：删除无生产调用方、会产生不可接 Agent 的 session-only artifact 的 `NativeManagement.forkCurrent()` 及专属 DTO／测试；生产 `/fork` 仍唯一走完整 durable seed＋native `agents.create` 的原子切换路径。
+- **专项验收**：新增 `test/backend-context-regressions.test.ts` 22 项、`test/backend-subagent-refresh-guards.test.ts` 9 项与打包 1 项；context 的 12 个定向变异全部被抓取并恢复正式实现。Parent 独立 Backend **389/389**、Subagent **73/73**、management **29/29**、打包＋附件 **18/18**，strict TypeScript 通过；证据 `.cache/backend-all-parent.log`、`.cache/p2-typecheck-parent.log`。
+
 ## 未发布：P0/P1 缺陷修复（基于 v0.1.5）
 
 两轮并行只读审计（9 个 Agent）之后，按 P0/P1 修复并逐条加回归测试；backend 与 ui 的每项都做过「临时撤掉修复必须变红」的变异验证。最终完整 `pnpm check` **2421/2421**（197 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，508142ms），证据 `.cache/p01-check.log`。

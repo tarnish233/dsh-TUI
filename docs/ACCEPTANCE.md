@@ -1,5 +1,15 @@
 # v0.1.4 原生 DSH 边界与交互语义验收
 
+## 当前工作树：源码打包与 Backend P2 修复
+
+- **最终完整 `pnpm check` 2451/2451**，200 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **513316ms**，EXIT 0。`.cache/p2-full-check.log`。
+- **打包缺陷已在修复前复现**：`files` 包含 gitignored 的 `lib` 与 `vendor/pi-tui/dist`，但旧 manifest 没有 pack 生命周期；从没有两套产物的临时源码副本执行 `pnpm pack`，tarball 缺少 `package/lib/cli.js`，`.cache/package-pack-before.log`。
+- **修复与行为验收**：`prepack` 仅运行正式 `pnpm build`，不增加发布／全局安装行为。同一个 `test/package-pack.test.ts` 现在能从纯源码副本构建、打包、检查应用与 vendored TUI 的 JS／声明入口，并在解包后执行公开 CLI `--version`；Parent 独立组合打包与附件 admission **18/18**，`.cache/package-native-files-parent.log`。测试链接既有依赖以保持离线，使用 owned HOME、空 npm userconfig，不读取用户凭据或 profile。
+- **Backend P2 全部落地**：严格 surface／seq 校验、真实 session id、preset DTO 白名单；根 durable read 5 秒 bound 与 close／switch guard；`stageFile`／`native-default-update` active-command 登记；Agent 物化关闭竞态回滚；每 child event 不再全量枚举 Loader；`sendContent` 由唯一 native-UI bound＋carrier 防止取消后的迟到发送。原生无 signal 的调用均明确只取消 adapter 等待。
+- **Subagent 读取**：joined snapshot 返回当前 root 的新投影；冷行读取有界并发 8、保持目录顺序、取消后不启动下一批、lease 恰好释放，resident 行仍零额外观测 lease。Parent 独立 Subagent **73/73**，`.cache/backend-subagents-parent.log`。
+- **Fork 死代码**：确认 session-only `forkCurrent` 无生产调用方且其 artifact 无法接 Agent，删除该冗余适配面；保留并验证唯一交互 fork（durable seed＋native create＋原子 attachment switch）。Parent management **29/29**，`.cache/backend-native-management-parent.log`。
+- **变异与门禁**：context 新增 22 项回归，12 个定向变异全部使对应测试失败，随后恢复并再获 22/22；Subagent 新增 9 项并对串行／无界读取及旧 snapshot 分支做变异验证。Parent 全部 Backend **389/389**、strict TypeScript 通过，`.cache/backend-all-parent.log`、`.cache/p2-typecheck-parent.log`。全部场景 hermetic／owned HOME，无真实 Provider、profile、凭据或 session 操作；未提交／tag／push／publish。
+
 ## 当前工作树：P0/P1 缺陷修复（未提交，基于 v0.1.5）
 
 两轮并行只读审计（9 个 Agent：DSH 能力复用、backend、input、UI、死代码、性能、Web 对齐、会话/上下文缺口、工作区/终端缺口）之后并行修复 P0/P1。每条修复都带回归测试，backend 与 ui 的每一条都做过「临时撤掉修复必须变红」的变异验证。

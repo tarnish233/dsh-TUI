@@ -25,6 +25,39 @@
  * image read is ever performed for a file. Failures are coded adapter
  * diagnostics; the frontend draft is never consumed here.
  *
+ * ## Admission cancellation and the single wall-clock bound
+ *
+ * The installed public entry is, verbatim, `@deepseek-ai/dsh-attachment`
+ * `0.2.2-rc.1` `lib/types/index.d.ts`:
+ *
+ * ```ts
+ * admitPromptContent(content: readonly AttachmentAdmissionPart[]): Promise<AdmittedPromptContentPart[]>
+ * ```
+ *
+ * It accepts **no** `AbortSignal` and no cancellation option (only
+ * `readImage`, `readFileStream`, `readImageRequest` and `saveFileStream` carry
+ * one). This adapter therefore never forwards a fabricated signal argument:
+ * `NativeFileInput.admitPrompt(content, signal)` is an adapter-level
+ * cancellation contract, not a native one.
+ *
+ * - Pre-cancelled (`signal.aborted` before the call) admission is refused with
+ *   `ABORTED` after pure shape validation and before the capability probe or
+ *   any store call, so no native write or admission starts. Text-only content
+ *   honours the same pre-cancellation even though it never touches the store.
+ * - Mid-flight cancellation cannot interrupt the native await, because native
+ *   exposes no signal. When the unabortable call settles, the adapter re-checks
+ *   the signal (cancellation wins over a changed attachment identity) and
+ *   rejects `ABORTED`; admitted parts are never returned, so a late native
+ *   result cannot be mistaken for a sendable prompt. A late malformed result
+ *   is still refused (`ABORTED` when cancelled, otherwise
+ *   `RUNTIME_REQUEST_FAILED`) and is never returned.
+ * - Wall-clock bounding belongs to the caller. `Backend` supplies the sole
+ *   timeout through its `nativeUiRead` helper (which also re-checks the live
+ *   Agent before creating/sending the message); the send path must route this
+ *   call through that helper. This module deliberately adds no second timer: a
+ *   second bound would double-report the same stall and could reject a call
+ *   that the caller still owns.
+ *
  * @module dsh-tui/backend/native-files
  */
 import { asFileAttachmentRef, asImageAttachmentRef, isImageMediaType } from '../attachments.ts'
@@ -538,9 +571,18 @@ export class NativeFileInput {
   /**
    * Native prompt admission for ordered text, encoded images and durable file
    * references. Text-only content performs no store call.
+   *
+   * `signal` is the adapter's own cancellation contract, not a native feature:
+   * public `AttachmentStore.admitPromptContent(content)` takes no signal. A
+   * pre-cancelled call is refused before any native admission; a mid-flight
+   * cancellation is observed when the unabortable native call settles, and its
+   * late result is discarded (`ABORTED`) rather than returned. The caller owns
+   * the one wall-clock bound and the live/send guard after this method (see the
+   * module header).
    */
   async admitPrompt(content: readonly PromptContentPart[], signal?: AbortSignal): Promise<DisplayContentPart[]> {
     const parts = normalizePromptContent(content)
+    this.assertNotCancelled(signal, 'native prompt attachment admission')
     if (parts.every(part => part.type === 'text')) {
       return parts.map(part => ({ type: 'text' as const, text: part.type === 'text' ? part.text : '' }))
     }
@@ -608,9 +650,14 @@ export class NativeFileInput {
     return scope
   }
 
+  /** Refuse before any native call; a pre-cancelled operation owns no store work. */
+  private assertNotCancelled(signal: AbortSignal | undefined, action: string): void {
+    if (signal?.aborted === true) throw backendError('ABORTED', `${action} was cancelled`)
+  }
+
   /** Cancellation wins over a changed identity; both prevent any later native write. */
   private assertActive(scope: NativeUiScope, signal?: AbortSignal): void {
-    if (signal?.aborted === true) throw backendError('ABORTED', 'the file input operation was cancelled')
+    this.assertNotCancelled(signal, 'the file input operation')
     if (!this.access.isCurrent(scope)) {
       throw backendError('STALE_SESSION', 'the DSH attachment changed during file input; the input was not sent')
     }

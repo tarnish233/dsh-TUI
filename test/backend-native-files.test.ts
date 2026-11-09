@@ -8,9 +8,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
   NativeFileInput,
@@ -50,12 +50,14 @@ interface StoreCalls {
   encoded: unknown[]
   saved: unknown[]
   admitted: unknown[]
+  /** Argument count per native admission call; the public method takes exactly one. */
+  admittedArity: number[]
   readImage: unknown[]
   readFileStream: unknown[]
 }
 
 function fakeStore(overrides: Record<string, unknown> = {}): { store: RecordValue; calls: StoreCalls } {
-  const calls: StoreCalls = { encoded: [], saved: [], admitted: [], readImage: [], readFileStream: [] }
+  const calls: StoreCalls = { encoded: [], saved: [], admitted: [], admittedArity: [], readImage: [], readFileStream: [] }
   const store: RecordValue = {
     admitEncodedFile: async (input: { data: string; name?: string }) => {
       calls.encoded.push(input)
@@ -66,8 +68,9 @@ function fakeStore(overrides: Record<string, unknown> = {}): { store: RecordValu
       calls.saved.push(input)
       return { attachmentId: `sha256:${digest(input.data)}`, name: leafName(input.name), bytes: input.data.length }
     },
-    admitPromptContent: async (content: readonly RecordValue[]) => {
+    admitPromptContent: async (content: readonly RecordValue[], ...rest: unknown[]) => {
       calls.admitted.push(content)
+      calls.admittedArity.push(1 + rest.length)
       return content.map((part) => {
         if (part.type === 'text') return { type: 'text', text: part.text }
         if (part.type === 'file') return { type: 'file', attachment: part.attachment }
@@ -134,6 +137,22 @@ function fileRef(name = 'notes.txt', bytes = 5): FileAttachmentRef {
 
 function codeOf(error: unknown): string | undefined {
   return error instanceof Error && 'code' in error ? String((error as { code: unknown }).code) : undefined
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>
+  resolve(value: T): void
+  reject(error: unknown): void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept
+    reject = decline
+  })
+  return { promise, resolve, reject }
 }
 
 test('canonical base64 is exactly the native file wire fact, including the empty file', () => {
@@ -366,6 +385,129 @@ test('admitPrompt fails closed on refusal, staleness, cancellation and re-admiss
 
   await assert.rejects(new NativeFileInput(fakeHost({}).access).admitPrompt([{ type: 'file', attachment: fileRef() }]), (error: unknown) =>
     codeOf(error) === 'CAPABILITY_UNAVAILABLE')
+})
+
+test('the installed public admission entry takes no signal and the adapter forwards exactly one argument', async () => {
+  const resolver = createRequire(await nativeDshManifest())
+  const manifestPath = resolver.resolve('@deepseek-ai/dsh-attachment/package.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { types?: string }
+  const declaration = await readFile(join(dirname(manifestPath), manifest.types ?? 'lib/types/index.d.ts'), 'utf8')
+
+  const admission = /admitPromptContent\(([^)]*)\)\s*:\s*Promise<([^;]+)>/.exec(declaration)
+  assert.ok(admission, 'the installed package declares admitPromptContent')
+  assert.match(admission[1]!, /content: readonly AttachmentAdmissionPart\[\]/)
+  assert.doesNotMatch(admission[1]!, /signal|abort/i, 'public prompt admission exposes no cancellation parameter')
+  assert.match(admission[2]!, /AdmittedPromptContentPart\[\]/)
+  // The package does expose signals where native supports them; the absence
+  // above is therefore a real API fact, not a regex miss.
+  const readImage = /readImage\(ref: ImageAttachmentRef([^)]*)\)/.exec(declaration)
+  assert.ok(readImage, 'the installed package declares readImage')
+  assert.match(readImage[1]!, /signal\?: AbortSignal/)
+
+  const loaded: unknown = await import(pathToFileURL(resolver.resolve('@deepseek-ai/dsh-attachment')).href)
+  assert.ok(loaded !== null && typeof loaded === 'object')
+  const AttachmentStore: unknown = (loaded as RecordValue).AttachmentStore
+  assert.ok(typeof AttachmentStore === 'function', 'the installed package exports the AttachmentStore class')
+  const nativeAdmission = (AttachmentStore as { prototype: RecordValue }).prototype.admitPromptContent as (...args: unknown[]) => unknown
+  assert.equal(typeof nativeAdmission, 'function')
+  assert.equal(nativeAdmission.length, 1, 'the runtime entry declares exactly one parameter')
+
+  const { store, calls } = fakeStore()
+  await new NativeFileInput(fakeHost({ attachments: store }).access).admitPrompt([{ type: 'file', attachment: fileRef() }])
+  assert.deepEqual(calls.admittedArity, [1], 'the adapter never fabricates a second signal argument')
+})
+
+test('pre-cancelled admission is refused before capability, service or native work', async () => {
+  const { store, calls } = fakeStore()
+  const host = fakeHost({ attachments: store })
+  const controller = new AbortController()
+  controller.abort()
+  const input = new NativeFileInput(host.access)
+
+  await assert.rejects(input.admitPrompt([{ type: 'file', attachment: fileRef() }], controller.signal), (error: unknown) =>
+    codeOf(error) === 'ABORTED' && /native prompt attachment admission was cancelled/.test(String((error as Error).message)))
+  assert.deepEqual(calls.admitted, [], 'a cancelled admission starts no native call')
+  assert.deepEqual(host.reads, [], 'a cancelled admission does not even resolve the attachment service')
+
+  const textHost = fakeHost({})
+  await assert.rejects(new NativeFileInput(textHost.access).admitPrompt([{ type: 'text', text: 'plain' }], controller.signal),
+    (error: unknown) => codeOf(error) === 'ABORTED')
+  assert.deepEqual(textHost.reads, [], 'text-only cancellation also needs no attachment service')
+
+  // Cancellation wins over a missing capability and a detached identity...
+  await assert.rejects(new NativeFileInput(fakeHost({}).access).admitPrompt([{ type: 'file', attachment: fileRef() }], controller.signal),
+    (error: unknown) => codeOf(error) === 'ABORTED')
+  const detached: NativeUiAccess = { ...fakeHost({ attachments: store }).access, current: () => undefined }
+  await assert.rejects(new NativeFileInput(detached).admitPrompt([{ type: 'file', attachment: fileRef() }], controller.signal),
+    (error: unknown) => codeOf(error) === 'ABORTED')
+
+  // ...but shape validation is pure and still runs first, matching stageFile.
+  await assert.rejects(input.admitPrompt([], controller.signal), (error: unknown) => codeOf(error) === 'INVALID_ARGUMENT')
+})
+
+test('mid-flight cancellation discards a late native admission and never returns admitted parts', async () => {
+  const ref = fileRef('late.txt', 4)
+  const pending = deferred<readonly unknown[]>()
+  const { store, calls } = fakeStore({
+    admitPromptContent: (content: readonly RecordValue[], ...rest: unknown[]) => {
+      calls.admitted.push(content)
+      calls.admittedArity.push(1 + rest.length)
+      return pending.promise
+    },
+  })
+  const controller = new AbortController()
+  const call = new NativeFileInput(fakeHost({ attachments: store }).access)
+    .admitPrompt([{ type: 'file', attachment: ref }], controller.signal)
+  assert.equal(calls.admitted.length, 1)
+
+  controller.abort()
+  // Native admission has no signal, so the adapter must not invent an abort
+  // race or a second timeout: it stays pending until native actually settles.
+  const early = await Promise.race([
+    call.then(() => 'settled', () => 'settled'),
+    new Promise<string>(resolve => { setTimeout(() => resolve('pending'), 25) }),
+  ])
+  assert.equal(early, 'pending')
+
+  pending.resolve([{ type: 'file', attachment: ref }])
+  await assert.rejects(call, (error: unknown) => codeOf(error) === 'ABORTED')
+  assert.deepEqual(calls.admittedArity, [1])
+
+  // A late malformed result after cancellation is still cancellation, not a
+  // content-validation failure, and is never returned.
+  const malformed = deferred<readonly unknown[]>()
+  const malformedStore = fakeStore({ admitPromptContent: () => malformed.promise }).store
+  const malformedController = new AbortController()
+  const malformedCall = new NativeFileInput(fakeHost({ attachments: malformedStore }).access)
+    .admitPrompt([{ type: 'file', attachment: ref }], malformedController.signal)
+  malformedController.abort()
+  malformed.resolve([{ type: 'text', text: 'tampered' }])
+  await assert.rejects(malformedCall, (error: unknown) => codeOf(error) === 'ABORTED')
+
+  // A native rejection that races the abort is reported as the cancellation.
+  const rejection = deferred<readonly unknown[]>()
+  const rejectionStore = fakeStore({ admitPromptContent: () => rejection.promise }).store
+  const rejectionController = new AbortController()
+  const rejectionCall = new NativeFileInput(fakeHost({ attachments: rejectionStore }).access)
+    .admitPrompt([{ type: 'file', attachment: ref }], rejectionController.signal)
+  rejectionController.abort()
+  rejection.reject(Object.assign(new Error('storage write failed'), { code: 'ATTACHMENT_WRITE_FAILED' }))
+  await assert.rejects(rejectionCall, (error: unknown) => codeOf(error) === 'ABORTED')
+})
+
+test('a malformed native admission result is refused and never returned', async () => {
+  const ref = fileRef()
+  const wrongLength = new NativeFileInput(fakeHost({
+    attachments: fakeStore({ admitPromptContent: async () => [{ type: 'text', text: 'tampered' }] }).store,
+  }).access)
+  await assert.rejects(wrongLength.admitPrompt([{ type: 'file', attachment: ref }, { type: 'file', attachment: ref }]), (error: unknown) =>
+    codeOf(error) === 'RUNTIME_REQUEST_FAILED' && /unexpected prompt content length/.test(String((error as Error).message)))
+
+  const substituted = new NativeFileInput(fakeHost({
+    attachments: fakeStore({ admitPromptContent: async () => [{ type: 'image', attachment: {} }] }).store,
+  }).access)
+  await assert.rejects(substituted.admitPrompt([{ type: 'file', attachment: ref }]), (error: unknown) =>
+    codeOf(error) === 'RUNTIME_REQUEST_FAILED' && /altered the admitted file reference/.test(String((error as Error).message)))
 })
 
 test('descriptor gate and command attachment assembly stay native-shaped and honest', () => {

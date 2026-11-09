@@ -353,6 +353,13 @@ interface ActiveSkillQuery {
   readonly preset: string | undefined
 }
 
+/** One adapter-owned, bounded durable session-query read. */
+interface ActiveDurableRead {
+  readonly controller: AbortController
+  /** Exact attachment epoch this read belongs to; undefined for corpus reads. */
+  readonly sessionId: string | undefined
+}
+
 const BASE_CAPABILITIES = ['stream', 'followup', 'steer', 'cancel', 'new', 'resume', 'state', 'dequeue']
 
 /**
@@ -451,6 +458,8 @@ const SNAPSHOT_BYTE_BUDGET = 4 * 1024 * 1024
 const MAX_CACHED_TOOL_CALLS = 2048
 /** Abandon uncooperative read-only SDK requests; never terminate native I/O. */
 const NATIVE_UI_READ_TIMEOUT_MS = 8_000
+/** Bound on one durable session-query read; same order as the subagent reads. */
+const SESSION_QUERY_READ_TIMEOUT_MS = 5_000
 const IDLE_SETTLE_TIMEOUT_MS = 15_000
 const COMMAND_DRAIN_TIMEOUT_MS = 15_000
 const CANCEL_SETTLE_TIMEOUT_MS = 2_000
@@ -1032,6 +1041,8 @@ export class DshContextBackend implements Backend {
   private readonly disposers: Array<() => void> = []
   private readonly pendingDecisions = new Map<string, PendingDecision>()
   private readonly activeCommands = new Map<string, ActiveCommand>()
+  /** In-flight bounded durable session-query reads (root snapshot/listing/titles). */
+  private readonly activeDurableReads = new Map<string, ActiveDurableRead>()
   private readonly activeImageReads = new Map<string, AbortController>()
   /** In-flight skill metadata reads; metadata only, never a model turn. */
   private readonly activeSkillQueries = new Map<string, ActiveSkillQuery>()
@@ -1188,6 +1199,77 @@ export class DshContextBackend implements Backend {
   private abortNativeUiReads(sessionId?: string): void {
     for (const entry of this.activeNativeUiReads.values()) {
       if (sessionId === undefined || entry.scope.sessionId === sessionId) entry.controller.abort()
+    }
+  }
+
+  /**
+   * Run one durable session-query read under an adapter-owned bound.
+   *
+   * `ctx.sessionQuery` reads are read-only native calls: this adapter never
+   * terminates or polls them. It abandons the *wait* after
+   * {@link SESSION_QUERY_READ_TIMEOUT_MS}, aborts the signal handed to the
+   * native method, and rejects with a coded adapter diagnostic. `close()` and
+   * the retirement of one attachment abort the same carrier, so a read that
+   * settles late can never deliver a snapshot/listing for a closed or replaced
+   * attachment: the caller awaits the rejection, and no value is returned after
+   * `close()`.
+   *
+   * @param label - adapter-owned description used in coded diagnostics.
+   * @param task - native read; receives the owned cancellation signal.
+   * @param sessionId - exact attachment epoch the read belongs to, when scoped.
+   * @returns the native value, untouched.
+   */
+  private async durableRead<T>(
+    label: string,
+    task: (signal: AbortSignal) => Promise<T>,
+    sessionId?: string,
+  ): Promise<T> {
+    this.assertOpen()
+    const id = randomUUID()
+    const controller = new AbortController()
+    this.activeDurableReads.set(id, { controller, sessionId })
+    const timer = setTimeout(() => {
+      controller.abort(codedError('RUNTIME_REQUEST_FAILED', `${label} timed out after ${SESSION_QUERY_READ_TIMEOUT_MS}ms`))
+    }, SESSION_QUERY_READ_TIMEOUT_MS)
+    timer.unref?.()
+    let onAbort: () => void = () => {}
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        const reason = controller.signal.reason
+        reject(reason instanceof Error
+          ? reason
+          : codedError('ABORTED', label + ' was cancelled'))
+      }
+      if (controller.signal.aborted) onAbort()
+      else controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      const value = await Promise.race([
+        Promise.resolve().then(() => {
+          if (controller.signal.aborted) throw codedError('ABORTED', label + ' was cancelled')
+          return task(controller.signal)
+        }),
+        aborted,
+      ])
+      // A native read that settled just after the adapter stopped waiting is
+      // never delivered as a fresh fact.
+      if (this.closed) throw codedError('CLOSED', 'the backend closed during ' + label)
+      return value
+    } finally {
+      clearTimeout(timer)
+      controller.signal.removeEventListener('abort', onAbort)
+      controller.abort()
+      this.activeDurableReads.delete(id)
+    }
+  }
+
+  private abortDurableReads(sessionId?: string): void {
+    for (const entry of this.activeDurableReads.values()) {
+      if (sessionId === undefined || entry.sessionId === sessionId) {
+        if (!entry.controller.signal.aborted) {
+          entry.controller.abort(codedError('ABORTED', 'the durable session read was cancelled'))
+        }
+      }
     }
   }
 
@@ -1649,9 +1731,27 @@ export class DshContextBackend implements Backend {
     return await run
   }
 
+  /**
+   * Materialize the pending attachment's Agent exactly once.
+   *
+   * `close()` sets `closed` synchronously and then joins this serialized
+   * create/switch chain, so every asynchronous boundary inside creation is
+   * followed by a closed/ownership re-check:
+   *
+   * - an Agent whose native factory settles after shutdown is discarded, never
+   *   committed or announced;
+   * - only the exact pending observation captured at entry may be consumed;
+   * - no `ready` is emitted after `closed`, and a switched attachment cannot be
+   *   overwritten by a stale materialization.
+   *
+   * Only the handle this call created is ever disposed. The host root, a
+   * previous Agent and unrelated carriers are untouched.
+   */
   private async ensureCurrent(): Promise<void> {
+    this.assertOpen()
     if (this.live !== undefined) return
     await this.serialize(async () => {
+      this.assertOpen()
       if (this.live !== undefined) return
       const pending = this.pending
       if (pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
@@ -1659,17 +1759,46 @@ export class DshContextBackend implements Backend {
         attachmentId: pending.attachmentId,
         route: pending.route,
       })
+      // The only async factory boundary this adapter owns. A close that landed
+      // during composition must not publish a live Agent or a ready event.
+      if (this.closed) {
+        await this.discardAgent(prepared)
+        throw codedError('CLOSED', 'the backend closed while the native Agent was created; nothing was published')
+      }
+      if (this.pending !== pending) {
+        await this.discardAgent(prepared)
+        throw codedError('STALE_SESSION', 'the staged DSH session changed while its Agent was created; nothing was published')
+      }
       try {
         this.commitAgent(prepared)
       } catch (error) {
+        // A partially committed publication is rolled back before disposal so
+        // `live` never points at an Agent this adapter is about to dispose.
+        this.releaseCommittedAgent(prepared)
         await this.discardAgent(prepared)
         throw error
       }
       // Retire the pending reads before the captured observation disappears.
       this.abortSkillQueries('session materialized', pending.sessionId)
       if (this.pending === pending) this.pending = undefined
-      this.emitAnnouncement(await this.sessionInfo(false))
+      const info = await this.sessionInfo(false)
+      // The announcement is the last asynchronous boundary: a close during the
+      // info/snapshot reads suppresses it instead of emitting a stale ready.
+      if (this.closed) throw codedError('CLOSED', 'the backend closed before the materialized DSH session was announced')
+      if (this.live !== prepared) throw codedError('STALE_SESSION', 'the DSH attachment changed before the materialized session was announced')
+      this.emitAnnouncement(info)
     })
+  }
+
+  /** Undo this adapter's own publication fields for one exact prepared Agent. */
+  private releaseCommittedAgent(prepared: LiveAgent): void {
+    if (this.live !== prepared) return
+    this.live = undefined
+    this.toolPresenter = undefined
+    this.planStates.delete(prepared.agent.session.id)
+    this.metricsStates.delete(prepared.agent.session.id)
+    this.subagentBridge.setRoot(undefined)
+    this.childPresenters.clear()
   }
 
   private commitAgent(prepared: LiveAgent): void {
@@ -1841,6 +1970,9 @@ export class DshContextBackend implements Backend {
     // must reject rather than deliver a catalog for a retired Agent.
     this.abortSkillQueries(reason, sessionId)
     this.abortNativeUiReads(sessionId)
+    // A durable snapshot/listing read scoped to this exact attachment stops
+    // waiting here; a late native log can never be published for it.
+    this.abortDurableReads(sessionId)
     // Only this Agent's own decisions: a child's pending approval/question is
     // refused by its own interruption path, never by a parent switch.
     this.closePendingDecisions(reason, { agent: target.agent, sessionId })
@@ -2121,8 +2253,19 @@ export class DshContextBackend implements Backend {
   }
 
   private subagentControlCapabilitySignature(): string {
-    // All mounted read/control faces can change during native composition.
-    return this.capabilities().join(' ')
+    // Only the mounted subagent discovery/control faces can appear or vanish
+    // per child event (DSH may activate them after the first ready). This
+    // signature deliberately avoids `capabilities()`: that read enumerates the
+    // Loader and every other service, which would run on every subagent frame.
+    // Other capability changes arrive through their own native invalidations
+    // and re-announce from there, so no dynamic fact is frozen here.
+    if (!this.subagentBridge.available()) return ''
+    const subagents = this.service<Record<string, unknown>>('subagents')
+    return [
+      'subagents',
+      typeof subagents?.interrupt === 'function' ? 'subagent-interrupt' : '',
+      typeof subagents?.prompt === 'function' ? 'subagent-prompt' : '',
+    ].join(' ')
   }
 
   /**
@@ -2217,12 +2360,24 @@ export class DshContextBackend implements Backend {
   } | undefined> {
     const query = this.service<SessionQueryLike>('sessionQuery')
     if (typeof query?.readSession !== 'function') return undefined
+    const captured = this.live
     let rawLog: unknown
     try {
-      rawLog = await query.readSession(sessionId)
-    } catch {
-      // A failed durable read is reported as incomplete, never as empty.
+      // Public `readSession(id)` takes no signal: the adapter bounds its own
+      // wait and aborts only the reads that can be cancelled. A late log for a
+      // closed or replaced attachment is rejected, never returned.
+      rawLog = await this.durableRead('native session snapshot', () => query.readSession(sessionId), sessionId)
+    } catch (error) {
+      const code = backendErrorCodeOf(error)
+      // Closing, cancellation and a replaced attachment are not an incomplete
+      // conversation: they must abort the caller instead of publishing one.
+      if (code === 'CLOSED' || code === 'ABORTED' || code === 'STALE_SESSION') throw error
+      // A failed or timed-out durable read is reported as incomplete, never as empty.
       return undefined
+    }
+    if (this.closed) throw codedError('CLOSED', 'the backend closed during the native session snapshot')
+    if (captured === undefined || this.live !== captured || captured.agent.session.id !== sessionId) {
+      throw codedError('STALE_SESSION', 'the DSH session changed while its durable snapshot was read')
     }
     const log = record(rawLog)
     const raw = Array.isArray(log?.events) ? log.events : []
@@ -2572,6 +2727,18 @@ export class DshContextBackend implements Backend {
     else agent.followup(message)
   }
 
+  /**
+   * Send one ordered native prompt, admitting attachments exactly once.
+   *
+   * Public `attachments.admitPromptContent(content)` takes no signal: DSH owns
+   * that call and offers no cancellation. The adapter therefore owns the single
+   * wall-clock bound (`nativeUiRead`) and an adapter-owned cancellation carrier
+   * registered in the active-command table. `cancel()` (Esc), `close()` and the
+   * retirement of the attachment abort that carrier: the adapter stops waiting
+   * immediately, and `NativeFileInput.admitPrompt` discards the unabortable
+   * native result when it eventually settles, so no late message is created or
+   * sent. No fabricated signal is passed to DSH's native method.
+   */
   async sendContent(content: readonly PromptContentPart[], mode: 'followup' | 'steer' = 'followup'): Promise<void> {
     this.assertOpen()
     if (mode !== 'followup' && mode !== 'steer') throw codedError('INVALID_ARGUMENT', `unsupported send mode: ${String(mode)}`)
@@ -2589,17 +2756,39 @@ export class DshContextBackend implements Backend {
     await this.ensureNative()
     await this.ensureCurrent()
     const live = this.live
-    if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    const admitted = await this.nativeFiles.admitPrompt(parts)
+    const scope = this.nativeUiScope()
+    if (live === undefined || scope === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    const admitted = await this.runActiveCommand('native prompt admission', scope.sessionId, async (owned) => {
+      return await this.nativeUiRead('native prompt admission', signal => this.nativeFiles.admitPrompt(parts, signal), owned)
+    })
+    if (this.closed) throw codedError('CLOSED', 'the backend closed during native prompt admission; the prompt was not sent')
     if (this.live !== live) throw codedError('STALE_SESSION', 'the DSH Agent attachment changed during prompt admission; the prompt was not sent')
     const message = this.native!.createUserMessage({ content: admitted, source: { kind: 'user' } })
     if (mode === 'steer') await live.agent.steer(message)
     else await live.agent.followup(message)
   }
 
+  /**
+   * Stage one frontend-read file through the native attachment store.
+   *
+   * The native write is registered in the existing active-command table, so an
+   * in-flight stage is visible to `assertReloadIdle()` and to `close()`/
+   * session retirement exactly like a native command. The caller's signal is
+   * composed with the carrier (either aborts the native-UI read), and the
+   * existing `nativeUiRead` bound/identity guard still governs the wait.
+   *
+   * @param input - canonical base64 bytes plus an optional name.
+   * @param signal - caller cancellation; never weakened by the registry carrier.
+   * @returns the native durable file reference.
+   */
   async stageFile(input: EncodedFileInput, signal?: AbortSignal): Promise<FileAttachmentRef> {
     this.assertOpen()
-    return this.nativeUiRead('native file staging', owned => this.nativeFiles.stageFile(input, owned), signal)
+    const scope = this.nativeUiScope()
+    if (scope === undefined) throw codedError('NOT_CONNECTED', 'no native attachment is current')
+    return await this.runActiveCommand('native file staging', scope.sessionId, async (owned) => {
+      const cancellation = signal === undefined ? owned : AbortSignal.any([owned, signal])
+      return await this.nativeUiRead('native file staging', read => this.nativeFiles.stageFile(input, read), cancellation)
+    })
   }
 
   /**
@@ -3026,8 +3215,12 @@ export class DshContextBackend implements Backend {
         if ((target !== 'agent-preset-default' && target !== 'permission-default-preset') || typeof value !== 'string' ||
             typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 ||
             (params.attachmentId !== undefined && typeof params.attachmentId !== 'string')) throw codedError('INVALID_ARGUMENT', 'native default update requires a target, value and confirmed revision')
-        return this.nativeManagement.updateDefault({ target, value, expectedRevision,
-          ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
+        // Native `settings.mutate` takes no signal: the carrier only makes the
+        // in-flight write visible to the reload gate and shutdown drain. It is
+        // never presented as native cancellation.
+        const sessionId = this.nativeUiScope()?.sessionId ?? ''
+        return await this.runActiveCommand('native default update', sessionId, async () => this.nativeManagement.updateDefault({ target, value, expectedRevision,
+          ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) }))
       }
       case 'session-rename': return this.nativeManagement.renameCurrent({ sessionId: params.sessionId as string, title: params.title as string,
         ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
@@ -3486,6 +3679,45 @@ export class DshContextBackend implements Backend {
     return detail === undefined ? execution.result : { ...result, text: `${result.text}\nNative cause: ${detail}` }
   }
 
+  /**
+   * Run one native write inside the existing active-command registry.
+   *
+   * `assertReloadIdle()` and `close()` observe these carriers exactly like a
+   * native command execution: an in-flight native write blocks a profile
+   * recomposition and is aborted (then boundedly drained) at shutdown or when
+   * its attachment is retired. Registration happens once per call and is
+   * released on every exit path, success or failure.
+   *
+   * The carrier is adapter-owned cancellation only. A native write that takes no
+   * signal (`settings.mutate`) keeps running after abort; its outcome is still
+   * reported because the native side owns that fact, while an aborted stageFile
+   * observes the owned signal and stops before publishing a reference.
+   *
+   * @param label - adapter-owned description used in coded diagnostics.
+   * @param sessionId - exact attachment epoch the write belongs to (`''` when sessionless).
+   * @param task - native write; receives the owned carrier signal.
+   * @returns the native outcome, untouched.
+   */
+  private async runActiveCommand<T>(
+    label: string,
+    sessionId: string,
+    task: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const requestId = randomUUID()
+    const controller = new AbortController()
+    let settle: () => void = () => {}
+    const settled = new Promise<void>(resolve => { settle = resolve })
+    this.activeCommands.set(requestId, { requestId, controller, sessionId, settled, settle })
+    try {
+      // A cancel/retire that landed before the native call started prevents it.
+      if (controller.signal.aborted) throw codedError('ABORTED', label + ' was cancelled')
+      return await task(controller.signal)
+    } finally {
+      this.activeCommands.delete(requestId)
+      settle()
+    }
+  }
+
   private abortActiveCommands(reason: string, sessionId?: string): number {
     let count = 0
     for (const entry of this.activeCommands.values()) {
@@ -3702,9 +3934,17 @@ export class DshContextBackend implements Backend {
       ...(defaultId === undefined ? {} : { default: defaultId }),
       presets: (Array.isArray(roster) ? roster : []).flatMap((row) => {
         const item = record(row)
-        if (item === undefined || typeof item.id !== 'string') return []
+        if (item === undefined || typeof item.id !== 'string' || item.id.length === 0) return []
+        // Explicit native-row DTO: only the public `AgentPreset` display fields
+        // leave this adapter. A whole-row spread used to leak any extra runtime
+        // property the registry row happened to carry; unknown fields are now
+        // dropped by construction, exactly like skills/tools projections.
         return [{
-          ...item,
+          id: item.id,
+          ...(typeof item.name === 'string' ? { name: item.name } : {}),
+          ...(typeof item.description === 'string' ? { description: item.description } : {}),
+          ...(typeof item.order === 'number' && Number.isFinite(item.order) ? { order: item.order } : {}),
+          ...(typeof item.broken === 'string' && item.broken.length > 0 ? { broken: item.broken } : {}),
           current: item.id === current,
           ...(defaultId === item.id ? { isDefault: true } : {}),
         }]
@@ -3935,16 +4175,39 @@ export class DshContextBackend implements Backend {
     // metadata; this adapter only hides subagent children and applies the
     // caller's bound. It never stats a durable artifact, derives an activity
     // time or re-sorts, so no second durability truth exists here.
-    const records = await query.listSessions()
-    const visible = records
-      .map(item => record(item))
-      .filter((item): item is Record<string, unknown> => item !== undefined && record(item.header) !== undefined)
-      .filter(item => record(item.header)?.origin !== 'subagent')
-      .slice(0, limit)
-    const titles = args.titles === false ? undefined : await this.titleFactsOf(query, visible.map(item => String(record(item.header)?.id)))
-    return visible.map((item) => {
+    let records: readonly unknown[]
+    try {
+      records = await this.durableRead('native session listing', signal => query.listSessions(signal))
+    } catch (error) {
+      if (backendErrorCodeOf(error) !== undefined) throw error
+      throw nativeAgentFailure('the native session listing failed', error)
+    }
+    if (!Array.isArray(records)) {
+      throw codedError('RUNTIME_REQUEST_FAILED', 'the native session listing returned no session array; the picker was not overwritten with an empty corpus')
+    }
+    // Identity is a native fact: a row without a usable header id is skipped
+    // instead of being stringified into a fabricated `"undefined"` session that
+    // the picker could never resume. Valid rows keep their native order.
+    const usable: Array<{ readonly item: Record<string, unknown>; readonly id: string }> = []
+    let malformed = 0
+    for (const row of Array.isArray(records) ? records : []) {
+      const item = record(row)
+      const header = record(item?.header)
+      const id = header?.id
+      if (item === undefined || header === undefined || typeof id !== 'string' || id.length === 0) {
+        malformed += 1
+        continue
+      }
+      if (header.origin === 'subagent') continue
+      usable.push({ item, id })
+    }
+    if (malformed > 0) {
+      this.warn(`the native session listing returned ${malformed} row(s) without a session identity; they were skipped`)
+    }
+    const visible = usable.slice(0, limit)
+    const titles = args.titles === false ? undefined : await this.titleFactsOf(query, visible.map(row => row.id))
+    return visible.map(({ item, id }) => {
       const header = record(item.header) ?? {}
-      const id = String(header.id)
       const title = titles?.titles.get(id)
       return {
         id,
@@ -3981,7 +4244,7 @@ export class DshContextBackend implements Backend {
     const requested = new Set(ids)
     let observations: unknown
     try {
-      observations = await query.readTitleSnapshots(ids)
+      observations = await this.durableRead('native session titles', signal => query.readTitleSnapshots!(ids, signal))
     } catch (error) {
       // Host-owned diagnostics only: the UI never invents a title fact, and an
       // unavailable store must not surface as a conversation error.
@@ -4752,6 +5015,8 @@ export class DshContextBackend implements Backend {
     try {
       this.abortNativeUiReads()
       this.activeNativeUiReads.clear()
+      this.abortDurableReads()
+      this.activeDurableReads.clear()
       this.offNativeJobs?.(); this.offNativeJobs = undefined
       this.subagentBridge.close()
       this.childPresenters.clear()
@@ -4849,26 +5114,66 @@ function wireBytes(value: unknown): number {
   }
 }
 
+/**
+ * One non-negative safe native event sequence, or `undefined`.
+ *
+ * DSH's own surface validator accepts exactly `Number.isSafeInteger(value) &&
+ * value >= 0 && !Object.is(value, -0)`. This adapter never widens that: a
+ * non-finite, non-integer, negative or negative-zero seq is not a native seq
+ * and must never reach the UI as one.
+ *
+ * @param value - raw wire value from a native event.
+ * @returns the exact native seq, or undefined when it is not one.
+ */
+function nativeSeq(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0)
+    ? value
+    : undefined
+}
+
+/**
+ * Validate one native surface operation against the public `SurfaceOp` shape.
+ *
+ * `'append'` is the only string form. A replacement must be exactly the
+ * positional `{op:'replace', startSeq, endSeq}` shape with two valid native
+ * seqs; anything else (coerced numbers, strings, negative/unsafe values,
+ * unknown ops) is **omitted**, leaving the event as its native log fact with no
+ * claimed surface placement (`surfaceKind` `'none'`). A malformed placement can
+ * therefore never fold a replacement, shadow an earlier fact or emit `NaN`.
+ * The event itself is still forwarded: dropping a native log entry could hide
+ * lifecycle facts the transcript needs, which would be a worse failure.
+ *
+ * @param value - raw wire value from a native event.
+ * @returns the validated native operation, or undefined when malformed.
+ */
+function surfaceOperationOf(value: unknown): SessionEvent['surfaceOp'] | undefined {
+  if (value === 'append') return 'append'
+  const op = record(value)
+  if (op?.op !== 'replace') return undefined
+  const startSeq = nativeSeq(op.startSeq)
+  const endSeq = nativeSeq(op.endSeq)
+  if (startSeq === undefined || endSeq === undefined) return undefined
+  return { op: 'replace', startSeq, endSeq }
+}
+
 function sessionEventWire(event: unknown, presentation: JsonRecord | undefined): SessionEvent {
   const raw = record(jsonSafe(event)) ?? {}
+  const surfaceOp = surfaceOperationOf(raw.surfaceOp)
+  const sourceEventSeqs = Array.isArray(raw.sourceEventSeqs)
+    ? raw.sourceEventSeqs.flatMap((value): number[] => {
+        const seq = nativeSeq(value)
+        return seq === undefined ? [] : [seq]
+      })
+    : undefined
   return {
     type: typeof raw.type === 'string' ? raw.type : 'unknown',
-    seq: typeof raw.seq === 'number' ? raw.seq : 0,
-    ...(typeof raw.time === 'number' ? { time: raw.time } : {}),
+    // `0` stays the existing missing-seq default; an invalid value is never
+    // emitted as a number of its own.
+    seq: nativeSeq(raw.seq) ?? 0,
+    ...(typeof raw.time === 'number' && Number.isFinite(raw.time) ? { time: raw.time } : {}),
     data: raw.data,
-    ...(raw.surfaceOp === 'append' ? { surfaceOp: 'append' as const } : {}),
-    ...(record(raw.surfaceOp)?.op === 'replace'
-      ? {
-          surfaceOp: {
-            op: 'replace' as const,
-            startSeq: Number(record(raw.surfaceOp)?.startSeq),
-            endSeq: Number(record(raw.surfaceOp)?.endSeq),
-          },
-        }
-      : {}),
-    ...(Array.isArray(raw.sourceEventSeqs)
-      ? { sourceEventSeqs: raw.sourceEventSeqs.filter((seq): seq is number => typeof seq === 'number') }
-      : {}),
+    ...(surfaceOp === undefined ? {} : { surfaceOp }),
+    ...(sourceEventSeqs === undefined ? {} : { sourceEventSeqs }),
     ...(presentation === undefined ? {} : { toolPresentation: presentation }),
   }
 }
