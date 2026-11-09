@@ -106,6 +106,12 @@ export interface CcEditorOptions extends EditorOptions {
   bindings?: CcKeymapConfig
   /** Keyboard chord timeout in milliseconds (CC default 3000). */
   chordTimeoutMs?: number
+  /**
+   * How long a fragmented bracketed-paste prefix may be held waiting for the
+   * rest of the marker (default 50 ms). After it expires the held bytes are
+   * dispatched as ordinary keys instead of swallowing the next keystroke.
+   */
+  pasteHoldTimeoutMs?: number
   /** Editor-side action context (default `"editor"`). */
   context?: CcContext
   /** Override the in-memory prompt-attachment budgets (tests, constrained hosts). */
@@ -438,7 +444,7 @@ export class CcEditor extends Editor {
 
   private keymapInstance: CcKeymap
   private readonly imageBudgets: CcImageBudgets
-  private readonly pasteFilter = new BracketedPasteFilter()
+  private readonly pasteFilter: BracketedPasteFilter
   private actionContext: CcContext
   private chordTimer: ReturnType<typeof setTimeout> | undefined
   private detachChordListener: (() => void) | undefined
@@ -459,6 +465,16 @@ export class CcEditor extends Editor {
       })
     this.actionContext = options.context ?? "editor"
     this.imageBudgets = { ...DEFAULT_IMAGE_BUDGETS, ...options.imageBudgets }
+    this.pasteFilter = new BracketedPasteFilter({
+      holdTimeoutMs: options.pasteHoldTimeoutMs,
+      onHoldTimeout: (data) => {
+        // The held prefix was not a fragmented paste marker: release it through the
+        // normal key path so it cannot swallow the next keystroke.
+        if (this.disposed) return
+        this.dispatchKeys(data)
+        this.requestRender()
+      },
+    })
     this.onAction = options.onAction
     this.installFocusHook()
     this.installSubmitHook()
@@ -640,6 +656,11 @@ export class CcEditor extends Editor {
    * `CcImageBudgetError` when the hard in-memory attachment budget is exhausted.
    */
   insertImage(image: ImageUploadPart): number {
+    // Hand-typed or restored `[Image #N]` text carries no payload. Reserve its id
+    // before allocating, so this new upload can never silently resolve a marker it
+    // did not come from (the typed marker stays unresolved and blocks the send).
+    // Symmetric with `insertFile`.
+    this.noteImageMarkerIds(this.getText())
     this.reclaimAttachmentMemory()
     const bytes = imagePayloadBytes(image)
     const protectedBytes = this.protectedAttachmentBytes(this.imageFamily())
@@ -802,7 +823,12 @@ export class CcEditor extends Editor {
   captureSubmitPayload(): CcSubmitPayload {
     const snapshot = this.captureDraft()
     const expanded = this.getExpandedText()
-    const content = this.buildPromptContent(expanded)
+    // Trim exactly once, at the submit boundary, and derive `content` from that
+    // same trimmed text: the ordered parts must describe the submitted `text`,
+    // not a differently-padded draft. A whitespace-only draft submits `text: ""`
+    // with an empty text part, never text that disagrees with its content.
+    const text = expanded.trim()
+    const content = this.buildPromptContent(text)
     const images: CcImageAttachment[] = []
     const files: CcFileAttachment[] = []
     for (const occurrence of this.attachmentOccurrences(expanded)) {
@@ -810,7 +836,7 @@ export class CcEditor extends Editor {
       else files.push(occurrence.file)
     }
     return {
-      text: expanded.trim(),
+      text,
       content,
       snapshot,
       images,
@@ -1042,9 +1068,14 @@ export class CcEditor extends Editor {
     this.pasteFilter.reset()
   }
 
-  /** True while a bracketed paste is partially received. */
+  /**
+   * True while a bracketed paste is partially received, or while a possible
+   * paste-marker prefix is still held back waiting for the next chunk. Hosts use
+   * this as their paste protection, so held bytes are visible instead of the
+   * editor looking idle while input is pending.
+   */
   isPasting(): boolean {
-    return this.pasteFilter.isPasting
+    return this.pasteFilter.isPasting || this.pasteFilter.isHolding
   }
 
   /** Flush bytes held back while waiting for a fragmented paste marker. */

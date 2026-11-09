@@ -321,6 +321,25 @@ export function hoverRowSlot(row: number): string {
   return `row ${row}`
 }
 
+/**
+ * The hover target for a host control that is painted on exactly one row.
+ *
+ * A group may only claim the pointer for itself on the row its control is
+ * really painted on (row 0, the header). Every other row of a collapsed group
+ * is plain member text that advertises no hover, and a synthetic leave adopts
+ * nothing: adopting the header for those rows would claim a target the pointer
+ * is not on and would hand the previous owner an exit it never caused.
+ */
+export function hoverControlAt(
+  event: TuiMouseEvent,
+  component: Component,
+  row: number,
+  slot: string,
+): HoverSlot | undefined {
+  if (isHoverExit(event) || event.y !== row) return undefined
+  return { component, slot }
+}
+
 export class HoverOwnership {
   private owner: HoverSlot | undefined
   /** Last real motion, reused to shape the synthetic exit (coordinates are ignored). */

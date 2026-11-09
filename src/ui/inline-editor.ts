@@ -150,3 +150,28 @@ export class InlineAnswer {
     this.editor.invalidate()
   }
 }
+
+/**
+ * The bottom-dock prompt editor: the one `CcEditor` state plus a height
+ * measurement the parent can ask for before it lays the fixed dock out.
+ *
+ * `App.statusDockPool()` needs the editor's row count to compute the transcript
+ * budget, and `docs/FRONTEND-CONTRACT.md` forbids re-rendering a dock member
+ * just to count its rows. The vendored `Editor.render` keeps no cached lines (it
+ * re-lays out the text, clamps the scroll offset and re-emits the cursor cell),
+ * so the only answer that can never disagree with the paint is the paint's own
+ * length: `measureRows(width) === render(width).length` holds by construction
+ * and is pinned by test. Rendering is deterministic and side-effect-free for the
+ * visible rows, so measuring twice — or measuring and then painting — is
+ * idempotent and never moves the frame it describes.
+ *
+ * The App's `PromptEditor` (working-status border, brand-blue prompt arrow)
+ * extends this class and inherits the measurement; the decorations change cell
+ * content only, never the row count.
+ */
+export class DockPromptEditor extends CcEditor {
+  /** Rows this editor paints at `width`; equal to `render(width).length`. */
+  measureRows(width: number): number {
+    return this.render(Math.max(1, Math.floor(width))).length
+  }
+}

@@ -32,7 +32,7 @@ import {
   type TranscriptViewHints,
   type TranscriptViewOptions,
 } from './blocks.ts'
-import { dispatchToChild, HoverOwnership, hoverRowSlot } from './mouse.ts'
+import { dispatchToChild, HoverOwnership, hoverRowSlot, type HoverSlot } from './mouse.ts'
 import {
   planTranscriptNodes,
   releaseToolGroupContext,
@@ -199,6 +199,31 @@ interface FrameBlock {
   clearMouse?(): void
 }
 
+/** The projection-only preferences {@link planTranscriptNodes} and its folds read. */
+interface PlanOptions {
+  readonly groupTools: boolean
+  readonly groupSubagentMessages: boolean
+  readonly showThinking: boolean
+  readonly suppressLiveTodos: boolean
+}
+
+/**
+ * One planned frame: the display nodes of the current item order.
+ *
+ * A node is a pure view over the item objects and {@link PlanOptions} (it reads
+ * no width, no clock and no store state beyond the items), so an unchanged
+ * input order can reuse the whole projection *and* the derived eviction set
+ * instead of re-folding every turn on every paint.
+ */
+interface PlannedFrame {
+  readonly options: PlanOptions
+  /** Snapshot of the projected items that produced `nodes` (element identity). */
+  readonly items: readonly TranscriptItem[]
+  readonly nodes: readonly SubagentFrameNode[]
+  /** Cache keys that must survive {@link TranscriptView.evictUnplanned}. */
+  readonly keys: ReadonlySet<string>
+}
+
 /** One rendered item block's row span in the last frame (mouse routing). */
 export interface TranscriptRowSpan {
   readonly itemId: string
@@ -250,6 +275,16 @@ export class TranscriptView implements Component {
    * longer shows the block at the same row.
    */
   private readonly hover = new HoverOwnership()
+  /**
+   * The projection of the last paint, reused while its input order is unchanged.
+   *
+   * Rebuilt only when the item sequence (identity, order, length) or a
+   * projection preference changes — never on a clock, a frame counter or a
+   * width: the plan functions do not read any of those.
+   */
+  private plan: PlannedFrame | undefined
+  /** Number of node projections built so far (diagnostics/tests). */
+  private planBuilds = 0
   private sessionId: string | undefined
   /** Width of the last painted frame (`0` before the first render). */
   private lastWidth = 0
@@ -339,24 +374,74 @@ export class TranscriptView implements Component {
    *   3. consecutive durable subagent records (`SubagentGroupBlock`).
    *
    * Every fold is a view: the store still holds every native item, seq, sender,
-   * summary and exact message text in declaration order.
+   * summary and exact message text in declaration order. The result is cached
+   * per input order (see {@link plannedFrame}); the same nodes are used by the
+   * frame loop, the root disclosure keys and the viewport-anchor counter.
    */
   private frameNodes(): readonly SubagentFrameNode[] {
+    return this.plannedFrame().nodes
+  }
+
+  /** Number of node projections built so far (diagnostics/tests). */
+  get projectionBuilds(): number {
+    return this.planBuilds
+  }
+
+  /**
+   * The planned frame for the current items and preferences.
+   *
+   * The three plan functions are O(items) folds that allocate a node (and a
+   * key string) per row; a repaint on an unchanged transcript — a keystroke, a
+   * spinner tick, a hover hint — must not pay for them again. `store.items` is
+   * already composed for this read, so its element identity is the exact
+   * projection input: item objects are immutable and every content change
+   * replaces the object with the next `version`.
+   */
+  private plannedFrame(): PlannedFrame {
     const options = this.planOptions()
-    const toolNodes = planTranscriptNodes(this.store.items, options)
+    const items = this.store.items
+    const cached = this.plan
+    if (cached !== undefined && samePlanOptions(cached.options, options) && sameProjectionInput(cached.items, items)) {
+      return cached
+    }
+    const toolNodes = planTranscriptNodes(items, options)
     // A mixed activity group is the conjunction of the two existing preferences:
     // there is no third setting and no separate behaviour to explain.
     const activityNodes = planActivityGroupNodes(toolNodes, {
       groupActivities: options.groupTools && options.groupSubagentMessages,
     })
-    const nodes = planSubagentGroupNodes(activityNodes, {
+    const planned = planSubagentGroupNodes(activityNodes, {
       groupRecords: options.groupSubagentMessages,
     })
-    if (options.suppressLiveTodos !== true) return nodes
     // Grouping runs first so hiding the checklist does not change any tool,
     // activity or subagent run boundary: the live todos item still separates
     // runs exactly as it did before, only its own display node is dropped.
-    return nodes.filter(node => !(node.kind === 'item' && node.item.kind === 'todos'))
+    const nodes = options.suppressLiveTodos !== true
+      ? planned
+      : planned.filter(node => !(node.kind === 'item' && node.item.kind === 'todos'))
+    const frame: PlannedFrame = {
+      options,
+      // Compared element-wise on the next read; the composed array itself may be
+      // a fresh one, the item objects are not.
+      items: [...items],
+      nodes,
+      keys: plannedKeys(nodes),
+    }
+    this.plan = frame
+    this.planBuilds += 1
+    return frame
+  }
+
+  private planOptions(): PlanOptions {
+    return {
+      groupTools: this.flags.groupTools ?? true,
+      // Independent display preference: default on for standalone rendering,
+      // parent passes the migrated durable value.
+      groupSubagentMessages: this.flags.groupSubagentMessages ?? true,
+      showThinking: this.flags.showThinking,
+      // Opt-in parent-hosted dock only; default false preserves standalone use.
+      suppressLiveTodos: this.flags.suppressLiveTodos === true,
+    }
   }
 
   /** Root disclosure keys of the current projection (groups and ungrouped cards). */
@@ -424,23 +509,6 @@ export class TranscriptView implements Component {
       }
     }
     return count
-  }
-
-  private planOptions(): {
-    groupTools: boolean
-    groupSubagentMessages: boolean
-    showThinking: boolean
-    suppressLiveTodos: boolean
-  } {
-    return {
-      groupTools: this.flags.groupTools ?? true,
-      // Independent display preference: default on for standalone rendering,
-      // parent passes the migrated durable value.
-      groupSubagentMessages: this.flags.groupSubagentMessages ?? true,
-      showThinking: this.flags.showThinking,
-      // Opt-in parent-hosted dock only; default false preserves standalone use.
-      suppressLiveTodos: this.flags.suppressLiveTodos === true,
-    }
   }
 
   /** Diagnostics/tests: number of item components currently retained. */
@@ -517,6 +585,7 @@ export class TranscriptView implements Component {
     this.cache.clear()
     this.groupedKeys = new Set()
     this.spans = []
+    this.plan = undefined
   }
 
   render(width: number): string[] {
@@ -535,6 +604,7 @@ export class TranscriptView implements Component {
       this.cache.clear()
       this.groupedKeys = new Set()
       this.spans = []
+      this.plan = undefined
       clearThinkingExpansion()
       clearToolExpansion()
     }
@@ -551,17 +621,22 @@ export class TranscriptView implements Component {
     const cwd = this.store.info?.cwd ?? ''
     // The projection is display-only: `store.items` keeps the declared order and
     // every tool card keeps its own item identity/cache. A group is one extra
-    // cached host block anchored on its first member's call id.
-    const nodes = this.frameNodes()
+    // cached host block anchored on its first member's call id. The planned
+    // frame is reused while its input order and preferences are unchanged.
+    const plan = this.plannedFrame()
+    const nodes = plan.nodes
     // Evict what left the frame BEFORE any block is (re)assembled. A group that
     // lost its anchor must release its children while no new group owns them yet;
     // otherwise its cleanup would reset the context the frame just installed on
     // the blocks the new group took over.
-    this.evictUnplanned(plannedKeys(nodes))
+    this.evictUnplanned(plan.keys)
     const seen = new Set<string>()
     const grouped = new Set<string>()
     const disclosureKeys: string[] = []
     const spans: Array<{ block: FrameBlock; startRow: number; endRow: number }> = []
+    // Built in the same pass as the spans: `hover.retain` needs exactly the
+    // (block, placement) pairs of this frame, so no second array walk is made.
+    const hoverSlots: HoverSlot[] = []
     const out: string[] = []
     for (const node of nodes) {
       let block: FrameBlock
@@ -603,7 +678,9 @@ export class TranscriptView implements Component {
       const lines = block.render(safeWidth)
       if (lines.length === 0) continue
       if (out.length > 0) out.push('')
-      spans.push({ block, startRow: out.length, endRow: out.length + lines.length - 1 })
+      const startRow = out.length
+      spans.push({ block, startRow, endRow: startRow + lines.length - 1 })
+      hoverSlots.push({ component: block, slot: hoverRowSlot(startRow) })
       for (const line of lines) out.push(line)
     }
     this.groupedKeys = grouped
@@ -614,7 +691,7 @@ export class TranscriptView implements Component {
     this.spans = spans
     // A repaint that re-based (or dropped) the hovered block moved its hitbox
     // away from a pointer that did not move: the hint must go back to neutral.
-    this.hover.retain(spans.map(span => ({ component: span.block, slot: hoverRowSlot(span.startRow) })))
+    this.hover.retain(hoverSlots)
     this.syncLiveTimer()
     return out
   }
@@ -908,4 +985,32 @@ function plannedKeys(nodes: readonly SubagentFrameNode[]): ReadonlySet<string> {
     for (const item of node.members) planned.add(`tool|${item.id}`)
   }
   return planned
+}
+
+/** Are the projection preferences of two frames the same? */
+function samePlanOptions(previous: PlanOptions, next: PlanOptions): boolean {
+  return previous.groupTools === next.groupTools
+    && previous.groupSubagentMessages === next.groupSubagentMessages
+    && previous.showThinking === next.showThinking
+    && previous.suppressLiveTodos === next.suppressLiveTodos
+}
+
+/**
+ * Is the item order the same projection input as the cached one?
+ *
+ * `store.items` is composed per read (native child rows are spliced into the
+ * declared order), so the array is not a stable token. Item objects are
+ * immutable — every content change replaces the object with the next `version` —
+ * so identity is the token, with `kind`/`id`/`version` as the fallback for a
+ * recomposed-but-unchanged row. Nothing here reads a clock or a counter of the
+ * renderer: an unchanged input really is unchanged.
+ */
+function sameProjectionInput(previous: readonly TranscriptItem[], next: readonly TranscriptItem[]): boolean {
+  if (previous.length !== next.length) return false
+  for (const [index, item] of next.entries()) {
+    const cached = previous[index]!
+    if (cached === item) continue
+    if (cached.kind !== item.kind || cached.id !== item.id || cached.version !== item.version) return false
+  }
+  return true
 }

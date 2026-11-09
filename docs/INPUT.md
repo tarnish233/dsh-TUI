@@ -72,7 +72,7 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | --- | --- | --- |
 | Line/char motion | Ctrl+A/E, Home/End, Ctrl+B/F, Left/Right | logical line start/end; grapheme movement; line-boundary wrap follows Pi. match |
 | Word motion | Alt+B/F, Alt+Left/Right, Ctrl+Left/Right | punctuation + CJK aware via Intl.Segmenter; platform aliases bound together. match (terminal coverage caveat) |
-| Vertical/history | Up/Down, Ctrl+P/N | visual line first; on first/last visual line browse history; **no Pi jump-to-column-0 step**; draft, cursor and paste markers restored. match |
+| Vertical/history | Up/Down, Ctrl+P/N | visual line first; on first/last visual line browse history; **no Pi jump-to-column-0 step**; a recalled entry resumes with the cursor at its **end** (readline/CC: typing continues the entry); leaving browsing by editing keeps the draft's image/file payloads resolvable (undo/kill can still reach them); draft, cursor and paste markers restored. Multi-line stickiness is decided by browse state (`historyIndex > -1`), never by the cursor column. match |
 | Char delete | Backspace, Ctrl+H, Delete, Ctrl+D | grapheme-safe; line-boundary merge; Ctrl+D exits only when empty, and the empty guard is independent of binding priority (disabling/rebinding forward-delete cannot resurrect global exit); empty Delete no-ops. match |
 | Whitespace kill | Ctrl+W | shell-whitespace boundary: whole path/flag; paste markers atomic; column-0 merges newline. match |
 | Word kill | Alt+Backspace, Ctrl+Backspace, Alt+D/Alt+Delete | punctuation/CJK boundaries (Option+Delete on macOS). match |
@@ -81,7 +81,7 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | Undo | Ctrl+_ / Ctrl+- / Ctrl+Shift+- | restores text+cursor+paste registry; typing coalesced, kills/yanks/pastes atomic. match (byte equivalence documented) |
 | Submit/newline | Enter, Shift+Enter, Ctrl+J, Alt+Enter, backslash+Enter | Enter submits; others newline; backslash fallback. match |
 | Completion | Tab, Enter/Esc with menu, Ctrl+P/N in menu | menu owns nav/accept/cancel; editor editing works beneath. Exact `/name` ranks first (exact → prefix → fuzzy in the menu's name namespace), so an exact Skill is never replaced by an earlier prefix-sibling command; explicit navigation still wins, Tab only edits, Enter accepts then submits for a slash name. `@file` mentions are native (DSH grammar + `fileReferences`) and Enter/Tab only fill them; a second Enter submits. unverified for the remaining CC accept/submit split |
-| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands. match |
+| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a held prefix has a **bounded 50 ms** lifetime (`pasteHoldTimeoutMs`, unref'd timer, cleared by `dispose()`/flush) after which its bytes are released as ordinary keys, so a fragmented `ESC[` can never swallow the next keystroke; `isPasting()` is true while a prefix is held; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands; a large paste never takes an id that existing `[paste #N]` marker text already uses (hand-typed markers stay literal). match |
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
 | Tool details | Ctrl+X Ctrl+O, `[`/`]`, Alt+Left/Right, Tab/Right, Shift+Tab/Left, c | `app.tools.details` opens the tools inspector on the **latest tool** (TUI extension, not a CC default; plain Ctrl+O keeps expand/collapse). The read-only modal context `toolDetails → list → dialog → global` adds previous/next tool (`[` + Alt+Left, `]` + Alt+Right; Pi's legacy ESC-b/ESC-f reads alias Alt+Left/Right in this context), next/previous section, copy, shared list scrolling (`Up/Down`, `Ctrl+P/N`, `j/k`, PageUp/Down, Home/End), `Esc`/`list.cancel` close. `c` and brackets exist only in `toolDetails`, so they are ordinary text in the editor; unbound printable bytes are inert in the modal. |
@@ -259,11 +259,21 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
 - Unknown markers stay unresolved: a history entry or hand-typed `[Image #N]`
   without an upload is preserved verbatim, never upgraded to an attachment, and
   blocks the send through `onSubmitBlocked` (the draft is not cleared, so nothing
-  is silently sent as text only).
+  is silently sent as text only). Typing the marker yourself reserves its id
+  *before* the next upload is allocated (`insertImage` runs `noteImageMarkerIds`
+  on the draft text, symmetric with `insertFile`), so the next `insertImage()`
+  takes a fresh id and the typed marker can never turn into a second copy of
+  that upload.
 - In-session history keeps images: submitting records the payloads referenced by
   that entry's own text, so Up recalls real images and a payload can never be
   attached to a marker it did not come from. The history payload registry is
   pruned with the history list and trimmed oldest-first by budget.
+- History browsing never destroys payloads: leaving history browsing by typing,
+  undo, insert, kill or delete merges the pre-browsing draft's image/file
+  payloads back into the live registries instead of dropping them (its marker
+  text is still on the undo stack and in the kill ring). Browsing back to the
+  draft with Down/Esc still restores the saved draft registry, and a recalled
+  entry still resolves only its own payloads.
 - Ordered content: one image part per visible marker occurrence, in place —
   repeating the same marker sends the same upload twice (the input layer never
   de-duplicates or rewrites the prompt; DSH stores content-addressed bytes).
@@ -294,6 +304,13 @@ what guarantees:
 - `payload.snapshot` is the same pre-clear capture used by the Enter path, so a
   native rejection restores the identical draft (attachments and counters
   included).
+- Trimming happens once, at this boundary, and `text` and `content` come from
+  the same trimmed string: `payload.text` is the trimmed draft text and
+  `payload.content` is built from that trimmed text, so concatenating its text
+  parts always yields `payload.text`. A whitespace-only draft submits `text:
+  ""` with `content: [{ type: "text", text: "" }]` — never a non-empty content
+  next to an empty text; a draft padded around a marker
+  (`"  [Image #1]  "`) submits `text: "[Image #1]"` with just the image part.
 
 ## File attachments (native refs, memory only)
 
@@ -345,7 +362,10 @@ what guarantees:
 - macOS Option-as-Meta is terminal-configuration dependent; without CSI-u,
   Option+Delete may arrive as Ctrl+W.
 - tmux/screen prefix keys and SSH splitting: paste markers are reassembled;
-  chord bytes may still be intercepted by the multiplexer.
+  chord bytes may still be intercepted by the multiplexer. A paste-marker
+  prefix is held for at most `pasteHoldTimeoutMs` (50 ms default): a last-resort
+  split in the middle of `ESC[200~` later than that is delivered as ordinary
+  keys, which is the same fragmentation cost as sending the bytes unreassembled.
 - Lone ESC is treated as Escape immediately; a paste marker fragmented to a
   single leading ESC byte is not reassembled (documented trade-off).
 - IME composition/commit sequences are not interpreted here.
@@ -371,10 +391,23 @@ what guarantees:
 - `test/input-editor.test.ts` — Ctrl+W path/flag/yank/undo, word vs whitespace,
   punctuation/CJK word motion, grapheme emoji/combining, Ctrl+U/K + newline
   merges, accumulate/yank-pop, CC history boundaries (draft mid-line,
-  multi-line, wrapped), Ctrl+A/E/B/F, Ctrl+D/Delete semantics, fragmented
+  multi-line, wrapped; a recalled entry resumes with the cursor at its end and
+  multi-line stickiness comes from browse state, not the cursor column),
+  Ctrl+A/E/B/F, Ctrl+D/Delete semantics, fragmented
   paste, large-paste marker + submit expansion, chord actions/cancel/timer,
   app overrides, disabled/remapped keys, printable vs list, submit/newline,
   completion nav/accept/edit-fallback.
+- `test/input-regressions.test.ts` — the I1–I6 input-defect regressions, named
+  after the invariant each protects: history browsing never orphans the draft's
+  image/file payloads (typing/undo/insert after Up, both families, recalled
+  entries keep their own payloads); CJK/emoji/ZWJ and atomic paste markers
+  render at 1-3 columns without exhausting the stack (overflow instead of
+  recursion); a recalled entry resumes at its end; a hand-typed `[Image #N]` is
+  never resolved by the next upload and a hand-typed `[paste #n …]` is never
+  expanded by the next large paste; a held fragmented-paste prefix is released
+  after its deadline (and by `dispose()`) so the next keystroke types; submit
+  `text` and `content` are trimmed identically (including whitespace-only and
+  padded-attachment drafts).
 - `test/input-skills.test.ts` — slash menu over native command/skill metadata:
   exact-name priority in the mixed command+skill catalog (exact Skill vs
   longer prefix command, pure-command and same-name controls), explicit

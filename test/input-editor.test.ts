@@ -233,7 +233,7 @@ test("yank-pop is a no-op unless it immediately follows a yank", () => {
   assert.equal(editor.getText(), afterYank)
 })
 
-test("CC history: Up on the first visual line browses history without jumping to column 0", () => {
+test("CC history: Up recalls an entry with the cursor at the end, never at column 0", () => {
   const { editor } = makeEditor()
   editor.addToHistory("older entry")
   editor.addToHistory("newest entry")
@@ -243,10 +243,15 @@ test("CC history: Up on the first visual line browses history without jumping to
 
   press(editor, "\x10") // Ctrl+P
   assert.equal(editor.getText(), "newest entry")
-  assert.deepEqual(editor.getCursor(), { line: 0, col: 0 })
+  assert.deepEqual(
+    editor.getCursor(),
+    { line: 0, col: 12 },
+    "readline/CC recall puts the cursor at the end so typing continues the entry",
+  )
 
   press(editor, "\x10")
   assert.equal(editor.getText(), "older entry")
+  assert.deepEqual(editor.getCursor(), { line: 0, col: 11 }, "every recalled entry ends with the cursor at its end")
 
   press(editor, "\x0e") // Ctrl+N
   assert.equal(editor.getText(), "newest entry")
@@ -258,7 +263,7 @@ test("CC history: Up on the first visual line browses history without jumping to
   assert.equal(editor.ccIsBrowsingHistory(), false)
 })
 
-test("multi-line history entries: visual lines move first, history at the boundaries", () => {
+test("multi-line history entries stay sticky while the cursor starts at the entry end", () => {
   const { editor } = makeEditor()
   editor.addToHistory("line1\nline2")
   editor.addToHistory("newest")
@@ -268,15 +273,19 @@ test("multi-line history entries: visual lines move first, history at the bounda
   assert.equal(editor.getText(), "newest")
   press(editor, "\x10")
   assert.equal(editor.getText(), "line1\nline2")
-  assert.deepEqual(editor.getCursor(), { line: 0, col: 0 })
+  assert.deepEqual(editor.getCursor(), { line: 1, col: 5 }, "recall ends at the end of the entry")
 
-  // Cursor is on the first visual line of a two-line entry: moving down stays
-  // inside the entry.
+  // Browse-state (historyIndex > -1), not the cursor column, decides stickiness:
+  // Up moves inside the recalled entry because its start is not the visual top.
+  press(editor, "\x10")
+  assert.equal(editor.getText(), "line1\nline2", "Up stays inside the recalled entry")
+  assert.deepEqual(editor.getCursor(), { line: 0, col: 5 })
+
+  // Down moves back down inside the entry first, then browses newer entries.
   press(editor, "\x0e")
   assert.equal(editor.getText(), "line1\nline2")
-  assert.deepEqual(editor.getCursor(), { line: 1, col: 0 })
+  assert.deepEqual(editor.getCursor(), { line: 1, col: 5 })
 
-  // On the last visual line Down browses to the newer entry.
   press(editor, "\x0e")
   assert.equal(editor.getText(), "newest")
   press(editor, "\x0e")

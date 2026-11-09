@@ -20,6 +20,7 @@ editor.onAction = (event: CcActionEvent) => {}   // app-level actions, see below
 | `keymap?: CcKeymap` | shared keymap instance (also configurable at runtime) |
 | `bindings?: CcKeymapConfig` | shorthand for a keymap with user overrides |
 | `chordTimeoutMs?: number` | chord timeout, CC default 3000 ms |
+| `pasteHoldTimeoutMs?: number` | lifetime of a held fragmented-paste prefix, default 50 ms (`0` disables the release timer) |
 | `context?: CcContext` | editor dispatch context, default `"editor"` |
 | `onAction?: (event) => boolean \| void` | app action sink (same as `editor.onAction`) |
 | `imageBudgets?: Partial<CcImageBudgets>` | in-memory image payload budget overrides (tests/constrained hosts) |
@@ -52,7 +53,16 @@ Editor methods that matter to the app:
   CSI-u included; Ctrl/Alt keys, ESC sequences, C0 and DEL return undefined).
   Pure helper; does not mutate the editor.
 - `getExpandedText()`, `getText()`, `getCursor()`, `getLines()` – inherited Pi.
-- `isPasting()`, `flushInputBuffer()` – bracketed-paste reassembly state.
+- `isPasting()` – true while a bracketed paste is partially received **or**
+  while a possible paste-marker prefix is held back waiting for the next chunk.
+  The App's paste protection therefore sees in-flight bytes instead of an idle
+  editor.
+- `flushInputBuffer()` – release held paste-prefix bytes immediately. No longer
+  required for correctness: the hold always has a deadline
+  (`pasteHoldTimeoutMs`, 50 ms default, unref'd timer) after which the bytes are
+  dispatched as ordinary keys, so a fragmented `ESC[` cannot swallow the next
+  keystroke. `dispose()` and `restoreDraft()`/`replaceDraftText()` clear the
+  timer and the pending bytes.
 - `cancelChord()` – one cancellation entry point: clears the chord timer and
   the keymap's pending prefix, notifying `onChordChange` once.
 - `dispose()` – idempotent teardown: clears this editor's chord timer, detaches
@@ -169,14 +179,19 @@ while one capture is in flight, so a re-entrant call is not captured twice.
 
 ```ts
 interface CcSubmitPayload {
-  text: string                              // draft text with visible attachment markers, pastes expanded
-  content: readonly PromptContentPart[]     // image/file parts replace their own marker in place
+  text: string                              // trimmed draft text, visible attachment markers kept, pastes expanded
+  content: readonly PromptContentPart[]     // built from the same trimmed text; image/file parts replace their own marker in place
   snapshot: CcDraftSnapshot                 // full pre-clear state, attachments included (memory only)
   images: readonly { id: number; image: ImageUploadPart }[]
   files: readonly { id: number; part: CcFilePromptPart; attachment: FileAttachmentRef }[]
   wasBrowsingHistory: boolean
 }
 ```
+
+Trimming happens **once**, at this boundary, and both fields come from the same
+string: concatenating the `content` text parts yields `text` exactly. A
+whitespace-only draft submits `text: ""` with `content: [{ type: "text", text:
+"" }]`; `"  [Image #1]  "` submits `text: "[Image #1]"` with just the image part.
 
 `getPromptContent()` throws `CcUnresolvedImageMarkerError` (`.markerIds`) for
 image markers without an upload, then `CcUnresolvedFileAttachmentError` for file

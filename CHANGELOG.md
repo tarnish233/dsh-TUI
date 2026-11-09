@@ -1,5 +1,20 @@
 # 版本记录
 
+## 未发布：P0/P1 缺陷修复（基于 v0.1.5）
+
+两轮并行只读审计（9 个 Agent）之后，按 P0/P1 修复并逐条加回归测试；backend 与 ui 的每项都做过「临时撤掉修复必须变红」的变异验证。最终完整 `pnpm check` **2421/2421**（197 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，508142ms），证据 `.cache/p01-check.log`。
+
+- **输入 P0**：`exitHistoryBrowsing()` 把草稿的 `[Image #N]`/`[File #N]` payload 合并回 live registry，而不是在 18 条编辑路径上丢弃——此前 `↑` 召回历史后打字/undo 会让附件不可恢复、`getPromptContent()` 抛 `CcUnresolvedImageMarkerError`。`wordWrapLine()` 只对可分的多字素段再切分，1–3 列终端的 CJK/emoji/ZWJ 不再 `RangeError`。
+- **输入 P1**：历史召回光标落在条目末尾（readline/CC 语义，打字追加而非前置）；`insertImage()` 与 `insertFile()` 对称预留手打标记 id（手打 `[Image #N]`/`[paste #n]` 不再被下一次上传/大粘贴静默"升级"）；分片粘贴前缀有 50 ms 上限（`pasteHoldTimeoutMs`，unref 定时器，`dispose()`/flush 清理），held 字节也算 `isPasting()`，不再吞掉下一个按键；提交载荷 `text` 与 `content` 来自同一次裁剪。
+- **Backend P0**：`queue-send-now` 变成事务——`followup` 被拒时两个 inbox lane 的 id 序列完整回填；`close()` 缓存第一次清理 promise，重复调用 join，`closed` 只在 `sessions.flush` 之后发一次。
+- **Backend P1**：`COMMAND_DECLARATIONS` 单一声明表取代四处并行清单，`permissions`／`queue-remove`／`efforts` 真正 session-less（表驱动测试直接从 `docs/BACKEND.md` 解析清单校验，文档与代码不再漂移）；`readImage`／`commands.execute` 的原生拒绝统一走 coded + redacted 分类；pending decision 记录 owner，根 `cancel()` 不再越界结算子 Agent 的问题，`close()` 结算全部；`/reload` 在 pending 会话可用且仍拒绝 unsettled command/decision；会话切换 abort 并 drain 自己的原生命令，`/reload` 不会被永久拒绝。
+- **App P0**：安装 `uncaughtException`／`unhandledRejection` 恢复——画出脱敏原因、交还终端、非零退出，而不是把栈画进 alt-screen + raw mode。native 插件显式传 `installCrashHandlers: true`（launcher 拥有信号，但本进程拥有终端）。
+- **App P1**：一个后端事件只画一帧（`store.onChange` 在事件处理期间不重绘，`stream_start` 由两次变一次）；底部 dock 改用 `measureRows` 测量，不再为量高度重绘成员；`SIGTSTP` 被忽略时 500 ms 后回滚 UI 并提示（`setImmediate` 让真实 SIGCONT 赢得竞争，避免误报；回滚后的迟到 SIGCONT 不会二次 `start()`）；重复中断走 `interruptShutdown()`——停止等待有界清理但保留首次退出码，普通重入仍 join。
+- **UI P1**：折叠 group 只在 header 行声明 hover owner（tool/activity/subagent 三处统一，现有 hover 契约测试未改）；删除 `ModalListSurface.bodyMouse` 的不可达回退（同时恢复 body 尺寸重标定契约）；图文混排 run 之间至多一个空行（原空 `if` 分支从未实现）；`TranscriptView` 按 item 身份 + 投影偏好缓存整帧投影，未变更的重绘不再重跑三次折叠、不再重建 key 集合。
+- 新增 55 条专项回归：`test/input-regressions.test.ts` 17、backend 17（`backend-context`／`backend-subagents`）、`test/ui-rendering-hardening.test.ts` 16、`test/app-lifecycle-hardening.test.ts` 5。
+- 版本漂移修复：`src/version.ts` 从 `0.1.4` 同步到 `0.1.5`；`test/cli.test.ts` 与 `test/ui-identity.test.ts` 改为从 `package.json` 派生期望值（此前硬编码，任何 bump 都会红）。
+- 边界未变：`@path` 仍是纯路径 mention，`/attach` 仍是唯一 FileBlock 输入；无第二 Harness、私有进程、IPC、Pi AgentSession 后端或 TUI 自有 provider／凭据／调度。全部场景使用 owned HOME/workspace 与 hermetic fake host，无真实 Provider／用户 profile／凭据／session 操作，未提交／tag／push／publish。
+
 ## 未发布：DSH 原生 `@file` 补全（基于 v0.1.4）
 
 - 修复输入 `@` 只有普通字符、看不到工作区候选：删除对未配置 Pi `fdPath` 的伪委托，改为可取消地调用当前 attachment／真实 Agent 的 `ctx.fileReferences.list`；DSH provider 保留 effective cwd、排序、排除、索引失效与模型侧 `read` 指引所有权。

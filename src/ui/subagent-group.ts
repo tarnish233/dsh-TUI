@@ -44,7 +44,7 @@ import type { TranscriptItem } from '../state/transcript.ts'
 import type { SubagentMessageTranscriptItem, SubagentTranscriptItem } from '../state/subagents.ts'
 import type { ActivityFrameNode } from './activity-group.ts'
 import type { ItemBlock, TranscriptViewOptions } from './blocks.ts'
-import { dispatchToChild, HoverOwnership, hoverRowSlot, isHoverExit, type MouseHitbox } from './mouse.ts'
+import { dispatchToChild, HoverOwnership, hoverControlAt, hoverRowSlot, type MouseHitbox } from './mouse.ts'
 import { SubagentLinkHitboxes } from './subagent-link.ts'
 import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
 import {
@@ -145,6 +145,8 @@ export interface SubagentGroupRowSpan {
 
 /** Placement token of this group's own header control (row 0). */
 const HEADER_SLOT = 'header'
+/** The header is the group's first painted row; no other row is a host control. */
+const HEADER_ROW = 0
 const DOT = '⏺'
 /**
  * Two-column tree guides, exactly like the tool group: the first row of a member
@@ -253,6 +255,16 @@ export class SubagentGroupBlock implements Component {
   /** Hitboxes declared by the last render (diagnostics/tests). */
   get hitboxes(): readonly MouseHitbox[] {
     return this.frameBoxes
+  }
+
+  /**
+   * Placement this group claimed for itself by the last motion (diagnostics).
+   *
+   * `header` only while the pointer is really on the header row; a collapsed
+   * member row (a notice/record name) adopts nothing.
+   */
+  get hoverSlot(): string | undefined {
+    return this.hover.current === this ? this.hover.placement : undefined
   }
 
   get isDisposed(): boolean {
@@ -582,10 +594,13 @@ export class SubagentGroupBlock implements Component {
     const span = this.rows.find(entry => event.y >= entry.startRow && event.y <= entry.endRow)
     if (event.type === 'move' || event.type === 'drag') {
       // One hover target per pointer position: a member row, this group's own
-      // header/name link, or nothing (a synthetic leave must not re-adopt it).
+      // header row, or nothing at all. Only row 0 is a host control; a collapsed
+      // member row and a gap adopt nothing, and a synthetic leave never
+      // re-adopts the header. Collapsed member name links are handled below by
+      // their own gesture helper.
       const next = span !== undefined
         ? { component: span.block, slot: hoverRowSlot(span.startRow) }
-        : isHoverExit(event) ? undefined : { component: this, slot: HEADER_SLOT }
+        : hoverControlAt(event, this, HEADER_ROW, HEADER_SLOT)
       this.hover.moveTo(next, span === undefined ? event : { ...event, y: event.y - span.startRow })
     }
     if (span !== undefined) {

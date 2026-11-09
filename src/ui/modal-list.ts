@@ -317,19 +317,18 @@ export class ModalListSurface {
     return this.frame.handleMouse(event)
   }
 
-  /** Translate a mouse event into body-local coordinates, if it is in the body. */
+  /**
+   * Translate a mouse event into body-local coordinates, if it is in the body.
+   *
+   * The frame owns the geometry of the last `render` and answers `undefined`
+   * before the first paint and outside the body, so this is a straight
+   * delegation: a second, surface-local translation could only disagree with
+   * the frame — and would hand the body the full-screen `width`/`height`
+   * instead of `bodyWidth`/`bodyHeight`, so a body that wraps to the event
+   * width would paint wider than the frame's inner box.
+   */
   bodyMouse(event: TuiMouseEvent): TuiMouseEvent | undefined {
-    try {
-      const translated = this.frame.bodyMouse(event)
-      if (translated !== undefined) return translated
-    } catch {
-      // Fall through to the geometry-based translation below.
-    }
-    const geometry = this.geometry
-    if (geometry === undefined) return undefined
-    if (event.x < geometry.bodyCol || event.x >= geometry.bodyCol + geometry.bodyWidth) return undefined
-    if (event.y < geometry.bodyRow || event.y >= geometry.bodyRow + geometry.bodyHeight) return undefined
-    return { ...event, x: event.x - geometry.bodyCol, y: event.y - geometry.bodyRow }
+    return this.frame.bodyMouse(event)
   }
 
   /**

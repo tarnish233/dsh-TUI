@@ -54,7 +54,7 @@
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { ToolTranscriptItem, TranscriptItem } from '../state/transcript.ts'
 import { type ItemBlock, thinkingRunsOf, type TranscriptViewOptions } from './blocks.ts'
-import { dispatchToChild, HitboxRegistry, HoverOwnership, hoverRowSlot, isHoverExit, type MouseHitbox } from './mouse.ts'
+import { dispatchToChild, HitboxRegistry, HoverOwnership, hoverControlAt, hoverRowSlot, type MouseHitbox } from './mouse.ts'
 import { fit, visibleWidth } from './text.ts'
 import { t } from './theme.ts'
 import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
@@ -71,6 +71,8 @@ const DOT = '●'
 const HOLLOW = '◌'
 /** Placement token of this group's own header control (row 0). */
 const HEADER_SLOT = 'header'
+/** The header is the group's first painted row; no other row is a host control. */
+const HEADER_ROW = 0
 const BRANCH = { more: '├ ', last: '└ ', moreBody: '│ ', lastBody: '  ' } as const
 const GLYPH_WIDTH = 2
 
@@ -397,6 +399,16 @@ export class ToolGroupBlock implements Component {
   /** Hitboxes declared by the last render (diagnostics/tests). */
   get hitboxes(): readonly MouseHitbox[] {
     return this.frameBoxes
+  }
+
+  /**
+   * Placement this group claimed for itself by the last motion (diagnostics).
+   *
+   * `header` only while the pointer is really on the header row; member rows of
+   * a collapsed group adopt nothing.
+   */
+  get hoverSlot(): string | undefined {
+    return this.hover.current === this ? this.hover.placement : undefined
   }
 
   get isDisposed(): boolean {
@@ -738,12 +750,14 @@ export class ToolGroupBlock implements Component {
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     const span = this.rows.find(entry => event.y >= entry.startRow && event.y <= entry.endRow)
     if (event.type === 'move' || event.type === 'drag') {
-      // One hover target per pointer position: a child row, the header, or
-      // nothing (a synthetic leave from the transcript must not re-adopt the
-      // header). The previous target hears its exit before the new one enters.
+      // One hover target per pointer position: a child row, this group's header
+      // row, or nothing at all. The header row is the only row this host claims
+      // for itself; a collapsed member row and a gap adopt nothing, and a
+      // synthetic leave never re-adopts the header. The previous target hears
+      // its exit before the new one enters.
       const next = span !== undefined
         ? { component: span.block, slot: hoverRowSlot(span.startRow) }
-        : isHoverExit(event) ? undefined : { component: this, slot: HEADER_SLOT }
+        : hoverControlAt(event, this, HEADER_ROW, HEADER_SLOT)
       this.hover.moveTo(next, span === undefined ? event : { ...event, y: event.y - span.startRow })
     }
     if (span !== undefined) {

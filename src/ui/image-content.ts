@@ -156,32 +156,34 @@ export class ImageContentBody {
     const markers: ContentMarkerRow[] = []
     const markerRows: number[] = []
     let textSlot = 0
-    let firstBodyLine = true
 
+    /**
+     * Append one text run below a single blank separator.
+     *
+     * Adjacent runs are separated by *at most* one empty row: a marker row that
+     * is already followed by a blank one (or a run that paints nothing after
+     * its edges were trimmed) must not stack a second separator, and the body
+     * never ends on a dangling blank row. Marker rows keep their own adjacency
+     * — they are already one compact row each.
+     */
     const pushText = (text: string): void => {
       const rendered = this.renderText(text, safeWidth, textSlot++)
       // Trim the edges: adjacent image markers provide their own spacing.
       while (rendered.length > 0 && rendered[0]!.trim() === '') rendered.shift()
       while (rendered.length > 0 && rendered[rendered.length - 1]!.trim() === '') rendered.pop()
-      for (const line of rendered) {
-        if (!firstBodyLine && lines.length > 0 && lines[lines.length - 1] === '') {
-          // Keep a single separator between a text run and the following run.
-        }
-        lines.push(line)
-        firstBodyLine = false
-      }
+      if (rendered.length === 0) return
+      if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('')
+      for (const line of rendered) lines.push(line)
     }
 
     for (const run of this.runs) {
       if (run.kind === 'text') {
-        if (lines.length > 0) lines.push('')
         pushText(run.text)
         continue
       }
       if (run.kind === 'file') {
         lines.push(fileMarkerLine(run.fileNumber, run.attachment, safeWidth))
         markerRows.push(lines.length - 1)
-        firstBodyLine = false
         continue
       }
       const spec: ImageMarkerSpec = {
@@ -197,7 +199,6 @@ export class ImageContentBody {
       lines.push(imageMarkerLine(spec, safeWidth))
       markerRows.push(lines.length - 1)
       if (run.kind === 'image') markers.push({ row: lines.length - 1, key: run.key })
-      firstBodyLine = false
     }
 
     return { lines, markerRows, markers }

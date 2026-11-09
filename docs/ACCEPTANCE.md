@@ -1,5 +1,21 @@
 # v0.1.4 原生 DSH 边界与交互语义验收
 
+## 当前工作树：P0/P1 缺陷修复（未提交，基于 v0.1.5）
+
+两轮并行只读审计（9 个 Agent：DSH 能力复用、backend、input、UI、死代码、性能、Web 对齐、会话/上下文缺口、工作区/终端缺口）之后并行修复 P0/P1。每条修复都带回归测试，backend 与 ui 的每一条都做过「临时撤掉修复必须变红」的变异验证。
+
+- **最终完整 `pnpm check` 2421/2421**，197 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **508142ms**。`.cache/p01-check.log`。
+- **输入（P0）**：`exitHistoryBrowsing()` 现在把草稿的 `[Image #N]`/`[File #N]` payload 合并回 live registry 而不是丢弃；此前 `↑` 召回历史 + 打字/undo 会让附件不可恢复且 `getPromptContent()` 抛 `CcUnresolvedImageMarkerError`。`wordWrapLine()` 只对可分的多字素段再切分；1–3 列的 CJK/emoji/ZWJ 不再 `RangeError`。
+- **输入（P1）**：历史召回光标落在条目末尾（readline/CC）；`insertImage()` 与 `insertFile()` 对称地预留手打标记 id；分片粘贴前缀有 50 ms 上限并把 held 字节算作 `isPasting()`；提交载荷 `text` 与 `content` 来自同一次裁剪。
+- **Backend（P0）**：`promote()` 把队列重排与唤醒包进事务，`followup` 被拒时两个 lane 的 id 序列完整回填；`close()` 缓存第一次清理 promise，重复调用 join，`closed` 只在 `sessions.flush` 之后发一次。
+- **Backend（P1）**：`COMMAND_DECLARATIONS` 单一声明表取代四处并行清单，`permissions`/`queue-remove`/`efforts` 真正 session-less（测试直接从 `docs/BACKEND.md` 解析清单校验）；`readImage`/`commands.execute` 的原生拒绝走 coded + redacted 分类；pending decision 记录 owner，根 `cancel()` 不再结算子 Agent 的问题；`/reload` 在 pending 会话可用；会话切换 abort 并 drain 自己的原生命令。
+- **App（P0）**：安装 `uncaughtException`/`unhandledRejection` 恢复——画出脱敏原因、交还终端、非零退出，而不是把栈画进 alt-screen + raw mode。native 插件显式传 `installCrashHandlers: true`（launcher 拥有信号，但本进程拥有终端）。
+- **App（P1）**：一个后端事件只画一帧（`store.onChange` 在事件处理期间不重绘）；底部 dock 改用 `measureRows` 测量，不再为量高度重绘成员；`SIGTSTP` 被忽略时 500 ms 后回滚 UI 并提示（`setImmediate` 让真实的 SIGCONT 赢得竞争，避免误报）；重复中断走 `interruptShutdown()`，停止等待有界清理但保留首次退出码。
+- **UI（P1）**：折叠 group 只在 header 行声明 hover owner（三处统一）；删除 `ModalListSurface.bodyMouse` 的不可达回退（同时恢复 body 尺寸重标定契约）；图文混排 run 之间至多一个空行（原空 `if` 分支从未实现）；`TranscriptView` 按 item 身份 + 投影偏好缓存整帧投影，未变更的重绘不再重跑三次折叠。
+- 新增 55 条专项回归：`test/input-regressions.test.ts` 17、backend 17（`backend-context`/`backend-subagents`）、`test/ui-rendering-hardening.test.ts` 16、`test/app-lifecycle-hardening.test.ts` 5。
+- 版本漂移修复：`src/version.ts` 从 `0.1.4` 同步到 `0.1.5`，`test/cli.test.ts` 与 `test/ui-identity.test.ts` 改为从 `package.json` 派生期望值（此前硬编码使任何 bump 都会红）。
+- 全部 native/PTY 场景使用 owned HOME/workspace 与 hermetic fake host；无真实 Provider、用户 profile、凭据或 session 操作，未提交/tag/push/publish。
+
 ## 当前工作树：DSH 原生 `@file` 补全（未提交）
 
 用户现场确认输入 `@` 没有候选。本轮先复现出 Pi `CombinedAutocompleteProvider` 未传 `fdPath` 因而恒空、原测试 `null === null` 假阳性，再改接 DSH 官方 `fileReferences` seam；没有把 Pi Agent/runtime 或全局 `fd` 带回生产。

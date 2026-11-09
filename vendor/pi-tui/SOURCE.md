@@ -143,6 +143,56 @@ atomic undo/kill/history, snapshot high-water ids and unresolved-marker blocking
      typing after a completed/discarded reply and paste framing are unchanged.
    - Exit condition: upstream bounds reply reassembly and fails closed itself.
 
+7. `src/components/editor.ts` — history browsing keeps the draft's attachment
+   payloads and recalls entries at their end.
+   - `exitHistoryBrowsing()` (called by 18 edit paths: typing, undo, insert,
+     kill, delete, …) used to null `historyDraftImages`/`historyDraftFiles`
+     without merging them back into the live registries. The pre-browsing
+     draft's `[Image #N]`/`[File #N]` text stays on the undo stack and in the
+     kill ring, so its payloads became unreachable and the host refused the
+     draft with an unresolved-marker error even though Ctrl+_ restored the
+     markers. The method now merges the draft payloads into the live registries
+     before clearing them. Id spaces are monotonic, so merging cannot rebind an
+     id (live entries stay authoritative, draft-only ids are added).
+   - The only other restore path (`navigateHistory()` with `historyIndex ===
+     -1`, i.e. Down/Esc back to the draft) is unchanged: it installs the draft
+     registry instead of merging.
+   - A recalled entry now places the cursor at the end of the entry
+     (`setTextInternal()` default) instead of at column 0 for the Up direction.
+     Readline/CC/Pi all resume a recalled entry at its end, so a keystroke after
+     Up appends instead of prepending. Multi-line "sticky" behaviour does not
+     depend on the cursor: it is decided by `historyIndex > -1`.
+   - Exit condition: upstream keeps the pre-browsing draft's attachment
+     registries alive on its own and resumes recall at the end of the entry.
+
+8. `src/components/editor.ts` — `wordWrapLine()` terminates for a grapheme wider
+   than the layout.
+   - A segment wider than `maxWidth` is re-wrapped at grapheme granularity. For
+     an atomic marker (paste/image/file) that split makes progress, but a single
+     wide grapheme (CJK, emoji, ZWJ sequence) has no smaller unit, so
+     `wordWrapLine(grapheme, maxWidth)` recursed with identical arguments. In a
+     1-column layout (`layoutWidth === Math.max(1, …)`) every wide grapheme is
+     wider than the width, so `render(1)`/`render(2)` on CJK text crashed with
+     `RangeError: Maximum call stack size exceeded`.
+   - The re-wrap now only runs when the segment contains more than one grapheme;
+     an unsplittable grapheme stays one chunk and the visual line overflows the
+     column instead of crashing. Cursor movement, marker atomicity and the
+     marker-in-a-narrow-terminal split are unchanged.
+   - Exit condition: upstream word-wrap handles an unsplittable wide grapheme.
+
+9. `src/components/editor.ts` — a large paste never takes an id that existing
+   marker text already uses.
+   - `notePasteMarkerIds()` (new, public, mirrors `noteImageMarkerIds`/
+     `noteFileMarkerIds`) raises `pasteCounter` from `[paste #N …]` text already
+     in the draft, and the large-paste path calls it before allocating an id.
+     Otherwise a hand-typed or restored `[paste #1 999 chars]` made the next
+     large paste take id 1, and submit expanded the typed marker into that
+     paste's content (`expandPasteMarkers` matches by id). The typed marker now
+     stays literal text and the new paste gets the next free id.
+   - Id reservation is one-way: it never rewrites marker text and never expands
+     a typed marker. Pi's marker deletion/renumbering path is untouched.
+   - Exit condition: upstream reserves paste ids from existing marker text.
+
 All deviations are covered by DSH TUI's offline tests
 (`test/input-lifecycle.test.ts` covers the lifecycle one with a private PTY and
 a fake terminal; `test/input-terminal-output.test.ts` covers writer injection
@@ -150,4 +200,7 @@ with an in-process stream probe and a private PTY;
 `test/input-terminal-integration.test.ts` covers OSC 7501 encoding/limits,
 capability policy, record replay/clear, focus isolation from input and paste,
 title-stack balance, progress policy, after-stop write gating and the bounded
-reply reassembly); refresh them with every Pi TUI upgrade.
+reply reassembly; `test/input-regressions.test.ts` covers deviations 7-9 —
+history-browsing payload survival for both attachment families, the 1-3 column
+CJK/emoji/ZWJ and paste-marker wrap layouts, recall-at-end, and paste-id
+reservation); refresh them with every Pi TUI upgrade.

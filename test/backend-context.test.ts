@@ -6,10 +6,12 @@
  * request or subprocess is touched.
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { createDshBackend, type DshContextBackend } from '../src/backend/context.ts'
+import { BackendError } from '../src/backend/errors.ts'
 import type { BackendEvent, PromptContentPart, SessionInfo } from '../src/backend/types.ts'
-import { FakeAgentRegistry, FakeDshHost, fakeNativeHelpers, type FakeAgentState } from '../src/backend/testing.ts'
+import { FakeAgentRegistry, FakeDshHost, fakeNativeHelpers, nextTask, type FakeAgentState } from '../src/backend/testing.ts'
 
 interface Harness {
   host: FakeDshHost
@@ -601,5 +603,334 @@ test('sendContent text-only delegates to the normal native message path', async 
   assert.ok(agent)
   const message = agent.sent[0]?.message as Record<string, unknown>
   assert.deepEqual(message.content, [{ type: 'text', text: 'hello\nworld' }])
+  await backend.close()
+})
+// ---------------------------------------------------------------------------
+// Lifecycle, queue and native-error hardening regressions.
+//
+// Each test names the invariant it protects: the adapter must not lose the
+// user's native queue, must not announce `closed` before its own cleanup
+// settled, must not create a ghost session for a read-only command, and must
+// never forward an unredacted native rejection.
+// ---------------------------------------------------------------------------
+
+/** One recallable queued row, in the exact native user-message shape. */
+function queueRow(id: string, text: string): { id: string; content: Array<{ type: 'text'; text: string }>; source: { kind: string } } {
+  return { id, content: [{ type: 'text', text }], source: { kind: 'user' } }
+}
+
+function laneIds(agent: FakeAgentState): { nextTurn: string[]; nextStep: string[] } {
+  return {
+    nextTurn: agent.inbox.nextTurn.map(message => message.id),
+    nextStep: agent.inbox.nextStep.map(message => message.id),
+  }
+}
+
+function hasCode(code: string): (error: unknown) => boolean {
+  return (error: unknown) => (error as { code?: unknown }).code === code
+}
+
+/** Adapter-owned command carriers; read through a structural cast, never `any`. */
+function activeCommandCount(backend: DshContextBackend): number {
+  return (backend as unknown as { activeCommands: Map<string, unknown> }).activeCommands.size
+}
+
+/**
+ * A native command registry whose `execute` only settles when its carrier
+ * signal aborts: one uncooperative, long-running native command.
+ */
+function heldCommands(): { service: Record<string, unknown>; started: () => number } {
+  let started = 0
+  return {
+    started: () => started,
+    service: {
+      list: () => [],
+      execute: (_agent: unknown, _line: string, _parts: readonly unknown[], signal: AbortSignal): Promise<never> => {
+        started += 1
+        return new Promise<never>((_resolve, reject) => {
+          const abort = (): void => reject(Object.assign(new Error('the native command was cancelled'), { code: 'ABORTED' }))
+          if (signal.aborted) abort()
+          else signal.addEventListener('abort', abort, { once: true })
+        })
+      },
+    },
+  }
+}
+
+const IMAGE_REF = { attachmentId: 'image-1', mediaType: 'image/png' as const, bytes: 10, width: 2, height: 2 }
+
+/**
+ * The session-less command list exactly as documented.
+ *
+ * `docs/BACKEND.md` derives that list from the single `COMMAND_DECLARATIONS`
+ * table; parsing the document here is what keeps the document, the table and
+ * the observable behavior from drifting apart again.
+ */
+function documentedSessionlessCommands(): string[] {
+  const text = readFileSync(new URL('../docs/BACKEND.md', import.meta.url), 'utf8')
+  const statement = /Session-less commands \(([^)]*)\)/u.exec(text)
+  assert.ok(statement, 'docs/BACKEND.md states the session-less command list')
+  return [...statement[1].matchAll(/`([a-z0-9][a-z0-9-]*)`/gu)].map(match => match[1])
+}
+
+test('queue-send-now restores the exact native queue when the wake is refused', async () => {
+  const { backend, agents } = await connected()
+  await backend.send('prompt')
+  const agent = latestAgent({ agents })
+  agent.status = 'running'
+  const m1 = queueRow('m1', 'first')
+  const m2 = queueRow('m2', 'second')
+  agent.inbox.nextTurn.push(m1, m2)
+  agent.inbox.nextStep.push(queueRow('m3', 'next step'))
+  const before = laneIds(agent)
+  const refusal = Object.assign(new Error('agent "x" is not live'), { code: 'AGENT_NOT_LIVE' })
+  // The public wake is the only step that can refuse after the queue moved.
+  agent.followup = () => { throw refusal }
+  await assert.rejects(
+    backend.command('queue-send-now', { messageId: 'm1' }),
+    (error: unknown) => error === refusal,
+  )
+  assert.deepEqual(laneIds(agent), before, 'a refused wake leaves both native lanes exactly as they were')
+  assert.equal(agent.inbox.nextTurn[0], m1, 'the same native message object is restored, not a copy')
+  assert.equal(agent.inbox.nextTurn[1], m2)
+  await backend.close()
+})
+
+test('repeated close joins the first owned cleanup and announces closed once, after it settles', async () => {
+  const steps: string[] = []
+  let releaseFlush: () => void = () => {}
+  const flushing = new Promise<void>((resolve) => { releaseFlush = resolve })
+  const { backend, agents, events, turns } = await connected((host) => {
+    host.use('sessions', {
+      flush: async (): Promise<void> => {
+        steps.push('flush:start')
+        await flushing
+        steps.push('flush:end')
+      },
+    })
+  })
+  await backend.send('prompt')
+  const agent = latestAgent({ agents })
+  // A recorded turn is the native fact that makes the retirement flush real.
+  turns.lastTurn = 1
+  backend.onEvent((event) => { if (event.type === 'closed') steps.push('closed') })
+
+  const first = backend.close()
+  const second = backend.close()
+  let secondSettled = false
+  void second.then(() => { secondSettled = true }, () => { secondSettled = true })
+  await nextTask()
+  assert.deepEqual(steps, ['flush:start'], 'the joining close neither settles nor announces closed early')
+  assert.equal(secondSettled, false)
+
+  releaseFlush()
+  await Promise.all([first, second])
+  assert.deepEqual(steps, ['flush:start', 'flush:end', 'closed'], 'closed follows the settled cleanup')
+  assert.equal(events.filter(event => event.type === 'closed').length, 1, 'closed is announced exactly once')
+  assert.equal(agent.disposed, true)
+})
+
+test('a cleanup rejection still announces closed exactly once for every joining close', async () => {
+  const { backend, agents, events } = await connected()
+  await backend.send('prompt')
+  const agent = latestAgent({ agents })
+  // A native attachment that fails while it is being retired: the adapter's
+  // own announcement must survive the failure and stay single.
+  Object.defineProperty(agent.session, 'id', {
+    configurable: true,
+    get() { throw new Error('synthetic native cleanup failure') },
+  })
+  const first = backend.close()
+  const second = backend.close()
+  await assert.rejects(first, /synthetic native cleanup failure/)
+  await assert.rejects(second, /synthetic native cleanup failure/)
+  assert.equal(events.filter(event => event.type === 'closed').length, 1)
+})
+
+test('every documented session-less command answers without materializing the pending Agent', async () => {
+  const names = documentedSessionlessCommands()
+  for (const name of ['permissions', 'queue-remove', 'efforts']) {
+    assert.ok(names.includes(name), `${name} is documented as session-less`)
+  }
+  for (const name of names) {
+    const h = await connected()
+    assert.deepEqual(h.agents.createCalls, [])
+    // An unmounted native service may still reject; the invariant is that a
+    // session-less command never creates the pending Session's Agent.
+    await h.backend.command(name).catch(() => undefined)
+    assert.deepEqual(h.agents.createCalls, [], `${name} must not materialize a pending session`)
+    await h.backend.close()
+  }
+})
+
+test('read-only commands report structured pending facts instead of creating a session', async () => {
+  const { backend, agents } = await connected()
+  const permissions = await backend.command('permissions') as {
+    options?: Array<{ value?: unknown }>
+    currentValue?: unknown
+  }
+  assert.deepEqual(permissions.options?.map(option => option.value), ['read-only', 'workspace-write'])
+  assert.equal(permissions.currentValue, undefined, 'a pending attachment has no native current value')
+  assert.deepEqual(await backend.command('queue-remove', { messageId: 'm1' }), { removed: false })
+  const efforts = await backend.command('efforts') as {
+    provider?: string
+    model?: string
+    available?: boolean
+    efforts?: Array<{ id?: unknown }>
+  }
+  assert.equal(efforts.provider, 'p1', 'the pending route is the native default, not a created Agent')
+  assert.equal(efforts.model, 'm1')
+  assert.equal(efforts.available, true)
+  assert.deepEqual(efforts.efforts?.map(level => level.id), ['low', 'high'])
+  assert.deepEqual(agents.createCalls, [], 'no read-only command materialized the pending Agent')
+  await backend.close()
+})
+
+test('native image-read and command refusals keep a code and redact credentials', async () => {
+  const secret = 'sk-live-abcdef123456'
+  const { backend } = await connected((host) => {
+    host.use('attachments', {
+      readImage: async (): Promise<never> => { throw new Error(`Authorization: Bearer ${secret}`) },
+    })
+    host.use('commands', {
+      list: () => [],
+      execute: async (): Promise<never> => { throw new Error(`api_key=${secret}`) },
+    })
+  })
+  const image = await backend.readImage(IMAGE_REF).catch((error: unknown) => error)
+  assert.ok(image instanceof BackendError, 'the image-read rejection is a coded BackendError')
+  assert.equal(typeof image.code, 'string')
+  assert.equal(image.message.includes(secret), false, 'the bearer token never reaches the UI')
+  assert.match(image.message, /\[redacted\]/u)
+
+  await backend.send('prompt')
+  const command = await backend.command('execute', { line: '/compact' }).catch((error: unknown) => error)
+  assert.ok(command instanceof BackendError, 'the native command rejection is a coded BackendError')
+  assert.equal(command.code, 'RUNTIME_REQUEST_FAILED')
+  assert.equal(command.message.includes(secret), false, 'the API key never reaches the UI')
+  assert.match(command.message, /\[redacted\]/u)
+  await backend.close()
+})
+
+test('cancellation keeps its own code on the image and command seams', async () => {
+  const holding = await connected((host) => {
+    host.use('attachments', {
+      readImage: async (_ref: unknown, signal?: AbortSignal): Promise<never> => new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('the native read was aborted')), { once: true })
+      }),
+    })
+  })
+  const controller = new AbortController()
+  const reading = holding.backend.readImage(IMAGE_REF, controller.signal)
+  await nextTask()
+  controller.abort()
+  await assert.rejects(reading, hasCode('ABORTED'))
+  await holding.backend.close()
+
+  const held = heldCommands()
+  const running = await connected((host) => { host.use('commands', held.service) })
+  await running.backend.send('prompt')
+  const executing = running.backend.command('execute', { line: '/compact' })
+  await nextTask()
+  await running.backend.cancel()
+  await assert.rejects(executing, hasCode('ABORTED'))
+  await running.backend.close()
+})
+
+test('/reload reconciles the profile on a pending session without materializing it', async () => {
+  const calls: string[] = []
+  const { backend, agents, events, info } = await connected((host) => {
+    host.use('hmr', {
+      runExclusive: async (operation: () => Promise<unknown>): Promise<unknown> => {
+        calls.push('exclusive')
+        return await operation()
+      },
+      reconcileProfile: async (): Promise<unknown> => {
+        calls.push('reconcile')
+        return { warnings: ['native warning'], pending: [] }
+      },
+    })
+  })
+  const result = await backend.command('reload') as Record<string, unknown>
+  assert.deepEqual(calls, ['exclusive', 'reconcile'], 'a pending session runs the same single-step native reload')
+  assert.equal(result.available, true)
+  assert.deepEqual(result.warnings, ['native warning'])
+  const refreshed = result.info as SessionInfo
+  assert.equal(refreshed.sessionId, info.sessionId, 'the refreshed info is the same pending attachment')
+  assert.equal(refreshed.attachmentId, info.attachmentId)
+  assert.deepEqual(agents.createCalls, [], 'reload never materializes the pending Agent')
+  assert.equal(events.filter(event => event.type === 'ready').length, 1, '/reload does not replay ready')
+  await backend.close()
+})
+
+test('/reload still refuses while one of its own native commands is unsettled', async () => {
+  const held = heldCommands()
+  const { backend } = await connected((host) => {
+    host.use('commands', held.service)
+    host.use('hmr', {
+      runExclusive: async (operation: () => Promise<unknown>): Promise<unknown> => await operation(),
+      reconcileProfile: async (): Promise<unknown> => ({}),
+    })
+  })
+  await backend.send('prompt')
+  const executing = backend.command('execute', { line: '/compact' })
+  await nextTask()
+  assert.equal(held.started(), 1)
+  await assert.rejects(backend.command('reload'), /wait for the current turn/u)
+  await backend.cancel()
+  await assert.rejects(executing, hasCode('ABORTED'))
+  const result = await backend.command('reload') as Record<string, unknown>
+  assert.equal(result.available, true, 'a settled command no longer blocks the native reload')
+  await backend.close()
+})
+
+test('/reload refuses while a native decision is still open', async () => {
+  const { backend, agents, events } = await connected((host) => {
+    host.use('hmr', {
+      runExclusive: async (operation: () => Promise<unknown>): Promise<unknown> => await operation(),
+      reconcileProfile: async (): Promise<unknown> => ({}),
+    })
+  })
+  await backend.send('prompt')
+  const agent = latestAgent({ agents })
+  const host = (backend as unknown as { host: FakeDshHost }).host
+  const approval = host.waterfall('approval/request', { agent, toolName: 'bash' })
+  const decision = events.find(event => event.type === 'decision')
+  assert.ok(decision?.type === 'decision')
+  await assert.rejects(backend.command('reload'), /wait for the current turn/u)
+  await backend.respond(decision.request.id, 'rejected')
+  assert.equal(await approval, 'rejected')
+  // The turn that asked is finished, so only the (now settled) decision could
+  // have blocked the gate.
+  agent.status = 'idle'
+  const result = await backend.command('reload') as Record<string, unknown>
+  assert.equal(result.available, true, 'a settled decision no longer blocks the native reload')
+  await backend.close()
+})
+
+test('switching sessions aborts and drains its own native command so reload recovers', async () => {
+  const held = heldCommands()
+  const reloads: string[] = []
+  const { backend } = await connected((host) => {
+    host.use('commands', held.service)
+    host.use('hmr', {
+      runExclusive: async (operation: () => Promise<unknown>): Promise<unknown> => {
+        reloads.push('exclusive')
+        return await operation()
+      },
+      reconcileProfile: async (): Promise<unknown> => ({}),
+    })
+  })
+  await backend.send('prompt')
+  const executing = backend.command('execute', { line: '/compact' })
+  await nextTask()
+  assert.equal(activeCommandCount(backend), 1)
+  await backend.command('new')
+  await assert.rejects(executing, hasCode('ABORTED'))
+  await nextTask()
+  assert.equal(activeCommandCount(backend), 0, 'the retired attachment left no command carrier behind')
+  const result = await backend.command('reload') as Record<string, unknown>
+  assert.equal(result.available, true, 'the new attachment is not blocked by a foreign carrier')
+  assert.deepEqual(reloads, ['exclusive'])
   await backend.close()
 })

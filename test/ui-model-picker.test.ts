@@ -333,7 +333,10 @@ test('fragmented bracketed paste is reassembled, keeps Tab/Ctrl+C bytes as text 
   ]
   const p = makePicker({ models, currentProvider: 'p', currentModel: 'one' })
   p.dialog.handleInput('\x1b[2')
-  assert.equal(p.dialog.isPasting, false)
+  // A held prefix is input the editor has not classified yet. Hosts use
+  // `isPasting` as their protection flag, so bytes waiting for the rest of the
+  // paste marker must report as pasting instead of looking idle.
+  assert.equal(p.dialog.isPasting, true, 'a possible paste-marker prefix is held, not ignored')
   p.dialog.handleInput('00~alpha')
   assert.equal(p.dialog.isPasting, true)
   p.dialog.handleInput(KEY.ctrlC) // pasted byte, never an interrupt

@@ -10,9 +10,16 @@
  *   [{ kind: "keys", data }, { kind: "paste", text }, ...]
  *
  * A trailing fragment that could become `ESC[200~` is held until the next
- * chunk (or an explicit `flush()`), so `ESC[2` + `00~hello` is still a paste.
- * A lone ESC is dispatched immediately as Escape because it is far more common
- * than a one-byte-first fragmented paste marker.
+ * chunk, the hold deadline or an explicit `flush()`, so `ESC[2` + `00~hello` is
+ * still a paste. A lone ESC is dispatched immediately as Escape because it is
+ * far more common than a one-byte-first fragmented paste marker.
+ *
+ * The hold is always bounded: when no further chunk arrives within
+ * `holdTimeoutMs` (the same 50 ms order the terminal reply reassembler uses) the
+ * held bytes are released as ordinary keys through `onHoldTimeout`. A held
+ * prefix therefore cannot swallow the next keystroke indefinitely or require an
+ * external flush, and `isHolding`/`pendingBytes` let the host's paste protection
+ * see that bytes are still in flight.
  */
 
 export type PasteToken = { kind: "keys"; data: string } | { kind: "paste"; text: string }
@@ -20,13 +27,38 @@ export type PasteToken = { kind: "keys"; data: string } | { kind: "paste"; text:
 export const BRACKETED_PASTE_START = "\x1b[200~"
 export const BRACKETED_PASTE_END = "\x1b[201~"
 
+/** Default lifetime of a held paste-marker prefix (match `stdin-buffer.ts`). */
+export const DEFAULT_PASTE_HOLD_TIMEOUT_MS = 50
+
+export interface BracketedPasteFilterOptions {
+  /** How long a fragmented paste-marker prefix may wait for the next chunk. */
+  holdTimeoutMs?: number
+  /** Release sink for held bytes whose deadline expires (dispatched as keys). */
+  onHoldTimeout?: (data: string) => void
+}
+
 export class BracketedPasteFilter {
   private pending = ""
   private buffer = ""
   private pasting = false
+  private holdTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly holdTimeoutMs: number
+  private readonly onHoldTimeout: ((data: string) => void) | undefined
+
+  constructor(options: BracketedPasteFilterOptions = {}) {
+    const requested = Number(options.holdTimeoutMs ?? DEFAULT_PASTE_HOLD_TIMEOUT_MS)
+    this.holdTimeoutMs =
+      Number.isFinite(requested) && requested >= 0 ? requested : DEFAULT_PASTE_HOLD_TIMEOUT_MS
+    this.onHoldTimeout = options.onHoldTimeout
+  }
 
   get isPasting(): boolean {
     return this.pasting
+  }
+
+  /** True while a possible paste-marker prefix is held back for the next chunk. */
+  get isHolding(): boolean {
+    return this.pending.length > 0
   }
 
   get pendingBytes(): string {
@@ -34,6 +66,7 @@ export class BracketedPasteFilter {
   }
 
   reset(): void {
+    this.clearHoldTimer()
     this.pending = ""
     this.buffer = ""
     this.pasting = false
@@ -49,6 +82,43 @@ export class BracketedPasteFilter {
   }
 
   private consume(data: string, allowHold: boolean): PasteToken[] {
+    this.clearHoldTimer()
+    const tokens = this.consumeChunks(data, allowHold)
+    if (this.pending.length > 0) this.armHoldTimer()
+    return tokens
+  }
+
+  private armHoldTimer(): void {
+    if (!this.onHoldTimeout || this.holdTimeoutMs <= 0) return
+    if (this.holdTimer !== undefined) return
+    const timer = setTimeout(() => {
+      this.holdTimer = undefined
+      this.expireHold()
+    }, this.holdTimeoutMs)
+    // Never keep the process alive for a held paste prefix.
+    if (typeof timer.unref === "function") timer.unref()
+    this.holdTimer = timer
+  }
+
+  private clearHoldTimer(): void {
+    if (this.holdTimer === undefined) return
+    clearTimeout(this.holdTimer)
+    this.holdTimer = undefined
+  }
+
+  /**
+   * Deadline expired: the held bytes were not a fragmented paste marker after
+   * all, so they are released as ordinary keys. `pending` is cleared first so a
+   * re-entrant `push()` from the sink cannot see stale bytes.
+   */
+  private expireHold(): void {
+    const held = this.pending
+    this.pending = ""
+    if (held.length === 0) return
+    this.onHoldTimeout?.(held)
+  }
+
+  private consumeChunks(data: string, allowHold: boolean): PasteToken[] {
     const tokens: PasteToken[] = []
     let input = this.pending + data
     this.pending = ""

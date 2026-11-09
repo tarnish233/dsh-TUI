@@ -44,6 +44,8 @@ import { SubagentProgress } from './ui/subagent-progress.ts'
 import { TodoBoard } from './ui/todo-board.ts'
 import { GoalProgress } from './ui/goal-progress.ts'
 import { StatusDockStack } from './ui/status-dock-stack.ts'
+import { measureRows } from './ui/measure.ts'
+import { DockPromptEditor } from './ui/inline-editor.ts'
 import { subagentCanReply, subagentCanStop, subagentLabel } from './ui/subagent-format.ts'
 import { getTranscriptImages } from './ui/image-data.ts'
 import { resetImageDisplayCache } from './ui/image-cache.ts'
@@ -55,6 +57,7 @@ import { TranscriptView, transcriptHints, type TranscriptViewHints, type Transcr
 import { dim, editorTheme, t } from './ui/theme.ts'
 import { WelcomeHeader } from './ui/welcome.ts'
 import { TerminalIntegration, type TerminalEnvironment } from './ui/terminal-integration.ts'
+import { redactDiagnostic } from './backend/errors.ts'
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
 
@@ -99,6 +102,13 @@ function styledGitStatus(status: string): string {
   return out
 }
 const EXIT_ARM_MS = 1_000
+/**
+ * How long a sent SIGTSTP may stay unhandled before the suspended UI is rolled
+ * back. Comfortably longer than a job-control round trip: the signal itself is
+ * delivered in microseconds, so only "the disposition is ignored" reaches this
+ * deadline.
+ */
+const SUSPEND_ROLLBACK_MS = 500
 /** One renderer-owned clock/frame family for the editor and live child progress. */
 const WORKING_SPINNER_FRAMES = ['·', '✻', '✶', '✳'] as const
 /** Bound on graceful DSH close after the terminal is already restored. */
@@ -175,7 +185,7 @@ const OPTIONAL_UI_COMMANDS = [
 ] as const
 const UI_COMMAND_NAMES = new Set([...UI_COMMANDS.map(command => command.name), 'quit', 'config', 'clear'])
 
-class PromptEditor extends CcEditor {
+class PromptEditor extends DockPromptEditor {
   private workingStatus = ''
 
   /** Render the live working status inside the editor's top border. */
@@ -231,6 +241,12 @@ export interface AppOptions {
   registerSignals?: boolean
   /** A native host owns shutdown signals, independently of Unix suspend/resume. */
   allowSuspend?: boolean
+  /**
+   * Install process-level crash recovery. Defaults to `registerSignals !== false`;
+   * the native plugin sets it explicitly because the launcher owns the signals
+   * but this process still owns the visible terminal.
+   */
+  installCrashHandlers?: boolean
   /** User-triggered tool copy; offline acceptance injects this rather than touching a real clipboard. */
   copyText?: (text: string) => Promise<void>
   /** Native clipboard injection for offline image/text acceptance; never a credential/config subsystem. */
@@ -340,6 +356,8 @@ export class App {
   private connected = false
   private fatal = false
   private closing = false
+  /** Exit code owned by the first `shutdown()`; repeated interrupts keep it. */
+  private exitCode = 0
   private started = false
   private terminalPaused = false
   private readonly terminalIntegration: TerminalIntegration
@@ -456,6 +474,13 @@ export class App {
   private chordHint?: string[]
   private readonly warnings: string[] = []
   private readonly signals: Array<[NodeJS.Signals, () => void]> = []
+  private offCrash?: () => void
+  /** Set by the first escaping error; a crash loop must not paint repeatedly. */
+  private crashReported = false
+  /** Bumped on every suspend so a late rollback timer cannot fight a real resume. */
+  private suspendGeneration = 0
+  /** True while `onEvent` owns the frame, so `store.onChange` does not paint twice. */
+  private handlingEvent = false
   private offInput?: () => void
   private offTerminalFocus?: () => void
   private epoch = 0
@@ -723,7 +748,7 @@ export class App {
         { component: this.bottom, basis: 'auto', shrink: 1, minSize: 4 },
       ]))
     } else { this.tui.addChild(document); this.tui.addChild(this.bottom) }
-    this.store.onChange = () => this.render()
+    this.store.onChange = () => { if (!this.handlingEvent) this.render() }
     this.off = this.options.backend.onEvent(event => this.onEvent(event))
     this.offInput = this.tui.addInputListener(data => {
       const pasting = this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean } | undefined)?.isPasting === true
@@ -743,10 +768,11 @@ export class App {
     if (this.options.registerSignals !== false) {
       const handlers: Array<[NodeJS.Signals, number]> = [['SIGINT', 130], ['SIGTERM', 0], ['SIGHUP', 0]]
       for (const [signal, code] of handlers) {
-        const handler = () => { void this.shutdown(code) }
+        const handler = () => { this.interruptShutdown(code) }
         process.on(signal, handler); this.signals.push([signal, handler])
       }
     }
+    if (this.options.installCrashHandlers ?? this.options.registerSignals !== false) this.installCrashHandlers()
     this.render()
     await this.watchKeys()
     // Read-only git observations for the footer: async, debounced and
@@ -1732,6 +1758,14 @@ export class App {
   }
 
   private onEvent(event: BackendEvent): void {
+    // The store notifies on every mutation it applies. Let this handler own the
+    // frame instead: otherwise each event paints once from `onChange` and again
+    // from its own tail, doubling every streaming chunk.
+    this.handlingEvent = true
+    try { this.handleEvent(event) } finally { this.handlingEvent = false }
+  }
+
+  private handleEvent(event: BackendEvent): void {
     if (this.closing) return
     if (event.type === 'ready') { this.applyInfo(event.info); this.terminalIntegration.observe(event); return }
     if (event.type === 'native_ui_changed') { this.nativeUi.invalidate(event); return }
@@ -2002,8 +2036,11 @@ export class App {
   private statusDockPool(): number {
     const width = Math.max(1, this.tui.terminal.columns)
     const rows = this.tui.terminal.rows
-    const chrome = 1 + this.queueList.render(width).length + this.slot.render(width).length +
-      this.hint.render(width).length + this.footer.render(width).length
+    // Measure, never paint: `docs/FRONTEND-CONTRACT.md` forbids re-rendering a
+    // dock member just to count its rows, and each member answers from its own
+    // state through {@link measureRows}.
+    const chrome = 1 + measureRows(this.queueList, width) + measureRows(this.slot, width) +
+      measureRows(this.hint, width) + measureRows(this.footer, width)
     const preferred = Math.max(0, Math.min(15, Math.floor(rows / 2), rows - chrome - 4))
     const available = Math.max(0, rows - chrome - 1)
     return Math.min(available, Math.max(preferred, this.statusDockMinimumRows()))
@@ -3685,18 +3722,112 @@ export class App {
     }
   }
 
+  /**
+   * Stop watching the screen when an unhandled error escapes: paint the reason,
+   * hand the terminal back, and let the owner exit. Without this, Node prints
+   * the stack into alt-screen + raw mode and the user is left with a corrupted
+   * screen and no usable message.
+   */
+  private installCrashHandlers(): void {
+    if (this.offCrash !== undefined) return
+    const onException = (value: unknown): void => this.handleFatal('Fatal error', value)
+    const onRejection = (value: unknown): void => this.handleFatal('Unhandled rejection', value)
+    process.on('uncaughtException', onException)
+    process.on('unhandledRejection', onRejection)
+    this.offCrash = () => {
+      process.off('uncaughtException', onException)
+      process.off('unhandledRejection', onRejection)
+    }
+  }
+
+  /**
+   * Paint an escaping error while the renderer still owns the screen, then let
+   * `shutdown()` hand the terminal back. Restoring first would early-return
+   * every later paint and leave the user with no visible cause.
+   */
+  private handleFatal(label: string, value: unknown): void {
+    if (this.crashReported) return
+    this.crashReported = true
+    const message = label + ': ' + redactDiagnostic(errorText(value))
+    // Keep the fact in the transcript/log for anything that still reads it.
+    try { this.store.report(message, 'error') } catch { /* the store is not what failed */ }
+    try { this.render() } catch { /* the renderer itself may be what failed */ }
+    // A scheduled frame cannot be relied on: the renderer may be exactly what
+    // failed, and shutdown restores the terminal synchronously. Hand the screen
+    // back first, then emit the one sanitized line through the same writer the
+    // renderer uses, so the cause is visible instead of a raw stack drawn into
+    // alt-screen + raw mode.
+    try { this.restoreTerminal() } catch { /* the terminal may already be gone */ }
+    try { this.tui.terminal.write(message + '\n') } catch { /* nowhere left to report */ }
+    void this.shutdown(1).catch(() => { /* shutdown reports its own failures */ })
+  }
+
+  /**
+   * A repeated interrupt signal.
+   *
+   * The first one starts an ordinary shutdown (which joins on later calls and
+   * keeps its exit code). Every later one stops *waiting*: cleanup is bounded
+   * but can still take seconds, the terminal has already been handed back, and
+   * an interrupt that appears to do nothing reads as a hung process. The first
+   * requested code wins; the native launcher owns its own whole-tree deadline,
+   * so this only matters on the signal-owning path.
+   */
+  interruptShutdown(code: number): void {
+    if (!this.closing) { void this.shutdown(code); return }
+    this.restoreTerminal()
+    if (this.exitTimer) { clearTimeout(this.exitTimer); this.exitTimer = undefined }
+    this.resolveExit(this.exitCode)
+  }
+
   private suspend(): void {
     if (process.platform === 'win32' || (this.options.registerSignals === false && this.options.allowSuspend !== true)) { this.store.report('Suspend is unavailable in this terminal'); return }
     this.terminalPaused = true
     this.terminalIntegration.pause()
     this.tui.stop({ preserveScreen: true })
-    const resume = () => {
-      this.terminalPaused = false
-      if (!this.closing && !this.terminalRestored) {
-        this.tui.start(); this.syncTerminalPresentation(); this.terminalIntegration.resume()
-        this.render(); this.tui.requestRender(true)
+    const app = this
+    const generation = ++app.suspendGeneration
+    let settled = false
+    let rollback: NodeJS.Timeout | undefined
+    function settle(): void {
+      if (settled) return
+      settled = true
+      process.off('SIGCONT', resume)
+      if (rollback !== undefined) clearTimeout(rollback)
+      const index = app.signals.findIndex(entry => entry[0] === 'SIGCONT' && entry[1] === resume)
+      if (index >= 0) app.signals.splice(index, 1)
+    }
+    /** Put the screen back without deciding *why* it was paused. */
+    function restoreUi(): void {
+      app.terminalPaused = false
+      if (!app.closing && !app.terminalRestored) {
+        app.tui.start(); app.syncTerminalPresentation(); app.terminalIntegration.resume()
+        app.render(); app.tui.requestRender(true)
       }
     }
+    function resume(): void {
+      // A rollback already restored the UI; a late SIGCONT must not start the
+      // terminal a second time.
+      if (settled) return
+      settle()
+      restoreUi()
+    }
+    // SIGTSTP can be ignored (orphaned process group, ignored disposition,
+    // some containers). Then SIGCONT never arrives and the paused UI would be
+    // unrecoverable: no render, no stdin. Roll back instead of hanging.
+    //
+    // An overdue timer can fire in the same wake-up that delivers SIGCONT when
+    // the process really was stopped, and Node runs timers before the signal
+    // pipe is drained. Defer the decision to the check phase so a delivered
+    // SIGCONT always wins and a real suspend never reports a false failure.
+    rollback = setTimeout(() => {
+      setImmediate(() => {
+        if (settled || app.suspendGeneration !== generation || !app.terminalPaused) return
+        settle()
+        restoreUi()
+        app.store.report('Suspend is unavailable in this terminal')
+      })
+    }, SUSPEND_ROLLBACK_MS)
+    rollback.unref()
     process.once('SIGCONT', resume); this.signals.push(['SIGCONT', resume])
     process.kill(process.pid, 'SIGTSTP')
   }
@@ -3739,10 +3870,12 @@ export class App {
 
   async shutdown(code = 0): Promise<void> {
     // Reentry must join cleanup, not pretend the App is already quiescent.
-    // The first invocation still owns the requested exit code.
+    // The first invocation still owns the requested exit code. A *repeated
+    // interrupt* is a different thing: see `interruptShutdown()`.
     if (this.closing) { await this.exited; return }
     this.closing = true
     let outcome = code !== 0 ? code : (this.fatal ? 1 : 0)
+    this.exitCode = outcome
     // Detach input synchronously, then let the supplied native host arm its
     // whole-tree deadline before any editor/backend/UI persistence await.
     this.restoreTerminal()
@@ -3775,6 +3908,7 @@ export class App {
       this.gitRefresher?.dispose()
       this.editor.setKeymap(this.keymap)
       this.watcher?.close(); this.off?.(); this.offInput?.(); this.offTerminalFocus?.()
+      this.offCrash?.(); this.offCrash = undefined
       const dialog = this.dialog
       this.hideDialog()
       disposeComponent(dialog)

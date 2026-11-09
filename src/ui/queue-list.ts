@@ -26,6 +26,8 @@ const BUTTONS = [
 
 const BUTTON_GAP = '  '
 const BUTTONS_WIDTH = BUTTONS.reduce((sum, button, index) => sum + button.label.length + (index === 0 ? 0 : BUTTON_GAP.length), 0)
+/** Header row + the blank row that separates the list from the editor. */
+const CHROME_ROWS = 2
 
 export class QueueList implements Component {
   rows: readonly QueueEntry[] = []
@@ -90,6 +92,22 @@ export class QueueList implements Component {
     lines.push('')
     this.hitboxes.sync(boxes)
     return lines
+  }
+
+  /**
+   * Rows this list paints at `width`, without subscribing hitboxes.
+   *
+   * The parent's fixed-dock budget needs this height before it lays the frame
+   * out, and the contract forbids a second render just to count rows. The count
+   * is state-derived and can never drift from the paint: every queued message is
+   * exactly one row (`rowLine` composes and truncates a single line at any
+   * width), collapsed lists paint the header only, and an empty list paints
+   * nothing. `measureRows(width) === render(width).length` is pinned by test.
+   */
+  measureRows(_width: number): number {
+    if (this.rows.length === 0) return 0
+    const body = this.collapsed ? 0 : this.rows.length
+    return CHROME_ROWS + body
   }
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {

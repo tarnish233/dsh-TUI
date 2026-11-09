@@ -141,6 +141,9 @@ export function apply(ctx: Context, config: Config): void {
         terminal: new ProcessTerminal({ write: lease.terminalWrite }),
         demo: options.demo, initialPrompt: options.initialPrompt ?? (options.demo ? 'tools' : undefined),
         resumePicker: options.resumePicker, registerSignals: false, allowSuspend: true,
+        // The native launcher owns the shutdown signals, but this process still
+        // owns the visible terminal: an escaping error must restore it.
+        installCrashHandlers: true,
       })
       const ownedApp = app
       for (const record of earlyDiagnostics.splice(0)) diagnostics.handle(record)

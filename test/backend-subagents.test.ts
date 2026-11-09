@@ -1064,3 +1064,66 @@ test('a child session event never becomes a main transcript event while unfollow
   assert.equal(rootEvent.type, 'session_event')
   assert.equal(rootEvent.type === 'session_event' ? rootEvent.sessionId : undefined, ROOT)
 })
+/**
+ * Capture a waterfall outcome without leaving an unhandled rejection behind:
+ * a decision that is settled during `close()` rejects before the test awaits it.
+ */
+type CapturedDecision = { value: unknown } | { failure: unknown }
+
+function captureDecision(promise: Promise<unknown>): Promise<CapturedDecision> {
+  return promise.then(value => ({ value }), (failure: unknown) => ({ failure }))
+}
+
+/** One lineage-proven child in the current root tree, with no catalog row. */
+function lineageChild(h: Harness, id: string): FakeAgentState {
+  h.world.add({ id, parentSession: ROOT, origin: 'subagent', delegationDepth: 1, events: [] })
+  const child = createFakeAgent({ id, status: 'running' })
+  h.agents.enter(child.agent)
+  return child.agent
+}
+
+async function openChildQuestion(h: Harness, child: FakeAgentState): Promise<{ id: string; outcome: Promise<CapturedDecision> }> {
+  const pending = captureDecision(h.host.waterfall('user-questions/request', {
+    agent: child,
+    questions: [{ id: 'q1', question: 'Pick one', options: [{ label: 'One' }] }],
+  }))
+  await until(() => h.events.some(event => event.type === 'decision'), 'child question decision')
+  const decision = h.events.filter(event => event.type === 'decision').at(-1)
+  assert.ok(decision?.type === 'decision')
+  assert.equal(decision.request.origin?.childSessionId, child.id, 'the decision is owned by the child that asked')
+  return { id: decision.request.id, outcome: pending }
+}
+
+test('a root cancel settles only the root Agent decisions, never an open child question', async () => {
+  const h = await harness({ children: [] })
+  const child = lineageChild(h, 'child-lineage')
+  const question = await openChildQuestion(h, child)
+
+  await h.backend.cancel()
+
+  assert.equal(
+    h.events.some(event => event.type === 'decision_closed' && event.id === question.id),
+    false,
+    'the root interruption must not close a child decision the user never saw',
+  )
+  assert.deepEqual(child.cancellations, [], 'the root interruption never cancels a child Agent')
+  assert.deepEqual(h.rootAgent.cancellations.at(-1), { cause: 'user', keepInbox: true })
+
+  await h.backend.respond(question.id, { answers: [['One']] })
+  assert.deepEqual(await question.outcome, { value: { answers: [{ id: 'q1', selected: ['One'] }] } })
+  await h.backend.close()
+})
+
+test('close settles every remaining decision, including a child request', async () => {
+  const h = await harness({ children: [] })
+  const child = lineageChild(h, 'child-lineage')
+  const question = await openChildQuestion(h, child)
+
+  await h.backend.close()
+
+  const settled = await question.outcome
+  assert.ok('failure' in settled, 'a surviving decision is settled when the adapter closes')
+  assert.equal((settled.failure as { code?: string }).code, 'ASK_ABORTED')
+  assert.ok(h.events.some(event => event.type === 'decision_closed' && event.id === question.id))
+  assert.equal(h.events.filter(event => event.type === 'closed').length, 1, 'closed is announced exactly once')
+})

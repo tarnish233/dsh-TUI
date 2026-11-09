@@ -19,7 +19,12 @@ permissions, commands, sessions and persistence. The adapter
 - `close()` releases only adapter-owned listeners, decisions, in-flight
   command/image/file-staging/native-UI/skill-discovery requests and the Agent handle it created. It never disposes
   the host root, never calls `appExit`, and never exits the process. The parent
-  plugin owns application shutdown and `ctx.effect` lifecycle.
+  plugin owns application shutdown and `ctx.effect` lifecycle. The first
+  `close()` caches its cleanup promise and every later `close()` joins it, so a
+  repeated shutdown neither returns early nor announces `closed` while the last
+  turn's `sessions.flush()` or the owned handle disposal is still running;
+  `closed` is emitted exactly once, after owned cleanup settled (a cleanup
+  failure still emits it once and is rethrown to every joiner).
 
 Local exit intent and owned cleanup are separate: after synchronous terminal
 restoration, `App.exitRequested` asks the parent plugin to call public
@@ -234,12 +239,14 @@ the exact one this adapter owns, so a late frame after `/new` or resume cannot
 reach the UI. `/new` validates the requested preset first and retires the old
 Agent only after the new pending session exists.
 
-`closeAgent` settles decisions, calls native
+`closeAgent` settles that Agent's own decisions, calls native
 `agent.cancel({kind:'user'},{keepInbox:true})`, waits boundedly for
 `whenIdle`, skips the explicit `sessions.flush` only when the native
 turn-boundary projection proves no turn started (an explicit flush would
 materialize an empty session), then disposes the owned handle. Errors during
-disposal are contained.
+disposal are contained. It also aborts and boundedly drains its own in-flight
+native commands: a retired attachment must not leave a command carrier that the
+native idle gate would attribute to the *next* session.
 
 ## Streaming and durable facts
 
@@ -281,12 +288,45 @@ introduced. `state.pending` reports raw inbox lengths, while `state.queued` and
 `dequeue` share one predicate (`source.kind === 'user'` and only text/image
 blocks), so native context notices are neither counted nor recalled.
 
+Every pending decision records its owner — the exact native Agent object plus
+that Agent's own session id — and settling is owner-scoped: a root `cancel()`, a
+`/new` and an attachment retirement settle only their own Agent's decisions. A
+child's open approval/question stays open (and answerable) until the child's own
+interruption path or `close()` settles it; `close()` settles every remaining
+decision because nothing else can answer it afterwards. `decision_closed` is
+announced under the session the request was announced under.
+
+Queue promotion is transactional. `queue-send-now` captures both native inbox
+lanes before it recalls the rest of `next-turn`, drops the replaced row and
+wakes the driver through `followup`; a refused wake restores the captured lanes
+in their original order and rethrows the native rejection unchanged, so a failed
+"send now" never empties the queue. The public inbox face only exposes
+`remove`/`append`/`prepend`, so ordering is restored by rebuilding each lane
+from the captured sequence — the strongest guarantee that face allows — and each
+restore call is individually contained so a hostile inbox cannot mask the
+original error. A native `cancel({keepInbox:true})` already delivered before the
+failed wake is not reversible; it only keeps the inbox.
+
 ## Commands, models, presets, permissions
 
 `command()` keeps the UI-facing names. Session-less commands (`state`,
-`commands`, `sessions`, `titles`, `models`, `presets`, `permissions`, `new`,
-`resume`, `auto-title`, `dequeue`, `cancel`) never materialize a pending
-session. `model`/`preset`/`effort` stage on a pending session; they apply through
+`commands`, `sessions`, `titles`, `models`, `presets`, `permissions`, `efforts`,
+`skills`, `auto-title`, `dequeue`, `queue-remove`, `cancel`, `new`, `resume`,
+`native-jobs`, `native-job-output`, `native-goal`, `native-working-directory`,
+`native-inventory`, `native-tools`, `native-questions`,
+`native-question-answer`, `native-defaults`, `native-default-update`,
+`session-fork`) never materialize a pending session. That list is the
+`sessionless` rows of the one declaration table
+(`COMMAND_DECLARATIONS` in `src/backend/context.ts`), which also owns the
+accepted-name set and the staging rule; it is not maintained in parallel here.
+A session-less command that needs current-session facts degrades explicitly
+instead of creating an Agent: `permissions` omits `currentValue`, `queue-remove`
+answers `{removed:false}` (a pending attachment has no native inbox, exactly
+like `dequeue` answering `[]`), and `efforts` reads the pending route.
+`queue-replace`/`queue-send-now` are not session-less: they rewrite or wake a
+queue row that only a live Agent owns.
+
+`model`/`preset`/`effort` stage on a pending session; they apply through
 DSH's own owners when live:
 
 - live route: `agent.model.select({provider,model,reasoningEffort?})` is the
@@ -312,7 +352,8 @@ DSH's own owners when live:
   and only its locked refusal becomes `locked`. No guessed lock precheck;
 - permissions: `permissionPresets.catalog()/current(session)` passthrough;
   switching executes the mounted native `/permission` command, and native
-  `/plan` remains independent;
+  `/plan` remains independent. A pending attachment has no native Session, so
+  no `currentValue` is reported and no Agent is created to invent one;
 - commands: `ctx.commands.list(agent)` descriptors and
   `ctx.commands.execute(agent, line, [], signal)`; DSH mints
   `command/run`/`command/done` and owns validation/audit. The declared native
@@ -726,7 +767,12 @@ quoted values included — and common `sk-…` key shapes become `[redacted]`.
 `asBackendError()` never serializes an arbitrary thrown object: only its scalar
 `message`/`name`/`detail` fields become (redacted) diagnostics, so enumerable
 `stack`, `cause` or credential-shaped properties cannot reach the UI; an object
-without a usable message becomes one generic sentence. This is textual
+without a usable message becomes one generic sentence. A native rejection with no
+stable code is normalized the same way at every seam — `readImage`,
+`commands.execute`, attachment storage/staging, file references, agent
+create/resume and question answers — so the UI always receives a coded,
+redacted `BackendError`; an adapter-owned cancellation keeps its own `ABORTED`
+code instead. This is textual
 diagnostics hygiene only. Native session events,
 tool calls/results, `toolPresentation` and decision payloads are never rewritten,
 and image bytes/base64 never enter diagnostics.
@@ -839,9 +885,13 @@ status, active commands, pending decisions, native inbox except
 `hmr.runExclusive(() => hmr.reconcileProfile())`. `reconcileProfile` requires
 that exclusive context; there is no nested acquisition, no prepare/commit
 reservation and no scratch sync. The result is DSH's own
-warnings/pending/restartReason plus refreshed `info`. `close()` never awaits an
-in-flight reload, so a recomposition that unloads this plugin cannot deadlock on
-its own disposal; an absent HMR service returns `available:false`.
+warnings/pending/restartReason plus refreshed `info`. A pending attachment has no
+Agent, no owned command, no decision and no inbox, so every gate dimension is
+empty by construction and `/reload` works before the first `send`; the refreshed
+`info` is that same pending attachment and `/reload` emits no `ready`, exactly as
+for a live attachment (consumers refetch native metadata). `close()` never awaits
+an in-flight reload, so a recomposition that unloads this plugin cannot deadlock
+on its own disposal; an absent HMR service returns `available:false`.
 
 ## Removed architecture
 

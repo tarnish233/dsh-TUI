@@ -309,9 +309,27 @@ interface PendingSession {
   preset: string | undefined
 }
 
+/**
+ * The exact native owner of one pending decision.
+ *
+ * A root `cancel()`/attachment retirement may only settle decisions that its
+ * own Agent asked. Recording the asking Agent (identity, not just the id)
+ * keeps a root interruption from closing a child Agent's approval or question
+ * that the user never saw and that no root action can answer.
+ */
+interface DecisionOwner {
+  /** The native Agent object that raised the request. */
+  readonly agent: unknown
+  /** That Agent's own session id (a child id, never the root id). */
+  readonly sessionId: string
+  /** Root session the decision was announced under (`decision`/`decision_closed`). */
+  readonly eventSessionId: string
+}
+
 interface PendingDecision {
   readonly kind: 'approval' | 'question'
   readonly signal: AbortSignal | undefined
+  readonly owner: DecisionOwner
   readonly resolve: (value: unknown) => void
   readonly reject: (error: Error) => void
   readonly onAbort: () => void
@@ -336,22 +354,88 @@ interface ActiveSkillQuery {
 }
 
 const BASE_CAPABILITIES = ['stream', 'followup', 'steer', 'cancel', 'new', 'resume', 'state', 'dequeue']
-const SESSIONLESS_COMMANDS = new Set([
-  // `skills` is read-only metadata: it must never materialize the pending Agent.
-  'new', 'resume', 'sessions', 'titles', 'models', 'presets', 'commands', 'skills',
-  'state', 'auto-title', 'dequeue', 'cancel',
-  'native-jobs', 'native-job-output', 'native-goal', 'native-working-directory', 'native-inventory', 'native-tools',
-  'native-questions', 'native-question-answer', 'native-defaults', 'native-default-update', 'session-fork',
-])
-const STAGEABLE_COMMANDS = new Set(['model', 'preset', 'effort'])
-const COMMAND_NAMES = new Set([
-  'models', 'sessions', 'titles', 'commands', 'skills', 'input-route', 'execute', 'cancel', 'new', 'resume', 'model',
-  'presets', 'preset', 'efforts', 'effort', 'permissions', 'auto-title', 'state',
-  'reload', 'dequeue', 'queue-remove', 'queue-replace', 'queue-send-now',
-  'subagent-session', 'subagent-follow', 'subagent-interrupt', 'subagent-prompt',
-  'native-jobs', 'native-job-output', 'native-goal', 'native-working-directory', 'native-inventory', 'native-tools',
-  'native-questions', 'native-question-answer', 'native-defaults', 'native-default-update', 'session-rename', 'session-fork',
-])
+
+/**
+ * One command's policy facts, declared exactly once.
+ *
+ * The accepted-name set, the lazy-materialization gate and the documented
+ * session-less list were three parallel hand-maintained lists before this
+ * table; they drifted (`permissions`, `queue-remove` and `efforts` silently
+ * materialized a pending Agent). Every policy read now comes from here.
+ */
+interface CommandDeclaration {
+  readonly name: string
+  /**
+   * Pending-safe: answers from native services and staged attachment facts
+   * only, so it must never materialize the pending Agent. Any fact that needs
+   * the Agent degrades explicitly (omitted field / `removed:false` / the
+   * pending route) instead of creating a durable session.
+   */
+  readonly sessionless?: true
+  /** Stages the choice on a pending session; applies through native owners when live. */
+  readonly stageable?: true
+}
+
+/**
+ * The one declaration table. `docs/BACKEND.md` lists the session-less rows,
+ * and `test/backend-context.test.ts` proves both the table and that list by
+ * asserting `agents.createCalls` stays empty for every one of them.
+ *
+ * `queue-replace`/`queue-send-now` are deliberately *not* session-less: they
+ * rewrite/wake a native inbox row that only a live Agent owns, and a pending
+ * attachment has no queue to address. `queue-remove` is session-less because
+ * "nothing is queued" is a complete answer (`removed:false`), exactly like
+ * `dequeue` answering `[]`.
+ */
+const COMMAND_DECLARATIONS: readonly CommandDeclaration[] = [
+  // Read-only/pending-safe control commands.
+  { name: 'state', sessionless: true },
+  { name: 'commands', sessionless: true },
+  { name: 'skills', sessionless: true },
+  { name: 'sessions', sessionless: true },
+  { name: 'titles', sessionless: true },
+  { name: 'models', sessionless: true },
+  { name: 'presets', sessionless: true },
+  { name: 'permissions', sessionless: true },
+  { name: 'auto-title', sessionless: true },
+  { name: 'efforts', sessionless: true },
+  { name: 'dequeue', sessionless: true },
+  { name: 'queue-remove', sessionless: true },
+  { name: 'cancel', sessionless: true },
+  { name: 'new', sessionless: true },
+  { name: 'resume', sessionless: true },
+  // Native read faces and exact-session mutations of the attached root.
+  { name: 'native-jobs', sessionless: true },
+  { name: 'native-job-output', sessionless: true },
+  { name: 'native-goal', sessionless: true },
+  { name: 'native-working-directory', sessionless: true },
+  { name: 'native-inventory', sessionless: true },
+  { name: 'native-tools', sessionless: true },
+  { name: 'native-questions', sessionless: true },
+  { name: 'native-question-answer', sessionless: true },
+  { name: 'native-defaults', sessionless: true },
+  { name: 'native-default-update', sessionless: true },
+  { name: 'session-fork', sessionless: true },
+  // Pending-staged selections; live application goes through DSH's own owners.
+  { name: 'model', stageable: true },
+  { name: 'preset', stageable: true },
+  { name: 'effort', stageable: true },
+  // Everything below needs the live Agent's own scope.
+  { name: 'input-route' },
+  { name: 'execute' },
+  { name: 'reload' },
+  { name: 'queue-replace' },
+  { name: 'queue-send-now' },
+  { name: 'subagent-session' },
+  { name: 'subagent-follow' },
+  { name: 'subagent-interrupt' },
+  { name: 'subagent-prompt' },
+  { name: 'session-rename' },
+]
+/** Every accepted backend command name, derived from the declaration table. */
+const COMMAND_DECLARATIONS_BY_NAME: ReadonlyMap<string, CommandDeclaration> = new Map(
+  COMMAND_DECLARATIONS.map(declaration => [declaration.name, declaration]),
+)
 const TITLE_PROVIDER_NAMES = [
   '@deepseek-ai/dsh-session-title-first-prompt-llm',
   '@deepseek-ai/dsh-session-title-all-prompts-llm',
@@ -574,6 +658,22 @@ function nativeAgentFailure(label: string, error: unknown): BackendError {
   return backendError('RUNTIME_REQUEST_FAILED', `${label}: ${errorMessage(error)}`)
 }
 
+/**
+ * Normalize one native attachment-store rejection into the adapter taxonomy.
+ *
+ * `ctx.attachments.readImage` is a native seam like any other: a coded refusal
+ * keeps its exact code, and an uncoded failure becomes one redacted
+ * `RUNTIME_REQUEST_FAILED` diagnostic. A raw native `Error` would reach the UI
+ * without a code and without credential redaction.
+ *
+ * @param error - the rejection the native attachment store produced.
+ * @returns a coded, redacted BackendError safe to surface in the UI.
+ */
+function imageReadFailure(error: unknown): BackendError {
+  if (backendErrorCodeOf(error) !== undefined) return asBackendError(error)
+  return backendError('RUNTIME_REQUEST_FAILED', `the native image read failed: ${errorMessage(error)}`)
+}
+
 async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -658,6 +758,53 @@ function recallableContent(message: Record<string, unknown>): DisplayContentPart
 
 function isRecallableMessage(message: UserMessageLike): boolean {
   return recallableContent(message as unknown as Record<string, unknown>) !== undefined
+}
+
+/** One native inbox row with the lane it belongs to. */
+interface InboxRow {
+  readonly target: 'next-turn' | 'next-step'
+  readonly message: UserMessageLike
+}
+
+/** The two native inbox lanes of one Agent, in order. */
+function inboxRowsOf(agent: AgentLike): InboxRow[] {
+  return [
+    ...agent.inbox.nextTurn.map(message => ({ target: 'next-turn' as const, message })),
+    ...agent.inbox.nextStep.map(message => ({ target: 'next-step' as const, message })),
+  ]
+}
+
+/**
+ * Best-effort restoration of one captured native inbox.
+ *
+ * The public inbox face only offers `remove`/`prepend`/`append`, so an exact
+ * sequence is restored by rebuilding each lane in its captured order. Every
+ * native call is guarded individually: a failing inbox degrades the rollback
+ * but must never mask the rejection the caller is already carrying.
+ *
+ * @param agent - exact live Agent whose inbox is restored.
+ * @param rows - captured rows, in their original lane order.
+ */
+function restoreInbox(agent: AgentLike, rows: readonly InboxRow[]): void {
+  const lanes = [
+    ['next-turn', agent.inbox.nextTurn],
+    ['next-step', agent.inbox.nextStep],
+  ] as const
+  for (const [target, lane] of lanes) {
+    try {
+      for (const item of [...lane]) agent.inbox.remove(item.id)
+    } catch {
+      /* keep restoring what can still be restored */
+    }
+    for (const row of rows) {
+      if (row.target !== target) continue
+      try {
+        agent.inbox.append(target, row.message)
+      } catch {
+        /* best effort: a failed rollback never masks the original error */
+      }
+    }
+  }
 }
 
 function parseToolArguments(data: Record<string, unknown>): unknown {
@@ -912,6 +1059,8 @@ export class DshContextBackend implements Backend {
   private pending: PendingSession | undefined
   private switching: Promise<void> = Promise.resolve()
   private closed = false
+  /** First owned cleanup; every later `close()` joins it instead of returning early. */
+  private closing: Promise<void> | undefined
   private closedEmitted = false
   private decisionSeq = 0
   private modelFailureSignature = ''
@@ -1672,13 +1821,30 @@ export class DshContextBackend implements Backend {
     }
   }
 
+  /**
+   * Retire one owned Agent.
+   *
+   * Every adapter-owned carrier that pointed at this exact attachment ends
+   * here: skill metadata reads, native-UI reads, its own pending decisions and
+   * its in-flight native commands. Commands matter for `/reload`: the native
+   * idle gate counts any unsettled command, so a dangling carrier of a retired
+   * session would block reload forever with the new attachment as its owner.
+   * The drain is bounded exactly like `close()`'s, and an uncooperative native
+   * command still cannot extend retirement indefinitely.
+   *
+   * @param target - the exact Agent handle this adapter created or resumed.
+   * @param reason - user-facing reason recorded on aborted carriers.
+   */
   private async closeAgent(target: LiveAgent, reason: string): Promise<void> {
     const sessionId = target.agent.session.id
     // The attachment epoch ends here: a metadata read that started against it
     // must reject rather than deliver a catalog for a retired Agent.
     this.abortSkillQueries(reason, sessionId)
     this.abortNativeUiReads(sessionId)
-    this.closePendingDecisions(reason, sessionId)
+    // Only this Agent's own decisions: a child's pending approval/question is
+    // refused by its own interruption path, never by a parent switch.
+    this.closePendingDecisions(reason, { agent: target.agent, sessionId })
+    if (this.abortActiveCommands(reason, sessionId) > 0) await this.drainCommands(COMMAND_DRAIN_TIMEOUT_MS, sessionId)
     try {
       target.agent.cancel({ kind: 'user' }, { keepInbox: true })
     } catch {
@@ -1778,19 +1944,36 @@ export class DshContextBackend implements Backend {
     }
   }
 
-  private agentRoute(agent: AgentLike | undefined = this.live?.agent): Route | undefined {
-    if (agent !== undefined && typeof agent.model?.current === 'function') {
+  /**
+   * The current route of one native Agent, a retired/explicit Agent, or the
+   * pending attachment.
+   *
+   * `undefined` means "no Agent is current": the pending attachment's staged
+   * or followed native default is then the only route fact, and it is returned
+   * for the default lookup. A caller that passes an explicit Agent (a retired
+   * one, or a child) never inherits the pending route.
+   *
+   * @param agent - exact Agent to read; defaults to the current live Agent.
+   * @returns the native route, or undefined when it is unknown.
+   */
+  private agentRoute(agent?: AgentLike): Route | undefined {
+    const live = this.live
+    const target = agent ?? live?.agent
+    if (target !== undefined && typeof target.model?.current === 'function') {
       try {
         // Native authority: a recorded selection/request wins, else the live
         // `AgentOptions` accessors above.
-        const current = routeOf(agent.model.current())
+        const current = routeOf(target.model.current())
         if (current !== undefined) return current
       } catch {
         /* fall through to the adapter's own record */
       }
     }
-    if (agent === this.live?.agent && this.live !== undefined) return this.followedRoute(this.live.route)
-    if (agent === undefined && this.live === undefined) return this.pendingRoute()
+    if (live !== undefined && target === live.agent) return this.followedRoute(live.route)
+    // No Agent at all: the pending attachment has no session to record a
+    // selection in, so its staged pin (or the live native default) is the
+    // route fact. Read-only callers (`efforts`) use it without materializing.
+    if (target === undefined && live === undefined) return this.pendingRoute()
     return undefined
   }
 
@@ -2105,8 +2288,26 @@ export class DshContextBackend implements Backend {
     )
   }
 
+  /**
+   * The exact native owner of one decision request.
+   *
+   * The asking Agent object is the identity that `cancel()`/retirement filter
+   * on; its own session id is the owner id only. The event root stays the
+   * caller-supplied root (a child decision is announced under the root).
+   */
+  private decisionOwner(request: Record<string, unknown>, origin?: DecisionOrigin): DecisionOwner {
+    const agent = request.agent
+    const liveSessionId = this.live?.agent.session.id ?? ''
+    return {
+      agent,
+      sessionId: origin?.childSessionId ?? textOf(record(agent)?.id) ?? liveSessionId,
+      eventSessionId: origin?.rootSessionId ?? liveSessionId,
+    }
+  }
+
   private askApproval(request: Record<string, unknown>, origin?: DecisionOrigin): Promise<unknown> {
     const id = this.nextDecisionId('approval')
+    const owner = this.decisionOwner(request, origin)
     const title = typeof request.toolName === 'string' ? `Approve ${request.toolName}` : 'Approve tool'
     const display = record(request.displayReason)
     const message = typeof request.reason === 'string'
@@ -2114,7 +2315,7 @@ export class DshContextBackend implements Backend {
       : typeof display?.en === 'string' ? display.en : undefined
     this.emit({
       type: 'decision',
-      sessionId: origin?.rootSessionId ?? this.live?.agent.session.id ?? '',
+      sessionId: owner.eventSessionId,
       request: {
         id,
         kind: 'approval',
@@ -2128,7 +2329,7 @@ export class DshContextBackend implements Backend {
       },
     })
     const signal = request.signal instanceof AbortSignal ? request.signal : undefined
-    return this.awaitDecision(id, 'approval', signal).then(
+    return this.awaitDecision(id, 'approval', signal, owner).then(
       value => normalizeApprovalOutcome(value),
       () => 'cancelled',
     )
@@ -2136,6 +2337,7 @@ export class DshContextBackend implements Backend {
 
   private askQuestions(request: Record<string, unknown>, origin?: DecisionOrigin): Promise<unknown> {
     const id = this.nextDecisionId('question')
+    const owner = this.decisionOwner(request, origin)
     const questions = Array.isArray(request.questions)
       ? request.questions.map(question => record(question)).filter((question): question is Record<string, unknown> => question !== undefined)
       : []
@@ -2166,11 +2368,11 @@ export class DshContextBackend implements Backend {
     }
     this.emit({
       type: 'decision',
-      sessionId: origin?.rootSessionId ?? this.live?.agent.session.id ?? '',
+      sessionId: owner.eventSessionId,
       request: requestWire,
     })
     const signal = request.signal instanceof AbortSignal ? request.signal : undefined
-    return this.awaitDecision(id, 'question', signal).then(
+    return this.awaitDecision(id, 'question', signal, owner).then(
       value => normalizeAskAnswer(questions, value),
       (error: unknown) => {
         const code = record(error)?.code
@@ -2183,11 +2385,12 @@ export class DshContextBackend implements Backend {
     )
   }
 
-  private awaitDecision(id: string, kind: 'approval' | 'question', signal: AbortSignal | undefined): Promise<unknown> {
+  private awaitDecision(id: string, kind: 'approval' | 'question', signal: AbortSignal | undefined, owner: DecisionOwner): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const entry: PendingDecision = {
         kind,
         signal,
+        owner,
         resolve,
         reject,
         onAbort: () => {
@@ -2203,11 +2406,18 @@ export class DshContextBackend implements Backend {
     })
   }
 
+  /**
+   * Settle exactly one pending decision.
+   *
+   * `sessionId` is the event rooting of `decision_closed`; when the caller does
+   * not supply one, the owner's captured event root is used, so a late/aborted
+   * child decision still closes under the same session it was announced under.
+   */
   private settleDecision(
     id: string,
     value?: unknown,
     error?: Error,
-    sessionId: string = this.live?.agent.session.id ?? '',
+    sessionId?: string,
     errorCode?: string,
   ): boolean {
     const entry = this.pendingDecisions.get(id)
@@ -2218,7 +2428,7 @@ export class DshContextBackend implements Backend {
     } catch {
       /* signal already gone */
     }
-    this.emit({ type: 'decision_closed', sessionId, id })
+    this.emit({ type: 'decision_closed', sessionId: sessionId ?? entry.owner.eventSessionId, id })
     if (error === undefined) entry.resolve(value)
     else {
       if (errorCode !== undefined) Object.assign(error, { code: errorCode })
@@ -2227,12 +2437,25 @@ export class DshContextBackend implements Backend {
     return true
   }
 
-  private closePendingDecisions(reason: string, sessionId: string): void {
+  /**
+   * Settle the pending decisions owned by one exact native Agent.
+   *
+   * The filter is the owner, not the event root: a root interruption or one
+   * attachment's retirement must never answer a decision that a *different*
+   * Agent asked (the child's own approval/question stays open for its own
+   * interruption path). Without an `owner` every decision is settled, which is
+   * only correct when the adapter itself is closing.
+   *
+   * @param reason - user-facing reason for an aborted question.
+   * @param owner - exact native Agent (and its session id) being retired.
+   */
+  private closePendingDecisions(reason: string, owner?: { readonly agent: unknown; readonly sessionId: string }): void {
     for (const id of [...this.pendingDecisions.keys()]) {
       const entry = this.pendingDecisions.get(id)
       if (entry === undefined) continue
-      if (entry.kind === 'approval') this.settleDecision(id, undefined, undefined, sessionId)
-      else this.settleDecision(id, undefined, codedError('RUNTIME_REQUEST_FAILED', reason), sessionId, 'ASK_ABORTED')
+      if (owner !== undefined && (entry.owner.agent !== owner.agent || entry.owner.sessionId !== owner.sessionId)) continue
+      if (entry.kind === 'approval') this.settleDecision(id, undefined, undefined, entry.owner.eventSessionId)
+      else this.settleDecision(id, undefined, codedError('RUNTIME_REQUEST_FAILED', reason), entry.owner.eventSessionId, 'ASK_ABORTED')
     }
   }
 
@@ -2248,7 +2471,7 @@ export class DshContextBackend implements Backend {
         id,
         undefined,
         codedError('RUNTIME_REQUEST_FAILED', 'the user cancelled ask_user_question'),
-        undefined,
+        entry.owner.eventSessionId,
         'ASK_CANCELLED',
       )
     } else this.settleDecision(id, value)
@@ -2445,7 +2668,10 @@ export class DshContextBackend implements Backend {
         stored = record(await attachments.readImage(ref, controller.signal))
       } catch (error) {
         if (controller.signal.aborted) throw codedError('ABORTED', 'the image read was cancelled')
-        throw error
+        // Same taxonomy as every other native seam: keep a stable native code,
+        // otherwise report one redacted RUNTIME_REQUEST_FAILED. A raw native
+        // Error would carry an unredacted credential straight into the UI.
+        throw imageReadFailure(error)
       }
       if (controller.signal.aborted) throw codedError('ABORTED', 'the image read was cancelled')
       const data = stored?.data
@@ -2710,7 +2936,10 @@ export class DshContextBackend implements Backend {
     const sessionId = live.agent.session.id
     this.abortActiveCommands('command cancelled', sessionId)
     live.agent.cancel({ kind: 'user' }, { keepInbox: true })
-    this.closePendingDecisions('cancelled', sessionId)
+    // Only the root Agent's own decisions. A child's pending approval/question
+    // belongs to the child (and to its own interruption path); settling it here
+    // would answer a dialog the root interruption never showed the user.
+    this.closePendingDecisions('cancelled', { agent: live.agent, sessionId })
     if (live.agent.status === 'running') {
       try {
         await withTimeout(live.agent.whenIdle(), CANCEL_SETTLE_TIMEOUT_MS, 'agent cancel')
@@ -2723,7 +2952,8 @@ export class DshContextBackend implements Backend {
   async command(name: string, args: JsonRecord = {}): Promise<unknown> {
     this.assertOpen()
     if (typeof name !== 'string' || name.length === 0) throw codedError('INVALID_ARGUMENT', 'command requires a name')
-    if (!COMMAND_NAMES.has(name)) throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
+    const declaration = COMMAND_DECLARATIONS_BY_NAME.get(name)
+    if (declaration === undefined) throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
     const params = record(args) ?? {}
     // Explicit-submission classification prevalidates its token before the
     // lazy Agent path runs: a malformed name must never create a durable
@@ -2741,7 +2971,11 @@ export class DshContextBackend implements Backend {
           (typeof params.atSeq !== 'number' || !Number.isSafeInteger(params.atSeq) || params.atSeq < 0)) throw codedError('INVALID_ARGUMENT', 'fork requires a non-negative native boundary')
     }
     if (name === 'reload') return await this.reloadRuntime()
-    if (!SESSIONLESS_COMMANDS.has(name) && !STAGEABLE_COMMANDS.has(name)) await this.ensureCurrent()
+    // The single lazy-materialization gate: only a command that needs the live
+    // Agent's own scope may create the pending Session's Agent. A session-less
+    // or stageable declaration never does, so no read-only UI action can leave
+    // a ghost session behind.
+    if (declaration.sessionless !== true && declaration.stageable !== true) await this.ensureCurrent()
     switch (name) {
       case 'models': return await this.listModels()
       case 'sessions': return await this.listSessions(params)
@@ -2877,7 +3111,17 @@ export class DshContextBackend implements Backend {
     const settled = new Promise<void>(resolve => { settle = resolve })
     this.activeCommands.set(requestId, { requestId, controller, sessionId: live.agent.session.id, settled, settle })
     try {
-      const execution = record(await commands.execute(live.agent, line, submitted, controller.signal))
+      let raw: unknown
+      try {
+        raw = await commands.execute(live.agent, line, submitted, controller.signal)
+      } catch (error) {
+        if (controller.signal.aborted) throw codedError('ABORTED', 'the native command was cancelled')
+        // DSH owns validation/audit and can refuse a command with a bare native
+        // Error. Same taxonomy as the other native seams: keep a stable code,
+        // redact the diagnostic, never forward the raw object to the UI.
+        throw nativeAgentFailure(`the native command ${JSON.stringify(line)} failed`, error)
+      }
+      const execution = record(raw)
       if (execution === undefined) {
         const commandName = line.trimStart().slice(1).split(/\s/, 1)[0]
         throw codedError('UNSUPPORTED_COMMAND', `unknown or malformed command: /${commandName}`)
@@ -3253,8 +3497,10 @@ export class DshContextBackend implements Backend {
     return count
   }
 
-  private async drainCommands(timeoutMs: number): Promise<void> {
-    const pending = [...this.activeCommands.values()].map(entry => entry.settled)
+  private async drainCommands(timeoutMs: number, sessionId?: string): Promise<void> {
+    const pending = [...this.activeCommands.values()]
+      .filter(entry => sessionId === undefined || entry.sessionId === sessionId)
+      .map(entry => entry.settled)
     if (pending.length === 0) return
     try {
       await withTimeout(Promise.allSettled(pending), timeoutMs, 'native command drain')
@@ -3544,6 +3790,14 @@ export class DshContextBackend implements Backend {
     }
   }
 
+  /**
+   * Read-only reasoning-level roster for the current route.
+   *
+   * A pending attachment answers from the route it already follows (its staged
+   * pin or the live native default) through `agentRoute()`, so this read never
+   * creates the Agent. An unknown route stays an explicit failure instead of a
+   * fabricated level list.
+   */
   private async listEfforts(): Promise<unknown> {
     const route = this.agentRoute()
     if (route === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'this session has no model route')
@@ -3656,8 +3910,17 @@ export class DshContextBackend implements Backend {
       throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no permission-preset service')
     }
     const session = this.live?.agent.session
-    if (session === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    return jsonSafe({ ...(record(presets.catalog()) ?? {}), currentValue: presets.current(session) })
+    const catalog = record(presets.catalog()) ?? {}
+    if (session === undefined) {
+      // A pending attachment owns no native Session, so there is no native
+      // current permission value to report: the roster is the whole fact.
+      // Never create an Agent (and a durable session) to answer a read-only
+      // permission question; `currentValue` is simply absent, like every other
+      // unknown native fact this adapter omits.
+      if (this.pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+      return jsonSafe({ ...catalog })
+    }
+    return jsonSafe({ ...catalog, currentValue: presets.current(session) })
   }
 
   // ------------------------------------------------------------- sessions UI
@@ -4213,10 +4476,16 @@ export class DshContextBackend implements Backend {
   }
 
   private queueRemove(params: Record<string, unknown>): { removed: boolean } {
-    const agent = this.live?.agent
-    if (agent === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
     const messageId = typeof params.messageId === 'string' ? params.messageId : ''
     if (messageId === '') throw codedError('INVALID_ARGUMENT', 'queue-remove requires messageId')
+    const agent = this.live?.agent
+    if (agent === undefined) {
+      // A pending attachment owns no native inbox: nothing is queued, so
+      // nothing can be removed. Same answer as `dequeue` (`[]`), and no Agent
+      // is created just to say the queue is empty.
+      if (this.pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+      return { removed: false }
+    }
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
       .find(message => message.id === messageId)
     // Already claimed or never queued: the row just leaves. No error notice.
@@ -4246,9 +4515,16 @@ export class DshContextBackend implements Backend {
 
   /**
    * Put one human message at the front of `next-turn` and wake the driver.
+   *
    * `followup` is the public wake. Other recallable `next-turn` rows are
    * lifted out and appended behind it, so a running turn is cancelled with
    * the inbox kept and the rest still run later, one turn at a time.
+   *
+   * The promotion is transactional: it changes the native inbox (recall the
+   * rest of `next-turn`, drop the replaced row, wake the driver) and
+   * `followup` can refuse, so the exact pre-call inbox is captured first and
+   * restored on any failure before the original rejection is rethrown. A failed
+   * "send now" must leave the user's queue exactly as it was, never empty.
    */
   private async queueSendNow(params: Record<string, unknown>): Promise<{ messageId: string }> {
     await this.ensureNative()
@@ -4271,33 +4547,44 @@ export class DshContextBackend implements Backend {
     } else {
       throw codedError('INVALID_ARGUMENT', 'queue-send-now requires text, content, or messageId')
     }
-    if (existing !== undefined) this.dropRecallable(agent, existing.id)
-    this.promote(agent, message)
+    this.promote(agent, message, existing)
     return { messageId: message.id }
   }
 
-  private dropRecallable(agent: AgentLike, messageId: string): void {
-    this.findRecallable(agent, messageId)
-    agent.inbox.remove(messageId)
-  }
-
-  private promote(agent: AgentLike, message: UserMessageLike): void {
-    const saved: UserMessageLike[] = []
-    for (const item of [...agent.inbox.nextTurn]) {
-      if (item.id === message.id || !isRecallableMessage(item)) continue
-      if (agent.inbox.remove(item.id)) saved.push(item)
+  /**
+   * Move one message to the front of `next-turn` and wake the native driver.
+   *
+   * @param agent - exact live Agent whose inbox is being reordered.
+   * @param message - the admitted message that must lead the next turn.
+   * @param original - queued row this call replaces, when it is a different one.
+   */
+  private promote(agent: AgentLike, message: UserMessageLike, original?: UserMessageLike): void {
+    // The two native lanes, in order: the only fact a failed wake can be
+    // rolled back to. Restoring the *sequence* (not just membership) is what
+    // keeps the queue exactly as the user left it.
+    const before = inboxRowsOf(agent)
+    try {
+      const saved: UserMessageLike[] = []
+      for (const item of [...agent.inbox.nextTurn]) {
+        if (item.id === message.id || item.id === original?.id || !isRecallableMessage(item)) continue
+        if (agent.inbox.remove(item.id)) saved.push(item)
+      }
+      if (original !== undefined) agent.inbox.remove(original.id)
+      if (agent.inbox.nextTurn.some(item => item.id === message.id) || agent.inbox.nextStep.some(item => item.id === message.id)) {
+        agent.inbox.remove(message.id)
+      }
+      if (agent.status === 'running') agent.cancel({ kind: 'user' }, { keepInbox: true })
+      agent.followup(message)
+      const index = agent.inbox.nextTurn.findIndex(item => item.id === message.id)
+      if (index > 0) {
+        agent.inbox.remove(message.id)
+        agent.inbox.prepend('next-turn', message)
+      }
+      for (const item of saved) agent.inbox.append('next-turn', item)
+    } catch (error) {
+      restoreInbox(agent, before)
+      throw error
     }
-    if (agent.inbox.nextTurn.some(item => item.id === message.id) || agent.inbox.nextStep.some(item => item.id === message.id)) {
-      agent.inbox.remove(message.id)
-    }
-    if (agent.status === 'running') agent.cancel({ kind: 'user' }, { keepInbox: true })
-    agent.followup(message)
-    const index = agent.inbox.nextTurn.findIndex(item => item.id === message.id)
-    if (index > 0) {
-      agent.inbox.remove(message.id)
-      agent.inbox.prepend('next-turn', message)
-    }
-    for (const item of saved) agent.inbox.append('next-turn', item)
   }
 
   private userMessageFromContent(content: readonly unknown[]): unknown {
@@ -4361,9 +4648,27 @@ export class DshContextBackend implements Backend {
 
   // ----------------------------------------------------------------- reload
 
+  /**
+   * The adapter's own reload gate: no turn, native command, pending decision or
+   * queued input may exist across a profile recomposition.
+   *
+   * A pending attachment is idle by construction: it owns no Agent, no native
+   * command, no decision and no inbox, so every dimension is empty. Requiring a
+   * live Agent here made `/reload` unusable until the first `send` for no reason
+   * the documented gate states.
+   */
   private assertReloadIdle(): void {
     const live = this.live
-    if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    if (live === undefined) {
+      if (this.pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+      if (this.activeCommands.size > 0 || this.pendingDecisions.size > 0) {
+        throw codedError(
+          'RUNTIME_REQUEST_FAILED',
+          'wait for the current turn, queued input or native command to finish before reloading',
+        )
+      }
+      return
+    }
     if (live.agent.status === 'running' ||
         this.activeCommands.size > 0 ||
         this.pendingDecisions.size > 0 ||
@@ -4388,7 +4693,7 @@ export class DshContextBackend implements Backend {
     }
     // Recomposition can replace skill providers and the preset-scoped tool, so
     // an in-flight metadata read must not deliver a pre-reload catalog.
-    this.abortSkillQueries('runtime reloaded', this.live?.agent.session.id)
+    this.abortSkillQueries('runtime reloaded', this.live?.agent.session.id ?? this.pending?.sessionId)
     this.assertReloadIdle()
     const hmr = this.service<HmrLike>('hmr')
     if (typeof hmr?.runExclusive !== 'function' || typeof hmr.reconcileProfile !== 'function') {
@@ -4404,7 +4709,12 @@ export class DshContextBackend implements Backend {
         // Recomposition can replace the projection registrations this bridge
         // reads; drop cached rows and re-resolve services on the next read.
         this.subagentBridge.invalidate()
-        const info = this.live === undefined ? undefined : await this.sessionInfo(false)
+        // The refreshed attachment facts come from the same read the ordinary
+        // attach path uses: the live Agent's SessionInfo, or the pending
+        // attachment's own `pendingInfo()`.
+        const info = this.live !== undefined
+          ? await this.sessionInfo(false)
+          : this.pending === undefined ? undefined : this.pendingInfo()
         // `/reload` does not emit `ready`; re-announce so subsequent child
         // changes are published against the refreshed attachment again.
         if (info !== undefined) this.subagentBridge.announce(info.sessionId, info.subagents)
@@ -4423,49 +4733,66 @@ export class DshContextBackend implements Backend {
 
   // ------------------------------------------------------------------ close
 
+  /**
+   * Release only what this adapter owns.
+   *
+   * Repeated shutdown joins the first attempt instead of returning early: the
+   * promise is cached before any await, so a second `close()` cannot resolve or
+   * announce `closed` while the first one is still draining native commands, a
+   * turn, `sessions.flush()` or the owned Agent handle. `closed` is therefore
+   * announced exactly once, after owned cleanup has actually settled.
+   */
   async close(): Promise<void> {
-    if (this.closed) {
-      if (!this.closedEmitted) this.emit({ type: 'closed', code: 0, signal: null })
-      return
-    }
+    this.closing ??= this.disposeOwned()
+    await this.closing
+  }
+
+  private async disposeOwned(): Promise<void> {
     this.closed = true
-    this.abortNativeUiReads()
-    this.activeNativeUiReads.clear()
-    this.offNativeJobs?.(); this.offNativeJobs = undefined
-    this.subagentBridge.close()
-    this.childPresenters.clear()
-    for (const dispose of this.disposers.splice(0)) {
-      try {
-        dispose()
-      } catch {
-        /* listener disposal is best effort */
+    try {
+      this.abortNativeUiReads()
+      this.activeNativeUiReads.clear()
+      this.offNativeJobs?.(); this.offNativeJobs = undefined
+      this.subagentBridge.close()
+      this.childPresenters.clear()
+      for (const dispose of this.disposers.splice(0)) {
+        try {
+          dispose()
+        } catch {
+          /* listener disposal is best effort */
+        }
       }
+      const aborted = this.abortActiveCommands('backend closed')
+      if (aborted > 0) await this.drainCommands(COMMAND_DRAIN_TIMEOUT_MS)
+      for (const controller of this.activeImageReads.values()) {
+        if (!controller.signal.aborted) controller.abort()
+      }
+      this.activeImageReads.clear()
+      // Metadata reads are aborted, never joined: an uncooperative provider or
+      // directory scan must not extend shutdown (same policy as an image read).
+      this.abortSkillQueries('backend closed')
+      this.activeSkillQueries.clear()
+      this.compactionCauses.clear()
+      await this.switching
+      this.pending = undefined
+      const current = this.live
+      if (current !== undefined) {
+        this.live = undefined
+        this.toolPresenter = undefined
+        await this.closeAgent(current, 'backend closed')
+      }
+      // `closeAgent` settles only its own Agent's decisions; anything still
+      // pending (a child's request) has no surviving answerer once this adapter
+      // is gone, so shutdown settles the rest explicitly.
+      this.closePendingDecisions('backend closed')
+      // Note: no `appExit`, no root disposal, no process exit. The parent plugin
+      // owns application shutdown; an in-flight HMR reload is intentionally not
+      // awaited because recomposition may be unloading this very plugin.
+      this.native = undefined
+      this.codec = undefined
+    } finally {
+      if (!this.closedEmitted) this.emit({ type: 'closed', code: 0, signal: null })
     }
-    const aborted = this.abortActiveCommands('backend closed')
-    if (aborted > 0) await this.drainCommands(COMMAND_DRAIN_TIMEOUT_MS)
-    for (const controller of this.activeImageReads.values()) {
-      if (!controller.signal.aborted) controller.abort()
-    }
-    this.activeImageReads.clear()
-    // Metadata reads are aborted, never joined: an uncooperative provider or
-    // directory scan must not extend shutdown (same policy as an image read).
-    this.abortSkillQueries('backend closed')
-    this.activeSkillQueries.clear()
-    this.compactionCauses.clear()
-    await this.switching
-    this.pending = undefined
-    const current = this.live
-    if (current !== undefined) {
-      this.live = undefined
-      this.toolPresenter = undefined
-      await this.closeAgent(current, 'backend closed')
-    }
-    // Note: no `appExit`, no root disposal, no process exit. The parent plugin
-    // owns application shutdown; an in-flight HMR reload is intentionally not
-    // awaited because recomposition may be unloading this very plugin.
-    this.native = undefined
-    this.codec = undefined
-    if (!this.closedEmitted) this.emit({ type: 'closed', code: 0, signal: null })
   }
 }
 

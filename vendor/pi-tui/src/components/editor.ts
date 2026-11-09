@@ -298,6 +298,19 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 
 			// The segment remains logically atomic for cursor
 			// movement / editing — the split is purely visual for word-wrap layout.
+			//
+			// Only re-wrap when there is something to split: a merged atomic
+			// segment (paste/image/file marker) spans many graphemes, but a plain
+			// wide grapheme (CJK, emoji, ZWJ sequence) has no smaller unit. Re-wrapping
+			// that one grapheme would recurse with identical arguments — in a
+			// 1-column layout (maxWidth === 1) every wide grapheme is wider than the
+			// width, which used to overflow the stack. Keep it as one chunk instead
+			// and let the line overflow the column visually.
+			if ([...graphemeSegmenter.segment(grapheme)].length <= 1) {
+				currentWidth += gWidth;
+				wrapOppIndex = -1;
+				continue;
+			}
 			const subChunks = wordWrapLine(grapheme, maxWidth);
 			for (let j = 0; j < subChunks.length - 1; j++) {
 				const sc = subChunks[j]!;
@@ -643,6 +656,21 @@ export class Editor implements Component, Focusable {
 	}
 
 	/**
+	 * Raise the large-paste id high-water mark from paste-marker text that arrived
+	 * from outside the editor (hand-typed `[paste #N ...]`, a restored draft).
+	 * A typed marker carries no payload, so a later large paste must not take that
+	 * id and silently turn the typed marker into its own content — it stays
+	 * ordinary text and is never expanded.
+	 */
+	notePasteMarkerIds(text: string): void {
+		for (const match of text.matchAll(PASTE_MARKER_REGEX)) {
+			const id = Number(match[1]);
+			if (!Number.isSafeInteger(id) || id <= 0) continue;
+			this.pasteCounter = Math.max(this.pasteCounter, id);
+		}
+	}
+
+	/**
 	 * Raise the file marker-id high-water mark from marker text that arrived from
 	 * outside the editor (restored drafts, persisted history). Mirrors
 	 * `noteImageMarkerIds` with the separate file id space.
@@ -738,7 +766,11 @@ export class Editor implements Component, Focusable {
 		} else {
 			this.applyHistoryImages(this.history[this.historyIndex] || "");
 			this.applyHistoryFiles(this.history[this.historyIndex] || "");
-			this.setTextInternal(this.history[this.historyIndex] || "", direction === -1 ? "start" : "end");
+			// Recalled entries place the cursor at the end, like readline/CC: typing
+			// right after Up continues the recalled entry instead of prepending to it.
+			// Staying inside a multi-line entry is a history-state decision
+			// (`historyIndex > -1`), never a cursor-position accident.
+			this.setTextInternal(this.history[this.historyIndex] || "");
 		}
 	}
 
@@ -782,11 +814,34 @@ export class Editor implements Component, Focusable {
 		this.fileAttachments = restored;
 	}
 
+	/**
+	 * Leave history browsing after an edit (typing, undo, insert, kill, delete).
+	 *
+	 * The pre-browsing draft's attachment payloads are merged into the live
+	 * registries instead of being dropped: the draft's `[Image #N]`/`[File #N]`
+	 * text is already on the undo stack and in the kill ring, so discarding its
+	 * payloads would leave those markers unresolvable (the host then refuses the
+	 * draft with an unresolved-marker error even though the payload is still
+	 * reachable through Ctrl+_). Id spaces are monotonic, so merging never rebinds
+	 * an id: live entries stay authoritative and draft-only ids are added.
+	 */
 	private exitHistoryBrowsing(): void {
 		this.historyIndex = -1;
 		this.historyDraft = null;
+		const draftImages = this.historyDraftImages;
 		this.historyDraftImages = null;
+		if (draftImages && draftImages.size > 0) {
+			const merged = new Map(draftImages);
+			for (const [id, payload] of this.imageAttachments) merged.set(id, payload);
+			this.imageAttachments = merged;
+		}
+		const draftFiles = this.historyDraftFiles;
 		this.historyDraftFiles = null;
+		if (draftFiles && draftFiles.size > 0) {
+			const merged = new Map(draftFiles);
+			for (const [id, payload] of this.fileAttachments) merged.set(id, payload);
+			this.fileAttachments = merged;
+		}
 	}
 
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
@@ -1781,7 +1836,11 @@ export class Editor implements Component, Focusable {
 		// Check if this is a large paste (> 10 lines or > 1000 characters)
 		const totalChars = filteredText.length;
 		if (pastedLines.length > 10 || totalChars > 1000) {
-			// Store the paste and insert a marker
+			// Store the paste and insert a marker. Reserve the ids of any paste markers
+			// already typed/restored in the draft first, so this new paste can never
+			// take an id that existing marker text points at (that text would then be
+			// expanded to this paste on submit).
+			this.notePasteMarkerIds(this.state.lines.join("\n"));
 			this.pasteCounter++;
 			const pasteId = this.pasteCounter;
 			this.pastes.set(pasteId, filteredText);
