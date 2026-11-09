@@ -26,11 +26,10 @@ test('compatibility alias help/version requires no DSH profile or terminal', () 
   assert.equal(run(['--version']).stdout.trim(), VERSION)
 })
 
-test('v0.1.4 package metadata and the shared application version agree', () => {
+test('package metadata and the shared application version agree', () => {
   const manifest: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.ok(manifest !== null && typeof manifest === 'object' && 'version' in manifest && 'private' in manifest)
-  assert.equal(VERSION, '0.1.4')
-  assert.equal(manifest.version, VERSION)
+  assert.equal(manifest.version, VERSION, 'src/version.ts must move together with package.json')
   assert.equal(manifest.private, true, 'a local version marker does not publish the package')
 })
 

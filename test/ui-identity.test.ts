@@ -19,6 +19,9 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { VERSION } from '../src/version.ts'
 
+const manifestVersion = (): unknown =>
+  (JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { version: unknown }).version
+
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const SRC = join(ROOT, 'src')
 const TEST = join(ROOT, 'test')
@@ -71,7 +74,7 @@ test('the visible application identity is dsh-tui and reads the shared release v
   const welcome = readFileSync(join(SRC, 'ui', 'welcome.ts'), 'utf8')
   assert.match(welcome, /const TAGLINE = 'DSH TUI · v' \+ VERSION/)
   assert.match(welcome, /import \{ VERSION \} from '\.\.\/version\.ts'/)
-  assert.equal(VERSION, '0.1.4', 'the shared release identity stays 0.1.4')
+  assert.equal(VERSION, manifestVersion(), 'the shared release identity follows package.json')
 })
 
 test('frontend sources reach Pi TUI only through the private #pi-tui seam', () => {
