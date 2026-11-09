@@ -13,6 +13,11 @@ Short API handoff: `docs/INPUT-API.md`.
   library, extracted from the published package sources. It contains no
   provider, credential, Agent or conversation implementation. The app builds
   it with `pnpm build:pi-tui`.
+- **Atomic attachment markers in the vendored editor** (approved additive
+  seam): `[Image #N]` and `[File #N]` are two families with separate ids,
+  registries and payloads, but one segmentation/undo/history mechanism. The
+  vendored editor recognizes a marker only when its id is registered, so a
+  hand-typed marker stays ordinary text and never becomes atomic by accident.
 - **Seam installer** (`src/input/pi-tui-seam.js`) adds *only* the app entry
   points to Editor/SelectList prototypes: `ccCaptureSnapshot`,
   `ccRestoreSnapshot`, cursor/word/whitespace primitives, kill/yank/undo,
@@ -29,6 +34,15 @@ Short API handoff: `docs/INPUT-API.md`.
   clipboard, queue/steer, dialogs. `getBindings(actionId)` supports
   non-mutating checks (e.g. cleared-draft Up/Down detection) without a second
   key dispatch.
+- **Completion sources are callbacks, not indexes.** `/name` rows come from the
+  mounted command roster plus App-owned skill metadata; `@path` rows come from
+  the parent's `fileReferences(query, signal)` mapped through DSH's public
+  `@file` grammar (`activeAtToken` / `formatFileMention`, imported lazily so the
+  offline `--demo` entry loads without the native peers). The input layer keeps
+  no catalog and no file index, never reads file contents, never stages or
+  attaches a mentioned path, never scans the filesystem or falls back to `fd`,
+  and still delegates plain path / argument / forced-Tab completion to Pi. See
+  `docs/INPUT-API.md`.
 
 ## Vendored TUI integration (parent)
 
@@ -66,7 +80,7 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | Yank | Ctrl+Y, Alt+Y | consecutive kills accumulate in kill direction; yank-pop only immediately after yank. match; CC yank-pop legality **unverified** |
 | Undo | Ctrl+_ / Ctrl+- / Ctrl+Shift+- | restores text+cursor+paste registry; typing coalesced, kills/yanks/pastes atomic. match (byte equivalence documented) |
 | Submit/newline | Enter, Shift+Enter, Ctrl+J, Alt+Enter, backslash+Enter | Enter submits; others newline; backslash fallback. match |
-| Completion | Tab, Enter/Esc with menu, Ctrl+P/N in menu | menu owns nav/accept/cancel; editor editing works beneath. unverified for exact CC accept/submit split |
+| Completion | Tab, Enter/Esc with menu, Ctrl+P/N in menu | menu owns nav/accept/cancel; editor editing works beneath. Exact `/name` ranks first (exact → prefix → fuzzy in the menu's name namespace), so an exact Skill is never replaced by an earlier prefix-sibling command; explicit navigation still wins, Tab only edits, Enter accepts then submits for a slash name. `@file` mentions are native (DSH grammar + `fileReferences`) and Enter/Tab only fill them; a second Enter submits. unverified for the remaining CC accept/submit split |
 | Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands. match |
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
@@ -260,6 +274,69 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   *before* editing the draft, so a new paste is rejected instead of breaking
   Ctrl+_ / Ctrl+Y on an older image.
 
+## Submit dispatch (one capture path)
+
+Every submit entry point captures the payload in `CcEditor.submitNow()` before
+Pi clears the draft: Enter, backslash-Enter, autocomplete confirm, and the
+public `ccSubmit()` override. The App calls `ccSubmit()` directly for send-now,
+steer, follow-up and queue delivery, so routing it through the same capture is
+what guarantees:
+
+- a draft holding any `[Image #N]` **or** `[File #N]` marker is delivered to
+  `onSubmitContent(payload)` whenever that consumer exists — the plain
+  `onSubmit(text)` consumer never receives marker text (production installs
+  both callbacks, so this is the normal path, not a corner case);
+- unresolved typed/persisted markers block instead of being sent as text;
+- attachments with no content consumer are blocked and the draft is preserved
+  (undo/kill/yank keep working on it);
+- a text-only draft keeps its existing callback behaviour (content consumer when
+  installed, otherwise the legacy `onSubmit(text)`);
+- `payload.snapshot` is the same pre-clear capture used by the Enter path, so a
+  native rejection restores the identical draft (attachments and counters
+  included).
+
+## File attachments (native refs, memory only)
+
+`[File #N]` is its own marker family, **not** an image with a different label.
+
+- Native shape (parent-owned, shared `PromptContentPart`):
+  `{ type: "file", attachment: { attachmentId, name, bytes } }`. The
+  attachment id is opaque, `name`/`bytes` are metadata (never a host path and
+  never inline bytes), and `bytes: 0` is a valid empty file. The parent stages
+  bytes (`Backend.stageFile`) and hands the durable ref to the editor; the input
+  layer never reads a file, a URL or a store, never calls `readImage` for a file
+  and never promotes pasted path text into an attachment (`/attach <path>` is an
+  explicit parent action).
+- `insertFile({ part })` (or the bare part) inserts one atomic `[File #N]`
+  marker; `addFile` is the same method. The ready part stays in the editor's
+  in-memory registry, carried by `captureDraft()` / `restoreDraft()` only, never
+  mirrored into `history.json`. A durable native `FileBlock` ref recalled from
+  the DSH queue is **already admissible**, so it restores as a ready part
+  directly (no byte read, no re-upload).
+- Ids are separate from image ids and monotonic per family, never reused. A
+  hand-typed `[File #N]` reserves its id before the next `insertFile`, so a new
+  attachment can never silently resolve marker text it did not come from; that
+  marker stays unresolved and blocks the send.
+- Atomicity, undo, kill/yank, transpose, word/whitespace deletion, history
+  recall, stash, external editor and pre-submit snapshot restore are identical
+  to images: the marker is one unit and its payload stays resolvable while the
+  draft, undo stack, kill ring, pre-browsing draft or in-session history can
+  still reach it.
+- Ordered content: one file part per visible marker occurrence, in place, with
+  text/image/file interleaved exactly as typed. Repeating a marker repeats the
+  part; nothing is de-duplicated or rewritten. `getFileAttachments()`,
+  `getAttachmentOccurrences()` and `getAttachmentCounts()` are the preview/count
+  source (data only; the UI renders it).
+- Blocked submits keep the draft: a `[File #N]` marker without a native payload
+  raises `CcUnresolvedFileAttachmentError` (after the image check, so a mixed
+  draft reports images first), and any attachment without an `onSubmitContent`
+  consumer is refused instead of being sent as text only.
+- The one shared attachment budget (`imageBudgets`, kept by name for
+  compatibility) now also bounds file payloads. It measures what this layer
+  actually holds (the serialized part), never the declared file size, so a 10 MB
+  file costs metadata only. `insertFile` refuses with `CcFileBudgetError` before
+  editing the draft when the protected set would exceed the budget.
+
 ## Terminal limitations (honest gaps)
 
 - Legacy terminals cannot distinguish Ctrl+H/Backspace, Ctrl+M/Enter,
@@ -298,6 +375,15 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   paste, large-paste marker + submit expansion, chord actions/cancel/timer,
   app overrides, disabled/remapped keys, printable vs list, submit/newline,
   completion nav/accept/edit-fallback.
+- `test/input-skills.test.ts` — slash menu over native command/skill metadata:
+  exact-name priority in the mixed command+skill catalog (exact Skill vs
+  longer prefix command, pure-command and same-name controls), explicit
+  navigation vs the exact default, Tab-edits/Enter-submits split through
+  `onSubmitContent`, native `inputHint`/Pi `argumentHint` descriptions,
+  dedupe/sanitization, delegation to Pi for plain path/argument/forced
+  completion (with an explicit no-`fileReferences` `@` case), and
+  single-flight/retryable skill refresh. `test/input-file-mentions.test.ts`
+  covers the native `@file` domain.
 - `test/input-image.test.ts` — `[Image #N]` atomicity (Backspace, Ctrl+W,
   Alt+Backspace, kill/yank), undo restores marker + payload, prompt content
   interleaving with repeated occurrences kept in order, undo/kill-ring payload
@@ -305,6 +391,31 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   submit, no-content-consumer refusal, stash/snapshot round-trip, in-session
   history recall, persisted-history identity (id reservation, unresolved
   markers), safe-integer boundary, budget reclaim.
+- `test/input-file.test.ts` — native file attachments: canonical
+  `{ type: "file", attachment }` parts, `insertFile`/`addFile`, separate
+  monotonic ids and mixed image/file order, atomicity for
+  Backspace/Delete/Ctrl+W/Alt+Backspace/Ctrl+U/K/undo/yank, file-only submit,
+  no-consumer refusal, hand-typed and persisted `[File #N]` markers blocking the
+  send (and reserving their id before the next attach), plain-text/pasted paths
+  never promoted, empty files and metadata-only sizes, snapshot JSON round trip
+  with id high-water preservation and malformed-payload rejection, stash/modal
+  context/external-editor transitions, in-session history recall, ready
+  `FileBlock` recall without any byte read, budget refusal and per-family
+  reclaim of unreachable payloads; plus the production **dual-consumer**
+  dispatch regressions (outputs on both `onSubmit` and `onSubmitContent`, direct
+  `ccSubmit()`): file-only/mixed/image drafts reach only the multipart consumer,
+  text-only keeps its existing callback, no-consumer and unresolved-marker cases
+  block with the draft/undo preserved, and multiline/bracketed-paste drafts keep
+  their content and snapshot identity.
+- `test/input-file-mentions.test.ts` — native `@file` mentions: DSH grammar
+  tokens only (`abc@def`/`(@src` are not triggers), bare `@` empty query,
+  callback order passthrough (no local sort/fuzzy), file/dir/spaced-quote
+  mapping (closed submittable quote with the cursor before it, then drill-down),
+  grammar-unrepresentable/malformed rows dropped, forced Tab, silent
+  rejection/abort/stale and no reopened menu, no skill refresh, Enter/Tab
+  fill-only plus second-Enter submit, and a child-process proof that slash /
+  argument / non-`@` completion never loads the `@file` grammar (the offline
+  `--demo` shape) while a missing grammar is a silent empty `@` domain.
 - `test/input-image-details.test.ts` — `imageDetails` context/chain, locked
   action ids and bindings, Esc close precedence, preview toggle (`p`
   viewer-only, remap/disable, no conflict), global interrupt priority,

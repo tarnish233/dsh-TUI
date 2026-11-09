@@ -413,7 +413,10 @@ test('generic fallback keeps the CC tool summary when no native card is forwarde
 test('live text renders directly, with no empty attempt row or settlement layout jump', () => {
   for (const showThinking of [false, true]) {
     const store = newStore([])
-    const view = new TranscriptView(store, { showThinking, expandTools: false })
+    // Layout is under test, not elapsed time: pin the renderer clock so a
+    // millisecond crossed between synthetic live and untimed settlement frames
+    // cannot produce a spurious "Thought for 1ms" comparison. Timing has its own tests.
+    const view = new TranscriptView(store, { showThinking, expandTools: false, now: () => 0, thinkingLiveTimerMs: 0 })
     store.handle({ type: 'stream_start', sessionId: 's1', attemptId: 'plain-live', revision: 1, turn: 1, step: 1 })
     assert.deepEqual(view.render(80), [], 'waiting for the first chunk adds no transcript placeholder')
     store.handle({ type: 'stream_chunk', sessionId: 's1', attemptId: 'plain-live', revision: 2, index: 0, chunk: { type: 'reasoning-delta', index: 0, text: 'private reasoning' } })

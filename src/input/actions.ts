@@ -709,7 +709,7 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     defaultBindings: ["ctrl+t"],
     implementor: "app",
     status: "cc-app-override",
-    description: "Toggle the todo list (CC Ctrl+T, not transpose-char)",
+    description: "Toggle native todos above the editor",
   },
   {
     id: "app.thinking.toggle",

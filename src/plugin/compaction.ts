@@ -113,8 +113,12 @@ function durableEffort(host: CompactionSeamHost, sessionId: string, provider: st
   } catch {
     return undefined
   }
-  const config = record(record(header)?.config)
+  const durable = record(header)
+  const config = record(durable?.config)
   if (config === undefined || config.provider !== provider || config.model !== model) return undefined
+  // Effective adapter defaults are logged too, but are not a caller's explicit
+  // selection. Leave them to the native adapter for this auxiliary request.
+  if (record(durable?.adapterDefaults)?.reasoningEffort === true) return undefined
   return identifier(config.reasoningEffort)
 }
 

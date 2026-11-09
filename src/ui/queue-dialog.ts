@@ -22,6 +22,7 @@ import {
   type TuiMouseEventResult,
 } from '#pi-tui'
 import type { QueueEntry } from '../backend/types.ts'
+import { queueAttachmentLabel, queueContentLabel } from './queue-content.ts'
 import { createCcKeymap, type CcContext, type CcKeymap } from '../input/index.ts'
 import { isInterruptKey } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
@@ -80,8 +81,7 @@ function targetLabel(entry: QueueEntry): string {
 }
 
 function imageLabel(entry: QueueEntry): string {
-  if (entry.images <= 0) return ''
-  return entry.images === 1 ? '1 image' : `${entry.images} images`
+  return queueAttachmentLabel(entry)
 }
 
 export class QueueDialog implements Component, Focusable {
@@ -494,7 +494,7 @@ export class QueueDialog implements Component, Focusable {
 
   private rowLines(entry: QueueEntry, index: number, width: number, focused: boolean): string[] {
     const marker = focused ? t.accentBright('❯') : ' '
-    const label = oneLine(entry.text) || (entry.images > 0 ? '(image)' : '(empty)')
+    const label = queueContentLabel(entry)
     const meta = [targetLabel(entry), imageLabel(entry)].filter(Boolean).join(' · ')
     const prefix = `${marker} ${dim(`#${index + 1}`)} `
     const lines: string[] = []

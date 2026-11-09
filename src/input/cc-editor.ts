@@ -33,6 +33,12 @@ installPiTuiSeam()
 import type { CcDraftSnapshot } from "./snapshot.ts"
 import type { PromptContentPart } from "../backend/types.ts"
 import type { ImageUploadPart } from "../ui/image-view.ts"
+import {
+  asCcFileUpload,
+  type CcFileAttachment,
+  type CcFilePromptPart,
+  type CcFileUpload,
+} from "./file-attachment.ts"
 
 /** Event forwarded to the app for actions the editor does not implement. */
 export interface CcActionEvent {
@@ -52,7 +58,14 @@ export interface CcActionEvent {
   definition?: CcActionDefinition
 }
 
-/** In-memory image payload budgets (encoded base64 length is used as the size). */
+/**
+ * In-memory prompt-attachment budgets.
+ *
+ * One budget covers both families (image uploads measured by encoded base64
+ * length, file parts by their serialized size) because both live in the same
+ * memory-only editor registry. The option name is retained for compatibility
+ * with existing hosts/tests; it is not an image-only budget any more.
+ */
 export interface CcImageBudgets {
   /** Hard cap for payloads a draft may reference; further inserts are refused. */
   readonly liveBytes: number
@@ -69,7 +82,22 @@ const DEFAULT_IMAGE_BUDGETS: CcImageBudgets = {
 }
 
 /** History payload registry is bounded by the prompt-history length as well. */
-const MAX_HISTORY_IMAGE_ENTRIES = 100
+const MAX_HISTORY_ATTACHMENT_ENTRIES = 100
+
+/**
+ * Accessors for one attachment family's live/history registries.
+ *
+ * Images and files keep separate ids, registries and payloads; only the
+ * budget/protection algorithm is shared so the two can never drift apart.
+ */
+interface AttachmentFamily {
+  readonly kind: "image" | "file"
+  entries(): Array<[number, unknown]>
+  setEntries(entries: Array<[number, unknown]>): void
+  reservedIds(): number[]
+  history(): Array<[string, Array<[number, unknown]>]>
+  setHistory(entries: Array<[string, Array<[number, unknown]>]>): void
+}
 
 export interface CcEditorOptions extends EditorOptions {
   /** Keymap instance; defaults to a new CC keymap. */
@@ -80,7 +108,7 @@ export interface CcEditorOptions extends EditorOptions {
   chordTimeoutMs?: number
   /** Editor-side action context (default `"editor"`). */
   context?: CcContext
-  /** Override the in-memory image payload budgets (tests, constrained hosts). */
+  /** Override the in-memory prompt-attachment budgets (tests, constrained hosts). */
   imageBudgets?: Partial<CcImageBudgets>
   /** Receives app-level actions; return true to report "handled". */
   onAction?: (event: CcActionEvent) => boolean | void
@@ -207,10 +235,39 @@ function splitJumpTarget(data: string): { target?: string; rest?: string } {
   return { target: first.segment, rest: rest.length > 0 ? rest : undefined }
 }
 
-// --- image attachments ---------------------------------------------------
+// --- prompt attachments (images and files) -------------------------------
 
-/** Global marker regex; every `[Image #N]` occurrence is one attachment slot. */
-const IMAGE_MARKER_GLOBAL = /\[Image #(\d+)\]/g
+/**
+ * Global marker regex for both attachment families.
+ *
+ * The family is part of the marker text, so `[Image #1]` and `[File #1]` are
+ * different occurrences with independent ids. Every occurrence is one slot in
+ * the ordered prompt content.
+ */
+const ATTACHMENT_MARKER_GLOBAL = /\[(Image|File) #(\d+)\]/g
+
+/** One attachment marker occurrence in draft order. */
+interface AttachmentMarker {
+  readonly kind: "image" | "file"
+  readonly id: number
+  readonly start: number
+  readonly end: number
+}
+
+/** Ordered marker occurrences of both families, image and file interleaved. */
+function findAttachmentMarkers(text: string): AttachmentMarker[] {
+  const markers: AttachmentMarker[] = []
+  for (const match of text.matchAll(ATTACHMENT_MARKER_GLOBAL)) {
+    const start = match.index ?? 0
+    markers.push({
+      kind: match[1] === "File" ? "file" : "image",
+      id: Number.parseInt(match[2]!, 10),
+      start,
+      end: start + match[0].length,
+    })
+  }
+  return markers
+}
 
 /** Base64 length is a stable, cheap proxy for encoded payload bytes. */
 function imagePayloadBytes(image: ImageUploadPart): number {
@@ -218,27 +275,44 @@ function imagePayloadBytes(image: ImageUploadPart): number {
 }
 
 /**
- * Split draft text around `[Image #N]` markers.
+ * Encoded size of one attachment payload.
  *
- * `segments[i]` is the exact text before marker `i` and `segments[ids.length]`
- * is the exact text after the last marker: whitespace, indentation and newlines
- * around a marker are the user's content and are preserved verbatim. Only the
- * marker itself is removed (it becomes an image part), so concatenating the
- * segments reproduces the input minus markers, character for character. The
- * only trimming happens once, at the submit boundary (`payload.text`).
+ * Images measure their base64 `data` (unchanged from the previous budget pass).
+ * A file payload keeps its native part (metadata only), so its serialized size
+ * is measured instead; it never contains a byte stream unless the parent put one
+ * in the part, and even then the measurement is of what this layer holds.
  */
-function splitImageMarkers(text: string): { segments: string[]; ids: number[] } {
+function attachmentPayloadBytes(payload: unknown): number {
+  if (typeof payload !== "object" || payload === null) return 0
+  const data = (payload as { data?: unknown }).data
+  if (typeof data === "string") return data.length
+  try {
+    return JSON.stringify(payload)?.length ?? 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Split draft text around attachment markers of both families.
+ *
+ * `segments[i]` is the exact text before marker `i`, and
+ * `segments[markers.length]` is the exact text after the last marker: whitespace, indentation, CJK/emoji
+ * text and newlines around a marker are the user's content and are preserved
+ * verbatim. Only the marker itself is removed (it becomes an attachment part),
+ * so concatenating the segments reproduces the input minus markers, character
+ * for character. The only trimming happens once, at the submit boundary.
+ */
+function splitAttachmentMarkers(text: string): { segments: string[]; markers: AttachmentMarker[] } {
+  const markers = findAttachmentMarkers(text)
   const segments: string[] = []
-  const ids: number[] = []
   let cursor = 0
-  for (const match of text.matchAll(IMAGE_MARKER_GLOBAL)) {
-    const start = match.index ?? cursor
-    segments.push(text.slice(cursor, start))
-    ids.push(Number.parseInt(match[1]!, 10))
-    cursor = start + match[0].length
+  for (const marker of markers) {
+    segments.push(text.slice(cursor, marker.start))
+    cursor = marker.end
   }
   segments.push(text.slice(cursor))
-  return { segments, ids }
+  return { segments, markers }
 }
 
 /** One image marker occurrence backed by a live upload. */
@@ -248,6 +322,17 @@ export interface CcImageAttachment {
   readonly image: ImageUploadPart
 }
 
+/** One attachment occurrence in draft order, mixed families. */
+export type CcAttachmentOccurrence =
+  | { readonly kind: "image"; readonly id: number; readonly image: ImageUploadPart }
+  | { readonly kind: "file"; readonly id: number; readonly file: CcFileAttachment }
+
+/** Attachment occurrences per family, for prompt counts/preview. */
+export interface CcAttachmentCounts {
+  readonly images: number
+  readonly files: number
+}
+
 /**
  * Pre-submit payload handed to `CcEditor.onSubmitContent`.
  *
@@ -255,14 +340,19 @@ export interface CcImageAttachment {
  * text, content and snapshot are captured before the clear.
  */
 export interface CcSubmitPayload {
-  /** Draft text as displayed: visible `[Image #N]` markers kept, large pastes expanded. */
+  /** Draft text as displayed: visible attachment markers kept, large pastes expanded. */
   readonly text: string
-  /** Ordered native prompt parts; each attached image replaces its marker in place. */
+  /**
+   * Ordered native prompt parts; each image/file marker replaces its own marker
+   * in place (mixed families keep their text order).
+   */
   readonly content: readonly PromptContentPart[]
   /** Full pre-submit draft state. Memory only: it may contain encoded image uploads. */
   readonly snapshot: CcDraftSnapshot
   /** Image occurrences referenced by the draft, in text order. */
   readonly images: readonly CcImageAttachment[]
+  /** File occurrences referenced by the draft, in text order (never images). */
+  readonly files: readonly CcFileAttachment[]
   /** True when the draft was recalled from prompt history when it was submitted. */
   readonly wasBrowsingHistory: boolean
 }
@@ -280,6 +370,25 @@ export class CcUnresolvedImageMarkerError extends Error {
   }
 }
 
+/**
+ * A `[File #N]` marker without a native file attachment.
+ *
+ * Only genuinely absent native refs can reach this: a durable `FileBlock` ref is
+ * already admissible, so a hand-typed `[File #9]` or persisted `history.json`
+ * text is the remaining source. Such a draft is never sent as text only.
+ */
+export class CcUnresolvedFileAttachmentError extends Error {
+  readonly markerIds: number[]
+  constructor(markerIds: readonly number[]) {
+    super(
+      `Draft references file markers without a native file attachment (${markerIds.map((id) => `[File #${id}]`).join(", ")}). ` +
+        "Remove the markers or attach the file again; this draft cannot be sent as text only.",
+    )
+    this.name = "CcUnresolvedFileAttachmentError"
+    this.markerIds = [...markerIds]
+  }
+}
+
 /** The in-memory image budget would be exceeded by this attachment. */
 export class CcImageBudgetError extends Error {
   readonly bytes: number
@@ -290,6 +399,21 @@ export class CcImageBudgetError extends Error {
         `(limit ${Math.round(limit / 1024)} KB). Remove an image before attaching another one.`,
     )
     this.name = "CcImageBudgetError"
+    this.bytes = bytes
+    this.limit = limit
+  }
+}
+
+/** The in-memory attachment budget would be exceeded by this file attachment. */
+export class CcFileBudgetError extends Error {
+  readonly bytes: number
+  readonly limit: number
+  constructor(bytes: number, limit: number) {
+    super(
+      `File attachment budget exceeded: ${Math.round(bytes / 1024)} KB of prompt attachments ` +
+        `(limit ${Math.round(limit / 1024)} KB). Remove an attachment before adding another one.`,
+    )
+    this.name = "CcFileBudgetError"
     this.bytes = bytes
     this.limit = limit
   }
@@ -397,9 +521,17 @@ export class CcEditor extends Editor {
    */
   override addToHistory(text: string): void {
     super.addToHistory(text)
-    this.reclaimImageMemory()
+    this.reclaimAttachmentMemory()
   }
 
+  /**
+   * Deliver one submit to the consumer that can carry it.
+   *
+   * A captured payload goes to `onSubmitContent` whenever that consumer exists
+   * (images **or** files), so the plain text callback can never receive draft
+   * marker text. Only a draft with no attachments and no content consumer keeps
+   * the legacy `onSubmit(text)` behaviour.
+   */
   private deliverSubmit(text: string, appHandler?: (text: string) => void): void {
     if (this.disposed) {
       this.pendingSubmit = undefined
@@ -407,11 +539,35 @@ export class CcEditor extends Editor {
     }
     const payload = this.pendingSubmit
     this.pendingSubmit = undefined
-    if (payload && this.onSubmitContent) {
+    if (payload !== undefined && this.onSubmitContent) {
       this.onSubmitContent(payload)
       return
     }
     appHandler?.(text)
+  }
+
+  /**
+   * Submit the current draft through the single capture path.
+   *
+   * The App calls `ccSubmit()` directly for send-now / steer / follow-up / queue
+   * delivery, which bypasses the Enter/backslash/autocomplete paths. Without
+   * this override those calls reach Pi's `submitValue()` with no captured
+   * payload, so a draft holding `[File #N]`/`[Image #N]` markers was handed to
+   * the plain `onSubmit(text)` consumer as literal marker text instead of the
+   * multipart `onSubmitContent(payload)`. Routing here makes every submit entry
+   * point identical: attachments always go to the content consumer when it
+   * exists, unresolved/typed markers block instead of sending text, and a
+   * text-only draft keeps its existing callback behaviour.
+   *
+   * `pendingSubmit` is set exactly while a capture is in flight, so an inner
+   * call from a handler (`onSubmitContent` re-entering) is not captured twice.
+   */
+  override ccSubmit(): void {
+    if (this.pendingSubmit !== undefined) {
+      super.ccSubmit()
+      return
+    }
+    this.submitNow(() => super.ccSubmit())
   }
 
   /** Capture the payload, then run a Pi submit path; block instead of clearing. */
@@ -425,14 +581,15 @@ export class CcEditor extends Editor {
       this.onSubmitBlocked?.(error instanceof Error ? error : new Error(String(error)))
       return
     }
-    // Images require a content consumer: a text-only handler would drop them and
-    // silently degrade the prompt, so the draft stays in the editor instead.
-    if (payload.images.length > 0 && !this.onSubmitContent) {
+    // Image/file attachments require a content consumer: a text-only handler
+    // would drop them and silently degrade the prompt, so the draft stays in the
+    // editor instead.
+    if ((payload.images.length > 0 || payload.files.length > 0) && !this.onSubmitContent) {
       this.pendingSubmit = undefined
       this.onSubmitBlocked?.(
         new Error(
-          "This draft contains image attachments but no prompt-content consumer is configured; " +
-            "the draft was kept instead of sending images as text only.",
+          "This draft contains prompt attachments but no prompt-content consumer is configured; " +
+            "the draft was kept instead of sending them as text only.",
         ),
       )
       return
@@ -445,7 +602,34 @@ export class CcEditor extends Editor {
     }
   }
 
-  // --- image attachments -------------------------------------------------
+  // --- prompt attachments (images and files) -----------------------------
+
+  /**
+   * The two attachment families share budget/protection semantics but never
+   * share ids, registries or payloads. These accessors keep one budget
+   * implementation instead of two divergent copies.
+   */
+  private imageFamily(): AttachmentFamily {
+    return {
+      kind: "image",
+      entries: () => this.getImageAttachmentEntries(),
+      setEntries: (entries) => this.setImageAttachmentEntries(entries),
+      reservedIds: () => this.getReservedImageMarkerIds(),
+      history: () => this.getHistoryImageAttachmentEntries(),
+      setHistory: (entries) => this.setHistoryImageAttachmentEntries(entries),
+    }
+  }
+
+  private fileFamily(): AttachmentFamily {
+    return {
+      kind: "file",
+      entries: () => this.getFileAttachmentEntries(),
+      setEntries: (entries) => this.setFileAttachmentEntries(entries),
+      reservedIds: () => this.getReservedFileMarkerIds(),
+      history: () => this.getHistoryFileAttachmentEntries(),
+      setHistory: (entries) => this.setHistoryFileAttachmentEntries(entries),
+    }
+  }
 
   /**
    * Insert one clipboard image as an atomic `[Image #N]` marker.
@@ -453,19 +637,55 @@ export class CcEditor extends Editor {
    * The upload is held in memory only. Marker ids are monotonic and never
    * reused, so a marker always resolves to the same image across undo, kill,
    * yank, stash restore and in-session history recall. Throws
-   * `CcImageBudgetError` when the hard in-memory image budget is exhausted.
+   * `CcImageBudgetError` when the hard in-memory attachment budget is exhausted.
    */
   insertImage(image: ImageUploadPart): number {
-    this.reclaimImageMemory()
+    this.reclaimAttachmentMemory()
     const bytes = imagePayloadBytes(image)
-    const protectedBytes = this.protectedImageBytes()
+    const protectedBytes = this.protectedAttachmentBytes(this.imageFamily())
     if (protectedBytes + bytes > this.imageBudgets.liveBytes) {
       throw new CcImageBudgetError(protectedBytes + bytes, this.imageBudgets.liveBytes)
     }
     const id = this.insertImageAttachment(image)
-    this.reclaimImageMemory()
+    this.reclaimAttachmentMemory()
     this.requestRender()
     return id
+  }
+
+  /**
+   * Insert one native file attachment as an atomic `[File #N]` marker.
+   *
+   * `upload` is either `{ part }` or the bare shared `PromptContentPart.file`
+   * part produced from a durable native ref (`Backend.stageFile`, or a durable
+   * `FileBlock` ref recalled from the native queue — already admissible, so no
+   * byte read is needed). Marker ids are monotonic, never reused and separate
+   * from image ids; a file marker can never resolve to an image payload.
+   *
+   * Throws before touching the draft when the payload is malformed or the
+   * in-memory attachment budget is exhausted.
+   */
+  insertFile(upload: CcFileUpload | CcFilePromptPart): number {
+    const normalized = asCcFileUpload(upload)
+    // Hand-typed or restored `[File #N]` text carries no payload. Reserve its id
+    // before allocating, so this new attachment can never silently resolve a
+    // marker it did not come from (the marker stays unresolved and blocks the
+    // send until the user removes it or attaches that file explicitly).
+    this.noteFileMarkerIds(this.getText())
+    this.reclaimAttachmentMemory()
+    const bytes = attachmentPayloadBytes(normalized)
+    const protectedBytes = this.protectedAttachmentBytes(this.fileFamily())
+    if (protectedBytes + bytes > this.imageBudgets.liveBytes) {
+      throw new CcFileBudgetError(protectedBytes + bytes, this.imageBudgets.liveBytes)
+    }
+    const id = this.insertFileAttachment(normalized)
+    this.reclaimAttachmentMemory()
+    this.requestRender()
+    return id
+  }
+
+  /** Explicit alias of `insertFile` (parent-facing name). */
+  addFile(upload: CcFileUpload | CcFilePromptPart): number {
+    return this.insertFile(upload)
   }
 
   /**
@@ -474,36 +694,64 @@ export class CcEditor extends Editor {
    * ring, pre-browsing draft) plus the in-session history payload registry,
    * which has its own budget.
    */
-  private protectedImageMarkerIds(): Set<number> {
-    const ids = new Set<number>(this.getReservedImageMarkerIds())
-    for (const [text, payloads] of this.getHistoryImageAttachmentEntries()) {
+  private protectedMarkerIds(family: AttachmentFamily): Set<number> {
+    const ids = new Set<number>(family.reservedIds())
+    for (const [text, payloads] of family.history()) {
       void text
       for (const [id] of payloads) ids.add(id)
     }
     return ids
   }
 
-  private protectedImageBytes(): number {
-    const protectedIds = this.protectedImageMarkerIds()
+  private protectedAttachmentBytes(family: AttachmentFamily): number {
+    const protectedIds = this.protectedMarkerIds(family)
     let total = 0
-    for (const [id, payload] of this.getImageAttachmentEntries()) {
-      if (protectedIds.has(id)) total += this.payloadBytes(payload)
+    for (const [id, payload] of family.entries()) {
+      if (protectedIds.has(id)) total += attachmentPayloadBytes(payload)
     }
     return total
   }
 
   /**
-   * Image occurrences referenced by the current draft, in text order.
-   * Only markers backed by a real upload are listed; hand-typed markers are not.
+   * Ordered attachment occurrences of both families in `text` order.
+   * Only markers backed by a real payload are listed; hand-typed or persisted
+   * markers without one are never upgraded into attachments.
    */
+  private attachmentOccurrences(text: string): CcAttachmentOccurrence[] {
+    const occurrences: CcAttachmentOccurrence[] = []
+    for (const marker of findAttachmentMarkers(text)) {
+      if (marker.kind === "image") {
+        const image = this.getImageAttachment(marker.id)
+        if (image === undefined) continue
+        occurrences.push({ kind: "image", id: marker.id, image: image as ImageUploadPart })
+        continue
+      }
+      const payload = this.getFileAttachment(marker.id)
+      if (payload === undefined) continue
+      const upload = asCcFileUpload(payload)
+      occurrences.push({
+        kind: "file",
+        id: marker.id,
+        file: { id: marker.id, part: upload.part, attachment: upload.part.attachment },
+      })
+    }
+    return occurrences
+  }
+
+  /** Image occurrences referenced by the current draft, in text order. */
   getImageAttachments(): CcImageAttachment[] {
     const occurrences: CcImageAttachment[] = []
-    for (const match of this.getText().matchAll(IMAGE_MARKER_GLOBAL)) {
-      const id = Number.parseInt(match[1]!, 10)
-      const image = this.getImageAttachment(id)
-      // Unknown ids are hand-typed pseudo markers: they are never attachments.
-      if (image === undefined) continue
-      occurrences.push({ id, image: image as ImageUploadPart })
+    for (const occurrence of this.attachmentOccurrences(this.getText())) {
+      if (occurrence.kind === "image") occurrences.push({ id: occurrence.id, image: occurrence.image })
+    }
+    return occurrences
+  }
+
+  /** File occurrences referenced by the current draft, in text order. */
+  getFileAttachments(): CcFileAttachment[] {
+    const occurrences: CcFileAttachment[] = []
+    for (const occurrence of this.attachmentOccurrences(this.getText())) {
+      if (occurrence.kind === "file") occurrences.push(occurrence.file)
     }
     return occurrences
   }
@@ -513,13 +761,34 @@ export class CcEditor extends Editor {
     return this.getImageAttachments().length > 0
   }
 
+  /** True when the draft references at least one real file attachment. */
+  hasFileAttachments(): boolean {
+    return this.getFileAttachments().length > 0
+  }
+
+  /** Mixed attachment occurrences in draft order (image and file interleaved). */
+  getAttachmentOccurrences(): CcAttachmentOccurrence[] {
+    return this.attachmentOccurrences(this.getText())
+  }
+
+  /** Prompt counts per family, for the dock/preview line. Data only, no rendering. */
+  getAttachmentCounts(): CcAttachmentCounts {
+    let images = 0
+    let files = 0
+    for (const occurrence of this.getAttachmentOccurrences()) {
+      if (occurrence.kind === "image") images += 1
+      else files += 1
+    }
+    return { images, files }
+  }
+
   /**
    * Ordered native prompt parts for the current draft.
    *
-   * Image markers become image parts in place; `[Image #N]` text is never sent
-   * to the model. Throws `CcUnresolvedImageMarkerError` when the draft contains
-   * a marker without an upload, so a restored or hand-edited draft can never be
-   * sent as silent text only.
+   * Image and file markers each become their own part in place; marker text is
+   * never sent to the model. Throws `CcUnresolvedImageMarkerError` /
+   * `CcUnresolvedFileAttachmentError` when the draft contains a marker without a
+   * payload, so a restored or hand-edited draft can never be sent as text only.
    */
   getPromptContent(): PromptContentPart[] {
     return this.buildPromptContent(this.getExpandedText())
@@ -527,71 +796,99 @@ export class CcEditor extends Editor {
 
   /**
    * Capture everything a submit needs before Pi clears the draft.
-   * Throws `CcUnresolvedImageMarkerError` for markers without an upload.
+   * Throws `CcUnresolvedImageMarkerError` / `CcUnresolvedFileAttachmentError` for
+   * markers without a payload.
    */
   captureSubmitPayload(): CcSubmitPayload {
     const snapshot = this.captureDraft()
     const expanded = this.getExpandedText()
     const content = this.buildPromptContent(expanded)
-    const { ids } = splitImageMarkers(expanded)
     const images: CcImageAttachment[] = []
-    for (const id of ids) {
-      const image = this.getImageAttachment(id)
-      if (image !== undefined) images.push({ id, image: image as ImageUploadPart })
+    const files: CcFileAttachment[] = []
+    for (const occurrence of this.attachmentOccurrences(expanded)) {
+      if (occurrence.kind === "image") images.push({ id: occurrence.id, image: occurrence.image })
+      else files.push(occurrence.file)
     }
     return {
       text: expanded.trim(),
       content,
       snapshot,
       images,
+      files,
       wasBrowsingHistory: snapshot.historyIndex > -1,
     }
   }
 
   private buildPromptContent(expanded: string): PromptContentPart[] {
-    const { segments, ids } = splitImageMarkers(expanded)
-    const unresolved = ids.filter((id) => this.getImageAttachment(id) === undefined)
-    if (unresolved.length > 0) {
-      throw new CcUnresolvedImageMarkerError([...new Set(unresolved)])
-    }
+    const { segments, markers } = splitAttachmentMarkers(expanded)
+    // Unresolved markers are reported before anything is built. Image checks keep
+    // their existing error/order first, then files, so a mixed draft reports
+    // deterministically and existing image behaviour is unchanged.
+    const unresolvedImages = [
+      ...new Set(
+        markers
+          .filter((marker) => marker.kind === "image" && this.getImageAttachment(marker.id) === undefined)
+          .map((marker) => marker.id),
+      ),
+    ]
+    if (unresolvedImages.length > 0) throw new CcUnresolvedImageMarkerError(unresolvedImages)
+    const unresolvedFiles = [
+      ...new Set(
+        markers
+          .filter((marker) => marker.kind === "file" && this.getFileAttachment(marker.id) === undefined)
+          .map((marker) => marker.id),
+      ),
+    ]
+    if (unresolvedFiles.length > 0) throw new CcUnresolvedFileAttachmentError(unresolvedFiles)
     const content: PromptContentPart[] = []
-    for (let index = 0; index < ids.length; index += 1) {
+    for (const [index, marker] of markers.entries()) {
       const segment = segments[index] ?? ""
       if (segment.length > 0) content.push({ type: "text", text: segment })
-      const id = ids[index]!
-      const image = this.getImageAttachment(id) as ImageUploadPart
-      // Every visible marker keeps its own position. Repeating one upload is the
-      // caller's intent; DSH's content-addressed store de-duplicates bytes, and
-      // the input layer never rewrites an ordered prompt.
-      content.push({
-        type: "image",
-        mediaType: image.mediaType,
-        data: image.data,
-        ...(image.name ? { name: image.name } : {}),
-      })
+      if (marker.kind === "image") {
+        const image = this.getImageAttachment(marker.id) as ImageUploadPart
+        // Every visible marker keeps its own position. Repeating one upload is the
+        // caller's intent; DSH's content-addressed store de-duplicates bytes, and
+        // the input layer never rewrites an ordered prompt.
+        content.push({
+          type: "image",
+          mediaType: image.mediaType,
+          data: image.data,
+          ...(image.name ? { name: image.name } : {}),
+        })
+        continue
+      }
+      // A file part carries the durable native ref the parent staged or recalled;
+      // it is passed through verbatim (same object identity is not assumed).
+      const file = asCcFileUpload(this.getFileAttachment(marker.id))
+      content.push({ type: "file", attachment: file.part.attachment })
     }
-    const tail = segments[ids.length] ?? ""
+    const tail = segments[markers.length] ?? ""
     if (tail.length > 0) content.push({ type: "text", text: tail })
     if (content.length === 0) content.push({ type: "text", text: "" })
     return content
   }
 
   /**
-   * Reclaim encoded image payloads that nothing references any more.
+   * Reclaim attachment payloads that nothing references any more, per family.
    *
    * Live entries referenced by the draft are always kept (they may still be
    * needed for undo, kill/yank, a stash restore or the next submit). Unreferenced
    * entries are kept newest-first up to the spare budget, so repeated
-   * paste/delete cycles cannot grow the registry without bound. The in-session
+   * attach/delete cycles cannot grow the registry without bound. The in-session
    * history registry is trimmed oldest-first to its own byte/entry budget.
    */
-  private reclaimImageMemory(): void {
+  private reclaimAttachmentMemory(): void {
     // Never drop a payload the native editor can still restore: a marker that is
     // reachable from the undo stack, kill ring or the pre-browsing draft must stay
-    // resolvable, otherwise Ctrl+_/Ctrl+Y would turn a real image into an
+    // resolvable, otherwise Ctrl+_/Ctrl+Y would turn a real attachment into an
     // unresolved marker. Reclaiming only ever touches payloads nothing can reach.
-    const referenced = this.protectedImageMarkerIds()
-    const entries = this.getImageAttachmentEntries()
+    this.reclaimFamily(this.imageFamily())
+    this.reclaimFamily(this.fileFamily())
+  }
+
+  private reclaimFamily(family: AttachmentFamily): void {
+    const referenced = this.protectedMarkerIds(family)
+    const entries = family.entries()
     const kept: Array<[number, unknown]> = []
     for (const [id, payload] of entries) {
       if (referenced.has(id)) kept.push([id, payload])
@@ -602,37 +899,33 @@ export class CcEditor extends Editor {
     for (let index = entries.length - 1; index >= 0 && spare > 0; index -= 1) {
       const [id, payload] = entries[index]!
       if (referenced.has(id)) continue
-      const bytes = this.payloadBytes(payload)
+      const bytes = attachmentPayloadBytes(payload)
       if (bytes > spareBytes) continue
       kept.push([id, payload])
       spareBytes -= bytes
       spare -= 1
     }
-    if (kept.length !== entries.length) this.setImageAttachmentEntries(kept)
+    if (kept.length !== entries.length) family.setEntries(kept)
 
-    const history = this.getHistoryImageAttachmentEntries()
+    const history = family.history()
     if (history.length === 0) return
     let total = 0
     const trimmed: Array<[string, Array<[number, unknown]>]> = []
     for (const [text, payloads] of history) {
-      const bytes = payloads.reduce((sum, [, payload]) => sum + this.payloadBytes(payload), 0)
       trimmed.push([text, payloads])
-      total += bytes
+      total += payloads.reduce((sum, [, payload]) => sum + attachmentPayloadBytes(payload), 0)
     }
     let changed = false
-    while ((total > this.imageBudgets.historyBytes || trimmed.length > MAX_HISTORY_IMAGE_ENTRIES) && trimmed.length > 0) {
+    while (
+      (total > this.imageBudgets.historyBytes || trimmed.length > MAX_HISTORY_ATTACHMENT_ENTRIES) &&
+      trimmed.length > 0
+    ) {
       const [text, payloads] = trimmed.shift()!
-      total -= payloads.reduce((sum, [, payload]) => sum + this.payloadBytes(payload), 0)
+      total -= payloads.reduce((sum, [, payload]) => sum + attachmentPayloadBytes(payload), 0)
       void text
       changed = true
     }
-    if (changed) this.setHistoryImageAttachmentEntries(trimmed)
-  }
-
-  private payloadBytes(payload: unknown): number {
-    if (typeof payload !== "object" || payload === null) return 0
-    const data = (payload as { data?: unknown }).data
-    return typeof data === "string" ? data.length : 0
+    if (changed) family.setHistory(trimmed)
   }
 
   private attachChordListener(): void {
@@ -767,12 +1060,27 @@ export class CcEditor extends Editor {
     return this.ccCaptureSnapshot()
   }
 
-  /** Restore a snapshot captured earlier (stash, history search cancel, suspend/resume). */
+  /**
+   * Restore a snapshot captured earlier (stash, history search cancel,
+   * suspend/resume, pre-submit restore after a native rejection).
+   *
+   * File payloads are validated before they reach the live registry: a malformed
+   * stash/queue receipt throws here instead of poisoning later submits. Image
+   * payload handling is unchanged.
+   */
   restoreDraft(snapshot: CcDraftSnapshot, options: { notify?: boolean } = {}): void {
     this.pasteFilter.reset()
     this.cancelChord()
-    this.ccRestoreSnapshot(snapshot, options)
-    this.reclaimImageMemory()
+    this.ccRestoreSnapshot(this.validateAttachmentSnapshot(snapshot), options)
+    this.reclaimAttachmentMemory()
+  }
+
+  /** Normalize file payloads (never bytes, paths or store ids) in a snapshot. */
+  private validateAttachmentSnapshot(snapshot: CcDraftSnapshot): CcDraftSnapshot {
+    const entries = snapshot.fileAttachments ?? []
+    if (entries.length === 0) return snapshot
+    const normalized: Array<[number, CcFileUpload]> = entries.map(([id, upload]) => [id, asCcFileUpload(upload)])
+    return { ...snapshot, fileAttachments: normalized }
   }
 
   /** Everything needed to round-trip a draft through an external editor. */

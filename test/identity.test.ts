@@ -41,6 +41,8 @@ test('native bundle entries and lifecycle services use the same application iden
   const options = readFileSync(join(ROOT, 'src/plugin/options.ts'), 'utf8')
   const plugin = readFileSync(join(ROOT, 'src/plugin/index.ts'), 'utf8')
   const startup = readFileSync(join(ROOT, 'src/plugin/startup.ts'), 'utf8')
+  assert.match(patch, /id: file-reference-local\s+name: '@deepseek-ai\/dsh-file-reference-local'/)
+  assert.doesNotMatch(patch, /@deepseek-ai\/dsh-client-ui-reference/, 'the terminal mounts the Host provider, never the Web frontend')
   assert.match(patch, /name: 'dsh-tui\/startup'/)
   assert.match(patch, /name: 'dsh-tui'/)
   assert.match(options, /STARTUP_SERVICE = 'dshTuiStartup'/)

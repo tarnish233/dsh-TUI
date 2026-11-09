@@ -65,7 +65,9 @@ export function reasoningView(value: unknown): ModelReasoningView | undefined {
  *
  * @param providerId - native provider id.
  * @param value - one entry from `llm.listModels(providerId)`.
- * @param defaultSelection - native default route used only to mark the default.
+ * @param defaultSelection - native deployment default route used only to mark
+ *   the default row. Never the session's current/pending/CLI route: those are
+ *   different native facts and must not be reported as the default.
  * @returns the row, or undefined when the native entry is malformed.
  */
 export function modelRow(

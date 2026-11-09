@@ -53,6 +53,7 @@ dsh-tui --fullscreen
 - 一个 profile 只能选择一个前端。若同一 profile 还挂载 web/headless/旧 TUI 等已知应用前端，本插件明确报错；请用 DSH 原生插件命令移除或禁用旧前端。本插件不剪裁别人的 patch、不重建 profile、不禁用竞品。
 - `--profile <name>` 要求该 profile 同样组合本插件，否则不会出现这个 TUI。
 - 模型目录、凭据、权限、工具与会话都由该 profile 的原生组合决定；TUI 不创建 profile、不镜像 profile/home、不维护 scratch runtime。
+- 本应用 bundle 明确挂载 DSH 的 canonical `file-reference-local` Host provider，供终端 `@path` 候选使用；用户的后置 profile patch 仍可禁用或替换该行。候选、effective cwd、索引失效与模型侧 `read` 指引均归 DSH，TUI 不另扫文件系统，也不挂载 Web `ui-reference` frontend。
 - `--models-file` 已移除，会明确失败；旧的 Pi 目录/凭据导入环境入口不再读取。Pi 的 `models.json` / `auth.json` 永不被导入。
 
 原生配置示例（示意字段，实际以 DSH 格式为准）：

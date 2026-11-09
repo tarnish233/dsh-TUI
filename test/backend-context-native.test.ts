@@ -8,19 +8,34 @@ import { createDshBackend, type DshContextBackend, type DshContextBackendOptions
 import type { BackendEvent, ImageAttachmentRef, PromptContentPart, SessionInfo } from '../src/backend/types.ts'
 import { FakeAgentRegistry, FakeDshHost, fakeNativeHelpers, nextTask, type FakeAgentState } from '../src/backend/testing.ts'
 
+/**
+ * Fake `ctx.sessionProjections` with the public carrier read face only.
+ *
+ * It serves `snapshot(session, keys)` (one validated cut, absent keys omitted)
+ * and the change feed. `stateOf` is the registry's deprecated raw fold read and
+ * is a trap here: the adapter must never call it.
+ */
 class FakeProjections {
-  readonly state = new Map<string, unknown>()
+  /** Native client views keyed by projection key, as DSH would validate them. */
   readonly views = new Map<string, unknown>()
+  readonly snapshotCalls: Array<readonly string[]> = []
+  stateOfCalls = 0
+  failSnapshot: Error | undefined
   private listeners: Array<(session: unknown, key: string, value: unknown, seq: unknown) => void> = []
 
-  stateOf(_session: unknown, key: string): unknown {
-    return this.state.get(key)
+  stateOf(): unknown {
+    this.stateOfCalls += 1
+    throw new Error('sessionProjections.stateOf is deprecated and must not be read by the adapter')
   }
 
-  snapshot(_session: unknown, keys?: readonly string[]): { values: Record<string, unknown> } {
+  snapshot(_session: unknown, keys?: readonly string[]): { asOfSeq: number; values: Record<string, unknown> } {
+    this.snapshotCalls.push(keys ?? [])
+    if (this.failSnapshot !== undefined) throw this.failSnapshot
     const values: Record<string, unknown> = {}
-    for (const key of keys ?? [...this.views.keys()]) values[key] = this.views.get(key)
-    return { values }
+    for (const key of keys ?? [...this.views.keys()]) {
+      if (this.views.has(key)) values[key] = this.views.get(key)
+    }
+    return { asOfSeq: 1, values }
   }
 
   onChanged(listener: (session: unknown, key: string, value: unknown, seq: unknown) => void): () => void {
@@ -30,12 +45,52 @@ class FakeProjections {
     }
   }
 
-  set(session: unknown, key: string, value: unknown, view: unknown = value): void {
-    if (value === undefined) this.state.delete(key)
-    else this.state.set(key, value)
-    if (view === undefined) this.views.delete(key)
-    else this.views.set(key, view)
-    for (const listener of [...this.listeners]) listener(session, key, view, 1)
+  set(session: unknown, key: string, value: unknown): void {
+    if (value === undefined) this.views.delete(key)
+    else this.views.set(key, value)
+    for (const listener of [...this.listeners]) listener(session, key, value, 1)
+  }
+}
+
+/**
+ * Fake `ctx.sessionTitle`: the owning domain read is `get(session)`.
+ * `undefined` is the native no-title fact, a throwing read is unavailable.
+ */
+class FakeSessionTitle {
+  private titles = new Map<unknown, string>()
+  /** Title returned for a session with no explicit entry (an unstaged fold). */
+  defaultTitle: string | undefined
+  getCalls = 0
+  failGet: Error | undefined
+  refreshCalls = 0
+
+  get(session: unknown): unknown {
+    this.getCalls += 1
+    if (this.failGet !== undefined) throw this.failGet
+    const title = this.titles.get(session) ?? this.defaultTitle
+    return title === undefined ? undefined : { title, messageSeqs: [], source: { kind: 'user' }, eventSeq: 1, updatedAt: 1 }
+  }
+
+  refresh(): void {
+    this.refreshCalls += 1
+  }
+
+  set(session: unknown, title: string | undefined): void {
+    if (title === undefined) this.titles.delete(session)
+    else this.titles.set(session, title)
+  }
+}
+
+/** Fake `ctx.planMode`: the public `get(agent)` read of logged plan state. */
+class FakePlanMode {
+  fact: Record<string, unknown> | undefined
+  readonly agents: unknown[] = []
+  failGet: Error | undefined
+
+  get(agent: unknown): unknown {
+    this.agents.push(agent)
+    if (this.failGet !== undefined) throw this.failGet
+    return this.fact
   }
 }
 
@@ -123,7 +178,8 @@ test('sendContent admits image content through the native attachment store', asy
     fakeHost.use('attachments', {
       admitPromptContent: async (content: readonly PromptContentPart[]) => {
         admitted.push(...content)
-        return [{ type: 'image', attachment }]
+        // Native admission preserves every ordered text and attachment part.
+        return content.map(part => part.type === 'text' ? part : { type: 'image', attachment })
       },
     })
   })
@@ -134,7 +190,7 @@ test('sendContent admits image content through the native attachment store', asy
   assert.equal(admitted.length, 2)
   assert.equal(agent.sent.at(-1)?.mode, 'steer')
   const message = agent.sent.at(-1)?.message as Record<string, unknown>
-  assert.deepEqual(message.content, [{ type: 'image', attachment }])
+  assert.deepEqual(message.content, [{ type: 'text', text: 'look' }, { type: 'image', attachment }])
   assert.equal(agents.createCalls.length, 1)
   await backend.close()
 })
@@ -150,7 +206,7 @@ test('image admission refusals never materialize a pending session', async () =>
   await backend.close()
 })
 
-test('native projections publish todos, an engaged plan once, and deduped metrics', async () => {
+test('native projections publish todos and deduped metrics from the public cut, never the raw fold', async () => {
   const projections = new FakeProjections()
   const { host, backend, events } = harness((fakeHost) => {
     fakeHost.use('sessionProjections', projections)
@@ -167,18 +223,6 @@ test('native projections publish todos, an engaged plan once, and deduped metric
   assert.ok(todos?.type === 'todos')
   assert.deepEqual(todos.value, [{ content: 'one', status: 'pending' }, { content: 'two', status: 'in_progress' }])
 
-  const idlePlan = { active: false, wanted: null, running: null, activeAtLastHeader: false, entered: false }
-  projections.set(session, 'plan', idlePlan, { active: false, pending: null })
-  assert.equal(events.filter(event => event.type === 'plan').length, 0, 'an unengaged plan is not a fact')
-
-  const engaged = { active: true, wanted: null, running: { commandId: 'c1', wanted: true }, activeAtLastHeader: true }
-  projections.set(session, 'plan', engaged, { active: true, pending: null })
-  const plan = events.filter(event => event.type === 'plan').at(-1)
-  assert.ok(plan?.type === 'plan')
-  assert.deepEqual(plan.value, { active: true, wanted: null, running: { commandId: 'c1', wanted: true } })
-  projections.set(session, 'plan', engaged, { active: true, pending: null })
-  assert.equal(events.filter(event => event.type === 'plan').length, 1, 'a rebuilt identical plan stays silent')
-
   projections.views.set('contextPressure', { contextWindow: 1000, projectedTokens: 400 })
   projections.views.set('tokenUsage', { uncachedInputTokens: 100, cacheReadTokens: 300, cacheWriteTokens: 0, outputTokens: 50 })
   projections.set(session, 'sessionStats', { turns: 1, steps: 2, ttftMs: 30, ignored: 9 })
@@ -190,17 +234,105 @@ test('native projections publish todos, an engaged plan once, and deduped metric
   projections.set(session, 'sessionStats', { turns: 1, steps: 2, ttftMs: 30, ignored: 9 })
   assert.equal(events.filter(event => event.type === 'metrics').length, count, 'unchanged figures stay silent')
   assert.equal(host.listenerCount('session/event'), 1)
+  assert.ok(projections.snapshotCalls.length > 0, 'every fact comes from the public carrier read')
+  assert.equal(projections.stateOfCalls, 0, 'the deprecated raw registry fold is never read')
   await backend.close()
 })
 
-test('native title baseline comes from the title projection even without a visible title event', async () => {
+test('a failing projection cut omits figures instead of inventing zeros', async () => {
   const projections = new FakeProjections()
-  projections.state.set('title', 'Native baseline')
-  const { backend, events } = harness((fakeHost) => {
+  projections.failSnapshot = new Error('registry disposed')
+  const warnings: string[] = []
+  const { backend, events } = await liveHarness((fakeHost) => {
     fakeHost.use('sessionProjections', projections)
+  }, { warn: message => { warnings.push(message) } })
+  projections.set(agentsSession(backend), 'todos', [{ content: 'one', status: 'pending' }])
+  await nextTask()
+  assert.equal(events.filter(event => event.type === 'metrics').length, 0, 'no usage/stats frame is fabricated')
+  assert.equal(events.some(event => event.type === 'todos' && event.value === null), false, 'an unreadable todos fold is not an empty checklist')
+  assert.equal(warnings.filter(message => /session-projection snapshot/.test(message)).length, 1, 'one host diagnostic, no spam')
+  await backend.close()
+})
+
+test('the native plan controller publishes active/pending on the exact Agent, not a folded command id', async () => {
+  const projections = new FakeProjections()
+  const planMode = new FakePlanMode()
+  const { backend, events, agent } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+    fakeHost.use('planMode', planMode)
+  })
+  await nextTask()
+  const frames = (): unknown[] => events.filter(event => event.type === 'plan').map(event => event.type === 'plan' ? event.value : undefined)
+  assert.deepEqual(frames(), [], 'a baseline with no native plan fact publishes nothing')
+
+  planMode.fact = { active: false }
+  projections.set(agentsSession(backend), 'plan', { active: false })
+  assert.deepEqual(frames(), [], 'an unengaged plan is not a fact')
+
+  planMode.fact = { active: true, pending: false }
+  projections.set(agentsSession(backend), 'plan', { active: true, pending: false })
+  assert.deepEqual(frames(), [{ active: true, pending: false }], 'pending:false is the requested plan-off intent, preserved as-is')
+
+  projections.set(agentsSession(backend), 'plan', { active: true, pending: false })
+  assert.equal(frames().length, 1, 'a rebuilt identical fact stays silent')
+
+  planMode.fact = { active: false, pending: true }
+  projections.set(agentsSession(backend), 'plan', { active: false, pending: true })
+  assert.deepEqual(frames().at(-1), { active: false, pending: true })
+
+  planMode.fact = undefined
+  projections.set(agentsSession(backend), 'plan', { active: false, pending: true })
+  assert.equal(frames().length, 2, 'an absent native read is unavailable, never an inactive fact')
+
+  planMode.failGet = new Error('plan controller disposed')
+  projections.set(agentsSession(backend), 'plan', { active: false, pending: true })
+  assert.equal(frames().length, 2, 'a throwing read publishes nothing')
+  assert.equal(planMode.agents.every(seen => seen === agent), true, 'every read names the exact supplied Agent')
+  await backend.close()
+})
+
+test('plan mode prefers the preset-isolated controller and publishes nothing when unmounted', async () => {
+  const projections = new FakeProjections()
+  const hostPlan = new FakePlanMode()
+  hostPlan.fact = { active: true }
+  const scopedPlan = new FakePlanMode()
+  scopedPlan.fact = { active: false, pending: true }
+  const serviceForCalls: Array<{ agent: unknown; name: string }> = []
+  const { backend, events, agent } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+    fakeHost.use('planMode', hostPlan)
+    fakeHost.use('agentPresets', {
+      serviceFor(seen: unknown, name: string) {
+        serviceForCalls.push({ agent: seen, name })
+        return name === 'planMode' ? scopedPlan : undefined
+      },
+    })
+  })
+  await nextTask()
+  assert.deepEqual(serviceForCalls[0], { agent, name: 'planMode' }, 'the exact Agent scope is queried')
+  assert.equal(hostPlan.agents.length, 0, 'the host-plane controller is not read when the preset scope owns planMode')
+  const frames = (): unknown[] => events.filter(event => event.type === 'plan').map(event => event.type === 'plan' ? event.value : undefined)
+  assert.deepEqual(frames().at(-1), { active: false, pending: true })
+  await backend.close()
+
+  const bare = new FakeProjections()
+  const unmounted = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', bare)
+  })
+  bare.set(agentsSession(unmounted.backend), 'plan', { active: true })
+  await nextTask()
+  assert.equal(unmounted.events.filter(event => event.type === 'plan').length, 0, 'capability absence publishes no plan fact')
+  await unmounted.backend.close()
+})
+
+test('the native title read supplies the resume baseline even without a title event', async () => {
+  const titles = new FakeSessionTitle()
+  titles.defaultTitle = 'Native baseline'
+  const { backend, events } = harness((fakeHost) => {
+    fakeHost.use('sessionTitle', titles)
     fakeHost.use('sessionQuery', {
       // A durable log whose retained suffix contains no title event: the
-      // baseline must still come from the native title projection.
+      // baseline must still come from the native session-title fold.
       readSession: async (sessionId: string) => ({ session: { id: sessionId }, events: [] }),
     })
   })
@@ -213,7 +345,33 @@ test('native title baseline comes from the title projection even without a visib
   assert.deepEqual(info.events, [], 'the retained event suffix has no title event')
   const ready = events.filter(event => event.type === 'ready').at(-1)
   assert.equal(ready?.type === 'ready' ? ready.info.title : undefined, 'Native baseline')
+  assert.equal(titles.refreshCalls, 0, 'a title read never asks the native provider to generate')
   await backend.close()
+})
+
+test('title is tri-state: a string, the native no-title null, or omitted when unreadable', async () => {
+  const titles = new FakeSessionTitle()
+  titles.defaultTitle = 'Native baseline'
+  const { backend } = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionTitle', titles)
+  })
+  assert.equal((await backend.connect()).title, 'Native baseline')
+  titles.defaultTitle = undefined
+  assert.equal((await backend.connect()).title, null, 'no folded title is the native no-title fact')
+  titles.failGet = new Error('title service disposed')
+  assert.equal(Object.hasOwn(await backend.connect(), 'title'), false, 'a failed read stays unknown and is omitted')
+  await backend.close()
+
+  const projections = new FakeProjections()
+  const fallback = await liveHarness((fakeHost) => {
+    fakeHost.use('sessionProjections', projections)
+  })
+  assert.equal(Object.hasOwn(await fallback.backend.connect(), 'title'), false, 'an unmounted title service and absent key stay unknown')
+  projections.views.set('title', null)
+  assert.equal((await fallback.backend.connect()).title, null, 'the public title view is the same native no-title fact')
+  projections.views.set('title', 'From the title projection')
+  assert.equal((await fallback.backend.connect()).title, 'From the title projection')
+  await fallback.backend.close()
 })
 
 test('native title updates and null clears come from projection changes with the live attachment', async () => {

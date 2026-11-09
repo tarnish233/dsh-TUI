@@ -17,6 +17,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { stripTypeScriptTypes } from 'node:module'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -32,6 +33,15 @@ const TOKEN = 'tok_999'
 const LISTING_OK = '[llm-fixture] model listing from https://example.invalid/models loaded 2 model(s), skipped 0 row(s)'
 const LISTING_FAILED = '[llm-fixture] model listing from https://example.invalid/models failed (synthetic); using the bundled catalog'
 const FATAL = 'dsh: fatal load failure: synthetic fatal diagnostic'
+/**
+ * The exact Node diagnostic the installed DSH PTC runtime triggers once per
+ * process (`stripTypeScriptTypes` in `node:module`, Node v26.13.0). Node writes
+ * the warning and its companion hint in ONE stderr write.
+ */
+const STRIP_TYPES_WARNING =
+  '(node:59500) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time'
+const TRACE_HINT = '(Use `node --trace-warnings ...` to show where the warning was created)'
+const STRIP_TYPES_WRITE = `${STRIP_TYPES_WARNING}\n${TRACE_HINT}\n`
 /** A native `installFailLoud` write: one multiline `util.inspect` diagnostic. */
 const FATAL_WRITE = `${FATAL}\n  code: "ENOENT",\n  Authorization: Bearer abc.def.ghi\n  at file:///synthetic/entry.js:1:1\n`
 
@@ -166,6 +176,183 @@ test('the known periodic successful model listing is routine, stored, and never 
     assert.equal(routine[0]?.channel, 'stderr')
     assert.equal(routine[0]?.text, LISTING_OK)
     assert.match(await box.log(), /model listing from https:\/\/example\.invalid\/models loaded 2 model\(s\), skipped 0 row\(s\)/)
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('the known Node stripTypeScriptTypes experimental warning and its paired hint are routine and log-only', async () => {
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box)
+      await withInstalled(lease, async () => {
+        // One write, exactly like Node's own `process.emitWarning` path.
+        process.stderr.write(STRIP_TYPES_WRITE)
+        await lease.flush()
+      })
+      assert.deepEqual(sinks.stderr, [], 'the known Node noise never reaches the terminal or a notice')
+      assert.deepEqual(sinks.stdout, [])
+    })
+    const warning = recordsAbout(box.records, 'ExperimentalWarning: stripTypeScriptTypes')
+    assert.equal(warning.length, 1)
+    assert.equal(warning[0]?.kind, 'routine', 'successful native TS stripping is not a native failure')
+    assert.equal(warning[0]?.channel, 'stderr')
+    assert.equal(warning[0]?.text, STRIP_TYPES_WARNING, 'the stored text keeps the original wording')
+    const hint = recordsAbout(box.records, 'trace-warnings')
+    assert.equal(hint.length, 1)
+    assert.equal(hint[0]?.kind, 'routine', 'the hint paired with this warning is demoted with it')
+    const log = await box.log()
+    assert.match(log, /info stderr: \(node:59500\) ExperimentalWarning: stripTypeScriptTypes/, 'bytes stay in the bounded log')
+    assert.match(log, /info stderr: \(Use `node --trace-warnings \.\.\.`/, 'the paired hint is stored too')
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('the known Node warning is recognized across split writes, PIDs and Buffer chunks', async () => {
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box)
+      await withInstalled(lease, async () => {
+        // Fragmented: the warning line arrives in three writes, then the hint in two.
+        process.stderr.write('(node:1) ExperimentalWarning: stripTypeScript')
+        process.stderr.write(Buffer.from('Types is an experimental feature and might chang', 'utf8'))
+        process.stderr.write('e at any time\n(Use `node --trace-')
+        process.stderr.write('warnings ...` to show where the warning was created)\n')
+        await lease.flush()
+      })
+      assert.deepEqual(sinks.stderr, [])
+    })
+    const warning = recordsAbout(box.records, 'ExperimentalWarning: stripTypeScriptTypes')
+    assert.equal(warning.length, 1, 'split writes are one complete line')
+    assert.equal(warning[0]?.kind, 'routine')
+    assert.equal(warning[0]?.text, '(node:1) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time')
+    assert.equal(recordsAbout(box.records, 'trace-warnings')[0]?.kind, 'routine', 'the split hint stays paired')
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('an intervening warning closes the pairing window, and a later hint stays visible', async () => {
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box)
+      await withInstalled(lease, async () => {
+        process.stderr.write(`${STRIP_TYPES_WARNING}\n`)
+        process.stderr.write('fixture-provider-refresh failed: upstream 503\n')
+        process.stderr.write(`${TRACE_HINT}\n`)
+        await lease.flush()
+      })
+      assert.deepEqual(sinks.stderr, [])
+    })
+    assert.equal(recordsAbout(box.records, 'ExperimentalWarning: stripTypeScriptTypes')[0]?.kind, 'routine')
+    assert.equal(recordsAbout(box.records, 'fixture-provider-refresh')[0]?.kind, 'warning', 'a provider failure stays visible')
+    const hint = recordsAbout(box.records, 'trace-warnings')[0]
+    assert.equal(hint?.kind, 'warning', 'a hint that does not directly continue the known warning stays visible')
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('a standalone hint, another experimental API, or a different wording stay warnings', async () => {
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box)
+      await withInstalled(lease, async () => {
+        // No known warning before it: this hint belongs to some other warning.
+        process.stderr.write(`${TRACE_HINT}\n`)
+        process.stderr.write('(node:9) ExperimentalWarning: Type Stripping is an experimental feature and might change at any time\n')
+        process.stderr.write('(node:9) ExperimentalWarning: stripTypeScriptTypes is an experimental feature\n')
+        process.stderr.write('(node:9) ExperimentalWarning: sqlite is an experimental feature and might change at any time\n')
+        await lease.flush()
+      })
+      assert.deepEqual(sinks.stderr, [])
+    })
+    assert.equal(
+      recordsAbout(box.records, 'trace-warnings')[0]?.kind,
+      'warning',
+      'a standalone companion hint is never blanket-suppressed',
+    )
+    const experimental = box.records.filter(record => record.text.includes('ExperimentalWarning'))
+    assert.equal(experimental.length, 3)
+    for (const record of experimental) {
+      assert.equal(record.kind, 'warning', `other experimental API wording stays visible: ${record.text}`)
+    }
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('the real public stripTypeScriptTypes warning is either demoted as known noise or surfaced, never dropped', async () => {
+  // Offline: Node's own API, one temporary log, no provider/network/filesystem work.
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box)
+      await withInstalled(lease, async () => {
+        stripTypeScriptTypes('const probe: number = 1')
+        // Node writes the warning on a later tick; the capture must span it.
+        for (let attempt = 0; attempt < 20 && box.records.length === 0; attempt += 1) {
+          await new Promise(resolve => setImmediate(resolve))
+        }
+        await lease.flush()
+      })
+      assert.deepEqual(sinks.stderr, [], 'a captured warning never paints over the renderer terminal')
+    })
+    const noise = box.records.filter(record => record.text.includes('stripTypeScriptTypes'))
+    // A future Node may stabilize the API and stop warning: nothing to classify.
+    if (noise.length === 0) return
+    const exactWording =
+      /^\([^\s()]{1,64}:\d{1,10}\) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time$/
+    const log = await box.log()
+    for (const record of noise) {
+      assert.equal(record.channel, 'stderr')
+      assert.equal(log.includes(record.text), true, 'the emitted bytes stay in the bounded log')
+      assert.equal(
+        record.kind,
+        exactWording.test(record.text) ? 'routine' : 'warning',
+        `classification follows the documented policy for: ${record.text}`,
+      )
+    }
+    const hintKind = noise.every(record => record.kind === 'routine') ? 'routine' : 'warning'
+    for (const record of box.records.filter(candidate => candidate.text.includes('trace-warnings'))) {
+      assert.equal(record.kind, hintKind, 'the companion hint follows the warning it belongs to')
+    }
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('the known Node noise never hides a following fatal or a second unpaired hint', async () => {
+  const box = await sandbox()
+  try {
+    await withTerminalSinks(async sinks => {
+      const lease = await leaseFor(box, text => box.fatals.push(text))
+      await withInstalled(lease, async () => {
+        process.stderr.write(STRIP_TYPES_WRITE)
+        // The window is one line: this second hint has no known warning before it.
+        process.stderr.write(`${TRACE_HINT}\n`)
+        process.stderr.write(`${FATAL_WRITE}`)
+        await lease.flush()
+      })
+      const forwarded = sinks.stderr.join('')
+      assert.match(forwarded, /fatal load failure: synthetic fatal diagnostic/, 'a fatal diagnostic is still forwarded')
+      assert.equal(forwarded.includes('stripTypeScriptTypes'), false, 'the routine line is never forwarded')
+      assert.equal(forwarded.includes('trace-warnings'), false)
+    })
+    assert.equal(recordsAbout(box.records, 'trace-warnings').length, 2)
+    assert.equal(
+      recordsAbout(box.records, 'trace-warnings')[1]?.kind,
+      'warning',
+      'the pairing window is exactly one line, so no state accumulates',
+    )
+    const fatal = recordsAbout(box.records, 'fatal load failure')
+    assert.equal(fatal[0]?.kind, 'fatal', 'fatal restoration/forwarding is unaffected')
+    assert.equal(box.fatals.length, 1, 'the fatal hook still runs exactly once')
   } finally {
     await box.dispose()
   }

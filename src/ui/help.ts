@@ -101,6 +101,13 @@ export interface HelpPanelOptions {
   skills?: SkillCatalogSnapshot
 }
 
+/**
+ * The read-only catalog metadata of one Help surface: the only state a refresh
+ * may replace. Keymap, callbacks and the surface identity stay parent-owned, so
+ * a native command/skill invalidation can never swap the open dialog.
+ */
+export type HelpPanelCatalog = Pick<HelpPanelOptions, 'commands' | 'customCommands' | 'skills' | 'note'>
+
 /** Two columns need two usable halves; below this the sections stack. */
 const WIDE_MIN_COLUMNS = 72
 const COLUMN_GAP = 2
@@ -269,6 +276,8 @@ export class HelpPanel implements Component, Focusable {
   readonly keymap: CcKeymap
   private readonly tui: TUI
   private readonly options: HelpPanelOptions
+  /** Current catalog snapshot; `setCatalog` replaces this object atomically. */
+  private catalog: HelpPanelCatalog
   private readonly frame = new ModalFrame()
   private readonly search: InlineAnswer
   private focusedState = false
@@ -276,13 +285,25 @@ export class HelpPanel implements Component, Focusable {
   private mode: 'browse' | 'search' = 'browse'
   private scroll = 0
   private viewport = 10
-  private lastWidth = 80
+  /**
+   * Body budget of the **painted** window, not the frame width. The body is
+   * wrapped at `ModalFrame`'s body width (frame width minus chrome), so a
+   * window/status computed from the frame width would under-count wrapped rows
+   * and stop the last page above the real tail. `0` means "not painted yet".
+   */
+  private lastBodyWidth = 0
   private done = false
   private disposedState = false
 
   constructor(tui: TUI, options: HelpPanelOptions) {
     this.tui = tui
     this.options = options
+    this.catalog = {
+      commands: options.commands,
+      customCommands: options.customCommands,
+      ...(options.note === undefined ? {} : { note: options.note }),
+      ...(options.skills === undefined ? {} : { skills: options.skills }),
+    }
     this.keymap = options.keymap
     this.search = new InlineAnswer(tui, this.keymap)
     this.search.editor.setContext('modalSearch')
@@ -369,6 +390,28 @@ export class HelpPanel implements Component, Focusable {
   invalidate(): void {
     this.frame.invalidate()
     this.search.invalidate()
+  }
+
+  /**
+   * Atomically replace the read-only catalog metadata after a native command/
+   * skill refresh. Only display data changes: the query editor, its text, the
+   * focus, keymap, callbacks, surface identity and the scroll offset are kept
+   * (the next render clamps the offset to the new body, exactly as any other
+   * render does). A closed or disposed panel ignores the update, so a late
+   * refresh can never resurrect a surface the parent already dismissed.
+   */
+  setCatalog(catalog: HelpPanelCatalog): void {
+    if (this.done || this.disposedState) return
+    this.catalog = {
+      commands: catalog.commands,
+      customCommands: catalog.customCommands,
+      ...(catalog.note === undefined ? {} : { note: catalog.note }),
+      ...(catalog.skills === undefined ? {} : { skills: catalog.skills }),
+    }
+    // The body height may change with the catalog, so the frame measurement
+    // cache is dropped; the parent's render request paints the new snapshot.
+    this.frame.invalidate()
+    this.tui.requestRender()
   }
 
   // -------------------------------------------------------------------------
@@ -547,8 +590,8 @@ export class HelpPanel implements Component, Focusable {
   /** The whole body, independent of the current window. */
   private bodyLines(width: number): string[] {
     const query = this.query().toLowerCase()
-    const commands = this.filteredCommands(this.options.commands, query)
-    const custom = this.filteredCommands(this.options.customCommands, query)
+    const commands = this.filteredCommands(this.catalog.commands, query)
+    const custom = this.filteredCommands(this.catalog.customCommands, query)
     const filtered = query !== ''
     let body: string[]
     if (width >= WIDE_MIN_COLUMNS) {
@@ -568,7 +611,7 @@ export class HelpPanel implements Component, Focusable {
     }
     // No snapshot at all keeps the historical body exactly: the parent decides
     // whether this session even has a readable native skill catalog.
-    const skills = this.options.skills
+    const skills = this.catalog.skills
     if (skills !== undefined) {
       body.push('', ...skillSectionLines(skills, width, this.filteredSkills(skills, query), filtered))
     }
@@ -580,12 +623,22 @@ export class HelpPanel implements Component, Focusable {
     return body
   }
 
+  /**
+   * Highest line offset the window can reach. It must be derived from the same
+   * body width the render paints (`lastBodyWidth`), never from the frame width:
+   * the frame width drops four columns of chrome, so wrapping there yields fewer
+   * rows and End would stop above the real tail while the status still said
+   * `N/N`. Before the first paint there is no measured window at all, so the
+   * offset stays 0 and the first render clamps it against freshly measured
+   * geometry.
+   */
   private maxScroll(): number {
-    return Math.max(0, this.bodyLines(this.lastWidth).length - this.viewport)
+    if (this.lastBodyWidth <= 0) return 0
+    return Math.max(0, this.bodyLines(this.lastBodyWidth).length - this.viewport)
   }
 
   private noteLines(width: number): string[] {
-    const note = sanitize(typeof this.options.note === 'string' ? this.options.note : '')
+    const note = sanitize(typeof this.catalog.note === 'string' ? this.catalog.note : '')
       .replace(/\s+/g, ' ')
       .trim()
     if (note === '') return []
@@ -635,29 +688,32 @@ export class HelpPanel implements Component, Focusable {
     return lines
   }
 
-  private statusText(): string {
+  /**
+   * One status line for the window actually painted. `total` and `viewport` are
+   * the body rows and body height of this render, not a re-measurement at the
+   * frame width: the reported window must never disagree with the visible slice.
+   */
+  private statusText(total: number, viewport: number): string {
     const query = this.query()
     const filtered = query !== ''
-    const commands = this.filteredCommands(this.options.commands, query).length
-    const custom = this.filteredCommands(this.options.customCommands, query).length
+    const commands = this.filteredCommands(this.catalog.commands, query).length
+    const custom = this.filteredCommands(this.catalog.customCommands, query).length
     const parts = [
       `${commands} command${commands === 1 ? '' : 's'}`,
       `${custom} custom`,
     ]
-    const skills = this.options.skills
+    const skills = this.catalog.skills
     if (skills !== undefined) {
       if (skills.available !== true) parts.push('skills unavailable')
       else parts.push(`${this.filteredSkills(skills, query).length} skill${this.filteredSkills(skills, query).length === 1 ? '' : 's'}`)
     }
     if (filtered) parts.push(`filter "${oneLine(this.search.text)}"`)
-    const total = this.bodyLines(this.lastWidth).length
-    if (total > this.viewport) parts.push(`${Math.min(this.scroll + 1, total)}-${Math.min(this.scroll + this.viewport, total)}/${total}`)
+    if (total > viewport) parts.push(`${Math.min(this.scroll + 1, total)}-${Math.min(this.scroll + viewport, total)}/${total}`)
     return parts.join(' · ')
   }
 
   render(width: number): string[] {
     const safeWidth = Math.max(4, Math.floor(width))
-    this.lastWidth = safeWidth
     const base = this.baseOptions()
     const bodyWidth = this.frame.measure(safeWidth, base).bodyWidth
     // The status line is one row in both probes: measuring with a spacer first
@@ -670,11 +726,16 @@ export class HelpPanel implements Component, Focusable {
     }
     const geometry = this.frame.measure(safeWidth, probe)
     this.viewport = Math.max(1, geometry.bodyHeight)
+    // The window, the status line and the painted slice all use this exact body
+    // budget. Laying the body out at the frame width instead would wrap fewer
+    // rows, so `maxScroll` would stop short of the true tail (the last command
+    // or skill stayed clipped below the frame while the footer claimed N/N).
+    this.lastBodyWidth = bodyWidth
     const body = this.bodyLines(bodyWidth)
     this.scroll = Math.max(0, Math.min(this.scroll, Math.max(0, body.length - this.viewport)))
     const options: ModalFrameOptions = {
       ...probe,
-      after: [fit(` ${t.subtle(this.statusText())}`, bodyWidth)],
+      after: [fit(` ${t.subtle(this.statusText(body.length, this.viewport))}`, bodyWidth)],
     }
     const painted = renderModalBody(this.frame, safeWidth, options, () =>
       textPaint(body.slice(this.scroll, this.scroll + this.viewport)) as BodyPaint)

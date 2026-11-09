@@ -255,7 +255,7 @@ test('parent resume picker: titles stream in only for the visible rows (two-phas
     // Phase 1 rows are headers-only: titles are unknown until phase 2 lands.
     await until(() => f.backend.titleCalls.length > 0, 'the visible window requested its titles')
     await paint(f.terminal)
-    assert.ok(f.terminal.screen().includes('(untitled)'), 'rows render before any title arrives')
+    assert.ok(f.terminal.screen().includes('(title unknown)'), 'headers-only rows do not claim a native no-title fact before enrichment')
     f.backend.releaseTitles()
     await until(() => f.terminal.screen().includes('Live local session'), 'the title command fills the visible rows')
     await paint(f.terminal)

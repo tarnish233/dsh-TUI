@@ -37,6 +37,8 @@ export async function runNativeScene(
     /** Public native services required by this synthetic scenario, never a bypass of Cordis injection. */
     extraInject?: readonly string[]
     streamFixture?: string
+    /** Test-only: false exercises native defaults without the fixture's usual explicit route. */
+    explicitRoute?: false | { readonly provider: string; readonly model: string }
     timeout?: number
     /** Prepare synthetic files in the isolated fixture before native services or catalog caches start. */
     prepare?: (fixture: NativeProfileFixture) => Promise<void>
@@ -49,6 +51,9 @@ export async function runNativeScene(
   const mock = options.streamFixture ?? new URL('../fixtures/mock-stream.mjs', import.meta.url).href
   const library = (path: string) => new URL('../../lib/' + path, import.meta.url).href
   const terminalModule = new URL('./terminal.ts', import.meta.url).href
+  const explicitRoute = options.explicitRoute === false ? {} : options.explicitRoute ?? {
+    provider: 'deepseek-official', model: 'deepseek-v4-flash',
+  }
   try {
     await options.prepare?.(fixture)
     await writeFile(scenarioPath, `export const run = ${scenario.toString()};\n`)
@@ -70,7 +75,7 @@ export function apply(ctx) {
   installCompactionReasoningEffort(ctx,{warn:message=>ctx.logger.warn(message)});
   await mountNativePresets(ctx);
   const events=[];
-  const backend=createDshBackend(ctx,{cwd:${JSON.stringify(fixture.cwd)},provider:'deepseek-official',model:'deepseek-v4-flash'});
+  const backend=createDshBackend(ctx,{cwd:${JSON.stringify(fixture.cwd)},...${JSON.stringify(explicitRoute)}});
   backend.onEvent(event=>events.push(event));
   terminal=new VirtualTerminal(110,35);
   app=new App({backend,cwd:${JSON.stringify(fixture.cwd)},configDir:${JSON.stringify(join(fixture.directory, 'tui'))},terminal,screen:${JSON.stringify(options.screen ?? 'fullscreen')},registerSignals:false});

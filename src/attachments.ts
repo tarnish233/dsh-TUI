@@ -1,6 +1,6 @@
-/** Image transport/display vocabulary, not an attachment store or admission policy. */
+/** Attachment transport/display vocabulary, not an attachment store or admission policy. */
 import type {
-  DisplayContentPart, ImageAttachmentRef, ImageAttachmentValue, ImageMediaType,
+  DisplayContentPart, FileAttachmentRef, ImageAttachmentRef, ImageAttachmentValue, ImageMediaType,
 } from './backend/types.ts'
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
@@ -35,7 +35,16 @@ export function asImageAttachmentRef(value: unknown): ImageAttachmentRef | undef
   }
 }
 
-/** Preserve repeated image occurrences and their order; never invent refs from inline test data. */
+/** Shape validation only; file metadata remains a native DSH fact, not a host path. */
+export function asFileAttachmentRef(value: unknown): FileAttachmentRef | undefined {
+  const ref = object(value)
+  if (!ref || typeof ref.attachmentId !== 'string' || ref.attachmentId.length === 0 ||
+      typeof ref.name !== 'string' || ref.name.length === 0 ||
+      typeof ref.bytes !== 'number' || !Number.isSafeInteger(ref.bytes) || ref.bytes < 0) return undefined
+  return { attachmentId: ref.attachmentId, name: ref.name, bytes: ref.bytes }
+}
+
+/** Preserve admitted content order and repeated refs; never invent refs from inline data. */
 export function displayContentParts(value: unknown): DisplayContentPart[] {
   if (!Array.isArray(value)) return []
   const parts: DisplayContentPart[] = []
@@ -45,6 +54,9 @@ export function displayContentParts(value: unknown): DisplayContentPart[] {
     else if (item?.type === 'image') {
       const attachment = asImageAttachmentRef(item.attachment)
       if (attachment) parts.push({ type: 'image', attachment })
+    } else if (item?.type === 'file') {
+      const attachment = asFileAttachmentRef(item.attachment)
+      if (attachment) parts.push({ type: 'file', attachment })
     }
   }
   return parts

@@ -3,7 +3,7 @@ import type { OverlayOptions, TUI, TuiMouseEvent, TuiMouseEventResult } from '#p
 import type { CcKeymap } from '../input/index.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import { fit, oneLine, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
-import { bg, bold, cc, t } from './theme.ts'
+import { bold, cc, surfaces, t } from './theme.ts'
 
 export type ModalSize = 'compact' | 'standard' | 'wide'
 
@@ -54,7 +54,16 @@ interface FrameLayout extends ModalGeometry {
   title: string
 }
 
-const surface = bg('#111113')
+/**
+ * The dialog plate is a semantic surface, never a private color: it derives
+ * from `surfaces.dialog`, which inherits the application canvas (the terminal
+ * background). This used to be a hardcoded near-black hex literal, which is why
+ * the Settings panel read as a black box over a transparent transcript that
+ * paints no background at all. Every framed line is painted through
+ * `surface.fill()` so the plate, its padding and its right edge all agree —
+ * including after Pi's `truncateToWidth()` appends a full reset.
+ */
+const surface = surfaces.dialog
 const graphicLine = (line: string): boolean => /\x1b(?:_G|\]1337;File=)/.test(line)
 const whole = (value: number, minimum: number): number => Number.isFinite(value) ? Math.max(minimum, Math.floor(value)) : minimum
 
@@ -184,13 +193,15 @@ export class ModalFrame {
     this.geometry = value
     const boxes: MouseHitbox[] = []
     const lines: string[] = []
-    const rule = (): string => cc.inactive('├' + '─'.repeat(value.width - 2) + '┤')
+    const rule = (): string => surface.fill(cc.inactive('├' + '─'.repeat(value.width - 2) + '┤'), value.width)
     const row = (text: string): string => {
+      if (!value.framed) return fit(text, value.bodyWidth)
       // Image owners already enforce their width/height budget. Do not parse,
-      // sanitize or reflow native APC transfers as terminal text.
-      const clipped = graphicLine(text) ? text : fit(text, value.bodyWidth)
+      // sanitize, reflow or re-measure native APC transfers as terminal text.
+      if (graphicLine(text)) return surface.style(cc.inactive('│') + ' ' + text + ' ' + cc.inactive('│'))
+      const clipped = fit(text, value.bodyWidth)
       const content = clipped + ' '.repeat(Math.max(0, value.bodyWidth - visibleWidth(clipped)))
-      return value.framed ? surface(cc.inactive('│') + ' ' + content + ' ' + cc.inactive('│')) : fit(text, value.bodyWidth)
+      return surface.fill(cc.inactive('│') + ' ' + content + ' ' + cc.inactive('│'), value.width)
     }
     if (value.framed) {
       const titleWidth = Math.max(1, (value.closeCol ?? value.width - 1) - 4)
@@ -205,7 +216,7 @@ export class ModalFrame {
         boxes.push({ id: closeId, startRow: 0, endRow: 0, startCol: value.closeCol, endCol: value.closeCol + 2,
           onClick: options.onClose, onHover: on => { this.hovered = on ? closeId : undefined } })
       } else top += cc.inactive('─'.repeat(Math.max(0, value.width - occupied - 1)) + '┐')
-      lines.push(fit(surface(top), value.width))
+      lines.push(surface.fill(top, value.width))
     } else if (value.height >= 2) lines.push(fit(bold(t.accentBright(value.title)), value.width))
     for (const line of value.before) lines.push(row(line))
     if (value.framed && value.before.length > 0) lines.push(rule())
@@ -229,7 +240,7 @@ export class ModalFrame {
       }
       lines.push(row(line))
     }
-    if (value.framed) lines.push(surface(cc.inactive('└' + '─'.repeat(value.width - 2) + '┘')))
+    if (value.framed) lines.push(surface.fill(cc.inactive('└' + '─'.repeat(value.width - 2) + '┘'), value.width))
     if (this.press?.id !== undefined && !boxes.some(box => box.id === this.press?.id)) this.press.invalidated = true
     this.chrome = boxes
     this.hitboxes.sync(boxes)

@@ -12,27 +12,80 @@ permissions, commands, sessions and persistence. The adapter
 (`src/backend/context.ts`) is a thin same-process seam:
 
 - the host Cordis context is passed in; `createDshBackend(ctx, options)` returns
-  the existing `Backend` contract (`src/backend/types.ts`) unchanged;
+  the UI-neutral `Backend` contract (`src/backend/types.ts`);
 - no loopback wire, JSON request dispatch, stdin/fd3, spawned second DSH,
   scratch profile mirror, second persistence, scheduler, permission rule or
   model transport exists;
 - `close()` releases only adapter-owned listeners, decisions, in-flight
-  command/image/skill-discovery operations and the Agent handle it created. It never disposes
+  command/image/file-staging/native-UI/skill-discovery requests and the Agent handle it created. It never disposes
   the host root, never calls `appExit`, and never exits the process. The parent
   plugin owns application shutdown and `ctx.effect` lifecycle.
 
+Local exit intent and owned cleanup are separate: after synchronous terminal
+restoration, `App.exitRequested` asks the parent plugin to call public
+`ctx.appExit` immediately. `App.exited` means owned cleanup has actually
+settled; repeated shutdown joins it, including native plugin disposal. DSH
+owns the existing whole-tree deadline and first requested process code — no
+TUI supervisor/global timeout/private exit controller is added. Log close and
+UI persistence cannot postpone that native request, and cannot retroactively
+rewrite its accepted code. See [confirmed fixes](NATIVE-API-FIXES.zh-CN.md).
+
 Public services used (all through `ctx.get(name)` with capability validation):
 `agents`, `commands`, `skills`, `workingDirectory`, `llm`, `attachments`,
-`sessionQuery`, `sessionProjections`, `agentDefaultModel`, `permissionPresets`,
-`agentPresets`, `sessions`, `hmr`, `tools`, `loader`, `sessionTitle`. Native pure
-helpers are
-`createUserMessage` and
+`fileReferences`, `sessionQuery`, `sessionProjections`, `agentDefaultModel`,
+`permissionPresets`, `agentPresets`, `sessions`, `hmr`, `tools`, `loader`,
+`sessionTitle`, `jobs`, `goals`, `settings` and `userQuestions`. Native pure helpers include
+`createUserMessage`, `buildForkSeed`, public `readPluginInventory` and
 `BlockAssembler` / `expandAssistantStream` / `assembleAssistantStream` /
 surface predicates; `makeTranscriptCodec(llmModule, sessionModule)` is a pure
 factory and tests inject fakes. Production may pass `options.native` from the
-parent bundle or omit it and let the adapter resolve the installed public
-exports by their package names. There is no `packageJsonPath`, global
+parent bundle or omit it and let the adapter resolve public exports against the
+supplied launcher's `profileContext.installAnchor` / public package lookup
+(shared `src/plugin/native-resources.ts`). Optional inventory does not install a
+package or another frontend; embedded/test hosts without an anchor keep direct
+public package resolution. There is no `packageJsonPath`, global
 discovery, private config/env or `loadNativeHelpers` production entry.
+
+## Native UI adapters (current mounted-only capabilities)
+
+`native-ui-scope.ts` passes the exact supplied host, current Session/Agent objects
+and attachment guard to small read/mutation adapters. It is not another Agent,
+SessionManager, transport or domain store.
+
+- `native-inspection.ts`: native jobs `list/get/readAt/events`, current Goal/get
+  or public snapshot, workingDirectory/get, whitelisted plugin inventory and
+  exact-Agent tools definitions/executable. Read-only; output does not consume
+  the model cursor. No job controller/supervisor/goal engine/tool resolution is copied.
+- `native-management.ts`: explicit native user-title rename; only two safe default
+  fields resolved by public Loader package identity, projected `describe` form and
+  confirmed native revision. `plainSchema` removes the volatile flag, so field
+  membership in that native projected form is the proof; `mutate/isVolatilePath`
+  remains final authority. No secret/config dump, generic editor or direct FS writes.
+- Interactive root fork: full public `snapshotEvents`, native `buildForkSeed`,
+  native `agents.create` with seed/inherited count/meta/preset setup and existing
+  atomic attachment switch. Never call session-only `SessionStore.fork` first or
+  build from a truncated UI snapshot. Original log/current-root ownership retained.
+- `native-files.ts`: explicit frontend bytes go to native admission/staging;
+  neutral prompts carry durable FileBlock refs. Native execute admits command
+  images; missing receipt owner leaves command files unavailable. Already durable
+  queue refs preserve order, files recover without bytes, no attachment warehouse.
+- `native-questions.ts`: one public `userQuestions`/`inbox` cut, native late answer
+  on the exact live root. No blocking respond/claim replacement, local timeout,
+  cancel API, pending-request store or timed-tool activation is invented.
+- `native-file-references.ts`: path-only `@file` discovery through the mounted
+  `ctx.fileReferences.list(agent, query, signal)` seam. No workspace scan, `fd`,
+  path resolution, file-content read/staging, provider, index or candidate cache
+  is added; the shipped local provider remains the owner of traversal/ranking.
+
+`native_ui_changed` is neutral read-view invalidation from actual public events,
+not a domain event bus. UI queries are current-attachment, single-flight/trailing;
+closed/foreign views are not revived. Owned native reads can be abandoned/aborted
+without extending shutdown; uncooperative SDK I/O without a signal remains native.
+The DSH root deadline still owns process exit.
+
+See [two-batch implementation and SDK limits](NATIVE-UI-BATCHES.zh-CN.md) and
+[current acceptance](ACCEPTANCE.md). Production package/credential/model semantics
+remain exclusively DSH-owned.
 
 ## Host composition requirements (parent-owned)
 
@@ -40,11 +93,15 @@ The parent bundle must mount the shared `dsh-base` rows (agent, agent-loop,
 commands, tools, llm, attachments, persistence/query, session-projection,
 permission presets, approval, user-questions, hmr/config-editor when
 profile-launched). For preset parity it must mount
-`@deepseek-ai/dsh-agent-preset-registry`. `session-stats` is optional: an absent
-service degrades explicitly instead of being faked. The parent adds the
-`0.2.2-rc.1` peer dependencies
-(`dsh-llm`, `dsh-session`, Cordis, agent services) and produces the publishable
-JS build.
+`@deepseek-ai/dsh-agent-preset-registry`. The terminal bundle declares the
+canonical `file-reference-local` row so `@path` discovery uses the Agent's
+native effective cwd/read namespace; a later user patch may disable or replace
+that provider, and the capability then follows the actually mounted service.
+It never mounts the Web `ui-reference` frontend. `session-stats` is optional:
+an absent service degrades explicitly instead of being faked. The parent adds
+the `0.2.2-rc.1` peer dependencies (`dsh-file-reference`, its local provider,
+`dsh-working-directory`, `dsh-llm`, `dsh-session`, Cordis, agent services) and
+produces the publishable JS build.
 
 ### Startup preset mount (`src/plugin/presets.ts`)
 
@@ -74,8 +131,11 @@ waterfall, owned by the frontend plugin fiber. It does not replace the
 compaction engine. For `purpose: 'compaction'` only, when no effort is already
 present and the request target exactly matches the session's latest durable
 `request/header`, it re-enters the public LLM stream with that header's
-`reasoningEffort` added. The adapter still runs once. A different configured
-summarization target, a missing effort and every non-compaction purpose keep
+explicit caller `reasoningEffort` added. A header whose
+`adapterDefaults.reasoningEffort` is `true` stays on the native default path;
+materialized defaults must not be pinned as explicit choices. The adapter
+still runs once. A different configured summarization target, a missing
+explicit effort and every non-compaction purpose keep
 the native request unchanged; messages, tools, tool history, output budget,
 session id and cancellation are preserved. Listener disposal follows the same
 HMR lifecycle as the TUI plugin.
@@ -113,9 +173,9 @@ function createDshBackend(ctx: DshHostContext, options): DshContextBackend
 `transcriptCodec` is available before the first `ready`; a missing native codec
 fails `connect()` loudly rather than substituting a mirror.
 
-`SessionInfo.title?: string | null` is a read-only native `title` projection
-baseline from `sessionProjections.stateOf(session, 'title')`, independent of the
-bounded transcript suffix. `null` is native no-title; unavailable/invalid data
+`SessionInfo.title?: string | null` is a read-only native title baseline from
+`sessionTitle.get(session)` (or public `snapshot(session,['title'])` when the
+domain service is absent), independent of the bounded transcript suffix. `null` is native no-title; unavailable/invalid data
 is omitted. The existing projection bridge forwards `{type:'title', sessionId,
 attachmentId, value}` only for the exact supplied live session. No title query
 policy, generator, refresh, provider enablement or profile write was added.
@@ -138,6 +198,16 @@ requested bound. It does not call `sessionPersistence.list`, `stat` durable
 JSONL files, derive an activity timestamp, or re-sort by creation time. The
 picker's age column is therefore the native header `createdAt`, not a second
 TUI-owned last-activity policy; explicit resume semantics are unchanged.
+
+`titles` (and the listing's inline titles) preserves the native batch
+observation's three-way fact: a fulfilled observation with a folded title is
+that string, a fulfilled observation whose session has no title is `null` (the
+native no-title fact), and a **rejected** row — or a whole absent/failing
+`readTitleSnapshots` — leaves `title` **omitted**, because the adapter does not
+know anything about it. The omitted field is the existing `SessionInfo.title`
+convention, so a title store that cannot be read is never rendered as "this
+session has no title"; a batch failure stays a host diagnostic (never a
+conversation warning) and is redacted like every other adapter diagnostic.
 
 An explicit resume of the session this adapter is **already attached to** is a
 no-op reattachment: the current attachment is reported (same `attachmentId`,
@@ -197,6 +267,13 @@ cancel settles the exact native request as `ASK_CANCELLED`; a signal/turn abort
 settles it as `ASK_ABORTED`, so Esc and Ctrl+C stay distinguishable. Every path
 emits `decision_closed` once before settling.
 
+Question answers keep the native `{id, selected, custom?}` meaning: `selected`
+holds chosen option labels only, and `custom` holds free-form text. A question
+with no declared options therefore reports typed text as `custom` with an empty
+`selected` (it is not a fabricated option label); an option-bearing answer that
+matches no label is `custom` too, while multiselect labels and plan-review's
+`Approve` label stay `selected` so DSH's own approval rule sees the same facts.
+
 Foreground interruption is native `Agent.cancel({kind:'user'},{keepInbox:true})`.
 It also aborts the exact AbortController of in-flight native commands and
 settles pending decisions; queued inbox input survives, no TUI scheduler is
@@ -212,22 +289,44 @@ blocks), so native context notices are neither counted nor recalled.
 session. `model`/`preset`/`effort` stage on a pending session; they apply through
 DSH's own owners when live:
 
-- live route: `agent.model.select({provider,model,reasoningEffort?})`, the only
-  native write; the footer reads `agent.model.current()` plus the creation
-  fallback;
+- live route: `agent.model.select({provider,model,reasoningEffort?})` is the
+  native selection write. Unselected AgentOptions use public native default
+  getters; pending reads follow the same getter. CLI/explicit selections pin
+  new sessions, while native logged selection/request wins on resume and after
+  request preparation. Footer/current badge receive metadata only, not a setter;
 - default save: `agentDefaultModel.saveSelection()` followed by a getter match.
   Metadata says `defaultPersistence:'native'` and `defaultsPersisted:false`
   because persistence is owned by the host's mounted ConfigEditor and this
   adapter cannot confirm a profile flush. No scratch/runtime wording is
   hardcoded;
-- presets: read-only native roster plus `blank`/`current`; a started session
-  returns `locked`; a pending session stages the preset;
+- settled config metadata: public `app-boot/config-reload()` and any-namespace
+  `settings/document-updated` coalesce into current-attachment
+  `presets_changed`/`models_changed`; a changed native getter produces
+  `model_route` first. Only already-open picker surfaces refetch, preserving
+  exact opaque selected id/query/focus/draft. No pre-commit HMR or private
+  registry hooks/polling. Direct runtime preset registration has no SDK event;
+  the next explicit native list remains the correct read.
+- presets: read-only native roster plus `blank`/`current`; `blank` comes from
+  public `agents.turnBoundaryOf(session)` and is omitted if unknown. Pending
+  sessions stage; live selection delegates to native `select(exactAgent,id)`
+  and only its locked refusal becomes `locked`. No guessed lock precheck;
 - permissions: `permissionPresets.catalog()/current(session)` passthrough;
   switching executes the mounted native `/permission` command, and native
   `/plan` remains independent;
 - commands: `ctx.commands.list(agent)` descriptors and
   `ctx.commands.execute(agent, line, [], signal)`; DSH mints
-  `command/run`/`command/done` and owns validation/audit;
+  `command/run`/`command/done` and owns validation/audit. The declared native
+  `commands/change(): void` notification is forwarded as a narrow
+  invalidation, `{type:'commands_changed', sessionId, attachmentId}`, for the
+  **current** surface (the live attachment when attached, else the pending
+  one); a consumer re-reads the native roster. The event carries no payload and
+  no scope, so the adapter never claims which layer changed and keeps no TUI
+  command registry, snapshot diff or poll. Registrations made by a child Agent
+  scope also reach this root listener, which is why the invalidation is
+  conservative rather than filtered. Bursts (one preset mount registers several
+  commands) stay one event each; consumers single-flight the native listing. The
+  subscription is disposed with the adapter and the pending→ready transition
+  already forces a roster refresh, so no dirty replay is needed.
 - input route: `command('input-route', {name})` classifies one **explicit user
   submission** after the ordinary lazy Agent path, so the preset-scoped command
   roster exists. It asks `ctx.commands.find(agent, name)` (with a `list`
@@ -247,10 +346,18 @@ DSH's own owners when live:
   small pure projection that only renames fields into UI rows
   (`id/provider/model/label/description/reasoning/isDefault`); the `id` is a UI
   correlation key and native provider/model values pass through unchanged.
-  Provider failures keep their native message (redacted) and never hide the
-  successful rows. There is no external/Pi catalog import, credential policy,
-  router or second default policy; `models` is advertised only when
-  `listProviders` and `listModels` are really mounted.
+  `isDefault` is exactly the public default-model getter — never the live
+  Agent's current route, a pending route or a `--provider/--model` override,
+  which are different native facts. An absent or failing default read marks no
+  row at all instead of promoting the session route; a session's current route
+  is still shown by the footer/state read of `agent.model.current()`. Provider
+  failures keep their native message (redacted) and never hide successful
+  rows. Up to four provider read tasks run concurrently and are flattened in
+  native registry order; no catalog cache is added. Native
+  `llm/adapters-updated`/`llm/models-updated` events invalidate metadata for the
+  current attachment; only an already-open picker re-reads, preserving UI state. There is no external/Pi catalog import, credential policy, router or
+  second default policy; `models` is advertised only when `listProviders` and
+  `listModels` are really mounted.
 - reasoning metadata: DSH 0.2.2 list DTOs may omit `reasoning`. When a model is
   selected, the adapter resolves that **target only** through
   `llm.resolveModelInfo(provider, model)` and carries an existing explicit
@@ -380,11 +487,11 @@ window/tab presentation of the native title, never this provider state.
 
 `sessionProjections.onChanged` is only a hint. `permissions` is forwarded as
 the native `{currentValue}`; `todos` is trimmed to `{content,status}`; `plan`
-re-reads the full host state and publishes only when the trimmed
-`{active,wanted,running}` fact changes, publishing an unengaged init view never.
-Footer `usage`/`stats` read the official wire views
-(`snapshot(session,keys)` with a `stateOf` fallback), re-read all contributing
-keys, and publish only on value change. The occupancy pair is atomic; cache
+re-reads the exact Agent's public `planMode.get(agent)` view and publishes
+`{active,pending?}` only on change. Pending-off `false` is a real selection,
+not a busy flag; no raw `wanted`/`running.commandId` is copied. Footer
+`usage`/`stats` read official `snapshot(session,keys)` views, with no deprecated
+`stateOf` fallback, and publish only on value change. The occupancy pair is atomic; cache
 share and whole-log total use the native token buckets; `sessionStats` fields
 are whitelisted non-negative numbers. One attach snapshot per new attachment
 replays the current facts.
@@ -402,15 +509,22 @@ only mutation path, and they call the public `ctx.subagents` primitives
 `prompt`/`interrupt` directly: no scheduler, persistence layer or second Agent
 is introduced.
 
-Membership is the recursive pre-order walk of reachable parent catalogs. Fork-
+Membership/discovery order comes from public native
+`subagents.listDescendants(root,signal)`, not an adapter catalog walker. Native
+branch metadata is preserved as `SubagentSnapshot.diagnostics` (id, parent,
+depth and reason only), and control membership uses native
+`listChildren(directParent,signal)` where an exact direct-parent mode is needed. Fork-
 inherited catalog facts stay excluded because the native projection already
 filters them by `inheritedEventCount`; the bridge additionally keeps only the
 root's own-suffix `subagent/catalog` event seq for transcript anchoring
 (`catalogSeq`). Each local child's immutable header is checked against the
 catalog parent (`parentSession`, and `origin` when present); a conflicting row
 is omitted and the snapshot is marked `truncated`. External rows are leaves and
-are never observed or traversed. Bounds: 200 entries, depth 8, one 5 s read per
-session, bounded header/run/activity caches.
+are never observed by the adapter. Bounds: 200 display entries, depth 8, one
+5 s projection read per session, bounded header/run/activity caches. The native
+enumeration itself has no row/depth limit; 15 s listing/deadline and root-epoch
+signals are forwarded to its supported cancellation face. Detailed read budget
+and remaining SDK boundaries: [adapter convergence](ADAPTER-CONVERGENCE.zh-CN.md).
 
 `SessionInfo.subagents` carries the cached snapshot on connect/resume and after
 each root switch; the `ready` payload is the first authoritative copy.
@@ -571,6 +685,37 @@ base64, media/count/pixel limits, model-vision projection, admission and durable
 promotion; refusals happen before materializing a pending session and keep the
 draft retryable.
 
+## `@file` discovery
+
+The optional `listFileReferences(query, signal)` method is a thin adapter over
+DSH's mounted `ctx.fileReferences` service, the same seam the official web
+client uses. The provider (`@deepseek-ai/dsh-file-reference-local` or a matching
+remote/virtual implementation) owns traversal, fuzzy ranking, exclusions,
+staleness, its bounded index and the `maxResults` limit. This backend only
+forwards the call and validates the answer, so selection stays ordinary
+`@path` prompt text and no file bytes are read or attached.
+
+- Capability name: `file-references`, advertised only while `ctx.fileReferences`
+  is mounted and its `list` is a function. The service is resolved from the
+  supplied host on every capability read and every query, so HMR replacement
+  never leaves a stale provider object behind.
+- Arguments: the exact live native Agent (whose Session cwd bounds discovery),
+  the query text after `@` forwarded verbatim, and the read's owned
+  `AbortSignal` (external cancellation is forwarded before and during the call).
+- Pending first prompt: the provider is confirmed first, then the existing lazy
+  `ensureCurrent()` materializes the same pending Session's Agent without a model
+  turn; only then is the provider called. A composition without a provider
+  rejects `CAPABILITY_UNAVAILABLE` and creates no Agent.
+- Result: must be an array of `{path: non-empty string, kind: 'file'|'directory'}`
+  entries. Order and length are preserved exactly and provider-private fields
+  are not projected. A malformed result is `RUNTIME_REQUEST_FAILED`, never an
+  empty or partial candidate list; a coded provider rejection keeps its code and
+  diagnostics are redacted.
+- Lifetime: the existing `nativeUiRead` identity guard rejects a result whose
+  Attachment changed and applies the bounded native-UI read timeout; closing or
+  replacing the session aborts the owned read instead of waiting for it. Nothing
+  is written to stdout/stderr.
+
 ## Diagnostics privacy
 
 Adapter-origin diagnostics (warnings, thrown `BackendError` text, `warn()` logs,
@@ -617,8 +762,19 @@ Classification is deliberately text-based and small: the native fail-loud labels
 (`<bin>: fatal load failure:` / `<bin>: fatal uncaught exception:`) are `fatal`;
 the exact periodic model-listing success line
 (`model listing from <url> loaded <n> model(s), skipped <m> row(s)`) is `routine`
-(log-only, never a transcript line); every other stderr line is `warning`, so
-native errors are never silently swallowed; unknown stdout stays `routine`
+(log-only, never a transcript line); the exact Node `ExperimentalWarning:
+stripTypeScriptTypes is an experimental feature and might change at any time` line
+is `routine` too. That warning is not a DSH failure: Node's own `node:module`
+`stripTypeScriptTypes()` is called by the installed DSH PTC runtime
+(`@deepseek-ai/dsh-ptc-runtime-node`, `stripTypes(program)`) for every `run_code`
+program, and Node emits the warning once per process on stderr. Its companion
+hint (`(Use `node --trace-warnings ...` …)`, which Node writes in the same
+stderr write) is demoted only when it directly follows that exact warning on the
+same stream; a standalone hint, any other experimental API or wording, a
+provider failure, a deprecation and a fatal line all keep their own
+classification. No global warning listener is replaced and `NODE_NO_WARNINGS`
+is never set; every other stderr line is `warning`, so native errors are never
+silently swallowed; unknown stdout stays `routine`
 log-only unless it plainly reads as a warning/failure (`error`, `failed`,
 `exception`, `denied`, `refused`, …), which keeps generic `console.log` chatter
 out of the transcript. Lines are stripped of ANSI/CSI/OSC sequences and C0/C1
@@ -713,5 +869,12 @@ session log or provider.
   output and `package.json` peer dependencies. The startup preset mount reads
   the official preset assets/plugin from the host installation; it adds no web
   frontend, copied preset or second preset implementation.
+- `@file` discovery inherits the shared 8 s bounded native-UI read timeout. A
+  first query that has to build a very large provider index can therefore be
+  abandoned (and the UI shows no candidates), while the provider keeps its own
+  background work; this adapter adds no second deadline or retry. Materializing a
+  pending Agent cannot be interrupted by the caller, so an abort that lands
+  during that existing lazy path still leaves the Agent materialized (as with
+  any other lazy first prompt).
 - Parent-owned files still referencing the deleted modules must be migrated by
   their owners (see the delegation report); this adapter does not edit them.

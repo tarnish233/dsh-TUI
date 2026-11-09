@@ -42,10 +42,10 @@ import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { SubagentEntry } from '../backend/types.ts'
 import type { TranscriptItem } from '../state/transcript.ts'
 import type { SubagentMessageTranscriptItem, SubagentTranscriptItem } from '../state/subagents.ts'
+import type { ActivityFrameNode } from './activity-group.ts'
 import type { ItemBlock, TranscriptViewOptions } from './blocks.ts'
-import { dispatchToChild, type MouseHitbox } from './mouse.ts'
+import { dispatchToChild, HoverOwnership, hoverRowSlot, isHoverExit, type MouseHitbox } from './mouse.ts'
 import { SubagentLinkHitboxes } from './subagent-link.ts'
-import type { TranscriptNode } from './tool-group.ts'
 import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
 import {
   subagentActivity,
@@ -74,8 +74,12 @@ export interface SubagentGroupFrameNode {
   readonly members: readonly SubagentRecordItem[]
 }
 
-/** Frame nodes of the transcript view (tool nodes plus subagent groups). */
-export type SubagentFrameNode = TranscriptNode | SubagentGroupFrameNode
+/**
+ * Frame nodes of the transcript view: tool nodes, mixed activity groups and
+ * consecutive subagent groups. The mixed group is planned *before* this fold, so
+ * it is passed through untouched here.
+ */
+export type SubagentFrameNode = ActivityFrameNode | SubagentGroupFrameNode
 
 export interface SubagentGroupPlanOptions {
   /**
@@ -100,7 +104,7 @@ export function isSubagentRecord(item: TranscriptItem): item is SubagentRecordIt
  * grouped and after the group dissolves.
  */
 export function planSubagentGroupNodes(
-  nodes: readonly TranscriptNode[],
+  nodes: readonly ActivityFrameNode[],
   options: SubagentGroupPlanOptions,
 ): readonly SubagentFrameNode[] {
   if (!options.groupRecords) return nodes
@@ -139,6 +143,8 @@ export interface SubagentGroupRowSpan {
   readonly xOffset: number
 }
 
+/** Placement token of this group's own header control (row 0). */
+const HEADER_SLOT = 'header'
 const DOT = '⏺'
 /**
  * Two-column tree guides, exactly like the tool group: the first row of a member
@@ -206,6 +212,13 @@ export class SubagentGroupBlock implements Component {
   readonly key: string
   private readonly flags: TranscriptViewOptions
   private readonly links = new SubagentLinkHitboxes()
+  /**
+   * The one hover target inside this group: the header/collapsed name links
+   * (this block) or the expanded member block the pointer's row belongs to.
+   * Motion only reaches one target per event, so the previously hovered one is
+   * released here instead of keeping a blue hint nobody points at.
+   */
+  private readonly hover = new HoverOwnership()
   private members: readonly SubagentGroupMember[] = []
   private rows: SubagentGroupRowSpan[] = []
   private collapsedRows: CollapsedRow[] = []
@@ -286,6 +299,7 @@ export class SubagentGroupBlock implements Component {
    * repaint (that would lose a pressed row).
    */
   clearMouse(): void {
+    this.hover.release()
     this.links.clear()
     this.frameBoxes = []
     this.rows = []
@@ -545,6 +559,12 @@ export class SubagentGroupBlock implements Component {
       }
     }
     this.links.sync(boxes)
+    // A frame that no longer paints the hovered target at the row it was
+    // entered in released its hitbox: the hint goes back to neutral.
+    this.hover.retain([
+      { component: this, slot: HEADER_SLOT },
+      ...this.rows.map(row => ({ component: row.block, slot: hoverRowSlot(row.startRow) })),
+    ])
     this.frameBoxes = boxes
   }
 
@@ -560,6 +580,14 @@ export class SubagentGroupBlock implements Component {
    */
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     const span = this.rows.find(entry => event.y >= entry.startRow && event.y <= entry.endRow)
+    if (event.type === 'move' || event.type === 'drag') {
+      // One hover target per pointer position: a member row, this group's own
+      // header/name link, or nothing (a synthetic leave must not re-adopt it).
+      const next = span !== undefined
+        ? { component: span.block, slot: hoverRowSlot(span.startRow) }
+        : isHoverExit(event) ? undefined : { component: this, slot: HEADER_SLOT }
+      this.hover.moveTo(next, span === undefined ? event : { ...event, y: event.y - span.startRow })
+    }
     if (span !== undefined) {
       const childEvent = { ...event, x: Math.max(0, event.x - span.xOffset), y: event.y - span.startRow }
       const result = dispatchToChild(span.block, childEvent)

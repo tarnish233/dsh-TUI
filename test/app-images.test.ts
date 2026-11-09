@@ -295,7 +295,7 @@ test('parent image App: missing send capability keeps image rather than sending 
     Object.defineProperty(f.backend, 'sendContent', { value: undefined })
     f.app.editor.insertImage(image.upload); f.terminal.type('\r'); await paint(f.terminal)
     assert.equal(f.app.editor.getImageAttachments().length, 1)
-    assert.match(f.terminal.screen(), /does not support native image/)
+    assert.match(f.terminal.screen(), /does not support native (?:image|attachment)/)
     assert.equal(f.backend.sent.length, 0)
   } finally { await f.close() }
 })

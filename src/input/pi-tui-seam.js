@@ -20,6 +20,7 @@ import { getKeybindings } from '#pi-tui/keybindings'
 
 const PASTE_MARKER_SINGLE = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/
 const IMAGE_MARKER_SINGLE = /^\[Image #(\d+)\]$/
+const FILE_MARKER_SINGLE = /^\[File #(\d+)\]$/
 function isPasteMarker(segment) {
   return segment.length >= 10 && PASTE_MARKER_SINGLE.test(segment)
 }
@@ -27,8 +28,12 @@ function isPasteMarker(segment) {
 function isImageMarker(segment) {
   return segment.length >= 10 && IMAGE_MARKER_SINGLE.test(segment)
 }
+/** File attachment markers are their own atomic family (never an image). */
+function isFileMarker(segment) {
+  return segment.length >= 9 && FILE_MARKER_SINGLE.test(segment)
+}
 function isAtomicMarker(segment) {
-  return isPasteMarker(segment) || isImageMarker(segment)
+  return isPasteMarker(segment) || isImageMarker(segment) || isFileMarker(segment)
 }
 
 let installed = false
@@ -78,6 +83,8 @@ ccCaptureSnapshot() {
         pasteBuffer: this.pasteBuffer,
         imageAttachments: this.getImageAttachmentEntries(),
         imageCounter: this.imageCounter,
+        fileAttachments: this.getFileAttachmentEntries(),
+        fileCounter: this.fileCounter,
         text: this.getText(),
         expandedText: this.getExpandedText(),
     };
@@ -162,10 +169,19 @@ ccRestoreSnapshot(snapshot, options = {}) {
             : [],
         Number.isFinite(snapshot.imageCounter) ? snapshot.imageCounter : 0,
     );
-    // An older snapshot must never roll the global id high-water mark back: ids
-    // allocated after it was captured stay reserved, and markers in the restored
-    // text reserve their own ids too.
-    for (const line of this.state.lines) this.noteImageMarkerIds(line);
+    this.setFileAttachmentEntries(
+        Array.isArray(snapshot.fileAttachments)
+            ? snapshot.fileAttachments.filter((entry) => Array.isArray(entry) && entry.length === 2)
+            : [],
+        Number.isFinite(snapshot.fileCounter) ? snapshot.fileCounter : 0,
+    );
+    // An older snapshot must never roll the per-family id high-water mark back:
+    // ids allocated after it was captured stay reserved, and markers in the
+    // restored text reserve their own ids too.
+    for (const line of this.state.lines) {
+        this.noteImageMarkerIds(line);
+        this.noteFileMarkerIds(line);
+    }
     this.cancelAutocomplete();
     if (options.notify !== false && this.onChange) {
         this.onChange(this.getText());
@@ -440,9 +456,13 @@ ccSetHistory(entries) {
     // Persisted history carries marker text but no payloads. Keep the markers
     // unresolved (never silently dropped) and reserve their ids so a later paste
     // cannot allocate an id an older entry already points at.
-    for (const entry of this.history) this.noteImageMarkerIds(entry);
+    for (const entry of this.history) {
+        this.noteImageMarkerIds(entry);
+        this.noteFileMarkerIds(entry);
+    }
     // Drop attachment payloads of entries the host no longer lists (bounded registry).
     this.pruneHistoryImages();
+    this.pruneHistoryFiles();
 }
 
 // --- insertion / submit -------------------------------------------------

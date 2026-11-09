@@ -15,7 +15,10 @@
  * is known and then call `setModels`/`setLoading`/`setError`. Loading, an empty
  * catalog, a query with no match and a visible native failure are four distinct
  * states. Late data never selects or submits anything: the selection is
- * preserved when its model id (or provider) still exists.
+ * preserved when its model id (or provider) still exists. A native
+ * `model_route` event may also settle the route *after* the picker opened: the
+ * parent calls `setCurrentRoute`, which only refreshes the `current` badge and
+ * status inputs - never the highlight, query, provider group or focus.
  *
  * Input uses the central CC/readline subsystem:
  * - exactly one `InlineAnswer`/`CcEditor` state for the query field;
@@ -242,8 +245,8 @@ export class ModelPickerDialog implements Component, Focusable {
   private readonly frame = new ModalFrame()
   private readonly grouped = new Map<string, ModelPickerItem[]>()
   private providers: string[]
-  private readonly currentProvider?: string
-  private readonly currentModel?: string
+  private currentProvider: string | undefined
+  private currentModel: string | undefined
   private readonly search: InlineAnswer
 
   private providerIndex = 0
@@ -372,6 +375,23 @@ export class ModelPickerDialog implements Component, Focusable {
   /** Show or clear a visible native failure in the current surface. */
   setError(message?: string): void {
     this.errorState = message === undefined || message.trim() === '' ? undefined : message
+  }
+
+  /**
+   * Update the native current route used by the `current` badge and the status
+   * line. A native `model_route` event can settle the effective route after the
+   * picker was opened with an earlier (e.g. default) one.
+   *
+   * This is a display-input update only: the selected row, provider group,
+   * query/editor state, focus, keymap and callbacks are untouched, nothing is
+   * selected or submitted, and no provider jump is inferred from the new route.
+   * An unknown route simply stops matching any row.
+   */
+  setCurrentRoute(provider: string | undefined, model: string | undefined): void {
+    if (this.currentProvider === provider && this.currentModel === model) return
+    this.currentProvider = provider
+    this.currentModel = model
+    this.frame.invalidate()
   }
 
   private applyModels(models: readonly ModelPickerItem[]): void {

@@ -1,6 +1,137 @@
 # v0.1.4 原生 DSH 边界与交互语义验收
 
-## 当前：v0.1.4 本地版本标记
+## 当前工作树：DSH 原生 `@file` 补全（未提交）
+
+用户现场确认输入 `@` 没有候选。本轮先复现出 Pi `CombinedAutocompleteProvider` 未传 `fdPath` 因而恒空、原测试 `null === null` 假阳性，再改接 DSH 官方 `fileReferences` seam；没有把 Pi Agent/runtime 或全局 `fd` 带回生产。
+
+- **最终完整 `pnpm check` 2370/2370**，194 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **510467ms**。`.cache/native-file-references/full-check.log`。
+- 应用 bundle 声明 canonical `@deepseek-ai/dsh-file-reference-local` Host row；后置用户 patch 可禁用／替换。Backend 只在实际 `ctx.fileReferences.list` 存在时广告 `file-references`，每次按 exact live Agent、verbatim query 与 owned AbortSignal 调用，保留 provider 顺序／长度，严验 unknown DTO 与 attachment identity；无扫描、`fd`、路径解析、文件读取／stage、目录缓存或第二 provider。
+- 首个 `@` 查询先确认 provider，再通过现有 lazy path 物化同一 pending Agent；不发 model turn。缺 service／预取消不创建 Agent；查询中取消、session replacement、close、HMR service replacement 和 malformed／credential diagnostics 均有回归。共享 8s native-UI read bound 与 materialization 不可中断边界明确记录。
+- Input 直接复用 DSH 公共 `activeAtToken`／`formatFileMention` grammar 与 native candidate order；Pi 仍唯一拥有菜单、Editor、undo、接受与目录光标。支持 file／directory、裸／嵌套、空格引号与连续下钻；邮箱／token 内 `@` 不触发。Tab／Enter 只填候选，第二 Enter 才提交；失败／取消／迟到结果静默为空，slash／参数／普通 Tab path 保持。
+- `@path` 是普通 prompt text，候选浏览／接受从不调用 `stageFile`、不生成 `[File #N]`、不读取内容；显式 `/attach` 仍是唯一 native FileBlock 输入。根输入不把根 workspace 候选借给 child Reply。
+- **Parent 独立专项**：Backend＋邻接 **52/52**、Input **63/63**、App **5/5**、真实临时 native profile **3/3**。后者覆盖 inline／fullscreen 首个 `@` 打开实际 native 候选、同 attachment 唯一 Editor、只物化 Agent／零 user message／零 model turn、接受后普通 path text／零 FileBlock，以及用户禁用 provider 后 capability 缺失、不建 Agent、不回退 Pi 扫描。日志与 final hygiene 在 `.cache/native-file-references/`。
+- 最终 HEAD 仍 `4738db0`，version `0.1.4/private`，工作树共 188 个状态条目、index 空，`git diff --check` 与 `pnpm peers check` 通过；`pnpm pack --dry-run` 359 个文件且未生成 tgz，包含 native adapter、lazy grammar input build 与 bundle patch。所有 native 场景使用 owned HOME/workspace 和 hermetic/no-send 路径；无真实 Provider／用户 profile／credentials／session/global install 操作，无提交/tag/push/publish。
+
+## 前次工作树：精确 Thinking 尾窗缓存（未提交）
+
+缓存语义、边界与本机基准见 [性能优化记录](THINKING-PREVIEW-PERFORMANCE.zh-CN.md)。只优化 ThinkingBlock 的测量成本，不改原生原文／ID／工具／计时／输入／终端业务。
+
+- **完整 `pnpm check` 2323/2323**，190测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **503378ms**。`.cache/thinking-preview-performance/full-check-final.log`。
+- 同 source/width hit 不再sanitize/wrap；普通append重用稳定行计数、只wrap最后一条mutableline＋delta，tail/hidden计数精确；expanded全body lazy并复用未着色wrap。preview/clock/hover/disclosure用现有语义。
+- Per-block默认16states／24tailrows／262144 UTF-16 code-unit retained budget，prune/LRU有界；超预算放弃reuse但保留精确输出。rewrite/shorten/width变化重建；retained ESC history／trailingCR保守重建，防止sequentialsanitize跨chunk露出早期CSI。
+- Parent独立冻结旧compiledThinkingBlock作oracle，**800场景／87016对照**全部精确一致（普通/恶意append、rewrite、clear、width、preview0..25、expanded、Unicode/combining/ZWJ、CRLF/tab/control/OSC/CSI和eviction）。`.cache/thinking-preview-performance/differential-final.log`。
+- Parent本机交替3轮中位数微基准（不含初次indexing）：1400hardlines／160append **866.73→14.11ms**（61.4x）；paragraph／100append **139.80→5.57ms**（25.1x）；16000字符unbroken-token／50append **55.26→2.13ms**（25.9x）；300timer-only **1590.98→0.443ms**；expandedunchanged70frame **370.22→4.24ms**。完整paint与旧module比较，非model/network/GPUlatency承诺。`benchmark.json`／`after-benchmark-final.log`。
+- Parent专项 **70/70**包含cache/UI thinking、原生1400line PTC handoff／真实return42、前次hover/title/focus和双模式PTY；所有native文本／display计数／鼠标／disclosure保持。
+- 独立对照抓到并补修两个cache边界：超预算用empty-string哨兵误命中真实clear；最后ESC分析不足以处理较早CSI被OSC移除后暴露。现在用undefined droppedstate＋conservativeescapehistory，nonfinitecachelimits回finite默认。source失败/修复与fuzzseed保留。
+- Baseline173旧文件保留；本次只有thinking-block、新测量cache、相关tests/docs。没有backend/state/App/input/vendor/依赖/版本变化；HEAD/tag4738db0/v0.1.4、index空，无commit/tag/push/publish、真实Provider／credentials/profile／server/global操作。
+
+## 前次工作树：四项现场渲染修复（未提交）
+
+来源、实现和只读 pi-cc-extensions 对照见 [四项修复记录](RENDERING-FOUR-FIXES.zh-CN.md)。保留 DSH tool admission／原生事件／native durable id，未替换 renderer／输入／配置系统。
+
+- **最终完整 `pnpm check` 2303/2303**，189 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **496805ms**。`.cache/rendering-four-fixes/full-check-final.log`。
+- Node v26.13.0／DSH0.2.2-rc.1 PTC host stripTypes 引发的 exact ExperimentalWarning＋紧邻 hint 降为 routine，日志保留。不同 API／措辞／独立 hint／provider failure／fatal 保持。没有 NODE_NO_WARNINGS 或 global listener；backend/UI diagnostic regressions通过。
+- 1400行 expanded Thinking 在合法 streaming→assistant/attempt settlement→tool/call/result 后保留原文／展开；UI-only thinkingKey 移交，不改durable id/seq/status；event→paint 间的 disclosure count 也保持。取消/retry/unknown/隐藏思考和Image↔Thinking hover覆盖。
+- 单一 hover owner 处理 tool／Thinking／group／child／gap/re-base/disclosure，Parent 补 Editor／Welcome／viewport／overlay／terminal focus 边界。使用 Terminal现有 onFocusChange（全屏先消费CSI O），未改vendor；helper/test模拟对应公开observer。draft/focus/drag/pins/selection保留。
+- ToolSummaryInfo.detail 显式compose label＋space＋detail；only exact case-insensitive whole-word 重复prefix归一化，native raw内容保留，Read Image /path 不再Read ImageRead image。ANSI/OSC/wide/CJK/emoji/无描述/窄宽度回归。
+- **Parent native2/2**：owned native profile＋hermetic model fixture，1400line thinking handoff与PTC真实执行 return42，工具状态done和结果42，exact warning/hint capture routine但原log可读；零remoteProvider。
+- **Parent App3/3＋双模式PTY**：标题，fullscreen真实SGR逐Tool→Thinking→group→Editor的FG cell证据，窗口focusOut/In、overlay和单Editor草稿，normalexit恢复；main-screen仅标题/exit，不冒称SGR支持。焦点边界重复10轮（每轮3cases）通过。
+- 首次 full-check **2303 tests／2302pass／1fail** 暴露新增focusOut断言：普通listener位于Pi fullscreen消费之后；已改成publicfocusobserver，修正mock与已有subclass字段冲突后，Parent37项相关integration和最终full-check通过。失败记录保留，不宣称首轮即通过。
+- pi-cc-extensions只读commit b8530b9／v1.0.8：采用稳定run disclosure思路，不移植Agent prototype/mainRendererpatch。全文thinking逐chunk rewrap的tail-cache优化尚未引入，单独记录边界。
+- 前153个未提交文件保留；只有授权诊断／UI/state／App及相关tests/docs变化。HEAD/tag仍4738db0/v0.1.4，index空，manifest/lock/version不变。无commit/tag/push/publish、真实credentials/profile/server/globalinstall操作。
+
+## 前次工作树：Demo 展示整体编排（未提交）
+
+只扩展既有 `--demo tasks` fixture，启动说明之后立即展示 tool/result → subagent-settled notice → agent-message relay，前两者混合，后者独立。已结束的第四个 catalog child 作为 sender，三个活动 child 不被假称结束；turn-scoped call/message id 防止重启覆盖旧事实。没有 UI／backend／命令／Renderer 改动。说明见 [Demo 指南](DEMO.md)。
+
+- **最终 build＋strict TypeScript＋专项 139/139**，`.cache/demo-presentation/final-scoped.log`。包含 Demo/store/projection、相关旧 Demo、生产 App 6/6，以及实际构建 public CLI 的 inline／fullscreen PTY：初始 Activities 1 tool＋1 update、Ctrl+O 通知原文、独立 DEMO CHILD MESSAGE、统一固定区、原控制输入和退出恢复。
+- 示例 tool、notice、relay、sender 全是确定性离线数据，无真实工具执行／Agent／模型，Root fixture active count3、catalog count4，sender无虚构 timing/token。clear/new/resume 重置，next/done 不重复发活动样例。
+- 本次未复跑整仓；下节此前 Parent 完整 **2265/2265** 保持历史记录，不将 fixture 专项称为完整门禁。
+- 版本／manifest／lock／旧 tag 不变，无提交／新 tag／推送／发布、真实 profile／credentials／Provider／服务器／全局安装操作。
+
+## 前次工作树：展示层整体收敛（未提交）
+
+用户确认固定区布局和活动分组一起改；实现与边界见 [整体编排记录](PRESENTATION-COMPOSITION.zh-CN.md)。内容块、只读分组投影、固定区编排与 renderer 分层，不改 DSH 业务或增设配置层。
+
+- **最终完整 `pnpm check` 2265/2265**，184 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **492448ms**。`.cache/presentation-convergence/full-check-final.log`。首个候选 full-check 同为 2265/2265；随后重建最后的 empty-member fallback 修正，再由 Parent 独立复跑完整门禁。
+- **固定区组件与 Stack**：纯 preferred／comfortable／compact 行事实，一帧一成员绘制，uniform all-or-none 间距、内容先于空白、0..18 预算、standalone separator 兼容、冻结输入和实际 mouse spans。新增 Stack 19 个场景与相关组件断言。App 删除三套 sibling render 测量预算回调，Parent 生命周期与唯一 Editor 保持。
+- **混合活动组 18/18**：真实工具和 source.kind=subagent-settled／form=notice 分开计数，两设置 conjunction，原生 form 直接消费不改 state/backend；普通工具和纯 Subagent 分组保持，actual message／unknown form／visible text／todo／diff／known turn 边界保持。共享 cache／Ctrl+O／single-expand／viewport／context ownership／鼠标委派完整。
+- **Parent App 8/8**：宽裕统一间距、短屏全部零间距、空／隐藏／settled 释放、同一多行草稿，原生计数、原文与设置独立语义。
+- **Parent real native Session／codec 2/2**：合法 synthetic first-class tool/result＋settlement notice 经真实公开 Session 日志和 adapter，不 fake 工具，before-control 两模式无 Activity 组；after 1 tool＋1 update，原文／source／seq 保留，Ctrl+O 和真实 agent-message 可见。这个 probe 没有实际执行 synthetic 工具或启动 child，模型 baseline 被 hermetic stream 截获。
+- **新双模式 PTY**：production App 配 explicit offline fixture，统一／紧凑间距、混合展开、真实消息、多行／Ctrl+T、Agents 导航、正常退出；全屏额外用实际 SGR mouse 验证新 Stack span 坐标，main-screen 使用既有 keyboard／native scrollback。原 tasks demo 与原 UI／文件 PTY 同时回归。
+- PTY 首轮对 resize 的旧帧立即断言、随后在半个 DEC 2026 write 上断言，以及给 legacy main-screen 强加 fullscreen mouse 的测试假设均已更正；不将它们写成生产布局／鼠标修复。日志保留。
+- 只有 UI 编排／App 挂载和相关 tests/docs，本次无 backend/input/vendor/manifest/version/用户配置变化，已有未提交工作完整保留。HEAD/tag 仍 `4738db0`／`v0.1.4`，index 为空，无提交／新 tag／推送／发布、真实 Provider／credentials／服务器／全局安装操作。所有 acceptance 以 Parent 日志为准；不采纳越界重复运行的 delegated full suite 为门禁。
+
+## 前次工作树：离线 tasks 交互 Demo（未提交）
+
+通过既有 `dsh-tui --demo tasks`／`pnpm demo tasks` 入口使用生产 App、一个 Editor 和相同两种 renderer；不替换正常 native 连接。说明与控制文字见 [Demo 指南](DEMO.md)。
+
+- **完整 `pnpm check` 2208/2208**，179 测试文件，vendor/src build＋strict TypeScript；0 fail/cancel/skip/todo；tests **529830ms**。`.cache/demo-tasks/full-check-first.log`。
+- **Demo 状态 9/9**：六项有序 Todo、readonly GoalRead、三个本地活动 child；严格 tasks trigger、两步 next／原生 paused、done 的原生 complete／completed、clear、bounded history、new/resume/reset、cancel/close、有限 line-batched stream 和无虚构 child runtime。仅 fixture 数据，无真实 Agent／工具／模型。
+- **生产 App 6/6**（两 renderer）：真实 initialPrompt 入口，根回到 idle 时三个 dock 共存；next/done/clear/restart，24 组有上限的历史事实、80×16／40×18 resize、Ctrl+T、Agents／Settings 原有 overlay、同一多行草稿／焦点保持。
+- **public CLI PTY 双模式**：实际构建后的 `bin/dsh-tui.mjs --demo tasks`，给不可执行的 `--dsh` 路径并使用 owned HOME／DSH_HOME／cwd／config，证明 demo 不依赖 native launcher。覆盖进退阶段、history／小屏、Ctrl+T、Agents／Settings、重启和正常退出恢复。`.cache/demo-tasks/pty/`；没有 native API／真实模型／GUI 冒名验收。
+- 首次 public CLI 发现默认 delay 下逐 grapheme 的长说明超过 8s，且 child 的历史 fixture 时间被显示为 12274h。修复为 task-only line/phrase chunks，并省略未观察到的 timing/token fields；Reply 不凭空补旧时间，现有 Stop/Reply 和其他 demo 的播放延迟保持。初次失败与最后回归日志均保留。
+- 原有 tools／images／skills／subagents／cancel、实际 native 接入、输入、固定区与退出测试同时通过；裸 `--demo` 默认 tools 不变，没有自动播放器／Goal loop／新增模型 transport。
+- 只有 `src/demo.ts` fixture、CLI help 和相关 tests/docs 改动；版本/manifest/lock、native backend、input/vendor 和用户配置没有本次变化。旧工作保留、HEAD/tag 仍 `4738db0`／`v0.1.4`，index 为空。无提交／新 tag／推送／发布、真实 Provider／用户凭据／服务器／全局安装操作。
+
+## 前次工作树：Todo／Goal／Subagent 共存修复（未提交）
+
+用户现场报告 Todo 被 Subagent 顶掉。父级实际 App 对照确认两处布局缺口：Todo 单行预算直接返回空；settled-only child catalog 仍按非空目录预留高度。新增可见性断言，不用原有“总高度未超标”替代共存验收。规则与原生所有权见 [Todo 共存说明](TODO-UX.md)。
+
+- **完整 `pnpm check` 2192/2192**，176 测试文件，vendor/src build＋strict TypeScript；0 fail/cancel/skip/todo；tests **474406ms**。`.cache/task-dock-coexist/full-check-first.log`。包含此前全部 native、输入、Subagent、终端与退出回归，未改 native 业务。
+- **112 组实际 App 布局对照**：两 renderer × 七种高度 × 四种草稿行数 × Goal 有／无；每组依次投影无 child／running／completed。Todo child-start 后消失数从 8 降到 0，有足够空间的三者共存无缺项。`.cache/task-dock-coexist/before.json`／`after.json`。
+- **新增 App 8/8**：child start 不替换 Todo，settlement 释放预留高度；短屏三状态行顺序、resize／更新、Ctrl+T、编辑焦点与同一多行草稿保持。组件另覆盖一行摘要、冻结快照、CJK／emoji／控制字节，以及 active presence 与原 render filter 一致。
+- **新增 PTY 双模式**：实际 raw input＋生产 App/renderers，在五行草稿编辑期间到达离线 Todo／Goal／child projection；紧凑／展开、Ctrl+T、40 列 resize、settled child 释放高度、正常退出恢复均通过。`.cache/task-dock-coexist/pty/`。显式 fixture-only backend，不声称真实 native model／GUI 验收；原两批 PTY 也重新通过。
+- 平时保留四行 transcript，短屏最多借到一行，保证每个真正可见区域的紧凑行；editor／queue／hint／footer 保持实际测量高度。Todo 一行保留 native counts／首个未完成项，零预算才隐藏；active Subagent 的第一条名字在空间允许时优先保留，settled-only catalog 不占位。极短屏不虚增终端高度。
+- 本次只修改 App 布局、Todo／Subagent 呈现与相关测试／文档；没有再改 backend／input／vendor／依赖／版本。旧未提交工作保持，HEAD/tag 仍 `4738db0`／`v0.1.4`，index 为空。无提交／新 tag／推送／发布、真实 Provider／用户配置／凭据／服务器／全局安装操作。
+
+## 前次工作树：两批原生 UI、Todo 固定区与共享配色（未提交）
+
+详见 [本轮完成记录](NATIVE-UI-BATCHES.zh-CN.md)、[CC Todo 调研](TODO-UX.md) 和 [共享 Theme](THEME.md)。八个分工并行开发，父级集成／验收；没有新的业务 Harness、服务自动启用或版本标记。
+
+- **完整 `pnpm check` 2170/2170**，174 测试文件，vendor/src build＋strict TypeScript；0 fail/cancel/skip/todo；tests **442677ms**。`.cache/native-ui-expansion/full-check-third.log`。
+- **真实 native 两批能力 8/8**（两 renderer × 四组）：Jobs/readAt 不消费模型 cursor、unowned/current-owner 更新，Goal／effective cwd／scoped tools／安装锚定 inventory；安全 defaults native mutate／unset fallback／revision conflict 且无 Agent；user-title rename、完整 native fork seed＋promptable root／显式 resume；file-only storage／cold refs、declaring command image admission／refusal保草稿、command file receipt owner 未挂载 fail-closed。
+- **真实 native continued 2/2**：以隔离 Session 的合法 first-class timed replay facts 驱动 actual projection，现有 question dialog 经 native answer/inbox 录入，declared choice／custom 语义不变；local close 不发送 cancellation／blocking respond。默认 legacy tool 未被改成 timed。
+- **新增 PTY 双模式**：production App／输入／renderer ＋ explicit offline fixture backend，fixed Todo、Ctrl+T、update、resize、Settings inherited canvas、file-only multipart 与退出 terminal restoration。`.cache/native-ui-expansion/pty/`；该项不冒充 GUI／native API 验收。
+- 组件／App 验证 single-flight＋trailing、late/foreign/closed guards、opaque native id、safe default confirmation、one-editor draft/history/undo、file count queue mapping、width/CJK/emoji 和 truecolor/256-color nested surfaces。原有 Subagent continuation/approval/cancel、terminal/exit/native default-follow 等全量回归同时通过。
+- 首轮 **2161 tests，2156 pass/5 fail**：两例暴露 Help frame-width/body-width 差异（真实漏末行，已修复），其余为旧 image wording／新 ready file recall／不守原生 order 的 admission fixture。第二轮 **2170 中 2168 pass/2 fail**：遗漏 image/attachment wording fixture 与既有 1ms wall-clock layout flake。后者固定测试 clock，严格布局断言保持；所有失败／修正日志保留，不宣称首轮即通过。
+- Parent native acceptance 另抓到 direct ccSubmit 绕过 multipart（曾发 marker text）和 native projected form 移除 volatile flag 两处跨层错位；已修复并有实际 before/after 与新回归。原生路径最终通过，source/frame/control diagnostics 不被伪造为模型／用户事实。
+- 前 64 个未提交文件保留；只有本轮相关 source/docs/tests 与批准的 vendor File marker seam 扩展。HEAD/tag 仍 `4738db0`/`v0.1.4`，index 为空、version/private/manifest/lock 未变。无提交／新 tag／推送／发布、真实 Provider／用户配置／凭据／服务器／全局安装操作。所有 native 写入仅在 owned temporary profiles。
+
+## 前次工作树：适配层收敛完成（未提交）
+
+当前 DSH 0.2.2-rc.1 能支持的剩余收敛项已完成，详见 [完成记录](ADAPTER-CONVERGENCE-COMPLETE.zh-CN.md)。未新增功能入口／私有 registry／轮询，版本与既有 tag 不变。
+
+- **完整 `pnpm check` 1910/1910**，151 文件，build＋strict TypeScript，0 fail/cancel/skip/todo；tests **403009ms**。`.cache/adapter-convergence-final/full-check-first.log`。
+- **真实 native 默认跟随 4/4**：pending／materialized-before-request 跟随原生 default，request/selection/CLI 固定，logged resume 不被覆盖；已结算配置事件更新 footer。旧编译基线同组 2 fail＋2 pass，验证问题真实可达。
+- **真实 native preset/settings 2/2**：通过临时 profile 的 settings.update 改 actual registry entry default，公开 settled config-reload/document 信号刷新已有 picker，保留 native id、草稿／焦点，不创建 Agent，不调用模型。
+- resident projection cuts 替代额外 row lease：2 resident children 从 2 lease 降到 0；cold/mixed/failing cuts 仍使用并释放原生 lease，行数据与权限守卫保持。
+- 新回归覆盖 route async races、native config 失效合并／Owner／close、preset native id 插入重排／失败恢复、model current badge 不移动选择、关闭或外来 surface 不复活；完整检查含原有 continuation、审批／取消及 exit/PTY 防回归。
+- 51 个原先未提交源文件保留，只有授权收敛相关文件继续修改；HEAD/tag 为 4738db0/v0.1.4，无提交／新 tag／推送／发布、真实凭据／用户配置或全局安装变化。模型流全为 hermetic fixture。SDK direct runtime preset register 无专用事件及 native listing 无行数参数作为已确认边界记录，不自造实现。
+
+## 前次工作树：第一轮原生适配层收敛（未提交）
+
+详见 [收敛对照与 SDK 边界](ADAPTER-CONVERGENCE.zh-CN.md)。在下节 A1–A10 修复基础上，改用原生 Subagent 枚举／diagnostics、公开 snapshot/title/turnBoundary/Plan view，删除重复 locked 判定；模型目录四任务并行，已打开 picker 消费原生目录事件并保留状态。
+
+- **该阶段完整 `pnpm check` 1861/1861**，143 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo；tests **381857ms**，`.cache/adapter-convergence/full-check-first.log`。
+- **父级真实 native 专项 28/28**：parallel children、child approval/follow/live/cold/continuation/interrupt、native Plan review、显式 resume、终端标题/终态；上一轮 exact Skill/max-tokens/退出交接也由完整回归覆盖。所有模型流为 hermetic fixture，零真实 Provider 请求。
+- 新测试覆盖 listing/preorder、合法 child 不被 diagnostic 降级、metadata-only diagnostics、200/8 展示预算、epoch/deadline cancellation、lease release、无 display 节流控制、跨树/root/cycle guard、public projection/no-stateOf、unknown blank→native select、并行 registry-order、query/focus/draft 与迟到 metadata 隔离。
+- SDK `listDescendants` 没有 row/depth 参数；完整 native catalog + adapter row projection 的读取成本明确记录，不声称减少所有磁盘读取。创建模型 route 的 live-default-follow 差异仍未擅改，未增加 preset registry 轮询。
+- HEAD/tag 仍 `4738db0` / `v0.1.4`，版本/manifest/lock/vendor 不变；原先未提交 A1–A10 修改保留，无提交、tag、推送、发布、真实 profile/凭据读写或全局替换。
+
+## 前次工作树：原生接口审计确认问题修复（未提交）
+
+范围为此前 A1–A10 确认的正确性问题；实现与每项防回归见 [修复对照](NATIVE-API-FIXES.zh-CN.md)。基于本地 `v0.1.4` / `4738db0` 与 DSH `0.2.2-rc.1`，不改版本／依赖／lock／tag，不增加可选原生能力或重做 Harness。
+
+- **完整 `pnpm check` 1833/1833**，139 测试文件，vendor/src build＋strict TypeScript，0 fail/cancel/skip/todo，tests **381514ms**；`.cache/native-api-fixes/full-check-first.log`。这是本轮新执行结果，不是旧 tag 验收数字。
+- **真实 native correctness 场景**：inline/fullscreen 下精确 `/review` Enter 注入原生 Skill、不执行 `review-all`，后者显式输入仍正常；commands/change 自动刷新无需 Help。真实 max-tokens 在 live 与显式恢复后恰好显示一个提示。
+- **4 个真实 native plugin PTY fault 场景**：Settings flush/Backend close × 两 renderer，实际进入 I/O hold，终端先恢复，退出由 DSH 既有 5000ms whole-tree protection 接管；首次请求码 0，未添加私有退出控制器。ANSI `.cache/native-api-fixes/exit-pty/`。这不证明以前用户现场退出卡住的具体根因。
+- **真实 native 文件 API**：saveFile/admitPromptContent/createUserMessage/readFileStream 与 live/cold 只读投影；mixed/repeated/file-only 可见，metadata/源事件不改写，bytes 完整，files 不当作 images。另有 native canonical/folded header + real Cordis waterfall effort provenance 回归。
+- App 测试覆盖单次 trailing command reread、旧 attachment、Esc dismissal、Help query/draft/focus、title unknown/null/cache retry、原生 name/hint、权限确认与 shutdown reentry；正常 streaming 无新 settlement diagnostics。
+- 早期两个 parent fixture 控制错误（错误地用 generic `/permission` 打开 Settings picker、只给 queued 数字却没有队列行）及 TS assertion-binding 问题已纠正，未改变 native routing/queue policy 或削弱 guard；初次失败日志留在同一 cache。
+- 所有测试使用 owned temporary homes/workspaces 与 hermetic streams；未读取真实凭据、改变真实 profile／会话／全局安装或请求真实 Provider。未提交／打 tag／推送／发布；原静态鲸鱼与通用终端图标不变。没有新增 GUI／OS popup 或历史现场问题验收。
+
+## 前次：v0.1.4 本地版本标记
 
 用户明确选择 **v0.1.4**，收录当前已验收的源码／测试／文档，只创建本地版本提交和 annotated tag；没有推送、registry／GitHub release 发布或全局安装替换。生产仍为 native DSH app bundle＋同进程 Cordis 插件，DSH 的模型／工具／权限／Skills／会话所有权不变。
 
@@ -10,7 +141,7 @@
 - **终端实机证据边界**：此前静态标题真实 Rex App **2/2** 和独立原生 `>_` 图标 GUI 对照保留在下面阶段记录，本轮打 tag 没有重新执行 GUI 对照。Ghostty GUI／OS popup、原自定义标题恢复与用户现场退出卡住仍不作成功／已修复声明。
 - **Git／数据边界**：只提交源码、测试、文档、正式图标资产及版本 metadata；构建产物、缓存、运行状态和凭据不进入 Git。源码候选路径／大文件／credential-shaped literal 的脱敏审计通过，测试只用临时 homes/workspaces 与 hermetic streams，零真实 provider 请求，不读取或改写真实 profile／凭据。
 
-以下记录保留各开发阶段当时的版本、未发布状态和测试结果，不替代上面的 v0.1.4 最终验收。
+以下记录保留各开发阶段当时的版本、未发布状态和测试结果；tag snapshot 的 1761/1761、正确性修复的 1833/1833 与适配层收敛的 1861/1861 是三次独立验收。
 
 ## 打 tag 前：移除鲸鱼前的标题动画（当时未发布）
 

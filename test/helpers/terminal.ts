@@ -8,6 +8,7 @@ export class VirtualTerminal implements Terminal {
   readonly writes: string[] = []
   private input?: (data: string) => void
   private changed?: () => void
+  private readonly focusObservers = new Set<(focused: boolean) => void>()
   private cols: number
   private height: number
   stopped = false
@@ -52,7 +53,16 @@ export class VirtualTerminal implements Terminal {
     if (id === '') this.status = { ...status }
   }
 
+  onFocusChange(listener: (focused: boolean) => void): () => void {
+    this.focusObservers.add(listener)
+    return () => { this.focusObservers.delete(listener) }
+  }
+
   type(data: string): void {
+    if (data === '\x1b[I' || data === '\x1b[O') {
+      const focused = data === '\x1b[I'
+      for (const listener of this.focusObservers) listener(focused)
+    }
     if (data.startsWith('\x1b') || data.length === 1) this.input?.(data)
     else for (const char of data) this.input?.(char)
   }
@@ -75,7 +85,7 @@ export class VirtualTerminal implements Terminal {
     return Array.from({ length: buffer.length }, (_, row) => buffer.getLine(row)?.translateToString(true) ?? '').join('\n')
   }
 
-  dispose(): void { this.xterm.dispose() }
+  dispose(): void { this.focusObservers.clear(); this.xterm.dispose() }
 }
 
 export async function until(condition: () => boolean, label: string, timeout = 5000): Promise<void> {

@@ -8,7 +8,8 @@ import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { QueueEntry } from '../backend/types.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import { dim, t } from './theme.ts'
-import { oneLine, truncateToWidth, visibleWidth } from './text.ts'
+import { truncateToWidth, visibleWidth } from './text.ts'
+import { queueAttachmentLabel, queueContentLabel } from './queue-content.ts'
 
 export interface QueueListActions {
   sendNow(messageId: string): void
@@ -107,9 +108,10 @@ export class QueueList implements Component {
   } {
     const indexLabel = `#${index + 1}`
     const steer = row.target === 'next-step' ? ' steer' : ''
-    const imageLabel = row.images > 0 ? ` · ${row.images === 1 ? '1 image' : row.images + ' images'}` : ''
+    const attachments = queueAttachmentLabel(row)
+    const imageLabel = attachments === '' ? '' : ' · ' + attachments
     const prefix = `${indexLabel}${steer} `
-    const raw = oneLine(row.text) || (row.images > 0 ? '(image)' : '(empty)')
+    const raw = queueContentLabel(row)
     const showButtons = width - visibleWidth(prefix) - visibleWidth(imageLabel) - BUTTONS_WIDTH - 2 >= 4
     const room = showButtons
       ? Math.max(1, width - visibleWidth(prefix) - visibleWidth(imageLabel) - BUTTONS_WIDTH - 2)

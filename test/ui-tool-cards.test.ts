@@ -370,3 +370,71 @@ test('the factory uses the new tool block and keeps the item id/kind', () => {
   assert.match(plain(block).join('\n'), /Bash x/)
   assert.equal(typeof (block as ToolBlock).hitboxes, 'function')
 })
+test('the header keeps exactly one display name and one real separator space', () => {
+  clearToolExpansion()
+  const header = (item: ToolTranscriptItem, width = 80): string => plain(new ToolBlock(item, flags()), width)[0] ?? ''
+
+  // The reported bug: a native title that repeats the tool name in another case
+  // used to print `Read ImageRead image /Users/…` (no separator, name twice).
+  const nativeRead = tool({
+    name: 'read_image',
+    arguments: '{"path":"/Users/fulei/图片/a.png"}',
+    resultImages: 1,
+    presentation: { call: { card: 'generic', title: 'Read image /Users/fulei/图片/a.png' } },
+  })
+  assert.equal(header(nativeRead), '⏺ Read Image /Users/fulei/图片/a.png')
+
+  // The title *is* the label: no duplicate, no trailing separator.
+  for (const title of ['Read image', 'Read Image', 'read_image', 'read image']) {
+    const exact = tool({
+      name: 'read_image',
+      arguments: '{}',
+      resultImages: 1,
+      presentation: { call: { card: 'generic', title } },
+    })
+    assert.equal(header(exact), '⏺ Read Image', `exact native title ${JSON.stringify(title)}`)
+  }
+
+  // An OSC-8 hyperlink prefix / ANSI color must not desynchronize the split and
+  // must never reach the painted row.
+  const linked = tool({
+    name: 'read_image',
+    arguments: '{}',
+    resultImages: 1,
+    presentation: {
+      call: { card: 'generic', title: '\u001b]8;;file:///Users/x.png\u001b\\Read image /Users/x.png\u001b]8;;\u001b\\' },
+    },
+  })
+  assert.equal(header(linked), '⏺ Read Image /Users/x.png')
+  assert.ok(!header(linked).includes('\u001b]8'))
+
+  // A native title that never mentions the tool name is kept verbatim.
+  const unrelated = tool({
+    name: 'read_image',
+    arguments: '{}',
+    resultImages: 1,
+    presentation: { call: { card: 'generic', title: 'Show the picture 图片 🖼' } },
+  })
+  assert.equal(header(unrelated), '⏺ Read Image Show the picture 图片 🖼')
+
+  // Generic tools keep their own label and payload on one width-safe row.
+  const generic = tool({
+    name: 'run_code',
+    arguments: '{"code":"print(1)"}',
+    resultText: '1\n',
+    presentation: { call: { card: 'generic', title: 'Run code print(1)' } },
+  })
+  assert.equal(header(generic), '⏺ Run Code print(1)')
+  // No native title: the real argument is the payload after one separator space.
+  assert.equal(header(tool({ name: 'run_code', arguments: '{"code":"x"}', resultText: '1\n' })), '⏺ Run Code x')
+  // No payload at all: the display name stands alone, with no trailing space.
+  assert.equal(header(tool({ name: 'run_code', arguments: '', resultText: '' })), '⏺ Run Code')
+
+  // Wide titles are fitted by the final paint, never by a hardcoded offset.
+  for (const width of [12, 20, 32]) {
+    assert.ok(visibleWidth(new ToolBlock(nativeRead, flags()).render(width)[0] ?? '') <= width)
+    assert.ok(visibleWidth(new ToolBlock(unrelated, flags()).render(width)[0] ?? '') <= width)
+  }
+  // The label survives a narrow clip: the payload is what gets cut, not the name.
+  assert.ok(header(nativeRead, 20).startsWith('⏺ Read Image '))
+})

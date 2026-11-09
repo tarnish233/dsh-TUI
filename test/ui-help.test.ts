@@ -344,6 +344,9 @@ test('remapped and disabled list navigation never falls back to defaults', () =>
     rows: 12,
     keymap: keymap({ 'list.previous': 'alt+k', 'list.next': 'alt+j' }),
   })
+  // The App paints a surface before it can receive keys: the window budget is
+  // measured from the frame body width on that first render.
+  remapped.panel.render(80)
   remapped.panel.handleInput('\x0e') // Ctrl+N no longer bound to list.next
   assert.equal(remapped.panel.scrollTop, 0)
   remapped.panel.handleInput('\x1bj') // Alt+J
@@ -363,6 +366,7 @@ test('remapped and disabled list navigation never falls back to defaults', () =>
       'list.last': null,
     }),
   })
+  disabled.panel.render(80)
   for (const key of ['\x0e', '\x1b[B', '\x1b[6~', '\x1b[F', '\x1b[H']) disabled.panel.handleInput(key)
   assert.equal(disabled.panel.scrollTop, 0)
   assert.equal(disabled.calls.close, 0)
@@ -385,6 +389,7 @@ test('a pending chord can still be interrupted by global Ctrl+C', () => {
 test('a cancelled chord re-dispatches its fresh key and mismatch keys stay inert', () => {
   const scroll = makePanel({ commands: manyCommands(40), rows: 12 })
   scroll.panel.focused = true
+  scroll.panel.render(80)
   scroll.panel.handleInput('\x18') // Ctrl+X pending
   assert.equal(scroll.panel.keymap.isPendingChord(), true)
   scroll.panel.handleInput('\x1b[B') // mismatch -> fresh Down should still scroll
@@ -493,4 +498,138 @@ test('the search layer activates only through modal.search, and then Esc leaves 
   assert.match(render(panel, 80).text, /\/cmd0[0-9]/, 'the full catalog is listed again')
   panel.handleInput('\x1b')
   assert.equal(calls.close, 1, 'the second Esc closes')
+})
+
+// ---------------------------------------------------------------------------
+// In-place native catalog refresh (A5): metadata changes, surface does not
+
+test('setCatalog replaces only metadata and preserves the live search query, focus and editor', () => {
+  const tui = createFakeTui(24, 80)
+  const calls = { close: 0, interrupt: 0 }
+  const panel = new HelpPanel(asTui(tui), {
+    commands: manyCommands(12),
+    customCommands: [],
+    keymap: keymap(),
+    onClose: () => { calls.close += 1 },
+    onInterrupt: () => { calls.interrupt += 1 },
+  })
+  panel.focused = true
+  panel.render(80)
+  panel.handleInput('\x06') // Ctrl+F = modal.search
+  for (const char of 'cmd1') panel.handleInput(char)
+  assert.equal(panel.searching, true)
+
+  const beforeRequests = tui.renderRequests
+  panel.setCatalog({
+    commands: [{ name: 'model', description: 'Choose a DSH model' }],
+    customCommands: customCatalog(),
+    note: 'Refreshed after the native command change.',
+  })
+  assert.ok(tui.renderRequests > beforeRequests, 'the refresh requests a repaint')
+
+  // The same editor keeps its text: the query still filters the NEW catalog.
+  const searched = render(panel, 80).text.replace(/\s+/g, ' ')
+  assert.equal(panel.searching, true, 'the search layer is not replaced or closed')
+  assert.equal(panel.focused, true, 'focus is untouched')
+  assert.match(searched, /Nothing matches "cmd1"/, 'the typed query survives the refresh')
+  assert.match(searched, /Refreshed after the native command change\./)
+
+  panel.handleInput('\x1b') // leave the search layer: the query is discarded, the surface stays open
+  assert.equal(panel.searching, false)
+  assert.equal(calls.close, 0)
+  const listed = render(panel, 80).text
+  assert.match(listed, /\/model/)
+  assert.match(listed, /\/deploy <env>/)
+  assert.doesNotMatch(listed, /\/cmd0\d/, 'the old catalog is gone')
+
+  // The original keymap and callbacks still own the surface.
+  panel.handleInput('\x03')
+  assert.equal(calls.interrupt, 1)
+  assert.equal(calls.close, 0)
+  panel.handleInput('\x1b')
+  assert.equal(calls.close, 1)
+  assert.equal(calls.interrupt, 1)
+})
+
+test('setCatalog keeps the scroll position and clamps it only in the next render', () => {
+  const { panel } = makePanel({ commands: manyCommands(60), rows: 12 })
+  panel.render(80)
+  panel.handleInput('\x1b[F') // End
+  const before = panel.scrollTop
+  assert.ok(before > 0)
+
+  // A same-size refresh preserves the reader's place exactly.
+  panel.setCatalog({ commands: manyCommands(60), customCommands: [] })
+  panel.render(80)
+  assert.equal(panel.scrollTop, before)
+
+  // A shorter catalog clamps by the existing render path, never a blank window.
+  panel.setCatalog({ commands: manyCommands(3), customCommands: [] })
+  const text = render(panel, 80).text
+  assert.ok(panel.scrollTop < before, 'a shorter body clamps the kept offset')
+  assert.match(text, /\/cmd02/, 'the last row is still visible, never a blank window')
+})
+
+test('setCatalog refreshes commands, custom commands, skills and note as one read-only snapshot', () => {
+  const { panel } = makePanel({ commands: [{ name: 'help', description: 'Commands and shortcuts' }] })
+  assert.doesNotMatch(render(panel, 80).text, /Skills/i)
+
+  panel.setCatalog({
+    commands: [{ name: 'review', description: 'Review the current diff' }],
+    customCommands: customCatalog(),
+    skills: {
+      available: true,
+      complete: true,
+      entries: [{ name: 'review-all', description: 'Review everything', modelInvocable: true }],
+    },
+    note: 'Native snapshot refreshed.',
+  })
+  const refreshed = render(panel, 80).text.replace(/\s+/g, ' ')
+  assert.match(refreshed, /\/review\b/)
+  assert.match(refreshed, /Review the current diff/)
+  assert.match(refreshed, /\/deploy <env>/)
+  assert.match(refreshed, /Skills/)
+  assert.match(refreshed, /\/review-all/)
+  assert.match(refreshed, /Native snapshot refreshed\./)
+
+  // Replacing the snapshot without skills/note removes those sections: this is
+  // a whole-metadata replacement, not an accumulating overlay.
+  panel.setCatalog({ commands: [{ name: 'help', description: 'Commands and shortcuts' }], customCommands: [] })
+  const replaced = render(panel, 80).text
+  assert.match(replaced, /\/help/)
+  assert.doesNotMatch(replaced, /Skills/i)
+  assert.doesNotMatch(replaced, /Native snapshot refreshed/)
+  assertWidths(panel, [20, 40, 80, 120])
+})
+
+test('a closed or disposed Help panel ignores a late catalog refresh', () => {
+  const closedTui = createFakeTui(20, 80)
+  const closed = new HelpPanel(asTui(closedTui), {
+    commands: catalog(),
+    customCommands: [],
+    keymap: keymap(),
+    onClose: () => {},
+  })
+  const closedBefore = render(closed, 80).text
+  closed.handleInput('\x1b')
+  const closedRequests = closedTui.renderRequests
+  closed.setCatalog({ commands: [{ name: 'late', description: 'late' }], customCommands: [], note: 'late note' })
+  assert.equal(closedTui.renderRequests, closedRequests, 'a closed surface requests no repaint')
+  assert.equal(render(closed, 80).text, closedBefore)
+  assert.doesNotMatch(render(closed, 80).text, /late note/)
+
+  const disposedTui = createFakeTui(20, 80)
+  const disposed = new HelpPanel(asTui(disposedTui), {
+    commands: catalog(),
+    customCommands: [],
+    keymap: keymap(),
+    onClose: () => {},
+  })
+  disposed.render(80)
+  disposed.dispose()
+  const disposedRequests = disposedTui.renderRequests
+  disposed.setCatalog({ commands: [{ name: 'late', description: 'late' }], customCommands: [], note: 'late note' })
+  assert.equal(disposedTui.renderRequests, disposedRequests, 'a disposed surface requests no repaint')
+  assert.doesNotMatch(render(disposed, 80).text, /late note/)
+  assert.equal(disposed.isDisposed, true)
 })

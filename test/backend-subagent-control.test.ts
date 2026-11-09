@@ -27,11 +27,122 @@ const ROOT = 'root-session'
 const ROOT_ROUTE = { provider: 'p1', model: 'm1' }
 const PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 
+type RawRow = Record<string, unknown>
+type ChildMode = 'one-shot' | 'continuable' | 'external' | 'unknown'
+
+/** One native-shaped rejection carrying a public DSH error code. */
+function listingFailure(message: string, code: string): Error {
+  const error = new Error(message)
+  error.name = 'SubagentError'
+  Object.assign(error, { code })
+  return error
+}
+
+function modeOfRow(row: RawRow): ChildMode {
+  const mode = row.mode
+  return mode === 'one-shot' || mode === 'continuable' || mode === 'external' ? mode : 'unknown'
+}
+
+/** Mirrors `ctx.subagents.listChildren` only (exact direct-parent rows). */
+class FakeSubagentCatalog {
+  readonly childCalls: Array<{ parentSessionId: string; signal: AbortSignal | undefined }> = []
+  private readonly world: FakeSessionWorld
+
+  constructor(world: FakeSessionWorld) {
+    this.world = world
+  }
+
+  async listChildren(parentSessionId: string, signal?: AbortSignal): Promise<unknown[]> {
+    this.childCalls.push({ parentSessionId, signal })
+    if (signal?.aborted === true) throw listingFailure('subagent listing was cancelled', 'CANCELLED')
+    if (!this.world.has(parentSessionId)) {
+      throw listingFailure(`session "${parentSessionId}" not found`, 'SESSION_QUERY_SESSION_NOT_FOUND')
+    }
+    const rows = this.world.valuesOf(parentSessionId).subagentCatalog
+    if (!Array.isArray(rows)) {
+      throw listingFailure('listing subagents requires the registered subagentCatalog projection', 'SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE')
+    }
+    return rows as RawRow[]
+  }
+}
+
+/**
+ * Native-shaped discovery double plus the recorded mutation surface.
+ *
+ * It mirrors the public `ctx.subagents.listDescendants` contract only: stable
+ * pre-order, per-catalog event order, external leaves, branch diagnostics and
+ * one released observation per branch. Production code never walks catalogs.
+ */
+class FakeNativeSubagents extends FakeSubagentsService {
+  readonly directory: FakeSubagentCatalog
+  readonly descendantCalls: Array<{ rootSessionId: string; signal: AbortSignal | undefined }> = []
+  private readonly world: FakeSessionWorld
+
+  constructor(world: FakeSessionWorld) {
+    super()
+    this.world = world
+    this.directory = new FakeSubagentCatalog(world)
+  }
+
+  listChildren(parentSessionId: string, signal?: AbortSignal): Promise<unknown[]> {
+    return this.directory.listChildren(parentSessionId, signal)
+  }
+
+  async listDescendants(rootSessionId: string, signal?: AbortSignal): Promise<unknown[]> {
+    this.descendantCalls.push({ rootSessionId, signal })
+    const root = await this.catalog(rootSessionId, signal)
+    const stack = root.map(entry => ({ entry, parentId: rootSessionId, depth: 1 })).reverse()
+    const visited = new Set<string>([rootSessionId])
+    const result: RawRow[] = []
+    for (let position = stack.pop(); position !== undefined; position = stack.pop()) {
+      const { entry, parentId, depth } = position
+      const id = typeof entry.id === 'string' ? entry.id : ''
+      if (id === '' || visited.has(id)) continue
+      visited.add(id)
+      if (signal?.aborted === true) throw listingFailure('subagent listing was cancelled', 'CANCELLED')
+      let children: RawRow[]
+      try {
+        children = modeOfRow(entry) === 'external' ? [] : await this.catalog(id, signal)
+      } catch (error) {
+        const code = (error as { code?: unknown }).code
+        result.push({
+          kind: 'diagnostic',
+          id,
+          parentId,
+          depth,
+          reason: code === 'SESSION_QUERY_CORRUPT_SESSION' || code === 'SESSION_QUERY_SOURCE_CONFLICT' ? 'corrupt' : 'unavailable',
+        })
+        continue
+      }
+      if (modeOfRow(entry) === 'unknown') {
+        result.push({ kind: 'diagnostic', id, parentId, depth, reason: 'unsupported' })
+      } else {
+        result.push({
+          kind: 'child',
+          id,
+          parentId,
+          depth,
+          mode: modeOfRow(entry),
+          ...(typeof entry.label === 'string' ? { label: entry.label } : {}),
+          activity: this.world.store.get(id) === undefined ? 'inactive' : 'running',
+          hasChildren: children.length > 0,
+        })
+      }
+      for (const child of [...children].reverse()) stack.push({ entry: child, parentId: id, depth: depth + 1 })
+    }
+    return result
+  }
+
+  private async catalog(parentSessionId: string, signal: AbortSignal | undefined): Promise<RawRow[]> {
+    return await this.directory.listChildren(parentSessionId, signal) as RawRow[]
+  }
+}
+
 interface Harness {
   host: FakeDshHost
   agents: FakeAgentRegistry
   world: FakeSessionWorld
-  subagents: FakeSubagentsService
+  subagents: FakeNativeSubagents
   backend: DshContextBackend
   events: BackendEvent[]
   warnings: string[]
@@ -88,7 +199,7 @@ async function harness(controls = true): Promise<Harness> {
   const host = new FakeDshHost()
   const agents = new FakeAgentRegistry()
   const world = new FakeSessionWorld().attach(host)
-  const subagents = new FakeSubagentsService()
+  const subagents = new FakeNativeSubagents(world)
   if (controls) subagents.attach(host)
   const warnings: string[] = []
   host.use('agents', agents)
@@ -489,8 +600,23 @@ test('capabilities follow the exact native methods and the readable bridge', asy
   assert.ok(h.info.capabilities.includes('subagent-interrupt'))
   assert.ok(h.info.capabilities.includes('subagent-prompt'))
 
-  // Only interrupt mounted.
+  // A mutation method without usable discovery cannot prove current-tree
+  // membership, so it is not advertised: control stays fail-closed.
   h.host.use('subagents', { interrupt: h.subagents.interrupt.bind(h.subagents) })
+  const mutationOnly = await h.backend.connect()
+  assert.equal(mutationOnly.capabilities.includes('subagent-interrupt'), false)
+  assert.equal(mutationOnly.capabilities.includes('subagent-prompt'), false)
+  await assert.rejects(
+    h.backend.command('subagent-interrupt', { sessionId: 'child-c' }),
+    isCode('CAPABILITY_UNAVAILABLE'),
+  )
+
+  // Only interrupt mounted, over the readable native discovery.
+  h.host.use('subagents', {
+    interrupt: h.subagents.interrupt.bind(h.subagents),
+    listDescendants: h.subagents.listDescendants.bind(h.subagents),
+    listChildren: h.subagents.listChildren.bind(h.subagents),
+  })
   const interruptOnly = await h.backend.connect()
   assert.equal(interruptOnly.capabilities.includes('subagent-interrupt'), true)
   assert.equal(interruptOnly.capabilities.includes('subagent-prompt'), false)
@@ -500,8 +626,12 @@ test('capabilities follow the exact native methods and the readable bridge', asy
   )
   await h.backend.command('subagent-interrupt', { sessionId: 'child-c' })
 
-  // Only prompt mounted.
-  h.host.use('subagents', { prompt: h.subagents.prompt.bind(h.subagents) })
+  // Only prompt mounted, over the readable native discovery.
+  h.host.use('subagents', {
+    prompt: h.subagents.prompt.bind(h.subagents),
+    listDescendants: h.subagents.listDescendants.bind(h.subagents),
+    listChildren: h.subagents.listChildren.bind(h.subagents),
+  })
   const promptOnly = await h.backend.connect()
   assert.equal(promptOnly.capabilities.includes('subagent-prompt'), true)
   assert.equal(promptOnly.capabilities.includes('subagent-interrupt'), false)

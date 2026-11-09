@@ -1,5 +1,87 @@
 # 版本记录
 
+## 未发布：DSH 原生 `@file` 补全（基于 v0.1.4）
+
+- 修复输入 `@` 只有普通字符、看不到工作区候选：删除对未配置 Pi `fdPath` 的伪委托，改为可取消地调用当前 attachment／真实 Agent 的 `ctx.fileReferences.list`；DSH provider 保留 effective cwd、排序、排除、索引失效与模型侧 `read` 指引所有权。
+- 应用 bundle 声明 canonical `file-reference-local` Host provider，用户后置 profile patch 仍可禁用／替换；不挂 Web `ui-reference` frontend，不读取 Pi 安装的 `fd`，不另扫文件系统或维护第二目录缓存。
+- 输入直接复用 DSH 公共 `activeAtToken`／`formatFileMention` grammar；文件／目录、空格引号和目录下钻沿用唯一 Pi Editor 的菜单、undo 与光标。Tab／Enter 接受候选但不发送，第二次 Enter 才提交；失败／取消／旧 attachment 结果静默丢弃。
+- `@path` 始终是普通路径 mention，接受候选不读取／stage 字节，也不生成 `[File #N]`；显式 `/attach` 的 native FileBlock 语义与预算保持独立。首个 `@` 查询只在 provider 已挂载时通过现有 lazy path 物化同一个 DSH Agent，不发模型 turn。
+- Parent 最终完整 `pnpm check` **2370/2370**（194 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，510467ms）；独立专项 Backend＋邻接 **52/52**、Input **63/63**、App **5/5**、真实临时 native profile **3/3**（inline／fullscreen＋用户禁用 provider）。证据 `.cache/native-file-references/`。无真实 Provider、用户 profile／凭据或全局安装修改，未提交、打 tag、推送或发布。
+
+## 未发布：精确 Thinking 尾窗缓存（基于 v0.1.4）
+
+- 每ThinkingBlock有界cache：稳定prefix计数／mutablelastline＋delta／tailpreview，same-source timer/hover不再全文sanitize/wrap；展开fullbody lazy和unstyled复用。
+- 隐藏行数、尾部、完整原文与旧sharedwrap逐字一致；rewrite/width/unsafeESC/CR和overbudget走精确fallback，不引入估算、全局cache、设置或timer。
+- Parent旧compiledmodule微基准：1400line／160append867→14ms，longparagraph140→5.6ms，timer300frame1591→0.44ms。800场景／87016精确差分通过。
+- 完整Parent `pnpm check` **2323/2323**（190文件），native/PTy/旧handoff/hover等回归通过；无business/backend/input/vendor/版本/安装变化，未提交/发布。见 [性能记录](docs/THINKING-PREVIEW-PERFORMANCE.zh-CN.md)。
+
+## 前次未发布：四项现场渲染修复（基于 v0.1.4）
+
+- Node PTC stripTypeScriptTypes exact experimental warning＋相邻hint只留boundedlog，meaningful/fatal仍可见；无blanketwarning屏蔽。
+- expanded live Thinking在native settlement/toolhandoff后保留，durableid不变；复用稳定disclosure思路与event→paint计数，未移植PiAgentpatch。
+- 单一hoverowner和Parent编辑器／viewport／overlay／publicterminalfocus边界，旧历史click-hints恢复中性色；actualhoverblue、nativechild-brandlinks、drag/selection保持。
+- 标题用明确detail＋space组成，Read Image /path不再大小写导致粘连；原文/宽度/鼠标位置契约保持。
+- Parent最终完整 **2303/2303**（189文件），native2、App3、双模式PTY与10轮focus重复通过。版本/依赖/vendor/旧tag不变，未提交或发布，零真实Provider／用户配置／global操作。详见 [修复记录](docs/RENDERING-FOUR-FIXES.zh-CN.md)。
+
+## 前次未发布：Demo 展示整体编排（基于 v0.1.4）
+
+- `--demo tasks` 启动就展示混合 `Activities: 1 tool · 1 update` 和独立子任务 relay，Ctrl+O 对照通知折叠，固定区保留统一间距／紧凑态。
+- 用另一个已结束的本地 fixture 作 sender；catalog4／active3，无虚构 timing/token。重启使用 turn-scoped id，旧控制、clear/new/resume 保持。
+- 最终 build＋strict TypeScript＋专项 **139/139**，actual public CLI 双模式通过；本次未复跑整仓，上一阶段2265/2265为独立门禁。仅离线 fixture与相关测试／文档，无模型／工具／UI业务改动，未提交或发布。
+
+## 前次未发布：展示层整体收敛（基于 v0.1.4）
+
+- `StatusDockStack` 统一 Todo／Goal／Agents 可见性、总预算、紧凑态、all-or-none 间距和鼠标 span；Root 内容块不各自补空行，Parent 不再通过重复 render 测高。
+- 相邻真实工具＋纯原生 settlement notice 进入 `Activities` 展示组，tools／updates 独立计数；两现有分组设置同时开启才启用，不 fake tool、不改原生事件。真实消息、可见文本、todo、diff 等保持边界。
+- 复用现有 semantic surfaces、真实成员块、Ctrl+O／single-expand／viewport／cache／context 与名字链接，不再另造展示／配置层。
+- Parent 最终完整 `pnpm check` **2265/2265**（184 文件），App 8/8、native Session/codec 2/2、新双模式 PTY 和旧 tasks/UI/input/native 回归通过；无真实模型／配置／全局安装／版本标记变化，未提交或发布。见 [整体编排记录](docs/PRESENTATION-COMPOSITION.zh-CN.md)。
+
+## 前次未发布：离线 tasks 交互 Demo（基于 v0.1.4）
+
+- `dsh-tui --demo tasks`／`pnpm demo tasks` 同时展示六项 Todo、原生形状的只读 Goal 和三个本地 Subagent fixture；复用生产 App／Editor／renderer。
+- `tasks next`／`tasks done`／`tasks clear`／`tasks history` 手动推进，`tasks` 重启；说明流快速结算，场景保持可观察，不自动播放到消失。支持 Ctrl+T、resize、既有 Agents／Settings 和离线 child 快照／Stop／Reply。
+- 仅 task 场景使用 line/phrase-sized 说明流；省略未观察的 child 时间／token totals，完成脚本用 native complete／completed 词汇，正常 Stop 语义与原 demo 延迟不变。
+- 完整 `pnpm check` **2208/2208**（179 文件），App 6/6、Demo 9/9 与 public CLI 双模式 PTY 通过。显式离线，不加载 DSH、读 profile、调用模型或执行真实工具；版本/依赖/旧 tag 不变，未提交或发布。见 [Demo 指南](docs/DEMO.md)。
+
+## 前次未发布：Todo／Goal／Subagent 固定区共存修复（基于 v0.1.4）
+
+- 修复 Subagent 出现时 Todo 剩一行却直接消失；单行现在显示 native counts／首个未完成项。完整托盘、Ctrl+T、空／完成收起和原生快照语义保持。
+- 按实际可见区域分配最低高度，短屏借用 transcript 预留行；三者按 Todo → Goal → Subagent → Editor 共存，先收缩明细，不挤走唯一 Editor。settled-only child catalog 不再占预留名额。
+- 112 组实际 App before/after 中，Todo 被 child-start 顶掉由 8 降到 0；新增 8 个 App 可见性回归与双模式真实 PTY，覆盖多行草稿、resize、显隐、结束释放高度和退出恢复。
+- 完整 `pnpm check` **2192/2192**（176 文件，0 fail/cancel/skip/todo）。没有 native 业务、输入/vendor、依赖/版本/旧 tag 或用户配置更改；未提交／推送／发布。见 [Todo 规则](docs/TODO-UX.md) 与 [验收](docs/ACCEPTANCE.md)。
+
+## 前次未发布：两批原生 UI、Todo 固定区与统一配色（基于 v0.1.4）
+
+- Jobs 非消费式只读列表／输出、Goal 固定状态、有效 cwd、原生 plugin/tool 摘要、显式 rename、可继续输入并恢复的 native root fork；不新建调度／目标／会话引擎。
+- Settings 复用 native describe/mutate、公开 namespace 和 revision，两个 allowlisted 默认值带确认／冲突反馈；不编辑凭据或 raw profile。
+- `/attach` 一般文件直接进入 native store，同一 Editor 的 File/Image 原子 markers；file-only／queue ready refs／命令图片准入和拒绝恢复。当前 composition 无 command-file receipt owner，保持明确 unavailable。
+- `/questions` 读 native continued projection＋inbox，late answer 调用 native answer，不接管 blocking timeout 或伪造 cancel。
+- Todo 按 CC 状态区域／Ctrl+T 显隐／五项约定，固定在 Editor 上方、原位更新／完成收起，不追加历史摘要；共享 Todo/Goal/Subagent 高度池。
+- `surfaces` 统一 canvas/dialog/raised/selected/overlay；删除 modal 私有黑板，保留品牌／semantic／syntax 层级，嵌套 reset／背景 close 和 clipping/padding 统一。
+- 验收补修 direct ccSubmit multipart、native projected volatile form、Help body-width tail clipping，以及 file queue DTO/count。完整 `pnpm check` **2170/2170**（174 文件，0 fail/cancel/skip/todo），原生专项 10 cases、新增双模式 PTY 通过；见 [完成记录](docs/NATIVE-UI-BATCHES.zh-CN.md)。
+- 旧 64 个未提交文件保留；批准范围内仅扩大 vendor Editor 的 File marker 原子 seam，版本/manifest/lock 和旧 tag 不变。无提交／新 tag／推送／发布、真实 Provider／profile／credentials 或全局安装变化。
+
+## 前次未发布：当前 SDK 内适配层收敛完成（基于 v0.1.4）
+
+- unselected pending／AgentOptions 改为原生默认 live getters，selection/request/CLI/logged resume 仍由 DSH 固定；移除默认快照与不可达 fallback，异步路由前提变化拒绝旧选择。
+- resident child 用 public SessionStore + 四键 snapshot，去掉额外 observation lease／全量 fold；cold/failure fallback、diagnostics、权限与取消边界保持。
+- public settled config-reload/document-updated 合并失效 preset/model metadata；已有 preset picker 以 native id 保留选择，footer/current badge 跟随 native getter，不自动开窗／选模型或创建 Agent。
+- 全量 **1910/1910**（151 文件），native default 4/4、preset/settings 2/2；零实际 Provider 请求。无版本/依赖/vendor/tag/提交/发布/用户配置更改。详见 [完成记录](docs/ADAPTER-CONVERGENCE-COMPLETE.zh-CN.md)。
+
+## 前次未发布：第一轮原生适配层收敛（基于 v0.1.4）
+
+- Subagent 改用原生 listDescendants/listChildren，保留实时投影/当前树父子守卫；metadata-only diagnostics、可用性公告与 epoch/deadline 取消；不再依赖 750ms display cooldown 处理控制。
+- public snapshot/sessionTitle.get/agents.turnBoundaryOf/planMode.get 替代 raw stateOf/Plan fold；未知 blank 不造 locked，实际 preset selection 由 native select 决定。
+- 模型目录四任务并行且保持 native registry 顺序；公开 LLM catalog events 只刷新已打开 picker，single-flight、保留 query/focus/draft，不新增目录/凭据系统。
+- 完整 `pnpm check` **1861/1861**（143 文件）；真实 native 专项 **28/28**，临时 homes/workspaces 与 hermetic streams，零实际 Provider 请求。无版本/依赖/vendor/tag 更改、提交或发布；边界见 [收敛报告](docs/ADAPTER-CONVERGENCE.zh-CN.md)。
+
+## 前次未发布：原生接口审计确认问题修复（基于 v0.1.4）
+
+- 完成 A1–A10：精确 Skill 选择、native exit request/owned cleanup 分离、FileBlock 只读展示、原生非成功终态、commands/change + Help/补全刷新、default model/title/name/hint/free-text 映射，以及 compaction adapter-default effort provenance。
+- DSH 仍拥有业务与 root lifecycle；不增加可选原生 UI、通用文件输入、命令图片附件或 Subagent 遍历重构。保留静态 `🐳`、Rex 原生 `>_` 和单 Editor。
+- 完整 `pnpm check` **1833/1833**（139 文件，0 fail/cancel/skip/todo）；新增真实 native Skill/command、max-tokens/resume、文件 receipt 与 4 个 native plugin PTY 故障退出场景。全部临时 homes/workspaces、零真实 Provider 请求。
+- **未提交／打新 tag／推送／发布**，v0.1.4 tag 仍指向 `4738db0`；version/private/dependencies/lock/vendor 不变。详见 [修复对照](docs/NATIVE-API-FIXES.zh-CN.md) 和 [当前验收](docs/ACCEPTANCE.md)。
+
 ## v0.1.4（本地 tag）
 
 按用户确认，将当前已验收改动收录为 **v0.1.4/private**，范围仅为本地版本提交与 annotated `v0.1.4` tag；未推送、未发布 registry 或 GitHub release，不修改全局安装、真实 profile／凭据／会话。

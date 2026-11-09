@@ -54,7 +54,7 @@
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { ToolTranscriptItem, TranscriptItem } from '../state/transcript.ts'
 import { type ItemBlock, thinkingRunsOf, type TranscriptViewOptions } from './blocks.ts'
-import { dispatchToChild, HitboxRegistry, type MouseHitbox } from './mouse.ts'
+import { dispatchToChild, HitboxRegistry, HoverOwnership, hoverRowSlot, isHoverExit, type MouseHitbox } from './mouse.ts'
 import { fit, visibleWidth } from './text.ts'
 import { t } from './theme.ts'
 import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
@@ -69,6 +69,8 @@ export const NON_GROUPABLE_TOOL_NAMES: ReadonlySet<string> = new Set(['edit', 'w
 
 const DOT = '●'
 const HOLLOW = '◌'
+/** Placement token of this group's own header control (row 0). */
+const HEADER_SLOT = 'header'
 const BRANCH = { more: '├ ', last: '└ ', moreBody: '│ ', lastBody: '  ' } as const
 const GLYPH_WIDTH = 2
 
@@ -300,11 +302,15 @@ const PREFIX_WIDTH = 2
  * this, a group that loses a member (or its anchor) would clear a context a
  * neighbouring group already installed in the same frame — the classic ordering
  * bug when a merged group re-claims children released by the group beside it.
+ *
+ * Every tool-group-shaped host claims through this one map ({@link ToolGroupBlock}
+ * and the mixed {@link ActivityGroupBlock}), so two hosts can never both believe
+ * they own the same card.
  */
-const groupOwner = new WeakMap<ItemBlock, ToolGroupBlock>()
+const groupOwner = new WeakMap<ItemBlock, object>()
 
 /** Release a card's group context when `owner` owns it (any owner when omitted). */
-function releaseGroupContext(block: ItemBlock, owner?: ToolGroupBlock): void {
+function releaseGroupContext(block: ItemBlock, owner?: object): void {
   const current = groupOwner.get(block)
   if (current === undefined) return
   if (owner !== undefined && current !== owner) return
@@ -313,12 +319,24 @@ function releaseGroupContext(block: ItemBlock, owner?: ToolGroupBlock): void {
 }
 
 /**
+ * Install `context` on a card as `owner`'s grouped child.
+ *
+ * Claiming is what makes a grouped card delegate its expansion to the host
+ * instead of counting as an independent disclosure; `owner` is the only one
+ * allowed to release it again.
+ */
+export function claimToolGroupContext(block: ItemBlock, owner: object, context: ToolGroupContext): void {
+  groupOwner.set(block, owner)
+  block.setToolGroupContext?.(context)
+}
+
+/**
  * Release a card's group context from the outside (the view ungroups a card into
  * a standalone row). Ownership-aware: a card still claimed by a group this frame
  * keeps that group's context.
  */
-export function releaseToolGroupContext(block: ItemBlock): void {
-  releaseGroupContext(block)
+export function releaseToolGroupContext(block: ItemBlock, owner?: object): void {
+  releaseGroupContext(block, owner)
 }
 
 /**
@@ -336,6 +354,13 @@ export class ToolGroupBlock implements Component {
   readonly key: string
   private readonly flags: TranscriptViewOptions
   private readonly registry = new HitboxRegistry()
+  /**
+   * The one hover target inside this group: the header (this block) or the
+   * expanded child card whose row the pointer is on. Motion only reaches one of
+   * them per event, so the previously hovered target must be released here or a
+   * child card keeps a blue hint after the pointer moved to its sibling/header.
+   */
+  private readonly hover = new HoverOwnership()
   private members: readonly ToolGroupMember[] = []
   private rows: ToolGroupRowSpan[] = []
   private context: ToolGroupContext | undefined
@@ -415,10 +440,7 @@ export class ToolGroupBlock implements Component {
       // Only this group may release it; another group may already own it.
       releaseGroupContext(member.block, this)
     }
-    for (const member of this.members) {
-      groupOwner.set(member.block, this)
-      member.block.setToolGroupContext?.(this.groupContext())
-    }
+    for (const member of this.members) claimToolGroupContext(member.block, this, this.groupContext())
   }
 
   private groupContext(): ToolGroupContext {
@@ -447,6 +469,7 @@ export class ToolGroupBlock implements Component {
    * changes — never on an ordinary repaint (that would lose a pressed row).
    */
   clearMouse(): void {
+    this.hover.release()
     this.registry.clear()
     this.frameBoxes = []
     this.rows = []
@@ -582,6 +605,12 @@ export class ToolGroupBlock implements Component {
     }
     this.registry.sync(boxes)
     this.frameBoxes = boxes
+    // A frame that no longer paints the hovered child at the row it was entered
+    // in released its hitbox: the hint goes back to neutral.
+    this.hover.retain([
+      { component: this, slot: HEADER_SLOT },
+      ...this.rows.map(row => ({ component: row.block, slot: hoverRowSlot(row.startRow) })),
+    ])
   }
 
   private buildCollapsed(width: number): string[] {
@@ -692,9 +721,7 @@ export class ToolGroupBlock implements Component {
 
   /** `├ ✓ Bash npm test · 2.1s` — branch, real status, real summary, real duration. */
   private summaryRow(item: ToolTranscriptItem, last: boolean, width: number): string {
-    const branch = t.muted(last ? BRANCH.last : BRANCH.more)
-    const glyph = toolStatusGlyph(item) + ' '.repeat(GLYPH_WIDTH - 1)
-    return branch + glyph + this.summaryText(item, Math.max(1, width - PREFIX_WIDTH - GLYPH_WIDTH))
+    return collapsedToolRow(item, last, width, this.cwd, this.flags.toolLabelClip ?? 0)
   }
 
   // --- mouse -----------------------------------------------------------------
@@ -710,6 +737,15 @@ export class ToolGroupBlock implements Component {
    */
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     const span = this.rows.find(entry => event.y >= entry.startRow && event.y <= entry.endRow)
+    if (event.type === 'move' || event.type === 'drag') {
+      // One hover target per pointer position: a child row, the header, or
+      // nothing (a synthetic leave from the transcript must not re-adopt the
+      // header). The previous target hears its exit before the new one enters.
+      const next = span !== undefined
+        ? { component: span.block, slot: hoverRowSlot(span.startRow) }
+        : isHoverExit(event) ? undefined : { component: this, slot: HEADER_SLOT }
+      this.hover.moveTo(next, span === undefined ? event : { ...event, y: event.y - span.startRow })
+    }
     if (span !== undefined) {
       const childEvent = { ...event, x: Math.max(0, event.x - span.xOffset), y: event.y - span.startRow }
       const result = dispatchToChild(span.block, childEvent)
@@ -717,6 +753,31 @@ export class ToolGroupBlock implements Component {
     }
     return this.registry.handleMouse(event)
   }
+}
+
+/**
+ * One collapsed tool row: `├ ✓ Bash npm test · 2.1s`.
+ *
+ * Branch, the call's real status glyph, the shared `getToolSummary` wording and
+ * the measured duration only. Shared with the mixed activity group so a grouped
+ * call reads identically in both hosts; the arguments are explicit so neither
+ * host has to own a second summary implementation.
+ */
+export function collapsedToolRow(
+  item: ToolTranscriptItem,
+  last: boolean,
+  width: number,
+  cwd: string,
+  labelClip: number,
+): string {
+  const branch = t.muted(last ? BRANCH.last : BRANCH.more)
+  const glyph = toolStatusGlyph(item) + ' '.repeat(GLYPH_WIDTH - 1)
+  const summary = getToolSummary(item, cwd, labelClip)
+  // The duration is reserved before the summary is fitted, so a long command
+  // never truncates away the one honest measurement on the row.
+  const tail = durationTail(summary.durationMs)
+  const room = Math.max(1, width - PREFIX_WIDTH - GLYPH_WIDTH - visibleWidth(tail))
+  return branch + glyph + `${t.text(fit(summary.text, room))}${tail === '' ? '' : t.subtle(tail)}`
 }
 
 /** Reference equality of the children's painted frames (their own caches reuse arrays). */

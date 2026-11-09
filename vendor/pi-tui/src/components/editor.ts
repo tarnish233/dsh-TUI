@@ -45,6 +45,18 @@ const IMAGE_MARKER_REGEX = /\[Image #(\d+)\]/g;
 /** Non-global version for single-segment testing. */
 const IMAGE_MARKER_SINGLE = /^\[Image #(\d+)\]$/;
 
+/**
+ * Regex matching file attachment markers like `[File #1]`.
+ *
+ * A file marker is a *file* occurrence, never an image: the two families keep
+ * separate ids, registries and payloads. Only atomicity/registry lifetime is
+ * shared; what a payload means stays with the host application.
+ */
+const FILE_MARKER_REGEX = /\[File #(\d+)\]/g;
+
+/** Non-global version for single-segment testing. */
+const FILE_MARKER_SINGLE = /^\[File #(\d+)\]$/;
+
 /** Check if a segment is a paste marker (i.e. was merged by segmentWithMarkers). */
 function isPasteMarker(segment: string): boolean {
 	return segment.length >= 10 && PASTE_MARKER_SINGLE.test(segment);
@@ -55,9 +67,14 @@ function isImageMarker(segment: string): boolean {
 	return segment.length >= 10 && IMAGE_MARKER_SINGLE.test(segment);
 }
 
-/** True for any atomic marker this editor keeps together (paste or image attachment). */
+/** Check if a segment is a file attachment marker merged by segmentWithMarkers. */
+function isFileMarker(segment: string): boolean {
+	return segment.length >= 9 && FILE_MARKER_SINGLE.test(segment);
+}
+
+/** True for any atomic marker this editor keeps together (paste/image/file attachment). */
 function isAtomicMarker(segment: string): boolean {
-	return isPasteMarker(segment) || isImageMarker(segment);
+	return isPasteMarker(segment) || isImageMarker(segment) || isFileMarker(segment);
 }
 
 /** Marker ids referenced by `text`, in order of first appearance. */
@@ -68,6 +85,56 @@ export function findImageMarkerIds(text: string): number[] {
 		if (!ids.includes(id)) ids.push(id);
 	}
 	return ids;
+}
+
+/** File marker ids referenced by `text`, in order of first appearance. */
+export function findFileMarkerIds(text: string): number[] {
+	const ids: number[] = [];
+	for (const match of text.matchAll(FILE_MARKER_REGEX)) {
+		const id = Number.parseInt(match[1]!, 10);
+		if (!ids.includes(id)) ids.push(id);
+	}
+	return ids;
+}
+
+/** Normalize one marker-id registry replacement (snapshot restore / reclaim). */
+function mergeAttachmentEntries(entries: Iterable<readonly [number, unknown]>): {
+	next: Map<number, unknown>;
+	maxId: number;
+} {
+	const next = new Map<number, unknown>();
+	let maxId = 0;
+	for (const [id, payload] of entries) {
+		const numeric = Math.max(0, Math.floor(Number(id)));
+		if (!Number.isFinite(numeric) || numeric <= 0) continue;
+		next.set(numeric, payload);
+		maxId = Math.max(maxId, numeric);
+	}
+	return { next, maxId };
+}
+
+/** Serializable view of one history attachment registry. */
+function historyAttachmentEntries(
+	store: ReadonlyMap<string, ReadonlyMap<number, unknown>>,
+): Array<[string, Array<[number, unknown]>]> {
+	return [...store.entries()].map(([text, payloads]) => [text, [...payloads.entries()]]);
+}
+
+/** Replace one history attachment registry from a snapshot/reclaim pass. */
+function replaceHistoryAttachmentEntries(
+	store: Map<string, Map<number, unknown>>,
+	entries: Iterable<readonly [string, Iterable<readonly [number, unknown]>]>,
+): void {
+	store.clear();
+	for (const [text, payloads] of entries) {
+		if (typeof text !== "string" || text.length === 0) continue;
+		const map = new Map<number, unknown>();
+		for (const [id, payload] of payloads) {
+			const numeric = Math.max(0, Math.floor(Number(id)));
+			if (Number.isFinite(numeric) && numeric > 0) map.set(numeric, payload);
+		}
+		if (map.size > 0) store.set(text, map);
+	}
 }
 
 /** Shared empty set so segment() does not allocate on every call. */
@@ -85,11 +152,13 @@ function segmentWithMarkers(
 	baseSegmenter: Intl.Segmenter,
 	validIds: Set<number>,
 	validImageIds: ReadonlySet<number> = EMPTY_ID_SET,
+	validFileIds: ReadonlySet<number> = EMPTY_ID_SET,
 ): Iterable<Intl.SegmentData> {
 	const hasPasteMarkers = validIds.size > 0 && text.includes("[paste #");
 	const hasImageMarkers = validImageIds.size > 0 && text.includes("[Image #");
+	const hasFileMarkers = validFileIds.size > 0 && text.includes("[File #");
 	// Fast path: no markers in the text or no valid IDs.
-	if (!hasPasteMarkers && !hasImageMarkers) {
+	if (!hasPasteMarkers && !hasImageMarkers && !hasFileMarkers) {
 		return baseSegmenter.segment(text);
 	}
 
@@ -106,6 +175,13 @@ function segmentWithMarkers(
 		for (const m of text.matchAll(IMAGE_MARKER_REGEX)) {
 			const id = Number.parseInt(m[1]!, 10);
 			if (!validImageIds.has(id)) continue;
+			markers.push({ start: m.index, end: m.index + m[0].length });
+		}
+	}
+	if (hasFileMarkers) {
+		for (const m of text.matchAll(FILE_MARKER_REGEX)) {
+			const id = Number.parseInt(m[1]!, 10);
+			if (!validFileIds.has(id)) continue;
 			markers.push({ start: m.index, end: m.index + m[0].length });
 		}
 	}
@@ -403,6 +479,14 @@ export class Editor implements Component, Focusable {
 	/** Payloads of the in-progress draft while browsing history. */
 	private historyDraftImages: Map<number, unknown> | null = null;
 
+	// File attachment payloads for atomic `[File #N]` markers. Same semantics as
+	// the image registry above, with its own id space: a file is never an image
+	// and a `[File #N]` id can never collide with an `[Image #N]` id.
+	private fileAttachments: Map<number, unknown> = new Map();
+	private fileCounter: number = 0;
+	private readonly historyFileAttachments = new Map<string, Map<number, unknown>>();
+	private historyDraftFiles: Map<number, unknown> | null = null;
+
 	// Bracketed paste mode buffering
 	private pasteBuffer: string = "";
 	private isInPaste: boolean = false;
@@ -456,13 +540,19 @@ export class Editor implements Component, Focusable {
 		return new Set(this.imageAttachments.keys());
 	}
 
-	/** Segment text with paste/image-marker awareness, only merging markers with valid IDs. */
+	/** Set of currently valid file attachment IDs, for marker-aware segmentation. */
+	private validFileIds(): Set<number> {
+		return new Set(this.fileAttachments.keys());
+	}
+
+	/** Segment text with paste/image/file-marker awareness, only merging markers with valid IDs. */
 	private segment(text: string, mode: "word" | "grapheme"): Iterable<Intl.SegmentData> {
 		return segmentWithMarkers(
 			text,
 			mode === "word" ? wordSegmenter : graphemeSegmenter,
 			this.validPasteIds(),
 			this.validImageIds(),
+			this.validFileIds(),
 		);
 	}
 
@@ -504,13 +594,16 @@ export class Editor implements Component, Focusable {
 		const trimmed = text.trim();
 		if (!trimmed) return;
 		// Remember the attachment payloads referenced by this entry so an
-		// in-session recall (Up) still has real images instead of bare markers.
-		// `submitValue` clears the live registry right after this call.
+		// in-session recall (Up) still has real images/files instead of bare
+		// markers. `submitValue` clears the live registries right after this call.
 		// Store only the payloads this entry's own text references, so a mapping can
-		// never attach an image to a marker it did not come from.
+		// never attach a payload to a marker it did not come from.
 		const subset = this.imageAttachmentSubset(trimmed);
 		if (subset.size > 0) this.historyImageAttachments.set(trimmed, subset);
 		this.noteImageMarkerIds(trimmed);
+		const fileSubset = this.fileAttachmentSubset(trimmed);
+		if (fileSubset.size > 0) this.historyFileAttachments.set(trimmed, fileSubset);
+		this.noteFileMarkerIds(trimmed);
 		// Don't add consecutive duplicates
 		if (this.history.length > 0 && this.history[0] === trimmed) return;
 		this.history.unshift(trimmed);
@@ -518,6 +611,7 @@ export class Editor implements Component, Focusable {
 		if (this.history.length > 100) {
 			const dropped = this.history.pop();
 			this.pruneHistoryImages();
+			this.pruneHistoryFiles();
 			void dropped;
 		}
 	}
@@ -549,6 +643,28 @@ export class Editor implements Component, Focusable {
 	}
 
 	/**
+	 * Raise the file marker-id high-water mark from marker text that arrived from
+	 * outside the editor (restored drafts, persisted history). Mirrors
+	 * `noteImageMarkerIds` with the separate file id space.
+	 */
+	noteFileMarkerIds(text: string): void {
+		for (const id of findFileMarkerIds(text)) {
+			if (!Number.isSafeInteger(id) || id <= 0) continue;
+			this.fileCounter = Math.max(this.fileCounter, id);
+		}
+	}
+
+	/** File payloads referenced by `text`, i.e. exactly the markers that text shows. */
+	private fileAttachmentSubset(text: string): Map<number, unknown> {
+		const subset = new Map<number, unknown>();
+		for (const id of findFileMarkerIds(text)) {
+			const payload = this.fileAttachments.get(id);
+			if (payload !== undefined) subset.set(id, payload);
+		}
+		return subset;
+	}
+
+	/**
 	 * Drop attachment payloads for history entries that no longer exist.
 	 * Bounds the history registry by the history length (100 entries).
 	 */
@@ -557,6 +673,15 @@ export class Editor implements Component, Focusable {
 		const live = new Set(this.history);
 		for (const key of [...this.historyImageAttachments.keys()]) {
 			if (!live.has(key)) this.historyImageAttachments.delete(key);
+		}
+	}
+
+	/** Drop file payloads for history entries that no longer exist. */
+	private pruneHistoryFiles(): void {
+		if (this.historyFileAttachments.size === 0) return;
+		const live = new Set(this.history);
+		for (const key of [...this.historyFileAttachments.keys()]) {
+			if (!live.has(key)) this.historyFileAttachments.delete(key);
 		}
 	}
 
@@ -588,6 +713,7 @@ export class Editor implements Component, Focusable {
 			this.pushUndoSnapshot();
 			this.historyDraft = structuredClone(this.state);
 			this.historyDraftImages = new Map(this.imageAttachments);
+			this.historyDraftFiles = new Map(this.fileAttachments);
 		}
 
 		this.historyIndex = newIndex;
@@ -598,6 +724,8 @@ export class Editor implements Component, Focusable {
 			// Restore the attachments of the draft we were editing before browsing.
 			this.imageAttachments = this.historyDraftImages ?? new Map();
 			this.historyDraftImages = null;
+			this.fileAttachments = this.historyDraftFiles ?? new Map();
+			this.historyDraftFiles = null;
 			if (draft) {
 				this.state = draft;
 				this.preferredVisualCol = null;
@@ -609,6 +737,7 @@ export class Editor implements Component, Focusable {
 			}
 		} else {
 			this.applyHistoryImages(this.history[this.historyIndex] || "");
+			this.applyHistoryFiles(this.history[this.historyIndex] || "");
 			this.setTextInternal(this.history[this.historyIndex] || "", direction === -1 ? "start" : "end");
 		}
 	}
@@ -633,10 +762,31 @@ export class Editor implements Component, Focusable {
 		this.imageAttachments = restored;
 	}
 
+	/**
+	 * Merge the file attachment payloads of a recalled history entry into the live
+	 * registry so its `[File #N]` markers resolve to real payloads again. Mirrors
+	 * `applyHistoryImages` with the separate file id space/registry.
+	 */
+	private applyHistoryFiles(text: string): void {
+		const stored = this.historyFileAttachments.get(text.trim());
+		if (!stored) {
+			this.fileAttachments = new Map();
+			return;
+		}
+		// Only ids this recalled text actually references may become live again.
+		const live = new Set(findFileMarkerIds(text));
+		const restored = new Map<number, unknown>();
+		for (const [id, payload] of stored) {
+			if (live.has(id)) restored.set(id, payload);
+		}
+		this.fileAttachments = restored;
+	}
+
 	private exitHistoryBrowsing(): void {
 		this.historyIndex = -1;
 		this.historyDraft = null;
 		this.historyDraftImages = null;
+		this.historyDraftFiles = null;
 	}
 
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
@@ -1277,16 +1427,34 @@ export class Editor implements Component, Focusable {
 		}
 		this.pastes.clear();
 		this.pasteCounter = 0;
-		// Image payloads are intentionally kept: they are append-only and are still
-		// reachable from the undo stack. Unreferenced entries are reclaimed by the
-		// host's budget pass (see CcEditor.reclaimImageMemory).
+		// Image/file payloads are intentionally kept: they are append-only and are
+		// still reachable from the undo stack. Unreferenced entries are reclaimed by
+		// the host's budget pass (see CcEditor.reclaimAttachmentMemory).
 		// Markers in the new text (e.g. a draft restored from persisted history)
 		// reserve their ids so a later paste can never reuse them.
 		this.noteImageMarkerIds(normalized);
+		this.noteFileMarkerIds(normalized);
 		this.setTextInternal(normalized);
 	}
 
-	// --- image attachments ------------------------------------------------
+	// --- image / file attachments -----------------------------------------
+
+	/**
+	 * Splice one atomic attachment marker at the cursor and move the cursor after
+	 * it. Shared by `[Image #N]` and `[File #N]` so both families keep exactly the
+	 * same token spacing, undo entry and `onChange` behaviour.
+	 */
+	private insertAttachmentMarker(marker: string): void {
+		const line = this.state.lines[this.state.cursorLine] || "";
+		const before = line.slice(0, this.state.cursorCol);
+		const after = line.slice(this.state.cursorCol);
+		// Keep the marker a separate token so it never glues onto a word.
+		const lead = before.length > 0 && !/\s$/.test(before) ? " " : "";
+		const trail = after.length > 0 && !/^\s/.test(after) ? " " : "";
+		this.state.lines[this.state.cursorLine] = before + lead + marker + trail + after;
+		this.setCursorCol(before.length + lead.length + marker.length + trail.length);
+		if (this.onChange) this.onChange(this.getText());
+	}
 
 	/**
 	 * Insert a host-owned image attachment as one atomic, undoable `[Image #N]`
@@ -1308,16 +1476,29 @@ export class Editor implements Component, Focusable {
 		}
 		this.imageCounter = id;
 		this.imageAttachments.set(id, attachment);
-		const marker = `[Image #${id}]`;
-		const line = this.state.lines[this.state.cursorLine] || "";
-		const before = line.slice(0, this.state.cursorCol);
-		const after = line.slice(this.state.cursorCol);
-		// Keep the marker a separate token so it never glues onto a word.
-		const lead = before.length > 0 && !/\s$/.test(before) ? " " : "";
-		const trail = after.length > 0 && !/^\s/.test(after) ? " " : "";
-		this.state.lines[this.state.cursorLine] = before + lead + marker + trail + after;
-		this.setCursorCol(before.length + lead.length + marker.length + trail.length);
-		if (this.onChange) this.onChange(this.getText());
+		this.insertAttachmentMarker(`[Image #${id}]`);
+		return id;
+	}
+
+	/**
+	 * Insert a host-owned file attachment as one atomic, undoable `[File #N]`
+	 * marker and return its marker id.
+	 *
+	 * Same monotonic/never-reused/append-only semantics as the image family, with
+	 * its own id space: a file is never an image and the two never share payloads.
+	 */
+	insertFileAttachment(attachment: unknown): number {
+		this.cancelAutocomplete();
+		this.exitHistoryBrowsing();
+		this.lastAction = null;
+		this.pushUndoSnapshot();
+		const id = this.fileCounter + 1;
+		if (!Number.isSafeInteger(id)) {
+			throw new Error("File marker id space exhausted; start a new draft before attaching more files.");
+		}
+		this.fileCounter = id;
+		this.fileAttachments.set(id, attachment);
+		this.insertAttachmentMarker(`[File #${id}]`);
 		return id;
 	}
 
@@ -1326,29 +1507,45 @@ export class Editor implements Component, Focusable {
 		return this.imageAttachments.get(id);
 	}
 
-	/** Every live attachment payload, oldest first. */
+	/** Every live image payload, oldest first. */
 	getImageAttachmentEntries(): Array<[number, unknown]> {
 		return [...this.imageAttachments.entries()];
 	}
 
-	/** Replace the live attachment registry (snapshot restore / budget reclaim). */
+	/** Replace the live image registry (snapshot restore / budget reclaim). */
 	setImageAttachmentEntries(entries: Iterable<readonly [number, unknown]>, counter?: number): void {
-		const next = new Map<number, unknown>();
-		let maxId = 0;
-		for (const [id, payload] of entries) {
-			const numeric = Math.max(0, Math.floor(Number(id)));
-			if (!Number.isFinite(numeric) || numeric <= 0) continue;
-			next.set(numeric, payload);
-			maxId = Math.max(maxId, numeric);
-		}
+		const { next, maxId } = mergeAttachmentEntries(entries);
 		this.imageAttachments = next;
 		const requested = counter === undefined ? 0 : Math.floor(Number(counter));
 		this.imageCounter = Math.max(this.imageCounter, maxId, Number.isFinite(requested) ? requested : 0);
 	}
 
+	/** Payload for a file marker id owned by this editor. */
+	getFileAttachment(id: number): unknown {
+		return this.fileAttachments.get(id);
+	}
+
+	/** Every live file payload, oldest first. */
+	getFileAttachmentEntries(): Array<[number, unknown]> {
+		return [...this.fileAttachments.entries()];
+	}
+
+	/** Replace the live file registry (snapshot restore / budget reclaim). */
+	setFileAttachmentEntries(entries: Iterable<readonly [number, unknown]>, counter?: number): void {
+		const { next, maxId } = mergeAttachmentEntries(entries);
+		this.fileAttachments = next;
+		const requested = counter === undefined ? 0 : Math.floor(Number(counter));
+		this.fileCounter = Math.max(this.fileCounter, maxId, Number.isFinite(requested) ? requested : 0);
+	}
+
 	/** Ids referenced by the current draft text, in order of first appearance. */
 	getImageMarkerIdsInText(): number[] {
 		return findImageMarkerIds(this.getText());
+	}
+
+	/** File marker ids referenced by the current draft text, in order of first appearance. */
+	getFileMarkerIdsInText(): number[] {
+		return findFileMarkerIds(this.getText());
 	}
 
 	/**
@@ -1359,9 +1556,21 @@ export class Editor implements Component, Focusable {
 	 * already reclaimed. Read-only: nothing here mutates or duplicates the stack.
 	 */
 	getReservedImageMarkerIds(): number[] {
+		return this.reservedMarkerIds(findImageMarkerIds, this.historyDraftImages);
+	}
+
+	/** File equivalent of `getReservedImageMarkerIds` (separate registry/id space). */
+	getReservedFileMarkerIds(): number[] {
+		return this.reservedMarkerIds(findFileMarkerIds, this.historyDraftFiles);
+	}
+
+	private reservedMarkerIds(
+		findIds: (text: string) => number[],
+		historyDraft: Map<number, unknown> | null,
+	): number[] {
 		const ids = new Set<number>();
 		const collect = (text: string): void => {
-			for (const id of findImageMarkerIds(text)) ids.add(id);
+			for (const id of findIds(text)) ids.add(id);
 		};
 		for (const line of this.state.lines) collect(line);
 		for (const snapshot of this.undoStack.snapshots()) {
@@ -1371,29 +1580,30 @@ export class Editor implements Component, Focusable {
 		if (this.historyDraft) {
 			for (const line of this.historyDraft.lines) collect(line);
 		}
-		if (this.historyDraftImages) {
-			for (const id of this.historyDraftImages.keys()) ids.add(id);
+		if (historyDraft) {
+			for (const id of historyDraft.keys()) ids.add(id);
 		}
 		return [...ids];
 	}
 
-	/** History-entry attachment payloads, keyed by the trimmed entry text. */
+	/** History-entry image payloads, keyed by the trimmed entry text. */
 	getHistoryImageAttachmentEntries(): Array<[string, Array<[number, unknown]>]> {
-		return [...this.historyImageAttachments.entries()].map(([text, payloads]) => [text, [...payloads.entries()]]);
+		return historyAttachmentEntries(this.historyImageAttachments);
 	}
 
-	/** Replace the history attachment registry (budget reclaim after submit). */
+	/** Replace the history image registry (budget reclaim after submit). */
 	setHistoryImageAttachmentEntries(entries: Iterable<readonly [string, Iterable<readonly [number, unknown]>]>): void {
-		this.historyImageAttachments.clear();
-		for (const [text, payloads] of entries) {
-			if (typeof text !== "string" || text.length === 0) continue;
-			const map = new Map<number, unknown>();
-			for (const [id, payload] of payloads) {
-				const numeric = Math.max(0, Math.floor(Number(id)));
-				if (Number.isFinite(numeric) && numeric > 0) map.set(numeric, payload);
-			}
-			if (map.size > 0) this.historyImageAttachments.set(text, map);
-		}
+		replaceHistoryAttachmentEntries(this.historyImageAttachments, entries);
+	}
+
+	/** History-entry file payloads, keyed by the trimmed entry text. */
+	getHistoryFileAttachmentEntries(): Array<[string, Array<[number, unknown]>]> {
+		return historyAttachmentEntries(this.historyFileAttachments);
+	}
+
+	/** Replace the history file registry (budget reclaim after submit). */
+	setHistoryFileAttachmentEntries(entries: Iterable<readonly [string, Iterable<readonly [number, unknown]>]>): void {
+		replaceHistoryAttachmentEntries(this.historyFileAttachments, entries);
 	}
 
 	/**
@@ -1636,13 +1846,17 @@ export class Editor implements Component, Focusable {
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
 
 		// Record the draft's attachment payloads before the state is cleared, so an
-		// in-session recall keeps real images even when the host records history
-		// asynchronously. `addToHistory` upserts the same mapping for other paths.
+		// in-session recall keeps real images/files even when the host records
+		// history asynchronously. `addToHistory` upserts the same mapping for other
+		// paths.
 		const draftText = this.getText().trim();
 		if (draftText.length > 0) {
 			const subset = this.imageAttachmentSubset(draftText);
 			if (subset.size > 0) this.historyImageAttachments.set(draftText, subset);
 			this.noteImageMarkerIds(draftText);
+			const fileSubset = this.fileAttachmentSubset(draftText);
+			if (fileSubset.size > 0) this.historyFileAttachments.set(draftText, fileSubset);
+			this.noteFileMarkerIds(draftText);
 		}
 
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };

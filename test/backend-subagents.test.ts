@@ -44,10 +44,125 @@ const ROOT_AGENT_OPTIONS = {
   model: 'm1',
 }
 
+type RawRow = Record<string, unknown>
+type ChildMode = 'one-shot' | 'continuable' | 'external' | 'unknown'
+
+/** One native-shaped rejection carrying a public DSH error code. */
+function listingFailure(message: string, code: string): Error {
+  const error = new Error(message)
+  error.name = 'SubagentError'
+  Object.assign(error, { code })
+  return error
+}
+
+function modeOfRow(row: RawRow): ChildMode {
+  const mode = row.mode
+  return mode === 'one-shot' || mode === 'continuable' || mode === 'external' ? mode : 'unknown'
+}
+
+/**
+ * Host double for the public `ctx.subagents` discovery contract
+ * (`listChildren` / `listDescendants`): stable pre-order, per-catalog event
+ * order, external leaves, branch diagnostics and one released observation per
+ * branch. The adapter under test must never walk catalogs itself, so this double
+ * is the only structure source in these tests.
+ */
+class FakeNativeSubagents {
+  readonly descendantCalls: Array<{ rootSessionId: string; signal: AbortSignal | undefined }> = []
+  readonly childCalls: Array<{ parentSessionId: string; signal: AbortSignal | undefined }> = []
+  /** Parent ids whose catalog was read, in order (native releases each first). */
+  readonly catalogReads: string[] = []
+  /** Whole-listing failure with a native code. */
+  fail: Error | undefined
+  /** Per-branch catalog failure with a native code (`corrupt`/`unavailable`). */
+  readonly branchFailures = new Map<string, Error>()
+  /** Last-mile row rewrite: models a partial, older or hostile service. */
+  mapRows: ((rows: RawRow[]) => unknown[]) | undefined
+  private readonly world: FakeSessionWorld
+
+  constructor(world: FakeSessionWorld) {
+    this.world = world
+  }
+
+  /** Install this double as the mounted native discovery service. */
+  attach(host: FakeDshHost): this {
+    host.use('subagents', this)
+    return this
+  }
+
+  async listChildren(parentSessionId: string, signal?: AbortSignal): Promise<unknown[]> {
+    this.childCalls.push({ parentSessionId, signal })
+    return this.catalog(parentSessionId, signal)
+  }
+
+  async listDescendants(rootSessionId: string, signal?: AbortSignal): Promise<unknown[]> {
+    this.descendantCalls.push({ rootSessionId, signal })
+    if (this.fail !== undefined) throw this.fail
+    const root = this.catalog(rootSessionId, signal)
+    const stack = root.map(entry => ({ entry, parentId: rootSessionId, depth: 1 })).reverse()
+    const visited = new Set<string>([rootSessionId])
+    const result: RawRow[] = []
+    for (let position = stack.pop(); position !== undefined; position = stack.pop()) {
+      const { entry, parentId, depth } = position
+      const id = typeof entry.id === 'string' ? entry.id : ''
+      if (id === '' || visited.has(id)) continue
+      visited.add(id)
+      if (signal?.aborted === true) throw listingFailure('subagent listing was cancelled', 'CANCELLED')
+      let children: RawRow[]
+      try {
+        children = modeOfRow(entry) === 'external' ? [] : this.catalog(id, signal)
+      } catch (error) {
+        const code = (error as { code?: unknown }).code
+        result.push({
+          kind: 'diagnostic',
+          id,
+          parentId,
+          depth,
+          reason: code === 'SESSION_QUERY_CORRUPT_SESSION' || code === 'SESSION_QUERY_SOURCE_CONFLICT' ? 'corrupt' : 'unavailable',
+        })
+        continue
+      }
+      if (modeOfRow(entry) === 'unknown') {
+        result.push({ kind: 'diagnostic', id, parentId, depth, reason: 'unsupported' })
+      } else {
+        result.push({
+          kind: 'child',
+          id,
+          parentId,
+          depth,
+          mode: modeOfRow(entry),
+          ...(typeof entry.label === 'string' ? { label: entry.label } : {}),
+          activity: this.world.store.get(id) === undefined ? 'inactive' : 'running',
+          hasChildren: children.length > 0,
+        })
+      }
+      for (const child of [...children].reverse()) stack.push({ entry: child, parentId: id, depth: depth + 1 })
+    }
+    return this.mapRows === undefined ? result : this.mapRows(result)
+  }
+
+  /** One parent catalog read: cancels, releases (implicitly) and validates. */
+  private catalog(parentSessionId: string, signal: AbortSignal | undefined): RawRow[] {
+    if (signal?.aborted === true) throw listingFailure('subagent listing was cancelled', 'CANCELLED')
+    this.catalogReads.push(parentSessionId)
+    const branchFailure = this.branchFailures.get(parentSessionId)
+    if (branchFailure !== undefined) throw branchFailure
+    if (!this.world.has(parentSessionId)) {
+      throw listingFailure(`session "${parentSessionId}" not found`, 'SESSION_QUERY_SESSION_NOT_FOUND')
+    }
+    const rows = this.world.valuesOf(parentSessionId).subagentCatalog
+    if (!Array.isArray(rows)) {
+      throw listingFailure('listing subagents requires the registered subagentCatalog projection', 'SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE')
+    }
+    return rows as RawRow[]
+  }
+}
+
 interface Harness {
   host: FakeDshHost
   agents: FakeAgentRegistry
   world: FakeSessionWorld
+  subagents: FakeNativeSubagents
   backend: DshContextBackend
   events: BackendEvent[]
   warnings: string[]
@@ -85,6 +200,7 @@ async function harness(options: {
   const host = new FakeDshHost()
   const agents = new FakeAgentRegistry()
   const world = new FakeSessionWorld().attach(host)
+  const subagents = new FakeNativeSubagents(world)
   const warnings: string[] = []
   host.use('agents', agents)
   host.use('agentDefaultModel', {
@@ -109,6 +225,7 @@ async function harness(options: {
     },
   })
   options.setup?.(world, host)
+  if (host.get('subagents') === undefined) subagents.attach(host)
   const events: BackendEvent[] = []
   const backend = createDshBackend(host, {
     cwd: '/workspace',
@@ -120,7 +237,7 @@ async function harness(options: {
   const info = await backend.connect()
   const rootAgent = agents.get(ROOT)
   assert.ok(rootAgent !== undefined, 'the fake resume produced the root Agent')
-  return { host, agents, world, backend, events, warnings, info, rootAgent }
+  return { host, agents, world, subagents, backend, events, warnings, info, rootAgent }
 }
 
 function childSession(
@@ -236,7 +353,9 @@ test('cold catalog: native projections populate SessionInfo.subagents without an
   assert.equal(a.label, 'research')
   assert.equal(a.parentSessionId, ROOT)
   assert.equal(a.catalogSeq, 0)
-  assert.equal(a.createdAt, 1000)
+  // The native descendant listing drops the catalog row's createdAt; the child
+  // Session header is the durable fallback (see docs/SUBAGENT-ADAPTER-CONVERGENCE.md).
+  assert.equal(a.createdAt, 2)
   assert.equal(a.local, true)
   assert.equal(a.status, 'idle', 'a continuable child with a completed turn is idle, not terminal')
   assert.equal(a.totalTokens, 100, 'the four native token buckets are summed')

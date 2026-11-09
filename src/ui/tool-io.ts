@@ -444,21 +444,42 @@ export function toolNativeTitle(item: ToolTranscriptItem, presentation = toolPre
 }
 
 /**
- * Merge a native title with the single display label. A native title that
- * starts with the raw tool name (`Edit …`) or our alias (`Update …`) keeps only
- * one verb: the display label plus the title's remaining payload. The callId and
- * tool name remain DSH identity; only the visible label is normalized.
+ * Payload of a native title once the tool's own display label is removed.
+ *
+ * The card header composes `label + ' ' + detail`, so this function's only job
+ * is to answer *what is left of the native title*: nothing (the title is just
+ * the tool name in any case, e.g. `Read image`), or the title's remaining
+ * payload (e.g. `/Users/x.png` from `Read image /Users/x.png`).
+ *
+ * Only an exact, case-insensitive whole-word match of the display label or of
+ * the raw tool name is dropped; everything else is kept **verbatim** (never
+ * re-worded, reordered or dropped by keyword guessing), so an unfamiliar native
+ * title still shows up in full. Control/OSC/ANSI sequences are removed first:
+ * a terminal escape from a tool title is untrusted text, not a style, and a
+ * hyperlink prefix must not desynchronize the label detection from the paint.
  */
-function mergeNativeTitle(title: string, name: string): string {
-  const clean = oneLineValue(title)
-  const lower = clean.toLowerCase()
+function nativeTitleDetail(title: string, name: string): string {
+  const clean = oneLineValue(sanitizeText(title))
   const label = toolDisplayName(name)
-  const display = label.toLowerCase()
-  if (lower === display || lower.startsWith(`${display} `)) return clean
-  const raw = name.toLowerCase()
-  if (lower === raw) return label
-  if (lower.startsWith(`${raw} `)) return `${label}${clean.slice(name.length)}`
-  return `${label} ${clean}`
+  for (const prefix of [label, name, name.replace(/[_-]+/g, ' ')]) {
+    const rest = stripLabelPrefix(clean, prefix)
+    if (rest !== undefined) return oneLineValue(rest)
+  }
+  return clean
+}
+
+/**
+ * Text after `prefix` when `text` *is* the prefix (returns `''`) or starts with
+ * it as a complete word (returns the remainder verbatim). `undefined` means the
+ * text is not that label at all, so the caller keeps it whole.
+ */
+function stripLabelPrefix(text: string, prefix: string): string | undefined {
+  if (prefix === '') return undefined
+  const head = text.slice(0, prefix.length)
+  if (head.toLowerCase() !== prefix.toLowerCase()) return undefined
+  if (text.length === prefix.length) return ''
+  // A label glued to more of the same word (`Reading file`) is not our label.
+  return /^\s/.test(text.slice(prefix.length)) ? text.slice(prefix.length) : undefined
 }
 
 function argumentString(args: Record<string, unknown> | undefined, keys: readonly string[]): string {
@@ -544,21 +565,33 @@ export function getToolSummary(item: ToolTranscriptItem, cwd: string, labelClip:
   const label = toolDisplayName(item.name)
   const title = toolNativeTitle(item, presentation)
   const args = parseToolArguments(item.arguments)
-  let text: string
-  if (title !== undefined && title.trim() !== '') {
-    text = mergeNativeTitle(title, item.name)
-  } else {
-    const detail = fallbackSummary(item, args, cwd)
-    text = detail === '' ? label : `${label} ${detail}`
-  }
+  const detail = title !== undefined && title.trim() !== ''
+    ? nativeTitleDetail(title, item.name)
+    : fallbackSummary(item, args, cwd)
+  // The label is always painted once, as its own segment: `detail` is only the
+  // payload after it, never a re-composed string a renderer has to split again.
+  // `text` stays the exact same one-line wording for the group/collapsed rows.
+  const text = detail === '' ? label : `${label} ${detail}`
   const durationMs = isTerminalTool(item, presentation) && item.durationMs !== undefined && Number.isFinite(item.durationMs)
     ? item.durationMs
     : undefined
   return {
     label,
     text: clipText(text, labelClip),
+    detail: clipDetail(detail, label, labelClip),
     ...(durationMs === undefined ? {} : { durationMs }),
   }
+}
+
+/** Clip only the payload so the header keeps the complete display label. */
+function clipDetail(detail: string, label: string, labelClip: number): string {
+  if (detail === '' || !Number.isFinite(labelClip) || labelClip <= 0) return detail
+  // `text` is clipped as a whole (`label payload…`), so the payload keeps the
+  // remaining character budget instead of the label being cut in half.
+  const room = Math.max(0, labelClip - Array.from(label).length - 1)
+  const chars = Array.from(detail)
+  if (chars.length <= room) return detail
+  return room <= 0 ? '' : `${chars.slice(0, Math.max(1, room - 1)).join('')}…`
 }
 
 // ---------------------------------------------------------------------------

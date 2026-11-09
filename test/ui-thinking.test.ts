@@ -16,7 +16,9 @@ import {
   thinkingExpandedCount,
   thinkingExpansionKey,
 } from '../src/ui/thinking-block.ts'
-import { t } from '../src/ui/theme.ts'
+import { italic, t } from '../src/ui/theme.ts'
+import { sanitize, wrap } from '../src/ui/text.ts'
+import { ThinkingPreviewCache } from '../src/ui/thinking-preview-cache.ts'
 import { DEMO_TRANSCRIPT_CODEC } from '../src/demo.ts'
 
 // ---------------------------------------------------------------------------
@@ -1013,5 +1015,127 @@ test('a keyboard toggle fires the viewport anchor before the flip, like a click'
   assert.equal(view.toggleLatestThinking(), true)
   assert.equal(view.toggleLatestThinking(), true)
   assert.deepEqual(anchors, [{ expanding: true, expandedAt: false }, { expanding: false, expandedAt: true }])
+  clearThinkingExpansion()
+})
+
+// ---------------------------------------------------------------------------
+// ThinkingBlock on the preview/full-wrap cache
+
+/** The exact body rows the block must render for `text` at `width`. */
+function expectedBody(raw: string, width: number, previewLines: number, expanded: boolean): { summary: string; body: string[] } {
+  const text = sanitize(raw)
+  if (text.trim() === '') return { summary: '', body: [] }
+  const bodyWidth = Math.max(4, width - 2)
+  const wrapped = wrap(text.replace(/\s+$/, ''), bodyWidth)
+  const shown = expanded ? wrapped.length : Math.min(wrapped.length, Math.max(0, Math.floor(previewLines)))
+  const hidden = wrapped.length - shown
+  const rows = wrapped.slice(wrapped.length - shown).map(line => `  ${italic(t.subtle(line))}`)
+  return { summary: `hidden=${hidden} total=${wrapped.length}`, body: rows }
+}
+
+test('the block body matches the exact sanitize+wrap rows for every preview and width', () => {
+  clearThinkingExpansion()
+  const texts = [
+    THOUGHT,
+    words(60),
+    'x '.repeat(120).trim(),
+    'a\tb   c\n\nd   \n  e',
+    '思考 e\u0301 😀 漢字かなカナ 🧑🏽‍🚀 wrapping',
+    '\x1b[31mred\x1b[0m \x1b]0;title\x07 plain',
+    'one\u00a0two\u3000three',
+  ]
+  for (const raw of texts) {
+    for (const width of [12, 24, 40, 80]) {
+      for (const preview of [0, 1, 3, 5, 10]) {
+        const block = new ThinkingBlock({ itemId: 'differential' })
+        const lines = block.render({ runs: [{ text: raw }], width, previewLines: preview, screen: 'inline', toggleKey: '', rowOffset: 0 })
+        const expected = expectedBody(raw, width, preview, false)
+        assert.deepEqual(lines.slice(1), expected.body, `collapsed body for ${JSON.stringify(raw.slice(0, 16))} w=${width} p=${preview}`)
+        if (expected.summary !== '' && width >= 40) {
+          // Below this the summary row itself is width-truncated, so only the
+          // body rows carry the differential check.
+          const summary = plain([lines[0]!])
+          assert.match(summary, /✻ Thought/)
+          const hidden = Number(/· (\d+) more line/.exec(summary)?.[1] ?? 0)
+          assert.equal(`hidden=${hidden} total=${expected.summary.split('total=')[1]}`, expected.summary, `summary count for ${JSON.stringify(raw.slice(0, 16))} w=${width} p=${preview}`)
+        }
+      }
+      const block = new ThinkingBlock({ itemId: 'differential' })
+      const key = thinkingExpansionKey('differential', 0)
+      setThinkingExpanded(key, true)
+      const expanded = block.render({ runs: [{ text: raw }], width, previewLines: 3, screen: 'inline', toggleKey: '', rowOffset: 0 })
+      assert.deepEqual(expanded.slice(1), expectedBody(raw, width, 3, true).body, `expanded body for ${JSON.stringify(raw.slice(0, 16))} w=${width}`)
+      setThinkingExpanded(key, false)
+    }
+  }
+  clearThinkingExpansion()
+})
+
+test('appending to one block keeps exact rows and does not re-wrap the stable prefix', () => {
+  clearThinkingExpansion()
+  const counters = { wraps: 0, wrappedChars: 0, sanitizes: 0 }
+  const cache = new ThinkingPreviewCache({
+    wrap: (text, width) => { counters.wraps += 1; counters.wrappedChars += text.length; return wrap(text, width) },
+    sanitize: text => { counters.sanitizes += 1; return sanitize(text) },
+  })
+  const block = new ThinkingBlock({ itemId: 'streaming', previewCache: cache })
+  const prefix = Array.from({ length: 300 }, (_, line) => `reasoning line ${line} that wrapped once already`).join('\n')
+  let text = prefix
+  let wrapped = 0
+  let sanitized = 0
+  let coldChars = 0
+  for (let frame = 0; frame < 40; frame += 1) {
+    text += ` plus token${frame}`
+    const lines = block.render({ runs: [{ text }], width: 70, previewLines: 3, screen: 'inline', toggleKey: '', rowOffset: 0 })
+    if (frame === 0) {
+      wrapped = counters.wraps
+      sanitized = counters.sanitizes
+      coldChars = counters.wrappedChars
+    }
+    if (frame % 10 === 0) assert.deepEqual(lines.slice(1), expectedBody(text, 70, 3, false).body, `frame ${frame}`)
+    // Hover-only and timer-only repaints of the same source cost nothing.
+    block.render({ runs: [{ text }], width: 70, previewLines: 3, screen: 'inline', toggleKey: '', rowOffset: 0 })
+  }
+  assert.equal(counters.wraps - wrapped, 39, 'one restart wrap per append')
+  assert.equal(counters.sanitizes - sanitized, 39, 'only the appended chunk is sanitized')
+  assert.ok(counters.wrappedChars - coldChars < 4_000, `appends wrapped ${counters.wrappedChars - coldChars} chars`)
+  clearThinkingExpansion()
+})
+
+test('hover, clear and expansion keep the cached measurement', () => {
+  clearThinkingExpansion()
+  const counters = { wraps: 0, sanitizes: 0 }
+  const cache = new ThinkingPreviewCache({
+    wrap: (text, width) => { counters.wraps += 1; return wrap(text, width) },
+    sanitize: text => { counters.sanitizes += 1; return sanitize(text) },
+  })
+  const block = new ThinkingBlock({ itemId: 'hovered', previewCache: cache })
+  const runs = Object.freeze([Object.freeze({ text: THOUGHT })])
+  const input = { runs, width: 64, previewLines: 1, screen: 'fullscreen' as const, toggleKey: 'ctrl+g', rowOffset: 0 }
+  block.render(input)
+  block.sync()
+  const cold = { ...counters }
+  block.handleMouse({ type: 'move', button: 'none', x: 4, y: 0, screenX: 4, screenY: 0, width: 64, height: 10, shift: false, alt: false, ctrl: false })
+  block.render(input)
+  block.sync()
+  block.handleMouse({ type: 'move', button: 'none', x: 4, y: 6, screenX: 4, screenY: 6, width: 64, height: 10, shift: false, alt: false, ctrl: false })
+  block.clear()
+  block.render(input)
+  assert.deepEqual(counters, cold, 'hover, hitbox clear and repaints reuse the measurement')
+  // Expanding needs the full body once; collapsing back reuses the preview state.
+  const key = thinkingExpansionKey('hovered', 0)
+  setThinkingExpanded(key, true)
+  const expandedLines = block.render(input)
+  assert.deepEqual(expandedLines.slice(1), expectedBody(THOUGHT, 64, 1, true).body)
+  const afterExpand = { ...counters }
+  block.render(input)
+  assert.deepEqual(counters, afterExpand, 'an open, unchanged run is served from cache')
+  setThinkingExpanded(key, false)
+  block.render(input)
+  assert.deepEqual(counters, afterExpand, 'collapsing does not throw the measurement away')
+  // A width change does invalidate (and stays exact).
+  const narrow = block.render({ ...input, width: 30 })
+  assert.deepEqual(narrow.slice(1), expectedBody(THOUGHT, 30, 1, false).body)
+  assert.ok(counters.wraps > afterExpand.wraps)
   clearThinkingExpansion()
 })

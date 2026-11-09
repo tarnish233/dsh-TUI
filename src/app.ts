@@ -18,8 +18,12 @@ import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore, type S
 import { HistorySearch } from './history-search.ts'
 import { CcEditor, createCcKeymap, NativeAutocompleteProvider, type CcActionEvent, type CcDraftSnapshot, type CcKeymap, type CcKeymapConfig, type CcSubmitPayload } from './input/index.ts'
 import { leadingSkillGestureName, readSkillCatalog } from './skills.ts'
+import { NativeUiController } from './native-ui-controller.ts'
+import { readLocalFileInput } from './local-file.ts'
+import type { WorkingDirectoryRead } from './backend/native-inspection.ts'
+import { oneLine, sanitize } from './ui/text.ts'
 import { formatElapsed, formatOutputRate, formatOutputTokens, OutputTracker } from './state/output-stats.ts'
-import type { TodoItem } from './backend/types.ts'
+import type { TodosSnapshot } from './backend/types.ts'
 import { createGitStatsRefresher, readGitStats, type GitStats } from './state/git-stats.ts'
 import { TranscriptStore } from './state/transcript.ts'
 import { DecisionDialog, SelectDialog } from './ui/dialogs.ts'
@@ -37,11 +41,14 @@ import { ImageDetailsDialog } from './ui/image-details.ts'
 import { AgentsOverlay, type AgentsViewState } from './ui/agents-overlay.ts'
 import { ChildSessionView } from './ui/child-session-view.ts'
 import { SubagentProgress } from './ui/subagent-progress.ts'
+import { TodoBoard } from './ui/todo-board.ts'
+import { GoalProgress } from './ui/goal-progress.ts'
+import { StatusDockStack } from './ui/status-dock-stack.ts'
 import { subagentCanReply, subagentCanStop, subagentLabel } from './ui/subagent-format.ts'
 import { getTranscriptImages } from './ui/image-data.ts'
 import { resetImageDisplayCache } from './ui/image-cache.ts'
 import type { ImageDetailsRequest, ImageViewItem } from './ui/image-view.ts'
-import { displayContentParts, imageAttachmentValue, imageMediaTypeFromBytes } from './attachments.ts'
+import { asFileAttachmentRef, displayContentParts, imageAttachmentValue, imageMediaTypeFromBytes } from './attachments.ts'
 import { clearToolExpansion } from './ui/tool-expansion.ts'
 import { toolPreferences, type ToolDetailsRequest } from './ui/tool-view.ts'
 import { TranscriptView, transcriptHints, type TranscriptViewHints, type TranscriptViewOptionsShape } from './ui/transcript.ts'
@@ -120,6 +127,7 @@ function readQueueEntries(value: unknown): QueueEntry[] {
       text: typeof row.text === 'string' ? row.text : '',
       target: row.target === 'next-step' ? 'next-step' : 'next-turn',
       images,
+      ...(typeof row.files === 'number' && Number.isSafeInteger(row.files) && row.files >= 0 ? { files: row.files } : {}),
     })
   }
   return rows
@@ -131,7 +139,7 @@ function sameQueue(left: readonly QueueEntry[], right: readonly QueueEntry[]): b
     const a = left[index]
     const b = right[index]
     if (a === undefined || b === undefined) return false
-    if (a.messageId !== b.messageId || a.text !== b.text || a.target !== b.target || a.images !== b.images) return false
+    if (a.messageId !== b.messageId || a.text !== b.text || a.target !== b.target || a.images !== b.images || (a.files ?? 0) !== (b.files ?? 0)) return false
   }
   return true
 }
@@ -157,6 +165,14 @@ const UI_COMMANDS = [
   { name: 'reload', description: 'Reload TUI settings/keybindings and DSH configuration/plugins' },
   { name: 'exit', description: 'Exit' },
 ]
+const OPTIONAL_UI_COMMANDS = [
+  { name: 'jobs', description: 'Inspect native jobs and retained output', capability: 'native-jobs' },
+  { name: 'inspect', description: 'Read mounted native plugins and capabilities', capability: 'native-inventory' },
+  { name: 'questions', description: 'View and answer native continued questions', capability: 'continued-questions' },
+  { name: 'rename', description: 'Explicitly rename the current native session', capability: 'session-rename' },
+  { name: 'fork', description: 'Fork the durable native conversation and switch', capability: 'session-fork' },
+  { name: 'attach', description: 'Attach one local file through native DSH storage', capability: 'file-input', inputHint: '[local-path]' },
+] as const
 const UI_COMMAND_NAMES = new Set([...UI_COMMANDS.map(command => command.name), 'quit', 'config', 'clear'])
 
 class PromptEditor extends CcEditor {
@@ -239,6 +255,13 @@ interface UiContext {
   epoch: number
 }
 
+interface PresetPickerState {
+  readonly dialog: SelectDialog
+  readonly context: UiContext
+  readonly surface: number
+  catalog?: Record<string, unknown>
+}
+
 interface PendingDecision {
   sessionId: string
   /** Attachment observed when the native request arrived. */
@@ -260,7 +283,7 @@ interface DecisionDialogExtras {
 }
 
 /** A native dequeue transfer receipt held only until explicit editing succeeds. Never an execution queue. */
-interface QueuedImageRecovery {
+interface QueuedAttachmentRecovery {
   readonly text: string
   readonly messageId?: string
   readonly content: readonly DisplayContentPart[]
@@ -269,8 +292,12 @@ interface QueuedImageRecovery {
 export class App {
   readonly tui: TUI
   readonly store = new TranscriptStore()
+  /** Local exit intent after synchronous terminal restoration; native DSH owns the deadline. */
+  readonly exitRequested: Promise<number>
+  /** Quiescence of this App's owned cleanup, independent from the native exit request. */
   readonly exited: Promise<number>
   readonly keymap: CcKeymap
+  private resolveExitRequested!: (code: number) => void
   private resolveExit!: (code: number) => void
   private readonly options: AppOptions
   private readonly settings: SettingsStore
@@ -279,6 +306,8 @@ export class App {
   private readonly screen: 'inline' | 'fullscreen'
   /** Fullscreen transcript scroll host; the click-anchor freezes/restores it. */
   private scrollView: ScrollView | undefined
+  private hoverScrollTop: number | undefined
+  private terminalPointerActive = true
   /** ScrollTop captured when a disclosure click disabled follow; null when idle. */
   private anchoredScrollTop: number | null = null
   private readonly followHitboxes = new HitboxRegistry()
@@ -294,6 +323,12 @@ export class App {
   private readonly viewOptions: TranscriptViewOptionsShape
   private readonly transcript: TranscriptView
   private readonly subagentProgress: SubagentProgress
+  private readonly todoBoard: TodoBoard
+  private readonly goalProgress: GoalProgress
+  private readonly statusDockStack: StatusDockStack
+  private readonly nativeUi: NativeUiController
+  private nativeDirectory?: WorkingDirectoryRead
+  private fileAttachController?: AbortController
   private readonly prompt: Prompt
   private readonly welcome: WelcomeHeader
   private readonly slot = new Container()
@@ -357,7 +392,10 @@ export class App {
   private readonly decisions: PendingDecision[] = []
   private readonly activeCommands = new Map<string, string>()
   private nativeCommands: CommandCatalogEntry[] = []
-  private catalogRequest?: { sessionId: string; attachmentId: string | undefined; promise: Promise<void> }
+  private catalogRequest?: { sessionId: string; attachmentId: string | undefined; dirty: boolean; promise: Promise<void> }
+  private modelCatalogRequest?: { context: UiContext; dialog: ModelPickerDialog; surface: number; dirty: boolean; promise: Promise<void> }
+  private presetPicker?: PresetPickerState
+  private presetCatalogRequest?: { state: PresetPickerState; dirty: boolean; promise: Promise<void> }
   private autocomplete?: { editor: CcEditor; basePath: string; provider: NativeAutocompleteProvider }
   private skillCatalog?: SkillCatalogSnapshot
   private skillsDirty = true
@@ -381,7 +419,7 @@ export class App {
   /** Native sessionStats fold (turns/steps, rate, TTFT): `metrics` frames plus `state` baselines. */
   private stats?: { decodeTokens?: number; decodeMs?: number; ttftMs?: number; ttftSteps?: number; turns?: number; steps?: number }
   /** Latest native todos snapshot of the current session (null = cleared). */
-  private todos: TodoItem[] | null = null
+  private todos: TodosSnapshot = null
   /** Last seen native plan-mode state; toggles surface as notices. */
   private planActive: boolean | undefined
   /** Read-only git observations for the footer's second line. */
@@ -396,7 +434,7 @@ export class App {
   private queueRecallPending = false
   private queueReadController?: AbortController
   /** Ref-only retry receipts: bytes stay in DSH, and no message is automatically re-sent. */
-  private readonly queueImageRecoveries = new Map<string, readonly QueuedImageRecovery[]>()
+  private readonly queuedAttachmentRecoveries = new Map<string, readonly QueuedAttachmentRecovery[]>()
   private queued = 0
   private queueRows: QueueEntry[] = []
   private readonly queueRemovals = new Set<string>()
@@ -419,6 +457,7 @@ export class App {
   private readonly warnings: string[] = []
   private readonly signals: Array<[NodeJS.Signals, () => void]> = []
   private offInput?: () => void
+  private offTerminalFocus?: () => void
   private epoch = 0
   /** Increments on every applied SessionInfo; catches a ready event landing mid-command. */
   private infoStamp = 0
@@ -450,6 +489,7 @@ export class App {
     this.viewOptions = {
       ...toolPreferences(settings),
       groupSubagentMessages: settings.groupSubagentMessages,
+      suppressLiveTodos: true,
       showThinking: settings.showThinking, hints: this.viewHints(),
       thinkingPreviewLines: settings.thinkingPreviewLines,
       screen: this.screen,
@@ -473,9 +513,12 @@ export class App {
     this.welcome = new WelcomeHeader({ demo: options.demo })
     this.transcript = new TranscriptView(this.store, this.viewOptions)
     const app = this
+    this.todoBoard = new TodoBoard({
+      keymap: this.keymap, hint: () => true, trailingSeparator: false,
+    })
+    this.goalProgress = new GoalProgress()
     this.subagentProgress = new SubagentProgress({
-      keymap: this.keymap,
-      get maxRows() { return app.subagentProgressRowBudget() },
+      keymap: this.keymap, trailingSeparator: false,
       // Overlay close only asks Pi to repaint; sample the current owner rather
       // than keeping the last App.render() value blocked until another key.
       get mouseBlocked() { return app.closing || app.terminalPaused || app.dialog !== undefined || app.viewOptions.mouseBlocked === true },
@@ -483,7 +526,30 @@ export class App {
       onOpenChild: entry => { void this.openSubagentSession(entry.id) },
       onRenderRequest: () => this.render(),
     })
+    this.statusDockStack = new StatusDockStack({
+      todos: this.todoBoard, goal: this.goalProgress, agents: this.subagentProgress,
+      maxRows: () => this.statusDockPool(),
+      agentsEnabled: () => this.settings.get().showSubagentProgress,
+    })
+    this.nativeUi = new NativeUiController({
+      tui: this.tui, keymap: this.keymap, backend: options.backend,
+      info: () => this.info, capture: () => this.context(),
+      isCurrent: context => !this.closing && this.epoch === context.epoch && this.editor === context.editor &&
+        this.info?.sessionId === context.sessionId && this.info?.attachmentId === context.attachmentId,
+      dialog: () => this.dialog, show: dialog => this.showDialog(dialog), dismiss: () => this.dismissDialog(),
+      render: () => this.render(), report: (message, error) => this.store.report(message, error ? 'error' : 'info'),
+      interrupt: () => this.interrupt(), returnToSettings: () => this.returnToSettings(), settingsOpen: () => this.dialog instanceof SettingsDialog,
+      goal: value => { this.goalProgress.status = value }, directory: value => { this.nativeDirectory = value },
+      renamed: (sessionId, title) => {
+        if (this.info?.sessionId !== sessionId) return
+        this.info.title = title; this.sessionTitles.set(sessionId, title); this.render()
+      },
+      sessionCommand: (name, args) => this.runRemote(name, args, 'status-only'),
+    })
+    this.exitRequested = new Promise(resolve => { this.resolveExitRequested = resolve })
     this.exited = new Promise(resolve => { this.resolveExit = resolve })
+    this.terminalPointerActive = terminal.terminalFocused !== false
+    this.offTerminalFocus = terminal.onFocusChange?.(focused => this.handleTerminalFocus(focused))
   }
 
   get editor(): CcEditor { return this.prompt.editor }
@@ -524,6 +590,15 @@ export class App {
       this.info?.sessionId === context.sessionId &&
       this.info?.attachmentId === context.attachmentId &&
       this.editor === context.editor
+  }
+
+  /** Terminal focus is a pointer boundary, never an editor or native mode change. */
+  private handleTerminalFocus(focused: boolean): void {
+    if (this.closing || this.terminalRestored) return
+    this.terminalPointerActive = focused
+    if (!focused) this.transcript.releaseHover()
+    this.syncOverlayMouse()
+    this.render()
   }
 
   /**
@@ -613,12 +688,34 @@ export class App {
       handleMouse: event => this.followHitboxes.handleMouse(event),
       invalidate: () => this.followHitboxes.clear(),
     })
-    for (const item of [this.queueList, this.subagentProgress, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
+    for (const item of [this.queueList, this.statusDockStack, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
+    // Only TranscriptView sees pointer motion inside its own box. The parent
+    // releases that hover at the surrounding boundaries without clearing any
+    // press pin, drag, selection, disclosure or editor state.
+    const bottomMouse = this.bottom.handleMouse.bind(this.bottom)
+    this.bottom.handleMouse = event => {
+      this.transcript.releaseHover()
+      return bottomMouse(event)
+    }
     const document = new Container()
     document.addChild(this.welcome)
     // Keep the first conversation off the logo/identity block.
     document.addChild(new Spacer(1))
     document.addChild(this.transcript)
+    const documentMouse = document.handleMouse.bind(document)
+    document.handleMouse = event => {
+      if (event.y < this.welcome.render(event.width).length + 1) this.transcript.releaseHover()
+      return documentMouse(event)
+    }
+    const documentRender = document.render.bind(document)
+    document.render = width => {
+      const scrollTop = this.scrollView?.scrollTop
+      if (scrollTop !== this.hoverScrollTop) {
+        this.transcript.releaseHover()
+        this.hoverScrollTop = scrollTop
+      }
+      return documentRender(width)
+    }
     if (isViewportTUI(this.tui)) {
       this.scrollView = new ScrollView(document, { follow: 'end', primary: true })
       this.tui.setLayoutRoot(new VStack([
@@ -630,6 +727,11 @@ export class App {
     this.off = this.options.backend.onEvent(event => this.onEvent(event))
     this.offInput = this.tui.addInputListener(data => {
       const pasting = this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean } | undefined)?.isPasting === true
+      // Real ProcessTerminal notifies before Pi consumes focus reports. Only
+      // custom terminals without that public observer use this fallback.
+      if (!this.tui.terminal.onFocusChange && !pasting && (data === '\x1b[O' || data === '\x1b[I')) {
+        this.handleTerminalFocus(data === '\x1b[I')
+      }
       if (this.terminalIntegration.handleInput(data, pasting)) return { consume: true }
       return this.globalInput(data)
     })
@@ -682,8 +784,19 @@ export class App {
     this.render()
   }
 
+  private optionalUiCommands(): CommandCatalogEntry[] {
+    const capabilities = this.info?.capabilities ?? []
+    return OPTIONAL_UI_COMMANDS.filter(command =>
+      (capabilities.includes(command.capability) || (command.name === 'inspect' && capabilities.includes('native-tools'))) &&
+      !this.nativeCommands.some(native => native.name === command.name))
+  }
+
+  private isUiCommand(name: string): boolean {
+    return UI_COMMAND_NAMES.has(name) || this.optionalUiCommands().some(command => command.name === name)
+  }
+
   private commands(): CommandCatalogEntry[] {
-    const commands: CommandCatalogEntry[] = [...UI_COMMANDS]
+    const commands: CommandCatalogEntry[] = [...UI_COMMANDS, ...this.optionalUiCommands()]
     const names = new Set(commands.map(command => command.name))
     for (const command of this.nativeCommands) if (!names.has(command.name)) { commands.push(command); names.add(command.name) }
     return commands
@@ -700,6 +813,24 @@ export class App {
       skills: () => this.subagentReplyTarget === undefined && this.connected && this.skillCatalog?.available
         ? this.skillCatalog.entries : [],
       basePath,
+      ...(this.options.backend.listFileReferences === undefined ? {} : {
+        fileReferences: async (query: string, signal: AbortSignal) => {
+          // Native file-reference discovery is root-Agent scoped. Never call
+          // an unmounted capability or offer the root workspace while the same
+          // editor is addressing a child.
+          if (!this.info?.capabilities.includes('file-references') || this.subagentReplyTarget !== undefined) return []
+          const context = this.context()
+          try {
+            const candidates = await this.options.backend.listFileReferences!(query, signal)
+            return this.sameAttachment(context) && this.subagentReplyTarget === undefined ? candidates : []
+          } catch {
+            // DSH's candidate contract is intentionally quiet: an unavailable,
+            // cancelled or failed domain contributes no rows and never types a
+            // diagnostic into the prompt/transcript.
+            return []
+          }
+        },
+      }),
       refreshSkills: signal => {
         if (signal.aborted || this.subagentReplyTarget !== undefined) return Promise.resolve()
         this.rememberSkillAutocomplete(signal)
@@ -711,20 +842,22 @@ export class App {
   }
 
   private refreshCommands(force = false): Promise<void> {
+    if (this.closing) return Promise.resolve()
     const context = this.context()
     const sessionId = context.sessionId
     if (!sessionId || !this.info?.capabilities.includes('commands')) {
-      this.nativeCommands = []; this.updateAutocomplete(); return Promise.resolve()
+      this.catalogRequest = undefined
+      this.nativeCommands = []; this.updateAutocomplete(); this.updateHelpCatalog(); return Promise.resolve()
     }
     if (!force && this.catalogRequest?.sessionId === sessionId && this.catalogRequest.attachmentId === context.attachmentId) return this.catalogRequest.promise
     // Request identity also protects overlapping Help refreshes in the same
     // attachment: an older listing must not replace the newer native roster.
-    const request = { sessionId, attachmentId: context.attachmentId, promise: Promise.resolve() }
+    const request = { sessionId, attachmentId: context.attachmentId, dirty: false, promise: Promise.resolve() }
     this.catalogRequest = request
     request.promise = (async () => {
       try {
         const result = await this.options.backend.command('commands')
-        if (!this.sameContext(context) || this.catalogRequest !== request) return
+        if (!this.sameContext(context) || this.catalogRequest !== request || request.dirty) return
         this.nativeCommands = Array.isArray(result) ? result.flatMap(value => {
           const command = object(value)
           if (typeof command?.name !== 'string' || !command.name) return []
@@ -737,11 +870,20 @@ export class App {
           }]
         }) : []
         this.updateAutocomplete()
+        this.refreshSkillAutocomplete()
+        this.updateHelpCatalog()
+        this.render()
       } catch (error) {
-        if (this.sameContext(context) && this.catalogRequest === request) this.store.report('Could not read DSH commands: ' + errorText(error), 'error')
+        if (this.sameContext(context) && this.catalogRequest === request && !request.dirty) this.store.report('Could not read DSH commands: ' + errorText(error), 'error')
+      } finally {
+        if (this.catalogRequest === request) {
+          this.catalogRequest = undefined
+          // Many native registrations in one scope need only one trailing read.
+          // Await it so a Help caller never builds from the invalidated result.
+          if (request.dirty && this.sameContext(context)) await this.refreshCommands(true)
+        }
       }
     })()
-    void request.promise.finally(() => { if (this.catalogRequest === request) this.catalogRequest = undefined })
     return request.promise
   }
 
@@ -781,6 +923,7 @@ export class App {
         // the next actual menu query; never create an idle polling loop.
         this.skillsDirty = !snapshot.available || !snapshot.complete
         this.refreshSkillAutocomplete()
+        this.updateHelpCatalog()
         this.render()
       } catch (error) {
         if (this.skillsRequest === request && request.revision === this.skillRevision && this.sameAttachment(context)) {
@@ -823,19 +966,19 @@ export class App {
 
   private skillPromptCandidate(text: string): boolean {
     const name = leadingSkillGestureName(text)
-    return name !== undefined && !UI_COMMAND_NAMES.has(name) && this.connected &&
+    return name !== undefined && !this.isUiCommand(name) && this.connected &&
       this.info?.capabilities.includes('skills') === true
   }
 
   /** Native scope is consulted only after an explicit submission, so first-input commands win too. */
-  private async isSkillPrompt(text: string, context: UiContext, hasImages = false): Promise<boolean | undefined> {
+  private async isSkillPrompt(text: string, context: UiContext, hasAttachments = false): Promise<boolean | undefined> {
     const name = leadingSkillGestureName(text)
     if (name === undefined || !this.skillPromptCandidate(text)) return false
     if (this.info?.capabilities.includes('input-route')) {
       // The submission-time lookup may create the pending native scope. Do not
       // do that for an image when its native admission service is not mounted.
-      if (hasImages && !this.info.capabilities.includes('prompt-content')) {
-        throw new Error('This runtime has no native image prompt admission; your image draft was kept.')
+      if (hasAttachments && !this.info.capabilities.includes('prompt-content')) {
+        throw new Error('This runtime has no native attachment prompt admission; your draft was kept.')
       }
       const raw = object(await this.options.backend.command('input-route', { name }))
       if (!this.sameAttachment(context)) return undefined
@@ -853,13 +996,9 @@ export class App {
     return this.skillCatalog?.available === true && this.skillCatalog.entries.some(skill => skill.name === name)
   }
 
-  /** Read-only command discovery; Help never changes the prompt or runs a command. */
-  private async openHelp(): Promise<void> {
-    const context = this.context()
-    const surface = this.surfaceGeneration
-    await Promise.all([this.refreshCommands(true), this.refreshSkills(true)])
-    if (!this.sameContext(context) || surface !== this.surfaceGeneration) return
-    const localNames = new Set(UI_COMMANDS.map(command => command.name))
+  /** Display-only grouping of the current native metadata; never a command registry. */
+  private helpCatalog(): { commands: HelpCommand[]; customCommands: HelpCommand[]; skills: SkillCatalogSnapshot; note?: string } {
+    const localNames = new Set([...UI_COMMANDS, ...this.optionalUiCommands()].map(command => command.name))
     const commands: HelpCommand[] = []
     const customCommands: HelpCommand[] = []
     for (const command of this.commands()) {
@@ -870,12 +1009,27 @@ export class App {
         ? commands : customCommands
       group.push(command)
     }
-    this.showDialog(new HelpPanel(this.tui, {
-      commands, customCommands, keymap: this.keymap,
+    return {
+      commands, customCommands,
       // Missing capability must remain visible as unavailable, not silently
       // erase the section and leave the user unable to distinguish failures.
       skills: this.skillCatalog ?? { entries: [], available: false, complete: false },
       ...(customCommands.length ? { note: 'Custom commands includes plugin and unattributed native registrations.' } : {}),
+    }
+  }
+
+  private updateHelpCatalog(): void {
+    if (this.dialog instanceof HelpPanel) this.dialog.setCatalog(this.helpCatalog())
+  }
+
+  /** Read-only command discovery; Help never changes the prompt or runs a command. */
+  private async openHelp(): Promise<void> {
+    const context = this.context()
+    const surface = this.surfaceGeneration
+    await Promise.all([this.refreshCommands(true), this.refreshSkills(true)])
+    if (!this.sameContext(context) || surface !== this.surfaceGeneration) return
+    this.showDialog(new HelpPanel(this.tui, {
+      ...this.helpCatalog(), keymap: this.keymap,
       onClose: () => { this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { if (this.isBusy) void this.interrupt(); else { this.dismissDialog(); this.returnToSettings() } },
     }))
@@ -988,7 +1142,7 @@ export class App {
   private imageDetailsItems(): ImageViewItem[] {
     return [
       ...getTranscriptImages(this.store.items),
-      ...(this.queueImageRecoveries.get(this.info?.sessionId ?? '') ?? []).flatMap((message, index) =>
+      ...(this.queuedAttachmentRecoveries.get(this.info?.sessionId ?? '') ?? []).flatMap((message, index) =>
         message.content.flatMap((part, partIndex) => part.type === 'image' ? [{
           key: `queued:${this.info?.sessionId}:${message.messageId ?? index}:image-${partIndex}`,
           label: `Retrieved queued image ${index + 1}`,
@@ -1099,7 +1253,7 @@ export class App {
   // ------------------------------------------------------------- subagents
 
   private syncOverlayMouse(): void {
-    this.viewOptions.mouseBlocked = this.dialogOverlay !== undefined || this.toolDetailsOverlay !== undefined ||
+    this.viewOptions.mouseBlocked = !this.terminalPointerActive || this.dialogOverlay !== undefined || this.toolDetailsOverlay !== undefined ||
       this.imageDetailsOverlay !== undefined || this.agentsOverlay !== undefined ||
       this.childSessionOverlay !== undefined
   }
@@ -1177,6 +1331,7 @@ export class App {
     if (codec !== undefined) childStore.setCodec(codec)
     const view = new TranscriptView(childStore, {
       ...this.viewOptions,
+      suppressLiveTodos: false,
       mouseBlocked: false,
       onToolDetails: undefined,
       onImageDetails: undefined,
@@ -1500,9 +1655,11 @@ export class App {
       clearToolExpansion()
       this.anchoredScrollTop = null
       this.followHitboxes.clear()
-      this.subagentProgress.invalidate()
+      this.statusDockStack.invalidate()
       // Invalidate every asynchronous UI operation bound to the old attachment.
       this.epoch += 1
+      this.nativeUi.reset()
+      this.fileAttachController?.abort(); this.fileAttachController = undefined
       this.queueRequest = undefined
       this.queued = 0
       this.queueRows = []
@@ -1513,6 +1670,8 @@ export class App {
       this.nextPreset = undefined
       this.decisions.length = 0; this.activeCommands.clear(); this.nativeCommands = []
       this.todos = null
+      this.todoBoard.todos = null; this.todoBoard.visible = true
+      this.goalProgress.status = undefined
       this.planActive = undefined
       if (replacedSession) {
         const oldDialog = this.dialog
@@ -1547,6 +1706,7 @@ export class App {
       this.editor.ccRefreshAutocomplete()
     }
     void this.refreshSkills()
+    this.nativeUi.attached()
     this.render()
   }
 
@@ -1562,19 +1722,21 @@ export class App {
     this.store.report(active ? 'Plan mode is active.' : 'Plan mode is off.')
   }
 
-  /** Ctrl+T: the current native todos checklist (projection-backed). */
-  private showTodos(): void {
-    if (this.todos === null || this.todos.length === 0) {
-      this.store.report('No todos in this session yet.')
-      return
-    }
-    this.store.report(this.todos.map((item, index) =>
-      `${index + 1}. [${item.status === 'completed' ? 'x' : item.status === 'in_progress' ? '~' : ' '}] ${item.content}`).join('\n'))
+  /** CC Ctrl+T: toggle the live dock, never append a checklist to history. */
+  private toggleTodos(): void {
+    this.todoBoard.todos = this.todos
+    // Empty and retired all-completed trays have no visible toggle effect.
+    if (this.todoBoard.counts.total === 0 || !this.todoBoard.hasOpenItems) return
+    this.todoBoard.toggle()
+    this.render()
   }
 
   private onEvent(event: BackendEvent): void {
     if (this.closing) return
     if (event.type === 'ready') { this.applyInfo(event.info); this.terminalIntegration.observe(event); return }
+    if (event.type === 'native_ui_changed') { this.nativeUi.invalidate(event); return }
+    if (event.type === 'todos' && (event.sessionId !== this.info?.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId))) return
     if (event.type === 'title') {
       const info = this.info
       if (info === undefined || event.sessionId !== info.sessionId ||
@@ -1583,6 +1745,47 @@ export class App {
       this.sessionTitles.set(event.sessionId, event.value)
       if (this.dialog instanceof SessionPickerDialog) this.dialog.setTitles(new Map([[event.sessionId, event.value]]))
       this.render()
+      return
+    }
+    if (event.type === 'model_route') {
+      const info = this.info
+      if (info === undefined || event.sessionId !== info.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== info.attachmentId)) return
+      if (info.provider !== event.provider || info.model !== event.model || info.reasoningEffort !== event.reasoningEffort) this.infoStamp += 1
+      info.provider = event.provider; info.model = event.model
+      if (event.reasoningEffort === undefined) delete info.reasoningEffort
+      else info.reasoningEffort = event.reasoningEffort
+      if (this.dialog instanceof ModelPickerDialog) this.dialog.setCurrentRoute(event.provider, event.model)
+      this.render()
+      return
+    }
+    if (event.type === 'presets_changed') {
+      if (event.sessionId !== this.info?.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId)) return
+      const state = this.presetPicker
+      if (state === undefined || this.dialog !== state.dialog || !this.sameAttachment(state.context)) return
+      const request = this.presetCatalogRequest
+      if (request?.state === state) request.dirty = true
+      else void this.refreshPresetPicker(state)
+      return
+    }
+    if (event.type === 'models_changed') {
+      if (event.sessionId !== this.info?.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId)) return
+      const dialog = this.dialog
+      if (!(dialog instanceof ModelPickerDialog)) return
+      const request = this.modelCatalogRequest
+      if (request?.dialog === dialog && this.sameContext(request.context)) request.dirty = true
+      else void this.refreshModelPicker(dialog)
+      return
+    }
+    if (event.type === 'commands_changed') {
+      if (event.sessionId !== this.info?.sessionId ||
+        (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId)) return
+      if (this.editor.isShowingAutocomplete() && this.skillAutocompletePrefix()) this.rememberSkillAutocomplete()
+      const request = this.catalogRequest
+      if (request?.sessionId === event.sessionId && request.attachmentId === this.info?.attachmentId) request.dirty = true
+      else void this.refreshCommands(true)
       return
     }
     if (event.type === 'skills_changed') {
@@ -1619,9 +1822,9 @@ export class App {
     } else if (event.type === 'permissions' && this.info) {
       this.info.permissions = event.value
     } else if (event.type === 'todos') {
-      // The native todos projection drives the live checklist block; the
-      // tracked snapshot backs the Ctrl+T summary.
+      // Replace the current native snapshot; no checklist is appended to history.
       this.todos = event.value
+      this.todoBoard.todos = event.value
     } else if (event.type === 'plan') {
       this.applyPlanSnapshot(event.value)
     } else if (event.type === 'metrics') {
@@ -1791,18 +1994,25 @@ export class App {
   }
 
   /**
-   * Keep the progress widget above the one Editor, never in the transcript's
-   * scroll host. The getter is sampled by the component on every paint, so a
-   * resize or a growing multiline draft cannot leave an old height budget.
-   * Reserve the actual sibling heights and four visible transcript lines;
-   * a short terminal falls back to a header or hides the widget altogether.
+   * One adaptive pool for every status dock, not three competing height caps.
+   * Keep the usual four transcript rows when possible; a short terminal may
+   * borrow down to one so each actually visible dock retains a compact row.
+   * The one editor, queue, hints and footer always keep their measured height.
    */
-  private subagentProgressRowBudget(): number {
-    if (!this.settings.get().showSubagentProgress) return 0
+  private statusDockPool(): number {
     const width = Math.max(1, this.tui.terminal.columns)
-    const siblings = 1 + this.queueList.render(width).length + this.slot.render(width).length +
+    const rows = this.tui.terminal.rows
+    const chrome = 1 + this.queueList.render(width).length + this.slot.render(width).length +
       this.hint.render(width).length + this.footer.render(width).length
-    return Math.max(0, Math.min(8, Math.floor(this.tui.terminal.rows / 3), this.tui.terminal.rows - siblings - 4))
+    const preferred = Math.max(0, Math.min(15, Math.floor(rows / 2), rows - chrome - 4))
+    const available = Math.max(0, rows - chrome - 1)
+    return Math.min(available, Math.max(preferred, this.statusDockMinimumRows()))
+  }
+
+  /** Presence comes from the same pure component facts used by the shared stack. */
+  private statusDockMinimumRows(): number {
+    return this.todoBoard.compactRows + this.goalProgress.compactRows +
+      (this.settings.get().showSubagentProgress ? this.subagentProgress.compactRows : 0)
   }
 
   private render(): void {
@@ -1813,6 +2023,8 @@ export class App {
     this.syncSubagentReplyTarget()
     this.syncSpinner()
     const spinner = WORKING_SPINNER_FRAMES[this.settings.get().reducedMotion ? 0 : this.spinnerStep % WORKING_SPINNER_FRAMES.length]!
+    this.todoBoard.todos = this.todos
+    this.todoBoard.spinnerFrame = spinner
     const command = this.activeCommands.values().next().value
     this.queueList.rows = this.queueRows
     this.queueList.editingId = this.editingQueueId
@@ -1827,6 +2039,7 @@ export class App {
         (rootWorking === '' ? '' : dim(' · root ') + rootWorking))
     const hint = this.exitArm ? 'Press the same exit key again to exit'
       : this.clipboardPending ? 'Pasting…'
+      : this.fileAttachController !== undefined ? 'Attaching local file…'
       : this.chordHint ? this.chordHint.join(' ') + ' …'
       : this.decisionId ? 'Decision · Ctrl+P/N navigate · Enter choose · Esc ' + (this.decisions.find(decision => decision.request.id === this.decisionId)?.request.kind === 'question' ? 'cancel' : 'reject')
       : this.editingQueueId ? 'Editing queued message · Enter saves · Esc leaves the edit'
@@ -1892,6 +2105,10 @@ export class App {
     let place = t.accent(this.info?.cwd ?? this.options.cwd)
     // The permission value rides directly behind the path; the git chip
     // follows it (the user's requested order).
+    const directory = this.nativeDirectory
+    if (directory?.available === true && typeof directory.effectiveCwd === 'string' && directory.effectiveCwd !== (this.info?.cwd ?? this.options.cwd)) {
+      place += dim(' · effective: ') + t.accent(oneLine(sanitize(directory.effectiveCwd), 180))
+    }
     if (this.info?.permissions?.currentValue !== undefined && this.info.permissions.currentValue !== '') {
       place += dim(' · ') + t.subtle(this.info.permissions.currentValue)
     }
@@ -1915,12 +2132,14 @@ export class App {
       this.store.report('Resolve the pending DSH decision before opening another dialog.')
       return
     }
+    this.transcript.releaseHover()
     this.closeImageDetails()
     this.closeToolDetails()
     this.closeSubagentSurfaces()
     this.surfaceGeneration += 1
     this.dialogOverlay?.hide(); this.dialogOverlay = undefined
     if (this.dialog && this.dialog !== dialog) disposeComponent(this.dialog)
+    if (this.presetPicker?.dialog !== dialog) { this.presetPicker = undefined; this.presetCatalogRequest = undefined }
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialog = dialog
     // The one composer stays mounted and untouched behind the modal. Only the
@@ -1936,6 +2155,7 @@ export class App {
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialogOverlay?.hide(); this.dialogOverlay = undefined
     this.dialog = undefined; this.decisionId = undefined
+    this.presetPicker = undefined; this.presetCatalogRequest = undefined
     this.slot.clear(); this.slot.addChild(this.prompt)
     this.syncOverlayMouse()
     this.tui.setFocus(this.prompt)
@@ -2053,7 +2273,7 @@ export class App {
     const up = this.bound(data, 'editor.move.line-up') || this.bound(data, 'editor.history.previous')
     const down = this.bound(data, 'editor.move.line-down') || this.bound(data, 'editor.history.next')
     if (this.editingQueueId) return false
-    if (up && (this.busy || this.queued > 0 || this.queueImageRecoveries.has(this.info?.sessionId ?? '')) && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
+    if (up && (this.busy || this.queued > 0 || this.queuedAttachmentRecoveries.has(this.info?.sessionId ?? '')) && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
       if (!this.queueRecallPending) void this.recallQueue(data)
       return true
     }
@@ -2080,12 +2300,12 @@ export class App {
     const controller = new AbortController()
     this.queueReadController = controller
     try {
-      const recovery = sessionId === undefined ? undefined : this.queueImageRecoveries.get(sessionId)
-      if (recovery === undefined && this.queueImageRecoveries.size >= 8) {
-        throw new Error('Too many retrieved image drafts are waiting for editing. Restore one of those sessions first; the native queue was left untouched.')
+      const recovery = sessionId === undefined ? undefined : this.queuedAttachmentRecoveries.get(sessionId)
+      if (recovery === undefined && this.queuedAttachmentRecoveries.size >= 8) {
+        throw new Error('Too many retrieved attachment drafts are waiting for editing. Restore one of those sessions first; the native queue was left untouched.')
       }
       const result = recovery ?? await this.options.backend.command('dequeue', { sessionId, attachmentId })
-      const messages: QueuedImageRecovery[] = Array.isArray(result) ? result.flatMap(value => {
+      const messages: QueuedAttachmentRecovery[] = Array.isArray(result) ? result.flatMap(value => {
         if (typeof value === 'string') return [{ text: value, content: [] }]
         const message = object(value)
         if (message === undefined) return []
@@ -2094,24 +2314,24 @@ export class App {
         return [{ text, content, ...(typeof message.messageId === 'string' ? { messageId: message.messageId } : {}) }]
       }) : []
       const texts = messages.map(message => message.text)
-      const hasImages = messages.some(message => message.content.some(part => part.type === 'image'))
+      const hasAttachments = messages.some(message => message.content.some(part => part.type !== 'text'))
       // A dequeue already transferred these messages. Retain native refs on read
       // failure, cancellation or a competing draft; never fall back to image-less text.
-      if (hasImages && sessionId !== undefined) this.queueImageRecoveries.set(sessionId, messages)
+      if (hasAttachments && sessionId !== undefined) this.queuedAttachmentRecoveries.set(sessionId, messages)
       if (!this.sameContext(context)) {
-        if (!hasImages) for (const text of texts) void history.add(text).catch(() => {})
+        if (!hasAttachments) for (const text of texts) void history.add(text).catch(() => {})
         return
       }
       const draftChanged = () => editor.getText() !== before.lines.join('\n') || editor.isPasting() || this.keymap.isPendingChord()
       if (draftChanged()) {
-        if (!hasImages) for (const text of texts) { editor.addToHistory(text); void history.add(text).catch(() => {}) }
-        if (messages.length) this.store.report(hasImages
-          ? 'Retrieved image inputs were kept for editing. Stash your new draft, then press Up on the empty prompt to retry.'
+        if (!hasAttachments) for (const text of texts) { editor.addToHistory(text); void history.add(text).catch(() => {}) }
+        if (messages.length) this.store.report(hasAttachments
+          ? 'Retrieved attachment inputs were kept for editing. Stash your new draft, then press Up on the empty prompt to retry.'
           : 'Retrieved queued inputs were kept in recall history; your new draft was not replaced.')
         return
       }
       if (!messages.length) { editor.handleInput(key); return }
-      if (!hasImages) {
+      if (!hasAttachments) {
         this.updatingDraft = true
         try { editor.replaceDraftText(texts.join('\n\n')) } finally { this.updatingDraft = false }
       } else {
@@ -2120,18 +2340,21 @@ export class App {
           if (index > 0) parts.push({ type: 'text', text: '\n\n' })
           for (const part of message.content.length ? message.content : [{ type: 'text' as const, text: message.text }]) {
             if (part.type === 'text') parts.push(part)
-            else {
+            else if (part.type === 'image') {
               const read = this.options.backend.readImage
               if (read === undefined) throw new Error('Image reads are unavailable; the retrieved native references were kept. Press Up to retry after restoring the backend.')
               const value = imageAttachmentValue(await read.call(this.options.backend, part.attachment, controller.signal), part.attachment)
               if (controller.signal.aborted || !this.sameContext(context)) return
               parts.push({ type: 'image', mediaType: value.attachment.mediaType, data: value.data,
                 ...(value.attachment.name === undefined ? {} : { name: value.attachment.name }) })
+            } else if (part.type === 'file') {
+              // Already durable native refs are ready admission parts; no byte re-read.
+              parts.push(part)
             }
           }
         }
         if (controller.signal.aborted || !this.sameContext(context) || draftChanged()) {
-          if (this.sameContext(context)) this.store.report('Retrieved image inputs were kept for editing; your newer draft was not replaced.')
+          if (this.sameContext(context)) this.store.report('Retrieved attachment inputs were kept for editing; your newer draft was not replaced.')
           return
         }
         this.updatingDraft = true
@@ -2139,13 +2362,14 @@ export class App {
           editor.replaceDraftText('')
           for (const part of parts) {
             if (part.type === 'image') editor.insertImage(part)
+            else if (part.type === 'file') editor.insertFile(part)
             else editor.insertTextAtCursor(part.text)
           }
         } catch (error) {
           editor.restoreDraft(before)
           throw error
         } finally { this.updatingDraft = false }
-        if (sessionId !== undefined) this.queueImageRecoveries.delete(sessionId)
+        if (sessionId !== undefined) this.queuedAttachmentRecoveries.delete(sessionId)
       }
       this.restored = { text: editor.getExpandedText(), before }
     } catch (error) {
@@ -2260,7 +2484,7 @@ export class App {
         if (!event.empty && !this.editor.disableSubmit) { this.nextSendMode = 'followup'; this.editor.ccSubmit() }
         break
       case 'app.suspend': this.suspend(); break
-      case 'app.todo': this.showTodos(); break
+      case 'app.todo': this.toggleTodos(); break
       case 'app.help': void this.slash('/help'); break
       default: this.store.report('Action is not yet integrated: ' + event.id); break
     }
@@ -2290,18 +2514,18 @@ export class App {
   }
 
   async submit(text: string, mode: 'followup' | 'steer' | 'send-now' = 'followup', payload?: CcSubmitPayload): Promise<void> {
-    const hasImages = payload?.content.some(part => part.type === 'image') === true
-    if ((!text.trim() && !hasImages) || this.closing) return
+    const hasAttachments = payload?.content.some(part => part.type !== 'text') === true
+    if ((!text.trim() && !hasAttachments) || this.closing) return
     const context = this.context(), editor = context.editor, history = this.history
     const draftBeforeSend = editor.getText()
     const restore = () => {
       // A native failure never overwrites a newer draft or a replacement attachment/editor.
-      if (!this.sameContext(context) || editor.getText() !== draftBeforeSend) return
+      if (!this.sameAttachment(context) || editor.getText() !== draftBeforeSend) return
       if (payload !== undefined) editor.restoreDraft(payload.snapshot)
       else editor.replaceDraftText(text)
     }
-    if (this.clipboardPending) {
-      restore(); this.store.report('Wait for the clipboard paste to finish; your draft was kept.'); return
+    if (this.clipboardPending || this.fileAttachController !== undefined) {
+      restore(); this.store.report('Wait for the attachment input to finish; your draft was kept.'); return
     }
     const replyTarget = this.subagentReplyTarget
     if (replyTarget !== undefined) {
@@ -2322,7 +2546,7 @@ export class App {
       }
       const requestId = randomUUID()
       const delivery = mode === 'steer' ? 'steer' : 'queue'
-      const content: readonly PromptContentPart[] = hasImages
+      const content: readonly PromptContentPart[] = hasAttachments
         ? payload!.content
         : [{ type: 'text', text }]
       try {
@@ -2351,7 +2575,7 @@ export class App {
       return
     }
     const editingId = this.editingQueueId
-    if (editingId !== undefined && mode === 'followup' && !hasImages) {
+    if (editingId !== undefined && mode === 'followup' && !hasAttachments) {
       try {
         await this.options.backend.command('queue-replace', { messageId: editingId, text })
         if (this.sameContext(context)) {
@@ -2372,7 +2596,7 @@ export class App {
       // first native await; menu discovery must not delay /model or /settings.
       if (this.skillPromptCandidate(text)) {
         try {
-          skillPrompt = await this.isSkillPrompt(text, context, hasImages)
+          skillPrompt = await this.isSkillPrompt(text, context, hasAttachments)
         } catch (error) {
           restore()
           if (this.sameAttachment(context)) this.store.report('Input not accepted: ' + errorText(error), 'error')
@@ -2382,8 +2606,19 @@ export class App {
       }
       if (skillPrompt === undefined || !this.sameAttachment(context)) { restore(); return }
       if (!skillPrompt) {
-        if (hasImages) {
-          restore(); this.store.report('Image attachments cannot be passed to a slash command. Remove them or send a normal prompt.', 'error'); return
+        if (hasAttachments) {
+          const name = /^\/([^\s]+)/.exec(text)?.[1]?.toLowerCase() ?? ''
+          if (this.isUiCommand(name)) {
+            restore(); this.store.report('This TUI action does not accept prompt attachments; your draft was kept.', 'error'); return
+          }
+          if (!this.info?.capabilities.includes('execute')) {
+            restore(); this.store.report('Native command attachment execution is unavailable; your draft was kept.', 'error'); return
+          }
+          // Native execute owns descriptor restrictions and image admission (not model vision).
+          const attachments = payload!.content.filter(part => part.type !== 'text')
+          const result = object(await this.runRemote('execute', { line: text, attachments }))
+          if (result?.attachmentOutcome !== 'success') restore()
+          this.render(); return
         }
         await this.slash(text); return
       }
@@ -2392,7 +2627,7 @@ export class App {
     if (mode === 'send-now') {
       let accepted = false
       try {
-        const args: Record<string, unknown> = hasImages ? { content: payload!.content } : { text }
+        const args: Record<string, unknown> = hasAttachments ? { content: payload!.content } : { text }
         if (editingId !== undefined) args.messageId = editingId
         await this.options.backend.command('queue-send-now', args)
         accepted = true
@@ -2414,9 +2649,9 @@ export class App {
     }
     if (!this.connected) { restore(); this.store.report('DSH is disconnected. Check the error above, then restart.', 'error'); return }
     try {
-      if (hasImages) {
+      if (hasAttachments) {
         const sendContent = this.options.backend.sendContent
-        if (sendContent === undefined) throw new Error('This backend does not support native image prompt admission. Your image draft was kept.')
+        if (sendContent === undefined) throw new Error('This backend does not support native attachment prompt admission. Your draft was kept.')
         await sendContent.call(this.options.backend, payload!.content, mode)
       } else await this.options.backend.send(text, mode)
     } catch (error) {
@@ -2425,7 +2660,7 @@ export class App {
       this.render(); return
     }
     if (this.sameContext(context)) { editor.addToHistory(text); this.restored = undefined }
-    // Recall metadata remains text-only; image bytes belong to DSH and the editor's in-memory registry.
+    // Recall history is text-only; native file refs and encoded draft images stay in the one editor/DSH stores.
     void history.add(text).catch(error => { if (!this.closing) this.store.report('Prompt accepted, but recall history was not saved: ' + errorText(error), 'error') })
     this.refreshQueue()
     this.render()
@@ -2434,8 +2669,8 @@ export class App {
   private editQueued(messageId: string): void {
     const row = this.queueRows.find(item => item.messageId === messageId)
     if (row === undefined) return
-    if (row.images > 0) {
-      this.store.report('Recover image references with Up on an empty prompt before editing this native queued message.')
+    if (row.images > 0 || (row.files ?? 0) > 0) {
+      this.store.report('Recover attachment references with Up on an empty prompt before editing this native queued message.')
       return
     }
     this.editingQueueId = messageId
@@ -2506,6 +2741,7 @@ export class App {
 
   async interrupt(options?: { drain?: boolean }): Promise<void> {
     this.clipboardGeneration += 1; this.clipboardPending = false
+    this.fileAttachController?.abort(); this.fileAttachController = undefined
     this.queueReadController?.abort(); this.queueReadController = undefined
     this.closeImageDetails()
     this.closeToolDetails()
@@ -2537,6 +2773,14 @@ export class App {
     if (name === 'reload') { await this.reloadRuntime(); return }
     if (name === 'settings' || name === 'config') { this.openSettings(); return }
     if (name === 'agent') { this.openAgentsOverlay(); return }
+    if (this.optionalUiCommands().some(command => command.name === name)) {
+      if (name === 'jobs') { this.nativeUi.openJobs(); return }
+      if (name === 'inspect') { this.nativeUi.openInventory(); return }
+      if (name === 'questions') { this.nativeUi.openQuestions(); return }
+      if (name === 'rename') { if (argument) this.nativeUi.renameTo(argument); else this.nativeUi.openRename(); return }
+      if (name === 'fork') { if (argument) this.store.report('Use /fork without arguments to confirm the current native durable boundary.', 'error'); else this.nativeUi.openFork(); return }
+      if (name === 'attach') { await this.attachLocalFile(argument); return }
+    }
     if (name === 'model') { if (argument) await this.runRemote('model', { id: argument }); else await this.pick('models'); return }
     if (name === 'effort') { await this.effortCommand(argument); return }
     if (name === 'preset') { await this.presetCommand(argument); return }
@@ -2570,7 +2814,7 @@ export class App {
     const stamp = this.infoStamp
     try {
       const result = await this.options.backend.command(name, args)
-      const routeChanging = ['new', 'resume', 'model', 'effort', 'preset'].includes(name)
+      const routeChanging = ['new', 'resume', 'model', 'effort', 'preset', 'session-fork'].includes(name)
       if (!(routeChanging ? this.sameAttachment(context) : this.sameContext(context))) return result
       if (this.closing) return result
       // A `ready` event that landed while this request was in flight is DSH's
@@ -2598,7 +2842,8 @@ export class App {
           }
         } else if (result !== undefined) this.store.report('Invalid native command outcome.', 'error')
       } else if (result !== undefined && !['state', 'models', 'sessions', 'titles', 'commands', 'presets', 'efforts', 'auto-title'].includes(name)) this.store.report(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
-      if ((name === 'model' || name === 'effort') && !eventApplied) {
+      if ((name === 'model' || name === 'effort') && (!eventApplied ||
+          (info?.provider === this.info?.provider && info?.model === this.info?.model))) {
         // Confirmed native setter acknowledgements are status metadata, not
         // transcript output. Disk-flush uncertainty remains in the response;
         // failed/unavailable/unclassified warnings and other notes stay visible.
@@ -2707,7 +2952,7 @@ export class App {
         const created = typeof item.createdAt === 'number' ? item.createdAt : undefined
         return [{
           id,
-          ...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
+          ...(typeof item.title === 'string' || item.title === null ? { title: item.title } : {}),
           cwd: typeof item.cwd === 'string' ? item.cwd : '',
           // Native header creation time is display-only. The backend preserves
           // sessionQuery's order; neither layer stats artifacts or re-sorts.
@@ -2726,7 +2971,7 @@ export class App {
 
   /**
    * Phase 2: titles for the visible rows only. Coalesced and deduplicated;
-   * enrichment failures leave `(untitled)` rows usable and never surface as
+   * enrichment failures leave `(title unknown)` rows usable and never surface as
    * conversation errors.
    */
   private fetchSessionTitles(dialog: SessionPickerDialog, ids: string[]): void {
@@ -2766,8 +3011,10 @@ export class App {
       const update = new Map<string, string | null>()
       for (const value of result) {
         const item = object(value)
-        if (item === undefined || typeof item.sessionId !== 'string') continue
-        const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : null
+        if (item === undefined || typeof item.sessionId !== 'string' || !ids.includes(item.sessionId)) continue
+        // Unknown/unavailable enrichment must not become a cached no-title fact.
+        if (typeof item.title !== 'string' && item.title !== null) continue
+        const title = item.title
         this.sessionTitles.set(item.sessionId, title)
         update.set(item.sessionId, title)
       }
@@ -2791,24 +3038,54 @@ export class App {
       onInterrupt: () => { if (this.isBusy) void this.interrupt(); else { this.dismissDialog(); this.returnToSettings() } },
     })
     this.showDialog(dialog)
+    await this.refreshModelPicker(dialog)
+  }
+
+  /** Native metadata invalidation refreshes only the current model surface, never opens one. */
+  private refreshModelPicker(dialog: ModelPickerDialog): Promise<void> {
+    if (this.closing || this.dialog !== dialog) return Promise.resolve()
+    const context = this.context()
     const surface = this.surfaceGeneration
-    const result = await this.runRemote('models')
-    if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
-    if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
-    if (!Array.isArray(result)) { dialog.setError('Could not load native models. Close and reopen to try again.'); return }
-    const models: ModelPickerItem[] = result.flatMap(value => {
-      const item = object(value)
-      if (!item || typeof item.id !== 'string' || !item.id || typeof item.provider !== 'string' || !item.provider || typeof item.model !== 'string' || !item.model) return []
-      return [{
-        id: item.id, provider: item.provider, model: item.model,
-        label: typeof item.label === 'string' && item.label ? item.label : item.model,
-        ...(typeof item.description === 'string' ? { description: item.description } : {}),
-        ...(typeof item.isDefault === 'boolean' ? { isDefault: item.isDefault } : {}),
-      }]
-    })
-    dialog.setModels(models)
-    dialog.setLoading(false)
-    this.render()
+    const existing = this.modelCatalogRequest
+    if (existing?.dialog === dialog && existing.surface === surface && this.sameContext(existing.context)) return existing.promise
+    const request = { context, dialog, surface, dirty: false, promise: Promise.resolve() }
+    this.modelCatalogRequest = request
+    request.promise = (async () => {
+      try {
+        const result = await this.runRemote('models')
+        if (this.modelCatalogRequest !== request || this.dialog !== dialog || surface !== this.surfaceGeneration) return
+        if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
+        if (request.dirty) return
+        if (!Array.isArray(result)) {
+          dialog.setError('Could not load native models. Close and reopen to try again.')
+          dialog.setLoading(false)
+          this.render()
+          return
+        }
+        const models: ModelPickerItem[] = result.flatMap(value => {
+          const item = object(value)
+          if (!item || typeof item.id !== 'string' || !item.id || typeof item.provider !== 'string' || !item.provider || typeof item.model !== 'string' || !item.model) return []
+          return [{
+            id: item.id, provider: item.provider, model: item.model,
+            label: typeof item.label === 'string' && item.label ? item.label : item.model,
+            ...(typeof item.description === 'string' ? { description: item.description } : {}),
+            ...(typeof item.isDefault === 'boolean' ? { isDefault: item.isDefault } : {}),
+          }]
+        })
+        dialog.setError(undefined)
+        dialog.setModels(models)
+        dialog.setLoading(false)
+        this.render()
+      } finally {
+        if (this.modelCatalogRequest === request) {
+          this.modelCatalogRequest = undefined
+          if (request.dirty && this.dialog === dialog && surface === this.surfaceGeneration && this.sameContext(context)) {
+            await this.refreshModelPicker(dialog)
+          }
+        }
+      }
+    })()
+    return request.promise
   }
 
   /** Read the native preset roster without using generic command-result rendering. */
@@ -2835,7 +3112,9 @@ export class App {
       return
     }
     if (typeof entry.broken === 'string') { this.store.report('Agent preset ' + argument + ' is unavailable: ' + entry.broken, 'error'); return }
-    if (catalog.blank !== true) { this.stagePreset(argument); return }
+    // Unknown read state is not a native lock. Let the supplied selector
+    // decide; only a confirmed non-blank session is staged locally.
+    if (catalog.blank === false) { this.stagePreset(argument); return }
     await this.applyPreset(argument)
   }
 
@@ -2863,37 +3142,72 @@ export class App {
 
   private async pickPreset(existing?: Record<string, unknown>): Promise<void> {
     const context = this.context()
-    let catalog: Record<string, unknown> | undefined
+    let state: PresetPickerState | undefined
     const dialog = new SelectDialog(this.tui, {
       title: 'Choose agent preset', items: [], loading: true, keymap: this.keymap,
       onSelect: value => {
-        if (this.dialog !== dialog || !this.sameAttachment(context) || typeof value !== 'string' || catalog === undefined) return
+        if (state === undefined || this.presetPicker !== state || this.dialog !== dialog ||
+            !this.sameAttachment(context) || typeof value !== 'string' || state.catalog === undefined) return
+        const catalog = state.catalog
         this.dismissDialog()
-        if (catalog.blank !== true) { this.stagePreset(value); this.returnToSettings(); return }
+        if (catalog.blank === false) { this.stagePreset(value); this.returnToSettings(); return }
         void this.applyPreset(value).finally(() => this.returnToSettings())
       },
       onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
     })
     this.showDialog(dialog)
-    const surface = this.surfaceGeneration
-    catalog = existing ?? await this.presetCatalog()
-    if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
-    if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
-    if (catalog === undefined) { dialog.setError('Could not load native presets. Close and reopen to try again.'); return }
-    const current = typeof catalog.current === 'string' ? catalog.current : undefined
-    const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object).filter(item => typeof item?.id === 'string') : []
-    const items: DecisionOption[] = entries.filter(item => typeof item?.broken !== 'string').map(item => {
-      const id = String(item!.id)
-      const label = typeof item!.name === 'string' && item!.name.length > 0 ? item!.name : id
-      const marks = [id === current ? 'current' : '', item!.isDefault === true ? 'default' : '', id === this.nextPreset ? 'next' : ''].filter(Boolean)
-      const detail = typeof item!.description === 'string' && item!.description.length > 0 ? item!.description : id
-      return { label: label + (marks.length ? ' · ' + marks.join(' · ') : ''), description: detail, value: id }
-    })
-    dialog.setItems(items)
-    dialog.setLoading(false)
-    if (!items.length) dialog.setError('No usable native agent presets are available.')
-    this.render()
+    if (this.dialog !== dialog) return
+    state = { dialog, context, surface: this.surfaceGeneration }
+    this.presetPicker = state
+    await this.refreshPresetPicker(state, existing)
+  }
+
+  /** Native roster/default invalidation changes only the existing preset surface. */
+  private refreshPresetPicker(state: PresetPickerState, initial?: Record<string, unknown>): Promise<void> {
+    if (this.closing || this.presetPicker !== state || this.dialog !== state.dialog) return Promise.resolve()
+    const existing = this.presetCatalogRequest
+    if (existing?.state === state) return existing.promise
+    const request = { state, dirty: false, promise: Promise.resolve() }
+    this.presetCatalogRequest = request
+    request.promise = (async () => {
+      try {
+        const catalog = initial ?? await this.presetCatalog()
+        if (this.presetCatalogRequest !== request || this.presetPicker !== state ||
+            this.dialog !== state.dialog || state.surface !== this.surfaceGeneration || request.dirty) return
+        if (!this.sameAttachment(state.context)) { this.dismissDialog(); this.returnToSettings(); return }
+        const dialog = state.dialog
+        if (catalog === undefined) {
+          dialog.setLoading(false)
+          dialog.setError('Could not load native presets. Close and reopen to try again.')
+          this.render()
+          return
+        }
+        state.catalog = catalog
+        const current = typeof catalog.current === 'string' ? catalog.current : undefined
+        const entries = Array.isArray(catalog.presets) ? catalog.presets.map(object).filter(item => typeof item?.id === 'string') : []
+        const items: DecisionOption[] = entries.filter(item => typeof item?.broken !== 'string').map(item => {
+          const id = String(item!.id)
+          const label = typeof item!.name === 'string' && item!.name.length > 0 ? item!.name : id
+          const marks = [id === current ? 'current' : '', item!.isDefault === true ? 'default' : '', id === this.nextPreset ? 'next' : ''].filter(Boolean)
+          const detail = typeof item!.description === 'string' && item!.description.length > 0 ? item!.description : id
+          return { label: label + (marks.length ? ' · ' + marks.join(' · ') : ''), description: detail, value: id }
+        })
+        dialog.setError(items.length ? undefined : 'No usable native agent presets are available.')
+        dialog.setItems(items, { preserveValue: true })
+        dialog.setLoading(false)
+        this.render()
+      } finally {
+        if (this.presetCatalogRequest === request) {
+          this.presetCatalogRequest = undefined
+          if (request.dirty && this.presetPicker === state && this.dialog === state.dialog &&
+              state.surface === this.surfaceGeneration && this.sameAttachment(state.context)) {
+            await this.refreshPresetPicker(state)
+          }
+        }
+      }
+    })()
+    return request.promise
   }
 
   private async pickPermission(): Promise<void> {
@@ -2914,7 +3228,7 @@ export class App {
     const items: DecisionOption[] = Array.isArray(result?.options) ? result.options.flatMap(value => {
       const item = object(value)
       if (typeof item?.value !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(item.value)) return []
-      return [{ value: item.value, label: (typeof item.label === 'string' ? item.label : item.value) + (item.value === result.currentValue ? ' · current' : ''),
+      return [{ value: item.value, label: (typeof item.name === 'string' && item.name.length > 0 ? item.name : item.value) + (item.value === result.currentValue ? ' · current' : ''),
         ...(typeof item.description === 'string' ? { description: item.description } : {}) }]
     }) : []
     dialog.setItems(items); dialog.setLoading(false)
@@ -3027,6 +3341,9 @@ export class App {
     }
     const skills = this.skillCatalog
     const autoTitle = this.nativeAutoTitle
+    const defaults = this.nativeUi.defaults
+    const presetDefault = defaults?.targets.find(target => target.target === 'agent-preset-default')
+    const permissionDefault = defaults?.targets.find(target => target.target === 'permission-default-preset')
     return [
       { id: 'native.model', label: 'Current model', value: this.info === undefined ? 'Starting DSH…' : this.info.provider + '/' + this.info.model,
         description: 'DSH owns the catalog. Selection also submits the native default; profile persistence remains host-owned.', available: capabilities.includes('models'),
@@ -3050,10 +3367,27 @@ export class App {
           ? (autoTitle.enabled ? 'On' : 'Off') + ' · read-only' : autoTitle.available ? 'Read-only' : 'Unavailable',
         description: autoTitle?.detail ?? 'Read-only; the DSH profile composition owns enablement. When enabled, native titles may use the model.',
         available: autoTitle?.available !== false },
-      { id: 'native.defaults', label: 'Preset / permission defaults', value: 'Managed by DSH',
-        description: 'Profile default editing is not available here until a safe native scalar/revision API is exposed.', available: false },
-      { id: 'native.configuration', label: 'Tools / MCP / credentials', value: 'Managed by DSH',
-        description: 'No tool policy toggles, credential entry or raw profile auto-form in this TUI.', available: false },
+      { id: 'native.defaultPreset', label: 'Default agent preset', value: presetDefault?.effectiveValue ?? presetDefault?.value ?? (defaults === undefined ? 'Reading native state…' : 'Unavailable'),
+        description: presetDefault?.limitation ?? 'Changes only the native default via revision-guarded Settings. The current session preset is not selected.',
+        available: capabilities.includes('native-defaults') && presetDefault?.writable !== false,
+        onActivate: navigate(() => this.nativeUi.openDefaults('agent-preset-default')) },
+      { id: 'native.defaultPermission', label: 'Default permission preset', value: permissionDefault?.effectiveValue ?? permissionDefault?.value ?? (defaults === undefined ? 'Reading native state…' : 'Unavailable'),
+        description: permissionDefault?.limitation ?? 'Explicitly confirmed native default edit; current permission and Plan remain independent.',
+        available: capabilities.includes('native-defaults') && permissionDefault?.writable !== false,
+        onActivate: navigate(() => this.nativeUi.openDefaults('permission-default-preset')) },
+      { id: 'native.jobs', label: 'Jobs', value: 'Open read-only list', available: capabilities.includes('native-jobs'),
+        description: 'Current native owner and unowned jobs, retained output and terminal status; no TUI job supervisor.', onActivate: navigate(() => this.nativeUi.openJobs()) },
+      { id: 'native.goal', label: 'Goal status', value: this.goalProgress.goal?.phase ?? (this.goalProgress.state === 'none' ? 'No current goal' : 'Unavailable'),
+        description: 'Read-only native goal dock. Create/edit/resume via the mounted /goal command.', available: capabilities.includes('native-goal') },
+      { id: 'native.questions', label: 'Continued questions', value: 'Open native pending view', available: capabilities.includes('continued-questions'),
+        description: 'Native timed questions only; late replies use the native inbox. No local timeout or cancellation.', onActivate: navigate(() => this.nativeUi.openQuestions()) },
+      { id: 'native.inventory', label: 'Mounted capabilities', value: 'Read-only summary',
+        available: capabilities.includes('native-inventory') || capabilities.includes('native-tools'),
+        description: 'Public plugin inventory and scoped tool definitions; no policy toggles or schema/config dump.', onActivate: navigate(() => this.nativeUi.openInventory()) },
+      { id: 'native.rename', label: 'Session title', value: this.info?.title ?? 'No title', available: capabilities.includes('session-rename'),
+        description: 'Explicit native user-title rename; no replacement title generator.', onActivate: navigate(() => this.nativeUi.openRename()) },
+      { id: 'native.configuration', label: 'MCP / credentials', value: 'Managed by DSH',
+        description: 'No credential entry or raw profile auto-form in this TUI.', available: false },
     ]
   }
 
@@ -3093,6 +3427,7 @@ export class App {
     this.showDialog(dialog)
     void this.queryAutoTitle()
     void this.refreshSkills()
+    this.nativeUi.refreshSettings()
   }
 
   private openKeybindings(): void {
@@ -3235,6 +3570,51 @@ export class App {
     } catch (error) { this.store.report('Keybinding watch unavailable: ' + errorText(error), 'error') }
   }
 
+  /** Explicit local frontend input; bytes immediately enter the native store, never history. */
+  private async attachLocalFile(argument: string): Promise<void> {
+    if (argument.trim() === '') {
+      const context = this.context()
+      let dialog: DecisionDialog
+      dialog = new DecisionDialog(this.tui, {
+        request: { id: 'local-file-input', kind: 'question', title: 'Attach local file',
+          questions: [{ id: 'path', question: 'Local file path (relative to this workspace)', options: [] }] },
+        keymap: this.keymap, onCancel: () => this.dismissDialog(), onInterrupt: () => { void this.interrupt() },
+        onSubmit: value => {
+          if (this.dialog !== dialog || !this.sameAttachment(context)) return
+          const answer = object(value), values = answer?.answers
+          if (answer?.cancelled === true) { this.dismissDialog(); return }
+          if (!Array.isArray(values) || typeof values[0] !== 'string' || values[0].trim() === '') return
+          this.dismissDialog(); void this.attachLocalFile(values[0])
+        },
+      })
+      this.showDialog(dialog); return
+    }
+    if (this.fileAttachController !== undefined) { this.store.report('Wait for the current local file input to finish.'); return }
+    const stage = this.options.backend.stageFile
+    if (stage === undefined) { this.store.report('Native file staging is unavailable in this backend.', 'error'); return }
+    const context = this.context(), editor = context.editor
+    const text = editor.getText(), generation = this.inputGeneration
+    const controller = new AbortController()
+    this.fileAttachController = controller; this.render()
+    try {
+      const input = await readLocalFileInput(argument, this.options.cwd, controller.signal)
+      if (controller.signal.aborted || !this.sameAttachment(context)) return
+      const ref = asFileAttachmentRef(await stage.call(this.options.backend, input, controller.signal))
+      if (controller.signal.aborted || !this.sameAttachment(context)) return
+      if (ref === undefined) throw new Error('DSH returned an invalid staged file reference.')
+      if (this.inputGeneration !== generation || editor.getText() !== text || editor.isPasting()) {
+        this.store.report('The file was staged by DSH, but your newer draft was not changed. Use /attach again when ready.'); return
+      }
+      editor.insertFile({ type: 'file', attachment: ref })
+      this.store.report('Attached ' + oneLine(sanitize(ref.name), 120) + ' through native DSH storage.')
+    } catch (error) {
+      if (!controller.signal.aborted && this.sameAttachment(context)) this.store.report('File input: ' + errorText(error), 'error')
+    } finally {
+      if (this.fileAttachController === controller) this.fileAttachController = undefined
+      this.render()
+    }
+  }
+
   private async pasteClipboard(): Promise<void> {
     // A native read is already in flight; don't duplicate OS work on key repeat.
     if (this.clipboardPending) return
@@ -3358,52 +3738,64 @@ export class App {
   }
 
   async shutdown(code = 0): Promise<void> {
-    // Repeated SIGINT/SIGTERM while closing must not re-run teardown or re-enter
-    // a restored terminal; the first invocation owns the exit code.
-    if (this.closing) return
+    // Reentry must join cleanup, not pretend the App is already quiescent.
+    // The first invocation still owns the requested exit code.
+    if (this.closing) { await this.exited; return }
     this.closing = true
-    // Detach input before disposing any editor/dialog or awaiting native work.
-    this.restoreTerminal()
-    this.clipboardGeneration += 1; this.clipboardPending = false
-    this.skillAutocompleteIntent = undefined
-    this.autocomplete?.provider.dispose(); this.autocomplete = undefined
-    this.invalidateSkills(); this.skillsRequest = undefined
-    this.queueReadController?.abort(); this.queueReadController = undefined
-    this.queueImageRecoveries.clear()
-    this.closeImageDetails()
-    this.closeToolDetails()
-    this.closeSubagentSurfaces()
-    this.clearSubagentReplyTarget()
-    resetImageDisplayCache()
-    this.transcript.dispose()
-    this.subagentProgress.dispose()
-    this.stopSpinner()
-    if (this.exitTimer) clearTimeout(this.exitTimer)
-    if (this.titleTimer !== undefined) { clearTimeout(this.titleTimer); this.titleTimer = undefined }
-    if (this.gitTimer !== undefined) { clearInterval(this.gitTimer); this.gitTimer = undefined }
-    this.gitRefresher?.dispose()
-    this.editor.setKeymap(this.keymap)
-    this.watcher?.close(); this.off?.(); this.offInput?.()
-    const dialog = this.dialog
-    this.hideDialog()
-    disposeComponent(dialog)
-    disposeComponent(this.editor)
-    // Terminal restore is synchronous and comes before the bounded native close.
-    this.restoreTerminal()
-    await this.stopExternalEditor()
     let outcome = code !== 0 ? code : (this.fatal ? 1 : 0)
+    // Detach input synchronously, then let the supplied native host arm its
+    // whole-tree deadline before any editor/backend/UI persistence await.
+    this.restoreTerminal()
+    this.resolveExitRequested(outcome)
     try {
-      if (!await this.closeBackendBounded() && outcome === 0) outcome = 1
-    } catch { if (outcome === 0) outcome = 1 }
-    await Promise.allSettled([
-      this.settings.flush(),
-      this.keybindings.flush(),
-      ...[...this.histories.values()].map(history => history.flush()),
-    ])
-    await this.tui.terminal.drainInput().catch(() => {})
-    // Keep signal handlers while the bounded close runs so a repeated SIGINT
-    // is an idempotent no-op rather than an uncontrolled second teardown.
-    for (const [signal, handler] of this.signals) process.off(signal, handler)
-    this.resolveExit(outcome)
+      this.clipboardGeneration += 1; this.clipboardPending = false
+      this.skillAutocompleteIntent = undefined
+      this.catalogRequest = undefined
+      this.modelCatalogRequest = undefined
+      this.presetPicker = undefined; this.presetCatalogRequest = undefined
+      this.nativeUi.dispose()
+      this.fileAttachController?.abort(); this.fileAttachController = undefined
+      this.autocomplete?.provider.dispose(); this.autocomplete = undefined
+      this.invalidateSkills(); this.skillsRequest = undefined
+      this.queueReadController?.abort(); this.queueReadController = undefined
+      this.queuedAttachmentRecoveries.clear()
+      this.closeImageDetails()
+      this.closeToolDetails()
+      this.closeSubagentSurfaces()
+      this.clearSubagentReplyTarget()
+      resetImageDisplayCache()
+      this.transcript.dispose()
+      this.statusDockStack.dispose()
+      this.subagentProgress.dispose()
+      this.todoBoard.dispose(); this.goalProgress.status = undefined
+      this.stopSpinner()
+      if (this.exitTimer) clearTimeout(this.exitTimer)
+      if (this.titleTimer !== undefined) { clearTimeout(this.titleTimer); this.titleTimer = undefined }
+      if (this.gitTimer !== undefined) { clearInterval(this.gitTimer); this.gitTimer = undefined }
+      this.gitRefresher?.dispose()
+      this.editor.setKeymap(this.keymap)
+      this.watcher?.close(); this.off?.(); this.offInput?.(); this.offTerminalFocus?.()
+      const dialog = this.dialog
+      this.hideDialog()
+      disposeComponent(dialog)
+      disposeComponent(this.editor)
+      await this.stopExternalEditor()
+      try {
+        if (!await this.closeBackendBounded() && outcome === 0) outcome = 1
+      } catch { if (outcome === 0) outcome = 1 }
+      await Promise.allSettled([
+        this.settings.flush(),
+        this.keybindings.flush(),
+        ...[...this.histories.values()].map(history => history.flush()),
+      ])
+      await this.tui.terminal.drainInput().catch(() => {})
+    } catch {
+      if (outcome === 0) outcome = 1
+    } finally {
+      this.restoreTerminal()
+      // Keep signal handlers through cleanup so repeated signals join it.
+      for (const [signal, handler] of this.signals) process.off(signal, handler)
+      this.resolveExit(outcome)
+    }
   }
 }

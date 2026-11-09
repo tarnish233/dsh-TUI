@@ -21,6 +21,14 @@
  *   - the affordance never over-claims: `show more` only appears when wrap
  *     lines are actually hidden, and `collapse` only while the body is open.
  *
+ * Performance: the wrap measurement (exact line count + tail lines, and the
+ * expanded body on demand) is delegated to {@link ThinkingPreviewCache}. It
+ * never re-wraps the stable prefix of a growing run, returns cached numbers for
+ * a timer/hover-only repaint, and caches unstyled lines only - styling is
+ * applied here at output time. Hover, expansion and `clear()` therefore keep the
+ * content cache; a width change, a rewritten/shortened source or an unsettled
+ * escape boundary inside the cache falls back to one full exact pass.
+ *
  * Mouse: one full-width hitbox per summary row (expand/collapse) and, while a
  * run is expanded, one click-only hitbox over that run's own body rows
  * (`claimPress: false`, so text selection and drag keep working and only an
@@ -36,7 +44,8 @@
 import type { TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { TranscriptThinkingRun } from '../state/transcript.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
-import { fit, sanitize, visibleWidth, wrap } from './text.ts'
+import { fit, visibleWidth } from './text.ts'
+import { ThinkingPreviewCache } from './thinking-preview-cache.ts'
 import { italic, t } from './theme.ts'
 
 /** A reasoning run as the transcript store projects it. */
@@ -75,6 +84,28 @@ export function setThinkingExpanded(key: string, expanded: boolean): void {
 /** Drop every expanded run (session switch / resume). */
 export function clearThinkingExpansion(): void {
   expansion.clear()
+}
+
+/**
+ * Carry expanded runs from one item identity to another.
+ *
+ * The live attempt is a tentative display item; when the native settlement
+ * replaces it, the durable item has its own native id (`assistant:<seq>`).
+ * Without this transfer an expanded long thought would silently collapse on
+ * that frame - the exact "tool appears wrong/unstable after long Thinking"
+ * handoff. Only the module-level disclosure entries move; no durable id, seq,
+ * run text or timing is touched.
+ */
+export function adoptThinkingExpansion(fromItemId: string | undefined, toItemId: string): void {
+  if (fromItemId === undefined || fromItemId === '' || fromItemId === toItemId) return
+  const prefix = `${fromItemId}:`
+  for (const [key, expanded] of [...expansion]) {
+    if (!key.startsWith(prefix)) continue
+    const run = key.slice(prefix.length)
+    if (!/^\d+$/.test(run)) continue
+    expansion.delete(key)
+    if (expanded) expansion.set(`${toItemId}:${run}`, true)
+  }
 }
 
 /** Diagnostics/tests: how many runs are currently expanded. */
@@ -137,6 +168,11 @@ export interface ThinkingBlockOptions {
   /** Clock for an in-progress run; injectable for deterministic tests. */
   readonly now?: () => number
   /**
+   * Wrap-measurement cache; injectable so tests can hand in instrumented
+   * `wrap`/`sanitize` seams. Defaults to a private per-block instance.
+   */
+  readonly previewCache?: ThinkingPreviewCache
+  /**
    * Click-driven viewport anchor. Called BEFORE the expansion state flips so
    * the app can freeze follow-end scrolling: without it, content growth drags
    * the viewport to the bottom and the clicked summary row jumps away from
@@ -170,6 +206,7 @@ export class ThinkingBlock {
   readonly itemId: string
   private readonly options: ThinkingBlockOptions
   private readonly registry = new HitboxRegistry()
+  private readonly cache: ThinkingPreviewCache
   private hovered: string | undefined
   private boxes: MouseHitbox[] = []
   private plans: RunPlan[] = []
@@ -177,6 +214,7 @@ export class ThinkingBlock {
   constructor(options: ThinkingBlockOptions) {
     this.options = options
     this.itemId = options.itemId
+    this.cache = options.previewCache ?? new ThinkingPreviewCache()
   }
 
   private now(): number {
@@ -235,17 +273,17 @@ export class ThinkingBlock {
   }
 
   private plan(run: ThinkingRun, index: number, input: ThinkingRenderInput, row: number): RunPlan | undefined {
-    // Reasoning text is model output: strip ANSI/control bytes and expand tabs
-    // before wrapping, so the counted lines are exactly the lines rendered.
-    const text = sanitize(run.text)
-    if (text.trim() === '') return undefined
     const key = thinkingExpansionKey(this.itemId, index)
     const expanded = isThinkingExpanded(key)
     const bodyWidth = Math.max(4, input.width - INDENT.length)
-    const wrapped = wrap(text.replace(/\s+$/, ''), bodyWidth)
-    const preview = Math.max(0, Math.floor(input.previewLines))
-    const shown = expanded ? wrapped.length : Math.min(wrapped.length, preview)
-    const hidden = Math.max(0, wrapped.length - shown)
+    // Reasoning text is model output: the cache sanitizes it (ANSI/control bytes
+    // stripped, tabs expanded) before wrapping, so the counted lines are exactly
+    // the lines rendered - and the collapsed tail is the tail of that same wrap.
+    const measure = expanded
+      ? this.cache.expanded(index, run.text, bodyWidth)
+      : this.cache.preview(index, run.text, bodyWidth, Math.max(0, Math.floor(input.previewLines)))
+    if (measure.empty) return undefined
+    const hidden = measure.hidden
     const live = isThinkingRunLive(run)
     // A duration is only printed when somebody measured one: `0` means the clock
     // did not move, which is not a duration claim.
@@ -267,7 +305,7 @@ export class ThinkingBlock {
       summary = room >= 4 ? `${fit(head, room)}${hint}` : fit(summary, input.width)
     }
     summary = fit(summary, input.width)
-    const body = wrapped.slice(wrapped.length - shown).map(line => `${INDENT}${italic(t.subtle(line))}`)
+    const body = measure.lines.map((line: string) => `${INDENT}${italic(t.subtle(line))}`)
     return { key, hitboxId, summary, body, summaryRow: row, bodyRows: body.length, expanded }
   }
 
@@ -289,6 +327,8 @@ export class ThinkingBlock {
    * space directly.
    */
   render(input: ThinkingRenderInput): string[] {
+    // Runs that disappeared from this item must not keep their measurement state.
+    this.cache.prune(input.runs.length)
     const lines: string[] = []
     const plans: RunPlan[] = []
     input.runs.forEach((run, index) => {
@@ -342,6 +382,10 @@ export class ThinkingBlock {
    * `showThinking` switch, or no runs at all) must not keep the previous
    * frame's summaries alive: a phantom hitbox would swallow a click meant for
    * text selection and flip an expansion the user cannot see.
+   *
+   * Only the interaction state is dropped. Hover exits, width changes and this
+   * reset are harmless repaints: the sanitized/wrapped measurement stays cached
+   * per (source, width), so they never pay for a re-wrap.
    */
   clear(): void {
     this.plans = []

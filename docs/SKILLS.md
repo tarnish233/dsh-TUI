@@ -70,7 +70,9 @@ App 的单飞／dirty／revision 是显示缓存，不是技能注册表。unava
 
 迟到 metadata 通过 `ccRefreshAutocomplete()` seam（内部使用 Pi 原生 `explicitTab:false` 请求）重读候选，不应用唯一项、不移动 cursor、不更改 undo／图片／草稿或提交。刷新意图绑定 input generation、原文、Editor、surface、attachment；Esc 或焦点转移后不能复活旧菜单。
 
-UI-owned `/model`／`/effort`／`/settings` 等不经过额外技能 classification await，保持原有立即调用时序。文件／`@`／参数／forced completion 仍委托 Pi。
+UI-owned `/model`／`/effort`／`/settings` 等不经过额外技能 classification await，保持原有立即调用时序。参数、普通 Tab 路径（相对／绝对／`~`／引号）与 forced completion 仍委托 Pi。
+
+`@file` 提及不再算作“委托 Pi”：配置了父级 `fileReferences(query, signal)` 回调时，`NativeAutocompleteProvider` 用 DSH 公共 `@file` grammar 的 `activeAtToken`／`formatFileMention` 判定 token、映射候选（纯路径、按回调顺序、无本地扫描／fd／排序），文件内容不读取、不 stage、不自动变成附件；目录接受后保留可提交的闭合引号并把光标停在闭引号前继续下钻，Tab／Enter 只填充不提交（再次 Enter 才提交）。没有该回调时 `@` 仍是 Pi 原行为（不本地扫描，因此通常无候选）。失败／取消／过期一律静默为空，不产生终端诊断，也不触发技能 refresh。该 grammar 只在真正处理 `@` 查询时才惰性 import，因此离线 `--demo` 在没有 native DSH peers 时也能加载。
 
 ## 验收
 

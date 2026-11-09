@@ -27,6 +27,7 @@
  */
 
 import { asImageAttachmentRef, displayContentParts } from '../attachments.ts'
+import { redactDiagnostic } from '../backend/errors.ts'
 import type {
   BackendEvent,
   DisplayContentPart,
@@ -69,9 +70,10 @@ export interface UserTranscriptItem {
   /** Number of native image blocks, including blocks without a usable ref. */
   readonly imageCount: number
   /**
-   * Ordered display content when the durable message carried images.
-   * `text` stays the joined text projection for every consumer that does not
-   * need image positions; this array preserves the original text/image order.
+   * Ordered display content when the durable message carried non-text parts
+   * (images or native files). `text` stays the joined text projection for every
+   * consumer that does not need their positions; this array preserves the
+   * original text/image/file order and repeated references.
    */
   readonly content?: readonly DisplayContentPart[]
   readonly version: number
@@ -106,11 +108,24 @@ export interface AssistantTranscriptItem {
   readonly thinking: string
   /** Per-run reasoning projection; parallel to `thinking`, never a replacement for it. */
   readonly thinkingRuns?: readonly TranscriptThinkingRun[]
-  /** Ordered text/image content when the message carried images. */
+  /**
+   * UI-only reasoning/disclosure identity inherited from the live attempt this
+   * durable projection replaced. The durable id/seq stay native facts; this
+   * field only lets the renderer carry expanded reasoning, hover and cached
+   * body across the streaming -> settled handoff.
+   */
+  readonly thinkingKey?: string
+  /** Ordered text/image/file content when the message carried non-text parts. */
   readonly content?: readonly DisplayContentPart[]
   /** Native image block count, including legacy blocks without a usable ref. */
   readonly imageCount?: number
   readonly interrupted: boolean
+  /**
+   * Native `turn/end{aborted}` cancellation cause, when DSH recorded one for
+   * this message's turn. Absent means the cause is unknown, so the renderer
+   * must not attribute the interruption to anyone.
+   */
+  readonly interruptCause?: TurnEndCancelCause
   readonly version: number
 }
 
@@ -148,7 +163,7 @@ export interface ToolTranscriptItem {
   readonly status: ToolTranscriptStatus
   readonly resultText: string
   readonly resultImages: number
-  /** Ordered text/image parts of the durable result blocks, when images exist. */
+  /** Ordered text/image parts of the durable result blocks, when non-text parts exist. */
   readonly resultContentParts?: readonly DisplayContentPart[]
   readonly resultIsError: boolean
   /** Opaque DSH tool/result meta. Presentation may read it; it is never a success guess. */
@@ -177,8 +192,10 @@ export interface AttemptTranscriptItem {
   readonly thinking: string
   /** Per-run reasoning projection; same rules as on an assistant item. */
   readonly thinkingRuns?: readonly TranscriptThinkingRun[]
+  /** UI-only handoff identity (see `AssistantTranscriptItem.thinkingKey`). */
+  readonly thinkingKey?: string
   readonly toolNames: readonly string[]
-  /** Ordered text/image content when the live/settled stream carried images. */
+  /** Ordered text/image/file content when the live/settled stream carried non-text parts. */
   readonly content?: readonly DisplayContentPart[]
   /** Native image block count, including legacy blocks without a usable ref. */
   readonly imageCount?: number
@@ -211,6 +228,47 @@ export interface TodosTranscriptItem {
 }
 
 export type NoticeLevel = NoticeTranscriptItem['level']
+
+/** Native durable cancellation cause (`turn/end{aborted}.reason`). */
+export type TurnEndCancelCause = 'user' | 'parent' | 'hook' | 'disposed' | 'legacy'
+
+const CANCEL_CAUSES: ReadonlySet<string> = new Set(['user', 'parent', 'hook', 'disposed', 'legacy'])
+
+const isCancelCause = (value: string | undefined): value is TurnEndCancelCause =>
+  value !== undefined && CANCEL_CAUSES.has(value)
+
+/**
+ * Concise transcript outcome of a native `turn/end` that did not complete.
+ *
+ * The text states the native outcome only: it never invents a user message
+ * (a `blocked` turn may have admitted none), never attributes a cancellation,
+ * and never repeats the live `agent/error` frame that already reported a
+ * failed turn. Unknown/plugin-extended reasons stay silent: this store cannot
+ * describe a semantic it does not know.
+ */
+function turnEndNotice(kind: string, reason: Record<string, unknown>): { text: string; level: NoticeLevel } | undefined {
+  switch (kind) {
+    case 'max-tokens':
+      return { text: 'Output limit reached — the response may be incomplete.', level: 'info' }
+    case 'blocked':
+      return { text: 'Turn blocked by DSH.', level: 'info' }
+    case 'interrupted':
+      return { text: 'Turn interrupted before it completed (recovered from session history).', level: 'info' }
+    case 'forked':
+      return { text: 'Turn ended at a session fork boundary.', level: 'info' }
+    case 'error': {
+      // The durable reason carries the native failure facts; a live turn also
+      // emitted `agent/error` first, and only that live notice is shown.
+      const error = isRecord(reason.error) ? reason.error : undefined
+      // Redact only this derived diagnostic, never the durable event or tool content.
+      const message = error === undefined ? '' : redactDiagnostic(asString(error.message) ?? '').replace(/\s+/g, ' ').trim()
+      const detail = message.length > 300 ? `${message.slice(0, 299)}…` : message
+      return { text: detail === '' ? 'Turn failed.' : `Turn failed: ${detail}`, level: 'error' }
+    }
+    default:
+      return undefined
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Small unknown-value readers. DSH data crosses the backend boundary as
@@ -259,54 +317,53 @@ interface TextBlocks {
   text: string
   thinking: string
   images: number
-  /** Ordered text/image parts; only image-bearing messages need this array. */
+  files: number
+  /** Ordered text/image/file parts; only non-text parts need this array on an item. */
   content: DisplayContentPart[]
 }
 
 /**
  * Project durable content blocks without rewriting them.
  *
- * Images are counted even when the wire shape is only a legacy placeholder
- * (no usable attachment ref), so an item is never dropped just because its
- * bytes are unreachable. Only real, shape-valid refs become display parts —
- * the UI reads bytes lazily through `Backend.readImage`, never from the log.
+ * Image blocks are counted even when the wire shape is only a legacy placeholder
+ * (no usable attachment ref), so an item is never dropped just because its bytes
+ * are unreachable. Native `file` blocks keep their durable metadata ref in the
+ * ordered content; nothing here reads bytes or invents a path. The ordered parts
+ * come from {@link displayContentParts}, the one shared validation authority for
+ * admitted content, so repeated refs and their original order survive.
  */
 function projectBlocks(content: unknown): TextBlocks {
   const texts: string[] = []
   const thinking: string[] = []
-  const parts: DisplayContentPart[] = []
   let images = 0
   for (const block of asArray(content)) {
     if (!isRecord(block)) continue
     const type = asString(block.type)
     if (type === 'text') {
       const text = asString(block.text)
-      if (text !== undefined) {
-        texts.push(text)
-        parts.push({ type: 'text', text })
-      }
+      if (text !== undefined) texts.push(text)
     } else if (type === 'reasoning') {
       const text = asString(block.text)
       if (text !== undefined) thinking.push(text)
     } else if (type === 'image') {
       images += 1
-      const attachment = asImageAttachmentRef(block.attachment)
-      if (attachment !== undefined) parts.push({ type: 'image', attachment })
     }
   }
-  return { text: texts.join('\n\n'), thinking: thinking.join('\n\n'), images, content: parts }
+  const parts = displayContentParts(asArray(content))
+  const files = parts.reduce((count, part) => count + (part.type === 'file' ? 1 : 0), 0)
+  return { text: texts.join('\n\n'), thinking: thinking.join('\n\n'), images, files, content: parts }
 }
 
 /**
  * Native stream projection for a live/durable attempt. `content` is the
  * ordered wire value; `images` is the legacy replay-only convenience array.
  * Text-only content is not stored on the item (the joined `text`/`thinking`
- * fields already cover it) unless an image actually needs a position.
+ * fields already cover it) unless a non-text part actually needs a position.
+ * File blocks keep their native metadata ref; they are never treated as images.
  */
-function streamImageContent(view: StreamPresentation): DisplayContentPart[] {
+function streamDisplayContent(view: StreamPresentation): DisplayContentPart[] {
   const parts = displayContentParts(view.content)
-  const explicit = parts.filter(part => part.type === 'image')
-  if (explicit.length > 0) return parts
+  if (parts.some(part => part.type !== 'text')) return parts
   const legacy = (view.images ?? []).flatMap(ref => {
     const attachment = asImageAttachmentRef(ref)
     return attachment === undefined ? [] : [{ type: 'image' as const, attachment }]
@@ -318,15 +375,17 @@ function imagePartsCount(parts: readonly DisplayContentPart[]): number {
   return parts.reduce((count, part) => count + (part.type === 'image' ? 1 : 0), 0)
 }
 
-/** Image fields to attach to an attempt item; `{}` for a text-only stream. */
-function streamImageFields(view: StreamPresentation): {
+/** Non-text fields to attach to an attempt item; `{}` for a text-only stream. */
+function streamContentFields(view: StreamPresentation): {
   content?: readonly DisplayContentPart[]
   imageCount?: number
 } {
-  const content = streamImageContent(view)
+  const content = streamDisplayContent(view)
   const count = Math.max(imagePartsCount(content), view.images?.length ?? 0)
-  if (count === 0) return {}
-  return { content, imageCount: count }
+  const fields: { content?: readonly DisplayContentPart[]; imageCount?: number } = {}
+  if (content.some(part => part.type !== 'text')) fields.content = content
+  if (count > 0) fields.imageCount = count
+  return fields
 }
 
 /**
@@ -393,9 +452,9 @@ const TODOS_ITEM_ID = 'todos:current'
 
 function hasVisibleStream(view: StreamPresentation): boolean {
   if (view.text.trim() !== '' || view.thinking.trim() !== '' || view.toolNames.length > 0) return true
-  // A pure-image assistant turn is still real content; never drop it because
-  // it has no text. Legacy image counts are visible placeholders, not silence.
-  return streamImageContent(view).some(part => part.type === 'image') || (view.images?.length ?? 0) > 0
+  // A pure-image or file attachment turn is still real content; never drop it
+  // because it has no text. Legacy image counts are visible placeholders too.
+  return streamDisplayContent(view).some(part => part.type !== 'text') || (view.images?.length ?? 0) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +510,22 @@ export class TranscriptStore {
   private stepStartedAt: number | undefined
   private readonly processedSeqs = new Set<number>()
   private readonly subagentProjection = new SubagentProjection()
+  /**
+   * Turns whose non-success `turn/end` outcome is already in the transcript.
+   * A replayed frame (same durable turn) must not append a second notice.
+   */
+  private readonly endedTurns = new Set<number>()
+  /**
+   * Durable turn of the newest assistant item with text/thinking/content; used
+   * only to attach a native cancellation cause to the reply it interrupted.
+   */
+  private lastAssistantTurn: number | undefined
+  /**
+   * A live backend `error` frame (native `agent/error`) arrived since the
+   * current turn started. Its notice is the visible failure report, so the
+   * durable `turn/end{error}` must not report the same failure again.
+   */
+  private liveErrorSinceTurnStart = false
   private noticeCounter = 0
   private versionCounter = 0
   /** Called after every observable mutation. Parent assigns this to request a render. */
@@ -530,6 +605,9 @@ export class TranscriptStore {
     this.liveAttempt = undefined
     this.stepStartedAt = undefined
     this.processedSeqs.clear()
+    this.endedTurns.clear()
+    this.lastAssistantTurn = undefined
+    this.liveErrorSinceTurnStart = false
     // An absent catalog is not an empty native read: keep `subagentSnapshot`
     // undefined until DSH actually reports one. An explicit empty snapshot is
     // still recorded as a known-empty catalog.
@@ -550,6 +628,9 @@ export class TranscriptStore {
     this.list = []
     this.liveAttempt = undefined
     this.stepStartedAt = undefined
+    this.endedTurns.clear()
+    this.lastAssistantTurn = undefined
+    this.liveErrorSinceTurnStart = false
     this.subagentProjection.clear()
     this.notify()
   }
@@ -603,6 +684,8 @@ export class TranscriptStore {
         this.report(event.message, 'info')
         return
       case 'error':
+        // Live agent/error is the visible failure report for this turn.
+        this.liveErrorSinceTurnStart = true
         this.report(event.message, 'error')
         return
       case 'permissions':
@@ -619,8 +702,14 @@ export class TranscriptStore {
 
   /** Add a local notice (never presented as a model message). */
   report(text: string, level: NoticeLevel = 'info'): void {
+    if (!this.pushNotice(text, level)) return
+    this.notify()
+  }
+
+  /** Append one notice without notifying; callers own the batch notification. */
+  private pushNotice(text: string, level: NoticeLevel = 'info'): boolean {
     const trimmed = text.trim()
-    if (trimmed === '') return
+    if (trimmed === '') return false
     this.list.push({
       kind: 'notice',
       id: `notice:${++this.noticeCounter}`,
@@ -628,7 +717,7 @@ export class TranscriptStore {
       text: trimmed,
       version: ++this.versionCounter,
     })
-    this.notify()
+    return true
   }
 
   // -------------------------------------------------------------------------
@@ -729,7 +818,7 @@ export class TranscriptStore {
       text: live.view.text,
       thinking: live.view.thinking,
       ...(live.runs.length === 0 ? {} : { thinkingRuns: [...live.runs] }),
-      ...streamImageFields(live.view),
+      ...streamContentFields(live.view),
       toolNames: live.view.toolNames,
       status,
       tentative: true,
@@ -741,6 +830,10 @@ export class TranscriptStore {
     return {
       kind: 'attempt',
       id: `${live.itemId}:${status}`,
+      // Keep the live reasoning/disclosure identity available to the renderer
+      // after the attempt id changes; the id itself remains the stable display
+      // id of this settled/abandoned/unknown attempt.
+      thinkingKey: live.itemId,
       attemptId: live.attemptId,
       revision: live.revision,
       turn: live.turn,
@@ -748,7 +841,7 @@ export class TranscriptStore {
       text: live.view.text,
       thinking: live.view.thinking,
       ...(live.runs.length === 0 ? {} : { thinkingRuns: [...live.runs] }),
-      ...streamImageFields(live.view),
+      ...streamContentFields(live.view),
       toolNames: live.view.toolNames,
       status,
       tentative,
@@ -769,9 +862,15 @@ export class TranscriptStore {
 
   /**
    * Remove the live item that corresponds to a committed settlement and
-   * return its former position so durable items can take its place.
+   * return its former position plus its display identity. The durable items
+   * still keep their native ids/seqs; only reasoning/disclosure state is
+   * transferred through the returned `thinkingKey`.
    */
-  private settleLive(seq: number | undefined, turn: number | undefined, step: number | undefined): number | undefined {
+  private settleLive(
+    seq: number | undefined,
+    turn: number | undefined,
+    step: number | undefined,
+  ): { readonly index: number; readonly thinkingKey: string } | undefined {
     const live = this.liveAttempt
     if (live === undefined) return undefined
     if (live.pendingSeq !== undefined && seq !== undefined && live.pendingSeq !== seq) return undefined
@@ -781,9 +880,9 @@ export class TranscriptStore {
     }
     const index = this.list.findIndex(item => item.id === live.itemId)
     this.liveAttempt = undefined
-    if (index < 0) return this.list.length
+    if (index < 0) return { index: this.list.length, thinkingKey: live.itemId }
     this.list.splice(index, 1)
-    return index
+    return { index, thinkingKey: live.itemId }
   }
 
   /**
@@ -949,14 +1048,17 @@ export class TranscriptStore {
       case 'turn/start':
       case 'step/start':
         this.statusValue = 'running'
+        if (type === 'turn/start') this.liveErrorSinceTurnStart = false
         // Start of the step's own clock, used only for the approximate
         // attempt-level duration of a durable replay (see approximateRuns).
         this.stepStartedAt = asNumber(event.time) ?? this.stepStartedAt
         return
       case 'turn/end':
-        // Turn-end reasons are parent/status concerns. Failures already arrive
-        // through assistant/attempt and backend error events. Here we only make
-        // sure no card keeps claiming to run after its turn is over.
+        // The native reason is the only durable outcome fact. It is projected
+        // as one concise transcript notice (never a fabricated user message)
+        // and, for a cancellation, as attribution on the interrupted reply.
+        this.projectTurnEnd(data)
+        this.liveErrorSinceTurnStart = false
         this.statusValue = 'idle'
         this.settleOutstanding()
         return
@@ -971,6 +1073,53 @@ export class TranscriptStore {
     }
   }
 
+  /**
+   * Project the one durable outcome fact of a closed turn.
+   *
+   * `completed` and plugin-extended/unknown reasons add nothing: normal
+   * streaming must not print internal settlement diagnostics. `max-tokens`,
+   * `blocked`, cold `interrupted`/`forked` closers and replayed `error` turns
+   * each become exactly one concise notice, so scrollback and `--resume` show
+   * the same outcome as the live turn. `blocked` never fabricates a user
+   * message: DSH may have admitted none, and the notice says so.
+   */
+  private projectTurnEnd(data: Record<string, unknown>): void {
+    const turn = asIndex(data.turn)
+    const reason = isRecord(data.reason) ? data.reason : undefined
+    const kind = reason === undefined ? undefined : asString(reason.kind)
+    if (reason === undefined || kind === undefined || turn === undefined) return
+    if (kind === 'aborted') {
+      this.attributeCancellation(turn, reason)
+      return
+    }
+    const notice = turnEndNotice(kind, reason)
+    if (notice === undefined || this.endedTurns.has(turn)) return
+    // A live failed turn already reported itself through the native agent/error
+    // frame; only a cold/replayed error turn needs its own durable report.
+    if (kind === 'error' && this.liveErrorSinceTurnStart) return
+    this.endedTurns.add(turn)
+    this.pushNotice(notice.text, notice.level)
+  }
+
+  /**
+   * Attach the native cancellation cause to the reply it interrupted.
+   *
+   * The durable message alone carries only `interrupted: true`; the cause is
+   * `turn/end{aborted}.reason`. Attribution is therefore written only from that
+   * recorded cause (and only for the same turn's newest reply), never guessed:
+   * an unknown or external interruption stays unattributed.
+   */
+  private attributeCancellation(turn: number, reason: Record<string, unknown>): void {
+    if (this.lastAssistantTurn !== turn) return
+    const cause = isRecord(reason.reason) ? asString(reason.reason.kind) : undefined
+    if (!isCancelCause(cause)) return
+    const index = this.list.findLastIndex(item => item.kind === 'assistant')
+    if (index < 0) return
+    const item = this.list[index]
+    if (item.kind !== 'assistant' || !item.interrupted || item.interruptCause !== undefined) return
+    this.list[index] = { ...item, interruptCause: cause, version: ++this.versionCounter }
+  }
+
   private projectUserMessage(seq: number, data: Record<string, unknown>): void {
     const source = isRecord(data.source) ? data.source : undefined
     const sourceKind = source === undefined ? 'user' : asString(source.kind)
@@ -982,14 +1131,17 @@ export class TranscriptStore {
     // but not a human prompt. Keep the transcript to real user turns.
     if (source !== undefined && sourceKind !== 'user') return
     const blocks = projectBlocks(data.content)
-    if (blocks.text.trim() === '' && blocks.images === 0) return
+    // A file-only prompt is a real human turn: keep it visible instead of
+    // dropping the message because it has no text. Nothing is synthesized; the
+    // native file metadata is the only content shown.
+    if (blocks.text.trim() === '' && blocks.images === 0 && blocks.files === 0) return
     this.list.push({
       kind: 'user',
       id: `user:${seq}`,
       seq,
       text: blocks.text,
       imageCount: blocks.images,
-      ...(blocks.images > 0 ? { content: blocks.content } : {}),
+      ...(blocks.images > 0 || blocks.files > 0 ? { content: blocks.content } : {}),
       version: ++this.versionCounter,
     })
   }
@@ -1037,25 +1189,29 @@ export class TranscriptStore {
   private projectAssistantMessage(seq: number, data: Record<string, unknown>, settledAt: number | undefined): void {
     const turn = asNumber(data.turn)
     const step = asNumber(data.step)
-    const index = this.settleLive(seq, turn, step)
+    const settled = this.settleLive(seq, turn, step)
     const message = isRecord(data.message) ? data.message : {}
     const blocks = projectBlocks(message.content)
     const runs = this.approximateRuns(projectThinkingRuns(message.content), settledAt)
     const tools = projectMessageTools(message.content)
     const items: TranscriptItem[] = []
-    if (blocks.text.trim() !== '' || blocks.thinking.trim() !== '' || blocks.images > 0) {
+    if (blocks.text.trim() !== '' || blocks.thinking.trim() !== '' || blocks.images > 0 || blocks.files > 0) {
       items.push({
         kind: 'assistant',
         id: `assistant:${seq}`,
         seq,
+        ...(settled === undefined ? {} : { thinkingKey: settled.thinkingKey }),
         text: blocks.text,
         thinking: blocks.thinking,
         ...(runs.length === 0 ? {} : { thinkingRuns: runs }),
-        ...(blocks.images > 0 ? { content: blocks.content, imageCount: blocks.images } : {}),
+        ...(blocks.images > 0 || blocks.files > 0
+          ? { content: blocks.content, ...(blocks.images > 0 ? { imageCount: blocks.images } : {}) }
+          : {}),
         interrupted: data.interrupted === true,
         version: ++this.versionCounter,
       })
     }
+    if (items.some(item => item.kind === 'assistant')) this.lastAssistantTurn = turn
     for (const tool of tools) {
       if (this.list.some(item => item.kind === 'tool' && item.id === `tool:${tool.id}`)) continue
       items.push(this.newToolItem({
@@ -1070,24 +1226,25 @@ export class TranscriptStore {
         status: 'proposed',
       }))
     }
-    if (index === undefined) this.list.push(...items)
-    else this.list.splice(index, 0, ...items)
+    if (settled === undefined) this.list.push(...items)
+    else this.list.splice(settled.index, 0, ...items)
   }
 
   private projectAssistantAttempt(seq: number, data: Record<string, unknown>, settledAt: number | undefined): void {
     const turn = asNumber(data.turn)
     const step = asNumber(data.step)
-    const index = this.settleLive(seq, turn, step)
+    const settled = this.settleLive(seq, turn, step)
     const view = this.codecValue?.assemble(data.stream, true) ?? EMPTY_STREAM
     if (!hasVisibleStream(view)) return
     const runs = view.thinking.trim() === ''
       ? []
       : this.approximateRuns([{ text: view.thinking }], settledAt)
-    const images = streamImageFields(view)
+    const images = streamContentFields(view)
     const item: AttemptTranscriptItem = {
       kind: 'attempt',
       id: `attempt:${seq}`,
       seq,
+      ...(settled === undefined ? {} : { thinkingKey: settled.thinkingKey }),
       turn: turn ?? 0,
       step: step ?? 0,
       text: view.text,
@@ -1099,8 +1256,8 @@ export class TranscriptStore {
       tentative: false,
       version: ++this.versionCounter,
     }
-    if (index === undefined) this.list.push(item)
-    else this.list.splice(index, 0, item)
+    if (settled === undefined) this.list.push(item)
+    else this.list.splice(settled.index, 0, item)
   }
 
   private newToolItem(fields: {
@@ -1266,7 +1423,7 @@ export class TranscriptStore {
         status: isError ? 'error' : 'done',
         resultText: blocks.text,
         resultImages: blocks.images,
-        ...(blocks.images > 0 ? { resultContentParts: blocks.content } : {}),
+        ...(blocks.images > 0 || blocks.files > 0 ? { resultContentParts: blocks.content } : {}),
         resultIsError: isError,
         ...(content === undefined ? {} : { resultContent: content }),
         rawResult: data,
@@ -1295,7 +1452,7 @@ export class TranscriptStore {
       status: isError ? 'error' : 'done',
       resultText: blocks.text,
       resultImages: blocks.images,
-      ...(blocks.images > 0 ? { resultContentParts: blocks.content } : {}),
+      ...(blocks.images > 0 || blocks.files > 0 ? { resultContentParts: blocks.content } : {}),
       resultIsError: isError,
       ...(content === undefined ? {} : { resultContent: content }),
       rawResult: data,

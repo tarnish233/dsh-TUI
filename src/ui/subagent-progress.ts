@@ -62,6 +62,19 @@
  * through the shared sanitizers in `subagent-format.ts` and Pi TUI's width
  * helpers, and every emitted line is fitted to the supplied width.
  *
+ * Composition:
+ *
+ * - `preferredRows` / `comfortableRows` / `compactRows` are pure presentation
+ *   facts for a shared status-dock stack. They use exactly the same native
+ *   dedupe/active filter as `render()`, never paint, never measure a width and
+ *   never mutate the catalog, so row planning does not re-render live blocks
+ *   (which would churn hitboxes and hover state).
+ * - `trailingSeparator` (default `true`) preserves the standalone blank row
+ *   between this widget and the editor border. A root `StatusDockStack` owns
+ *   inter-section gaps, so it constructs this widget with `false`; the widget
+ *   then never chooses a root gap itself. This is a rendering parameter, not
+ *   a settings hierarchy.
+ *
  * @module dsh-tui/ui/subagent-progress
  */
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
@@ -168,11 +181,18 @@ export interface SubagentProgressOptions {
   /** Repaint hook owned by the parent; never a stdout write. */
   onRenderRequest?: () => void
   /**
-   * Total line budget (header, rows, overflow and the trailing separator).
-   * Read on every `render()`, so a getter may track the terminal height and the
-   * actual sibling heights of the editor, queue, hint and footer.
+   * Total line budget (header, rows, overflow and the optional trailing
+   * separator). Read on every `render()`, so a getter may track the terminal
+   * height and the actual sibling heights of the editor, queue, hint and footer.
    */
   maxRows?: number | (() => number)
+  /**
+   * Emit the standalone trailing blank row when the budget still has room.
+   * Default `true` keeps the historical standalone shape. A root
+   * `StatusDockStack` constructs this widget with `false` because the stack
+   * owns every inter-section gap uniformly.
+   */
+  trailingSeparator?: boolean
   /**
    * True while a dialog, decision, details/Agents/child overlay owns input.
    * A getter is read on every `render()`/`handleMouse()` call.
@@ -326,6 +346,55 @@ export class SubagentProgress implements Component {
 
   get isDisposed(): boolean {
     return this.disposed
+  }
+
+  /**
+   * True while the native catalog still holds at least one live child, using
+   * exactly the filter {@link SubagentProgress.render} uses (native-order
+   * dedupe by child id, then `running`/`initializing`).
+   *
+   * This is a presence fact for the parent's height allocation: a settled-only
+   * catalog paints nothing and must not reserve a status-dock row, while a
+   * catalog with live children may. It is deliberately budget-independent —
+   * `maxRows === 0` still reports the native presence so the parent's budget
+   * arithmetic does not have to re-derive it — and it never answers "is a row
+   * painted right now". No status rule lives here: {@link isActive} is the one
+   * definition shared with `render()`.
+   */
+  get hasActiveEntries(): boolean {
+    return !this.disposed && this.deduped().some(isActive)
+  }
+
+  /**
+   * Full content height at the current native catalog: the header plus one row
+   * per active child and one extra row for each child's native activity line.
+   * Excludes the trailing separator and any external content cap; `0` when this
+   * widget paints nothing (disposed or settled-only). Pure presentation fact:
+   * it never calls `render()`, never mutates the catalog and never registers a
+   * hitbox, so a composing stack can plan rows without re-rendering live blocks.
+   */
+  get preferredRows(): number {
+    if (this.disposed) return 0
+    const entries = this.deduped().filter(isActive)
+    if (entries.length === 0) return 0
+    let rows = 1
+    for (const entry of entries) rows += subagentActivity(entry) === undefined ? 1 : 2
+    return rows
+  }
+
+  /**
+   * Smallest useful content: header plus the first active child's name (its
+   * native activity line stays out until the preferred height is affordable).
+   * Bounded by {@link preferredRows}; `0` when the widget paints nothing.
+   */
+  get comfortableRows(): number {
+    const preferred = this.preferredRows
+    return preferred === 0 ? 0 : Math.min(preferred, 2)
+  }
+
+  /** One-row native fallback: the header identifies the dock and its count. */
+  get compactRows(): number {
+    return this.hasActiveEntries ? 1 : 0
   }
 
   /**
@@ -489,6 +558,8 @@ export class SubagentProgress implements Component {
     // spacer, no invisible hitbox — even when the catalog is truncated or a
     // settled id is still the parent's explicit reply target (the main Editor
     // already states that destination, and retiring it here is display-only).
+    // `hasActiveEntries` exposes the same presence fact to the parent, which is
+    // why the parent can stop reserving a dock row for settled-only history.
     const entries = this.deduped().filter(isActive)
     if (entries.length === 0) {
       this.syncFrame([])
@@ -583,8 +654,9 @@ export class SubagentProgress implements Component {
       }
     }
     // One separator row between the widget and the editor border, and only
-    // when the parent's budget still has room for it.
-    if (remaining >= 1 && selection.rows.length > 0) lines.push('')
+    // when the parent's budget still has room for it. A root stack disables it
+    // and owns every inter-section gap itself.
+    if (this.options.trailingSeparator !== false && remaining >= 1 && selection.rows.length > 0) lines.push('')
 
     // A row clipped away must not stay clickable on this frame.
     this.syncFrame(boxes.filter(box => box.endRow < lines.length))

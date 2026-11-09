@@ -14,6 +14,7 @@
 
 import type { Editor } from "#pi-tui"
 import type { ImageUploadPart } from "../ui/image-view.ts"
+import type { CcFileUpload } from "./file-attachment.ts"
 
 /** One undo-stack entry, flattened from the Pi editor snapshot. */
 export interface CcUndoSnapshot {
@@ -60,6 +61,15 @@ export interface CcEditorSnapshot {
   imageAttachments: Array<[number, ImageUploadPart]>
   /** Monotonic image marker counter; ids are never reused after a submit. */
   imageCounter: number
+  /**
+   * File attachment payloads keyed by `[File #N]` marker id.
+   *
+   * A separate registry and id space from images: a file marker never resolves
+   * to an image upload or vice versa. Memory only, same as images.
+   */
+  fileAttachments: Array<[number, CcFileUpload]>
+  /** Monotonic file marker counter; ids are never reused. */
+  fileCounter: number
   /** `getText()` at capture time (large pastes appear as `[paste #n ...]`). */
   text: string
   /** `getExpandedText()` at capture time (paste markers expanded). */
@@ -70,6 +80,27 @@ declare module "#pi-tui" {
   interface Editor {
     ccCaptureSnapshot(): CcEditorSnapshot
     ccRestoreSnapshot(snapshot: CcEditorSnapshot, options?: { notify?: boolean }): void
+    /** Raise marker-id high-water marks from text that arrived from outside. */
+    noteImageMarkerIds(text: string): void
+    noteFileMarkerIds(text: string): void
+    /** Image (`[Image #N]`) attachment registry — unchanged CC image API. */
+    insertImageAttachment(attachment: unknown): number
+    getImageAttachment(id: number): unknown
+    getImageAttachmentEntries(): Array<[number, unknown]>
+    setImageAttachmentEntries(entries: Iterable<readonly [number, unknown]>, counter?: number): void
+    getImageMarkerIdsInText(): number[]
+    getReservedImageMarkerIds(): number[]
+    getHistoryImageAttachmentEntries(): Array<[string, Array<[number, unknown]>]>
+    setHistoryImageAttachmentEntries(entries: Iterable<readonly [string, Iterable<readonly [number, unknown]>]>): void
+    /** File (`[File #N]`) attachment registry — separate ids and payloads. */
+    insertFileAttachment(attachment: unknown): number
+    getFileAttachment(id: number): unknown
+    getFileAttachmentEntries(): Array<[number, unknown]>
+    setFileAttachmentEntries(entries: Iterable<readonly [number, unknown]>, counter?: number): void
+    getFileMarkerIdsInText(): number[]
+    getReservedFileMarkerIds(): number[]
+    getHistoryFileAttachmentEntries(): Array<[string, Array<[number, unknown]>]>
+    setHistoryFileAttachmentEntries(entries: Iterable<readonly [string, Iterable<readonly [number, unknown]>]>): void
     ccIsEmpty(): boolean
     ccGetJumpMode(): "forward" | "backward" | null
     ccStartJump(direction: "forward" | "backward"): void

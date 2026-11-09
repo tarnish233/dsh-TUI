@@ -28,7 +28,6 @@ import {
   getToolSummary,
   isTerminalTool,
   toolAppliedDiffs,
-  toolDisplayName,
   toolInputText,
   toolOutputText,
   toolPresentationOf,
@@ -327,16 +326,25 @@ export class ToolBlock implements ItemBlock {
     return `${t.subtle(' · ')}${this.hovered === hoverId ? t.accent(text) : t.subtle(text)}`
   }
 
+  /**
+   * `⏺ Bash npm test · ctrl+o to collapse` — one display name, one real space,
+   * then the native title/argument payload.
+   *
+   * The header never re-splits `summary.text`: the label and its payload arrive
+   * as separate fields, so a native title that repeats the tool name in another
+   * case (`Read image /Users/x.png`) cannot print the name twice and cannot glue
+   * `Read ImageRead image …` together. The separator is a plain space and the
+   * whole row is width-fitted by `render`, so wide CJK/emoji or ANSI-clean
+   * titles keep their exact wording without any hardcoded offset.
+   */
   private summaryLine(): string {
     const summary = getToolSummary(this.item, this.cwd, this.flags.toolLabelClip ?? 0)
-    const label = toolDisplayName(this.item.name)
-    const rest = summary.text.startsWith(label) ? summary.text.slice(label.length) : summary.text
     const dot = this.item.status === 'done'
       ? t.green(DOT)
       : this.item.status === 'error' ? t.red(DOT) : t.muted(this.item.status === 'proposed' || this.item.status === 'unknown' ? HOLLOW : DOT)
-    const body = rest === '' ? '' : t.muted(rest)
+    const body = summary.detail === '' ? '' : ` ${t.muted(summary.detail)}`
     const hint = this.expanded ? this.styledHint('collapse', `${toolExpansionKey(this.item.callId)}:title`) : ''
-    return `${dot} ${bold(t.text(label))}${body}${hint}`
+    return `${dot} ${bold(t.text(summary.label))}${body}${hint}`
   }
 
   private canExpand(): boolean {

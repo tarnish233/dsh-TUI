@@ -456,7 +456,7 @@ test('missing native image admission rejects before a submitted skill creates an
     f.app.editor.insertImage((await imageFixture()).upload)
     const before = f.app.editor.captureDraft()
     f.terminal.type('\r')
-    await until(() => notices(f.app).includes('no native image prompt admission'), 'missing native admission keeps skill image draft')
+    await until(() => /no native (?:image|attachment) prompt admission/.test(notices(f.app)), 'missing native admission keeps skill image draft')
     assert.deepEqual(f.app.editor.captureDraft(), before)
     assert.equal(f.backend.calls.some(call => call.name === 'input-route'), false)
     assert.equal(f.backend.sent.length, 0)

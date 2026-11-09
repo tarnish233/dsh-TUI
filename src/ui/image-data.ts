@@ -32,7 +32,11 @@ export interface ImageOccurrence {
   readonly ordinal: number
 }
 
-/** Ordered display content of one item; absent means the item carries none. */
+/**
+ * Ordered display content of one item; absent means the item carries none.
+ * Native file parts stay in this order (they are not image occurrences and are
+ * skipped by the projections below), so text/image/file positions never drift.
+ */
 export function itemContentParts(item: TranscriptItem): readonly DisplayContentPart[] {
   if (item.kind === 'user' || item.kind === 'assistant' || item.kind === 'attempt') {
     return item.content ?? []

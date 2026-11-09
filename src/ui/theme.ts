@@ -35,6 +35,8 @@ import {
   parseColor,
   type SelectListTheme,
   type EditorTheme,
+  truncateToWidth,
+  visibleWidth,
 } from '#pi-tui'
 import { BRAND_BLUE, BRAND_BLUE_BRIGHT } from './brand.ts'
 import { highlightCode } from './highlight.ts'
@@ -113,6 +115,112 @@ export const palette = {
   /** Blue tint band behind human turns (surface, not brand text chrome). */
   userBg: '#1a4480',
 } as const
+
+/* ------------------------------------------------------------------------- *
+ * Semantic surfaces
+ *
+ * The palette above names colors; a *surface* names where a background is
+ * allowed. Components must ask for a surface role instead of inventing a
+ * background hex: a popup that paints its own near-black plate is exactly how
+ * the Settings panel ended up looking blacker than the transcript behind it.
+ *
+ * There is deliberately ONE switch for the application background
+ * (`canvasBackground`). `canvas` and `dialog` both derive from it, so a modal
+ * can never disagree with the main surface it covers. It is `undefined` today:
+ * the terminal's own background is authoritative, which is what Pi's `system`
+ * theme does for its canvas/background role. A painted dark canvas is only
+ * consistent once the App root paints *every* root row through
+ * `surfaces.canvas.fill(...)`; while the root stays transparent, a tinted
+ * dialog plate is a black slab over a transparent UI — the reported bug.
+ * ------------------------------------------------------------------------- */
+
+/** The background roles dialogs, lists, bands and overlays may request. */
+export type SurfaceRole = 'canvas' | 'dialog' | 'raised' | 'selected' | 'overlay'
+
+/** One semantic surface: its background (if any) plus width-safe painters. */
+export interface Surface {
+  readonly role: SurfaceRole
+  /** Concrete background color, or undefined while the terminal background shows through. */
+  readonly color?: string
+  /** ANSI background open sequence; '' on a transparent surface. */
+  readonly open: string
+  /** ANSI background close sequence; '' on a transparent surface. */
+  readonly close: string
+  /** True when this surface paints no background at all. */
+  readonly transparent: boolean
+  /**
+   * Apply the surface background to text. A full reset (`\x1b[0m`) inside the
+   * text — Pi's `truncateToWidth()` appends one — re-opens the surface instead
+   * of dropping back to the terminal default in the middle of a band.
+   */
+  readonly style: Style
+  /**
+   * Paint text as a band exactly `width` terminal columns wide: clip with
+   * Pi's width helpers, keep the surface under the right-edge padding, and end
+   * with the surface close (never leave styling open past the line).
+   */
+  fill(text: string, width: number): string
+}
+
+/** Reopen the semantic surface after resets, but not after zero RGB channels. */
+function reapply(open: string, text: string): string {
+  return text.replace(/\x1b\[([0-9;:]*)m/g, (sequence: string, raw: string) => {
+    const atoms = raw.split(';')
+    let reset = false
+    for (let i = 0; i < atoms.length; i += 1) {
+      const atom = atoms[i]!
+      // Colon-form extended colors are one atom; their channels are not SGR codes.
+      if (atom.includes(':')) continue
+      const code = atom === '' ? 0 : Number(atom)
+      if (code === 38 || code === 48 || code === 58) {
+        const colorMode = Number(atoms[i + 1])
+        i += colorMode === 2 ? 4 : colorMode === 5 ? 2 : 0
+      } else if (code === 0 || code === 49) reset = true
+    }
+    return reset ? sequence + open : sequence
+  })
+}
+
+function makeSurface(role: SurfaceRole, color: string | undefined): Surface {
+  const open = color === undefined ? '' : backgroundAnsi(parseColor(color), mode)
+  const close = color === undefined ? '' : '\x1b[49m'
+  const style: Style = color === undefined
+    ? text => text
+    : text => (text === '' ? '' : open + reapply(open, text) + close)
+  const fill = (text: string, width: number): string => {
+    const columns = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0
+    if (columns === 0) return ''
+    const clipped = visibleWidth(text) <= columns ? text : truncateToWidth(text, columns)
+    // A transparent surface must preserve the caller's foreground/clip reset.
+    const body = color === undefined ? clipped : reapply(open, clipped)
+    const padded = body + ' '.repeat(Math.max(0, columns - visibleWidth(body)))
+    return color === undefined ? padded : open + padded + close
+  }
+  return {
+    role, open, close, style, fill,
+    ...(color === undefined ? { transparent: true } : { transparent: false, color }),
+  }
+}
+
+const canvasBackground: string | undefined = undefined
+
+/**
+ * The surface ladder. `canvas`/`dialog`/`overlay` inherit the terminal
+ * background; `raised` (inset cards/banners) and `selected` (selection/focus
+ * bands, the same blue as the human-turn band) are the only tinted roles.
+ */
+export const surfaces: Readonly<Record<SurfaceRole, Surface>> = Object.freeze({
+  /** The application canvas: the terminal background, never a painted plate. */
+  canvas: makeSurface('canvas', canvasBackground),
+  /** A modal/popup plate that inherits the canvas it floats over. */
+  dialog: makeSurface('dialog', canvasBackground),
+  /** An inset card or banner inside a dialog (blue-tinted dark). */
+  raised: makeSurface('raised', palette.canvasSubtle),
+  /** A selection/focus band (same blue as `userBg`). */
+  selected: makeSurface('selected', palette.accentBg),
+  /** An overlay body: no plate and no dimming; the terminal owns what is below. */
+  overlay: makeSurface('overlay', undefined),
+})
 
 export const t = {
   text: fg(palette.fg),

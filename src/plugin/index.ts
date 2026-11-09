@@ -65,12 +65,17 @@ export function apply(ctx: Context, config: Config): void {
   let diagnostics: NativeDiagnosticProjection | undefined
   const earlyDiagnostics: TerminalDiagnosticRecord[] = []
   let closingOutput: Promise<void> | undefined
-  let outputCloseFailed = false
+  let nativeExitRequested = false
+  const requestExit = (code: number): void => {
+    if (disposed || nativeExitRequested) return
+    nativeExitRequested = true
+    // Native DSH coalesces requests and owns the whole-tree deadline/code.
+    ctx.appExit?.(code)
+  }
   const closeOutput = (): Promise<void> => {
     diagnostics?.dispose()
     output?.restore()
     return closingOutput ??= (output?.close() ?? Promise.resolve()).catch(() => {
-      outputCloseFailed = true
       // Capture has been restored and no renderer remains here.
       process.stderr.write('dsh-tui: the native diagnostic log could not finish closing.\n')
     })
@@ -139,16 +144,18 @@ export function apply(ctx: Context, config: Config): void {
       })
       const ownedApp = app
       for (const record of earlyDiagnostics.splice(0)) diagnostics.handle(record)
-      void ownedApp.exited.then(async code => {
-        await closeOutput()
-        if (!disposed) ctx.appExit?.(code === 0 && outputCloseFailed ? 1 : code)
-      })
+      // Start the launcher's deadline after synchronous terminal handback,
+      // not after potentially stalled local persistence/diagnostic cleanup.
+      void ownedApp.exitRequested.then(requestExit)
+      void ownedApp.exited.then(() => closeOutput())
       await ownedApp.start()
     })().catch(async (error: unknown) => {
       app?.restoreTerminal()
-      await app?.shutdown(1).catch(() => {})
-      await closeOutput().catch(() => {})
+      // Restore capture synchronously for the pre-screen diagnostic; neither
+      // log close nor App cleanup may delay the native startup-failure request.
+      const outputClosing = closeOutput()
       if (!disposed) {
+        requestExit(1)
         const message = redactDiagnostic(error instanceof Error ? error.message : String(error)).replace(/[\u0000-\u001f\u007f]/g, ' ')
         ctx.logger.error('dsh-tui startup failed: %s', message)
         // No renderer remains active here. Make pre-screen failures visible,
@@ -157,8 +164,9 @@ export function apply(ctx: Context, config: Config): void {
         if (error instanceof Error && 'code' in error && error.code === 'ERR_INTERNAL_ASSERTION') {
           process.stderr.write(redactDiagnostic(error.stack ?? message) + '\n')
         }
-        ctx.appExit?.(1)
       }
+      await app?.shutdown(1).catch(() => {})
+      await outputClosing.catch(() => {})
     })
   }), 'dsh-tui.ready')
 }

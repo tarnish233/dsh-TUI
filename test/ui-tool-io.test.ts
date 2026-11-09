@@ -40,6 +40,8 @@ test('summary prefers native titles, includes the label once, and clips by confi
   assert.deepEqual(getToolSummary(terminal, '/tmp/work', 0), {
     label: 'Bash',
     text: 'Bash npm test',
+    // The header paints `label` + real space + `detail`, never a re-split text.
+    detail: 'npm test',
     durationMs: 1_250,
   })
 

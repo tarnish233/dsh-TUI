@@ -23,7 +23,8 @@ type Picker = InstanceType<typeof SessionPickerDialog>
 
 interface Item {
   id: string
-  title?: string
+  // `null` is a native confirmation of no title; omitted is not-yet-known.
+  title?: string | null
   cwd: string
   createdAt?: number
   live?: boolean
@@ -350,8 +351,10 @@ test('streamed titles never re-order the rows they enrich', () => {
     ],
   })
   const before = text(p.picker)
-  assert.match(before, /1\. \(untitled\)/)
-  assertOrder(before, ['(untitled)', 'Zulu native'])
+  // An omitted title is not yet known (the header may still be enriched); it
+  // is not a native confirmation that the session has none.
+  assert.match(before, /1\. \(title unknown\)/)
+  assertOrder(before, ['(title unknown)', 'Zulu native'])
 
   // A title that sorts "late" by text must stay where its session was listed.
   p.picker.setTitles(new Map<string, string | null>([['t1', 'Aaa streamed'], ['t3', 'Mmm streamed']]))
@@ -408,8 +411,8 @@ test('a live session is marked and an untitled session falls back honestly', () 
   })
   const rendered = text(p.picker)
   assert.match(rendered, /open elsewhere/)
-  assert.match(rendered, /2\. \(untitled\)/)
-  assert.match(rendered, /3\. \(untitled\)/)
+  assert.match(rendered, /2\. \(title unknown\)/, 'an omitted title is unknown, not confirmed-none')
+  assert.match(rendered, /3\. \(untitled\)/, 'a known blank title renders untitled')
   // `live` is only a marker: the row still shows its own title and age.
   const liveLine = p.picker.render(80).map(stripTerminalSequences).find(line => line.includes('Live session')) ?? ''
   assert.match(liveLine, /2m ago · open elsewhere/)
@@ -788,7 +791,7 @@ test('streamed titles fill rows and the fuzzy search', () => {
     ],
   })
   const before = text(p.picker)
-  assert.match(before, /\(untitled\)/)
+  assert.match(before, /\(title unknown\)/, 'an omitted title stays unknown until it arrives')
   assert.match(before, /Native beta/)
 
   p.picker.setTitles(new Map<string, string | null>([['alpha', 'Streamed alpha'], ['beta', null]]))
@@ -823,6 +826,48 @@ test('streamed titles fill rows and the fuzzy search', () => {
   keep.picker.handleInput(KEY.down)
   keep.picker.setTitles(new Map<string, string | null>([['alpha', 'Streamed alpha'], ['beta', 'Streamed beta']]))
   assert.match(selectedLine(keep.picker), /Streamed beta/, 'the selection survives a title merge')
+})
+
+test('title states are distinct: native null, known blank, omitted and streamed', () => {
+  const now = Date.now()
+  const p = makePicker({
+    items: [
+      { id: 'known-null', title: null, cwd: DIRECTORY, createdAt: now },
+      { id: 'known-blank', title: '   ', cwd: DIRECTORY, createdAt: now - minutes(1) },
+      { id: 'omitted', cwd: DIRECTORY, createdAt: now - minutes(2) },
+      { id: 'present', title: 'Present native title', cwd: DIRECTORY, createdAt: now - minutes(3) },
+    ],
+  })
+  const initial = text(p.picker)
+  assert.match(initial, /1\. \(untitled\)/, 'a native null title is a known none')
+  assert.match(initial, /2\. \(untitled\)/, 'a known blank title is a known none')
+  assert.match(initial, /3\. \(title unknown\)/, 'an omitted title is not-yet-known')
+  assert.match(initial, /4\. Present native title/)
+  assert.doesNotMatch(initial, /no title|service failed|unavailable|not found/i,
+    'not-yet-known never claims a native no-title or a service failure')
+  assert.doesNotMatch(initial, /3\. \(untitled\)/, 'unknown is never collapsed into confirmed-none')
+
+  // The lazy native title stream may confirm none or fill a title later; the
+  // native order and the selected row stay put.
+  p.picker.setTitles(new Map<string, string | null>([['known-blank', null], ['omitted', 'Late streamed title']]))
+  const enriched = text(p.picker)
+  assert.match(enriched, /2\. \(untitled\)/, 'a confirmed none stays untitled')
+  assert.match(enriched, /3\. Late streamed title/, 'an unknown row is enriched in place')
+  assert.match(enriched, /4\. Present native title/)
+  assert.ok(enriched.indexOf('(untitled)') < enriched.indexOf('Late streamed title'))
+  assert.match(selectedLine(p.picker), /known-null|untitled/, 'selection stays on the first native row')
+
+  // Filtering uses the effective title; explicit resume returns the exact id.
+  for (const char of 'late') p.picker.handleInput(char)
+  const filtered = text(p.picker)
+  assert.match(filtered, /Late streamed title/)
+  assert.doesNotMatch(filtered, /Present native title/)
+  p.picker.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['omitted'], 'explicit resume returns the native session id')
+  assert.equal(p.cancelled, 0)
+
+  assertWidths(p.picker, 40)
+  assertWidths(p.picker, 80)
 })
 
 test('onVisibleIds follows the row window and never repeats a consecutive set', () => {

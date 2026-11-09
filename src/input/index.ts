@@ -14,16 +14,28 @@
 
 export {
   CcEditor,
+  CcFileBudgetError,
   CcImageBudgetError,
+  CcUnresolvedFileAttachmentError,
   CcUnresolvedImageMarkerError,
   printableInput,
   type CcActionEvent,
+  type CcAttachmentCounts,
+  type CcAttachmentOccurrence,
   type CcEditorOptions,
   type CcImageBudgets,
   type CcExternalEditorRequest,
   type CcImageAttachment,
   type CcSubmitPayload,
 } from "./cc-editor.ts"
+
+export {
+  asCcFileUpload,
+  isCcFilePromptPart,
+  type CcFileAttachment,
+  type CcFilePromptPart,
+  type CcFileUpload,
+} from "./file-attachment.ts"
 
 export {
   CcKeymap,
@@ -82,6 +94,7 @@ export {
   NativeAutocompleteProvider,
   createNativeAutocompleteProvider,
   type NativeAutocompleteProviderOptions,
+  type NativeCommandEntry,
 } from "./native-autocomplete.ts"
 
 export {

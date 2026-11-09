@@ -50,8 +50,10 @@ import type {
   SkillCatalogSnapshot,
   SubagentEntry,
   SubagentSnapshot,
+  TodoItem,
   TranscriptCodec,
 } from './backend/types.ts'
+import type { GoalRead, GoalStateView } from './backend/native-inspection.ts'
 
 export interface DemoBackendOptions {
   cwd?: string
@@ -75,6 +77,7 @@ export const DEMO_HINTS = [
   'subagent → 原生子 Agent 目录（并行运行/空闲/失败/外部）+ 结算与触发消息',
   'subagent-many → 同一 fixture + 3 个并行运行的 continuable 子 Agent（进度区溢出验收）',
   'skills   → 只读 native skill 元数据 fixture（/help 的 Skills 段；不读正文、不注入、不调模型）',
+  'tasks    → 离线 Todo/Goal/子 Agent 共存场景；tasks next/done/history/clear 显式推进',
 ] as const
 
 /** Mirrors DSH's public `CommandDescriptor`; the demo never invents capabilities. */
@@ -233,6 +236,108 @@ const DEMO_CHILD_ACTIVE_MANY = [
   { id: 'demo-child-active-2', label: 'Audit fixtures', activity: 'reading docs/FRONTEND-CONTRACT.md' },
   { id: 'demo-child-active-3', label: 'Map adapters', activity: 'checking width-safe link geometry' },
 ] as const
+
+/**
+ * Explicit offline `tasks` fixture: a static Todo/Goal/child coexistence scene.
+ *
+ * Control words are matched as the complete trimmed input only, so ordinary
+ * prose that merely contains "tasks", a bare `next`, or an unknown `/...`
+ * command line keeps its historical demo path. The fixture owns no scheduler,
+ * Agent, model, timer or playback loop: each word is one explicit turn and the
+ * long history is a bounded, synchronous durable fixture emission.
+ *
+ * `tasks next` walks this finite script; `tasks done` settles it; `tasks`
+ * restarts it; `tasks clear` removes the projections; `tasks history` appends a
+ * bounded transcript without touching the current scene.
+ */
+type DemoTasksStep = 'initial' | 'next' | 'done' | 'clear' | 'history'
+
+const DEMO_TASKS_STEP_WORDS: ReadonlySet<string> = new Set(['next', 'done', 'clear', 'history'])
+
+/** Two explicit next steps after the initial scene; a third advances nothing. */
+const DEMO_TASKS_LAST_STAGE = 2
+
+/** Bounded fixture transcript emitted by `tasks history` (user+assistant pairs). */
+const DEMO_TASKS_HISTORY_PAIRS = 24
+
+const DEMO_TASK_GOAL_ID = 'demo-task-goal'
+const DEMO_TASK_GOAL_OBJECTIVE = '离线演示：Todo、Goal 与子 Agent 停靠区共存（fixture-only，不启动真实轮次）'
+
+/** Ordered Todo titles; indices stay stable across every script stage. */
+const DEMO_TASK_TODO_TITLES = [
+  '检查 Todo 停靠区的原生快照',
+  '列出 6 项有序待办并验证 +N more 溢出',
+  '投影只读 native-goal 快照',
+  '观察 3 个本地子 Agent 的初始状态',
+  '用 Ctrl+T 切换停靠区，/agent 打开目录',
+  '用 tasks next/done/history/clear 显式推进',
+] as const
+
+/**
+ * The three known local fixture children. Their ids are the existing
+ * `DEMO_CHILD_ACTIVE_MANY` durable ids, so `subagent-session`,
+ * `subagent-interrupt` and `subagent-prompt` keep working through the existing
+ * `/agent` paths. Labels/activities are task-specific display facts only.
+ */
+const DEMO_TASK_CHILDREN = [
+  {
+    id: DEMO_CHILD_ACTIVE_MANY[0].id,
+    label: 'Todo 投影巡检 · todo-dock',
+    activity: 'grepping src/ui/todo-board.ts 的原生计数与 +N more 上限',
+  },
+  {
+    id: DEMO_CHILD_ACTIVE_MANY[1].id,
+    label: 'Goal 快照审计 · goal-dock',
+    activity: 'validating GoalStateView phase/rounds 的原生取值',
+  },
+  {
+    id: DEMO_CHILD_ACTIVE_MANY[2].id,
+    label: 'Agent 停靠区检查 · agents-dock',
+    activity: 'reading src/ui/subagent-progress.ts 的活动行',
+  },
+] as const
+
+/**
+ * Completed fixture child that owns the tasks scene's mixed-activity sample.
+ *
+ * It is the existing `DEMO_CHILD_TEST` identity (already in
+ * `DEMO_CHILD_SESSIONS`), so `subagent-session`/`/agent` can inspect the
+ * attributed sender. It is a fourth **catalog** row only: it is already
+ * finished, so the fixed Agents dock still reports exactly the three active
+ * script children and nothing is faked as a live worker completing.
+ */
+const DEMO_TASK_SAMPLE_CHILD_ID = DEMO_CHILD_TEST
+const DEMO_TASK_SAMPLE_CHILD_LABEL = 'Focused tests · DEMO sample'
+
+/**
+ * Stable body markers of the mixed-activity sample. The status-notice body is
+ * only painted when the shared Ctrl+O disclosure expands the Activities group;
+ * the relay body is a genuine message boundary and always stays visible.
+ */
+const DEMO_TASK_NOTICE_BODY = 'DEMO STATUS NOTICE BODY'
+const DEMO_TASK_RELAY_BODY = 'DEMO CHILD MESSAGE'
+
+/**
+ * Parse only the explicit offline task words. The whole trimmed input must be
+ * `tasks` or `tasks <next|done|clear|history>`; a `/...` line, `next` alone or
+ * any surrounding prose is not a trigger.
+ */
+function demoTasksStep(text: string): DemoTasksStep | undefined {
+  const tokens = text.trim().toLowerCase().split(/\s+/)
+  if (tokens[0] !== 'tasks') return undefined
+  if (tokens.length === 1) return 'initial'
+  if (tokens.length !== 2) return undefined
+  const word = tokens[1] ?? ''
+  return DEMO_TASKS_STEP_WORDS.has(word) ? word as DemoTasksStep : undefined
+}
+
+/** One immutable projection a script stage paints for the three dock kinds. */
+interface DemoTaskScene {
+  readonly stage: number
+  readonly todos: readonly TodoItem[]
+  readonly goal: GoalStateView
+  readonly children: readonly SubagentEntry[]
+}
 
 const DEMO_CHILD_SESSIONS: Readonly<Record<string, string>> = {
   [DEMO_CHILD_EXPLORE]: 'I mapped the transcript projection, the live settlement path and the keys that will open the Agents overlay.',
@@ -619,6 +724,14 @@ export class DemoBackend implements Backend {
   /** Deterministic durable event log per local child Session (fixture only). */
   private readonly demoChildEvents = new Map<string, SessionEvent[]>()
   private subagentMessageCounter = 0
+  /**
+   * Current explicit `tasks` fixture projection, or undefined when no scene is
+   * loaded (or after `tasks clear` / a new / resumed root). This is durable
+   * fixture state only: no timer, no playback loop and no Agent.
+   */
+  private taskScene: DemoTaskScene | undefined
+  /** Monotonic discriminator for repeated bounded `tasks history` emissions. */
+  private taskHistoryCounter = 0
 
   constructor(options: DemoBackendOptions = {}) {
     const delay = options.delayMs ?? 24
@@ -631,7 +744,7 @@ export class DemoBackend implements Backend {
       permissions: { currentValue: 'workspace-write' },
       preset: 'standard',
       reasoningEffort: DEMO_DEFAULT_EFFORT,
-      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'skills', 'subagents', 'subagent-session', 'subagent-follow', 'subagent-prompt', 'subagent-interrupt', 'demo'],
+      capabilities: ['stream', 'streaming', 'tools', 'questions', 'approval', 'cancel', 'followup', 'steer', 'new', 'resume', 'state', 'models', 'permissions', 'presets', 'preset', 'efforts', 'effort', 'dequeue', 'commands', 'execute', 'skills', 'subagents', 'subagent-session', 'subagent-follow', 'subagent-prompt', 'subagent-interrupt', 'native-goal', 'demo'],
       events: [],
     }
   }
@@ -722,6 +835,9 @@ export class DemoBackend implements Backend {
         delete this.infoValue.subagents
         this.demoSubagents.clear()
         this.demoChildEvents.clear()
+        // A resumed root has no task fixture of its own: never leak the old
+        // scene's Todo/Goal/child projections into the new attachment.
+        this.taskScene = undefined
         this.events.length = 0
         this.seq = 0
         this.queue.length = 0
@@ -862,6 +978,12 @@ export class DemoBackend implements Backend {
         // no skill body and no Agent to attach, so it can never grow a second
         // catalog or claim a capability it does not have.
         return DEMO_SKILL_CATALOG
+      case 'native-goal':
+        // Neutral read-only fixture of the existing public GoalRead shape. It
+        // projects the explicit `tasks` scene and is empty (a successful read
+        // with `goal: null`) for every other demo scenario. No /goal mutation,
+        // round driver or goal scheduling exists in the demo.
+        return this.demoGoalRead()
       case 'execute': {
         const line = typeof args.line === 'string' ? args.line : undefined
         if (line === undefined || line.trim() === '') throw new Error('DemoBackend command "execute" needs a non-empty { line }')
@@ -954,6 +1076,7 @@ export class DemoBackend implements Backend {
     delete this.infoValue.subagents
     this.demoSubagents.clear()
     this.demoChildEvents.clear()
+    this.taskScene = undefined
     this.events.length = 0
     this.seq = 0
     // A fresh Agent attachment has its own inbox: the old queued input is not
@@ -1140,7 +1263,13 @@ export class DemoBackend implements Backend {
 
     let reason: unknown = { kind: 'completed' }
     const skillRequest = demoSkillRequest(text)
-    if (imageRequest) {
+    const taskStep = demoTasksStep(text)
+    if (taskStep !== undefined) {
+      // Explicit offline coexistence scene. The complete trimmed input must be
+      // a documented `tasks` word; ordinary prose, a bare `next` or an unknown
+      // `/...` command line never reaches this fixture.
+      reason = await this.tasksFlow(turn, step, taskStep)
+    } else if (imageRequest) {
       reason = await this.imagesFlow(turn, step)
     } else if (skillRequest !== undefined) {
       // Explicit offline scenario: a skill keyword or a fixture `/name` gets a
@@ -1225,6 +1354,25 @@ export class DemoBackend implements Backend {
     const event = this.appendAt(seq, 'assistant/attempt', { turn, step, stream: compactStream(meta.timed) })
     this.emit({ type: 'stream_end', sessionId: this.infoValue.sessionId, attemptId: meta.attemptId, revision: ++this.revisionCounter, outcome: 'committed', seq })
     return event
+  }
+
+  /**
+   * Line/phrase-sized text chunks for the explicit `tasks` scene only.
+   *
+   * Deliberately not the legacy grapheme playback: the guide has to settle in
+   * a handful of frames at the default delay so the static scene is inspectable
+   * immediately. Concatenated deltas still equal the committed text exactly.
+   */
+  private taskTextChunks(index: number, text: string): DemoChunk[] {
+    const lines = text.split('\n')
+    const segments = lines
+      .map((line, position) => (position === lines.length - 1 ? line : line + '\n'))
+      .filter(segment => segment !== '')
+    return [
+      { type: 'block-start', index, blockType: 'text' },
+      ...segments.map(segment => ({ type: 'text-delta', index, text: segment })),
+      { type: 'block-end', index, block: { type: 'text', text } },
+    ]
   }
 
   /** Build block-start/delta/block-end/usage/finish chunks for one text block. */
@@ -1397,6 +1545,386 @@ export class DemoBackend implements Backend {
     if (second === undefined) return { kind: 'aborted' }
     this.commitMessage(second, turn, step, [{ type: 'text', text: finalText }])
     return { kind: 'completed' }
+  }
+
+  /**
+   * Explicit offline Todo/Goal/child coexistence scene.
+   *
+   * Every branch emits only durable fixture projections through the existing
+   * backend event shapes and then streams one short acknowledgement with the
+   * existing live-stream/pause infrastructure. There is no playback timer, no
+   * scheduler and no Agent: the scene stays static until the next explicit
+   * `tasks` input, so Ctrl+T, `/agent`, `/settings` and resize keep working
+   * while the root is idle.
+   */
+  private async tasksFlow(turn: number, step: number, action: DemoTasksStep): Promise<unknown> {
+    let text: string
+    switch (action) {
+      case 'initial':
+        this.applyTaskScene(this.taskStage(0))
+        text = [
+          '离线任务场景已载入（fixture-only，不调用模型、工具或网络）。',
+          '',
+          '- Todo：6 项有序待办，超过 5 行上限时显示 +N more；Ctrl+T 切换停靠区。',
+          '- Goal：只读 `native-goal` 快照（phase active · rounds 1/6）；它不是真实 `/goal` 执行，也不会启动轮次。',
+          '- 子 Agent：3 个活动本地 fixture 子会话（2 running / 1 initializing），外加 1 个已完成的样本发送者；`/agent` 打开目录。',
+          '- 混合活动：1 个 fixture 工具后紧跟 1 条纯通知，合并为 Activities；真实子消息保持独立，Ctrl+O 只展开 Activities。',
+          '',
+          '`tasks next` 推进 · `tasks done` 完成 · `tasks history` 长历史 · `tasks clear` 清理 · `tasks` 重载；均为显式离线输入。',
+        ].join('\n')
+        break
+      case 'next': {
+        if (this.taskScene === undefined) this.applyTaskScene(this.taskStage(0))
+        const current = this.taskScene
+        if (current === undefined) throw new Error('Demo tasks fixture failed to load')
+        if (current.stage >= DEMO_TASKS_LAST_STAGE) {
+          text = [
+            `已到最后一步（fixture）：状态保持不变，Goal 仍为 ${current.goal.phase}。`,
+            '',
+            '`tasks done` 结束并保留原生 `complete` Goal，`tasks` 重载初始场景，`tasks clear` 清理投影。',
+          ].join('\n')
+        } else {
+          const stage = current.stage + 1
+          this.applyTaskScene(this.taskStage(stage))
+          text = stage === 1
+            ? [
+                '已推进到第 2 步（fixture）：Todo 完成 2/6，Goal rounds 2/6 仍为 active。',
+                '',
+                'Todo 巡检子 Agent 已 completed；另外两个本地子 Agent 保持运行并更新活动。无模型或工具调用。',
+              ].join('\n')
+            : [
+                '已到最后一步（fixture）：Todo 完成 4/6，Goal phase 变为原生 `paused`（rounds 2/6，activation disarmed）。',
+                '',
+                'Goal 快照审计子 Agent 已 completed；Agent 停靠区子 Agent 继续运行并更新活动。无模型或工具调用。',
+              ].join('\n')
+        }
+        break
+      }
+      case 'done': {
+        const base = this.taskScene ?? this.taskStage(0)
+        this.applyTaskScene(this.taskDoneScene(base))
+        text = [
+          '任务场景已完成（fixture）：Todo 6/6，Goal phase 为原生 `complete`，脚本内活动子 Agent 以 `completed` 投影收尾（不经过 /agent Stop）。',
+          '',
+          '这里只更新只读投影；没有真实 Todo 写入、Goal 轮次或子 Agent 执行。`tasks` 可重载，`tasks clear` 可清理。',
+        ].join('\n')
+        break
+      }
+      case 'clear':
+        this.clearTaskProjections()
+        text = [
+          '任务投影已清理：Todo 快照为 null，`native-goal` 读取为空（`goal: null`），子 Agent 目录为空。',
+          '',
+          '其他 demo 场景不受影响；再次输入 `tasks` 可重载。',
+        ].join('\n')
+        break
+      case 'history': {
+        if (this.taskScene === undefined) this.applyTaskScene(this.taskStage(0))
+        text = [
+          `已追加一段有界的长 fixture transcript（${DEMO_TASKS_HISTORY_PAIRS} 组消息），不改变 Todo/Goal/子 Agent 状态。`,
+          '',
+          '它用于验证固定底部停靠区不被历史滚动冲掉；整段内容同步生成，没有模型、定时器或自行播放。',
+        ].join('\n')
+        break
+      }
+    }
+    const meta = await this.liveStream(turn, step, [
+      ...this.taskTextChunks(0, text),
+      ...this.terminalChunks(),
+    ])
+    if (meta === undefined) return { kind: 'aborted' }
+    this.commitMessage(meta, turn, step, [{ type: 'text', text }])
+    // The mixed-activity sample follows the committed guide, so it sits at the
+    // transcript tail and stays visible in a normal 28/36-row terminal.
+    if (action === 'initial') this.appendTaskActivitySample(turn, step)
+    if (action === 'history') this.appendTaskHistory()
+    return { kind: 'completed' }
+  }
+
+  /** One finite deterministic stage; indices stay stable across stages. */
+  private taskStage(stage: number): DemoTaskScene {
+    const clamped = Math.max(0, Math.min(DEMO_TASKS_LAST_STAGE, Math.floor(stage)))
+    return {
+      stage: clamped,
+      todos: this.taskStageTodos(clamped),
+      goal: this.taskStageGoal(clamped),
+      children: this.taskStageChildren(clamped),
+    }
+  }
+
+  private taskStageTodos(stage: number): readonly TodoItem[] {
+    const completed = [1, 2, 4][stage] ?? 0
+    const inProgress = completed
+    return DEMO_TASK_TODO_TITLES.map((content, index) => ({
+      content,
+      status: index < completed ? 'completed' as const : index === inProgress ? 'in_progress' as const : 'pending' as const,
+    }))
+  }
+
+  private taskStageGoal(stage: number): GoalStateView {
+    const at = this.now()
+    const paused = stage >= DEMO_TASKS_LAST_STAGE
+    const roundsStarted = [1, 2, 2][stage] ?? 2
+    return {
+      id: DEMO_TASK_GOAL_ID,
+      revision: stage + 1,
+      objective: DEMO_TASK_GOAL_OBJECTIVE,
+      phase: paused ? 'paused' : 'active',
+      maxGoalRounds: 6,
+      roundsStarted,
+      createdAt: at - 30_000,
+      updatedAt: at,
+      activation: paused ? 'disarmed' : 'armed',
+    }
+  }
+
+  /**
+   * The three scripted children plus the completed sample sender.
+   *
+   * Every stage carries the already-finished sample row, so the mixed-activity
+   * notice's durable `senderSessionId` keeps resolving to a known, openable
+   * child instead of degrading into an unknown id when the scene advances.
+   */
+  private taskStageChildren(stage: number): readonly SubagentEntry[] {
+    const at = this.now()
+    const sample = this.taskSampleChild(at)
+    const specs = DEMO_TASK_CHILDREN
+    if (stage <= 0) {
+      return [
+        this.taskChildEntry(specs[0], 'running', specs[0].activity, at, 0),
+        this.taskChildEntry(specs[1], 'initializing', specs[1].activity, at, 1),
+        this.taskChildEntry(specs[2], 'running', specs[2].activity, at, 2),
+        sample,
+      ]
+    }
+    const settledTodo = this.taskChildEntry(specs[0], 'completed', undefined, at, 0)
+    if (stage === 1) {
+      return [
+        settledTodo,
+        this.taskChildEntry(specs[1], 'running', 'checking GoalRead phase chips at 40 and 80 columns', at, 1),
+        this.taskChildEntry(specs[2], 'running', 'reading src/ui/subagent-progress.ts active rows', at, 2),
+        sample,
+      ]
+    }
+    return [
+      settledTodo,
+      this.taskChildEntry(specs[1], 'completed', undefined, at, 1),
+      this.taskChildEntry(specs[2], 'running', 'verifying fixed docks with a bounded history transcript', at, 2),
+      sample,
+    ]
+  }
+
+  /**
+   * Already-finished fixture child behind the mixed-activity sample.
+   *
+   * Native catalog facts only (id/mode/status/local), plus the existing
+   * openable local mode so the Agents overlay can inspect it. It carries no
+   * `timing`/`totalTokens` and no `lastActivity`: the fixture observed no run.
+   */
+  private taskSampleChild(at: number): SubagentEntry {
+    return {
+      id: DEMO_TASK_SAMPLE_CHILD_ID,
+      parentSessionId: this.infoValue.sessionId,
+      createdAt: at - 9_000,
+      mode: 'one-shot',
+      label: DEMO_TASK_SAMPLE_CHILD_LABEL,
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      local: true,
+      status: 'completed',
+      lastRunId: 'demo-run-tasks-sample',
+      lastStopReason: 'completed',
+    }
+  }
+
+  /** Fixture child row; ids are the existing `DEMO_CHILD_ACTIVE_MANY` ids. */
+  private taskChildEntry(
+    spec: (typeof DEMO_TASK_CHILDREN)[number],
+    status: 'running' | 'initializing' | 'completed' | 'stopped',
+    activity: string | undefined,
+    at: number,
+    index: number,
+  ): SubagentEntry {
+    const active = status === 'running' || status === 'initializing'
+    return {
+      id: spec.id,
+      parentSessionId: this.infoValue.sessionId,
+      createdAt: at - 5_000 + index * 1_000,
+      mode: 'continuable',
+      label: spec.label,
+      provider: this.infoValue.provider,
+      model: this.infoValue.model,
+      reasoningEffort: this.infoValue.reasoningEffort ?? DEMO_DEFAULT_EFFORT,
+      local: true,
+      status,
+      lastRunId: `demo-run-tasks-${index + 1}`,
+      ...(activity === undefined ? {} : { lastActivity: activity }),
+      // No `timing`/token totals: the demo clock is fixture time, while the
+      // production dock formats elapsed against Date.now(). Omit the fact
+      // rather than paint an invented multi-day runtime.
+      ...(active ? {} : { lastStopReason: 'completed' as const }),
+    }
+  }
+
+  /** `tasks done`: complete the list, finish the goal, retire live children. */
+  private taskDoneScene(base: DemoTaskScene): DemoTaskScene {
+    const at = this.now()
+    const children = base.children.map(entry => {
+      const current = this.demoSubagents.get(entry.id) ?? entry
+      return current.status === 'running' || current.status === 'initializing' ? this.completeTaskChild(current) : current
+    })
+    return {
+      stage: DEMO_TASKS_LAST_STAGE + 1,
+      todos: base.todos.map(item => ({ content: item.content, status: 'completed' as const })),
+      goal: {
+        ...base.goal,
+        revision: base.goal.revision + 1,
+        phase: 'complete',
+        roundsStarted: base.goal.roundsStarted,
+        updatedAt: at,
+        activation: 'disarmed',
+      },
+      children,
+    }
+  }
+
+  /**
+   * Success-ending `tasks done` projection: the scripted scene wraps up its live
+   * children as `completed`, not as an interrupted/stopped run. The real
+   * `/agent` Stop path and the existing `subagent-interrupt` fixture keep their
+   * own `stopped`/`aborted` semantics; this helper is task-fixture copy only
+   * and still invents no observed runtime timing.
+   */
+  private completeTaskChild(entry: SubagentEntry): SubagentEntry {
+    const next: SubagentEntry = { ...entry, status: 'completed', lastStopReason: 'completed' }
+    delete next.lastActivity
+    delete next.timing
+    return next
+  }
+
+  /** Publish the three native projections of one scene, then invalidate goal. */
+  private applyTaskScene(scene: DemoTaskScene): void {
+    this.taskScene = scene
+    const sessionId = this.infoValue.sessionId
+    for (const entry of scene.children) this.demoSubagents.set(entry.id, entry)
+    const snapshot: SubagentSnapshot = { entries: [...scene.children] }
+    this.infoValue = { ...this.infoValue, subagents: snapshot }
+    this.emit({ type: 'todos', sessionId, value: scene.todos.map(item => ({ ...item })) })
+    this.emit({ type: 'subagents', sessionId, value: snapshot })
+    // Reuse the public read-only goal invalidation: the app re-reads
+    // command('native-goal'); the demo never pushes a private goal event.
+    this.emit({ type: 'native_ui_changed', sessionId, domain: 'goal' })
+  }
+
+  private clearTaskProjections(): void {
+    this.taskScene = undefined
+    const sessionId = this.infoValue.sessionId
+    this.demoSubagents.clear()
+    this.demoChildEvents.clear()
+    const empty: SubagentSnapshot = { entries: [] }
+    this.infoValue = { ...this.infoValue, subagents: empty }
+    this.emit({ type: 'todos', sessionId, value: null })
+    this.emit({ type: 'subagents', sessionId, value: empty })
+    this.emit({ type: 'native_ui_changed', sessionId, domain: 'goal' })
+  }
+
+  /** Neutral readonly GoalRead fixture; empty outside the explicit tasks scene. */
+  private demoGoalRead(): GoalRead {
+    const scene = this.taskScene
+    return {
+      available: true,
+      complete: true,
+      sessionId: this.infoValue.sessionId,
+      goal: scene === undefined ? null : { ...scene.goal },
+    }
+  }
+
+  /**
+   * Explicit offline mixed-activity sample for the `tasks` scene.
+   *
+   * One real native-shaped tool call/result (`List Agents children`), one pure
+   * `subagent-settled`/`notice` message attributed to the already-finished
+   * fixture child, then one `agent-message`/`relay`. Declared in that order, so
+   * the existing projections collapse the tool + notice into one Activities
+   * disclosure while the relay stays its own message boundary. Nothing is
+   * invented: no proposal chunks, no duplicated call, no timer, no tool/model
+   * execution, and every id is turn-scoped so repeated restarts never overwrite
+   * earlier sample facts.
+   */
+  private appendTaskActivitySample(turn: number, step: number): void {
+    const callId = `demo-tasks-call-${turn}`
+    const args = JSON.stringify({ mode: 'children' })
+    this.append('tool/call', { turn, step, callId, name: 'list_agents', arguments: args })
+    this.append('tool/result', {
+      turn,
+      step,
+      message: {
+        id: `demo-tasks-tool-result-${turn}`,
+        role: 'tool',
+        toolCallId: callId,
+        content: [{
+          type: 'text',
+          text: [
+            `${DEMO_CHILD_ACTIVE_MANY[0].id}  running`,
+            `${DEMO_CHILD_ACTIVE_MANY[1].id}  initializing`,
+            `${DEMO_CHILD_ACTIVE_MANY[2].id}  running`,
+            `${DEMO_TASK_SAMPLE_CHILD_ID}  completed`,
+          ].join('\n'),
+        }],
+        isError: false,
+        source: { kind: 'tool', callId },
+      },
+    })
+    const summary = `Sample settlement: fixture child ${DEMO_TASK_SAMPLE_CHILD_ID} finished before this scene and cannot receive follow-up messages.`
+    this.append('user/message', {
+      id: `demo-tasks-notice-${turn}`,
+      role: 'user',
+      content: [
+        { type: 'text', text: summary },
+        { type: 'text', text: `${DEMO_TASK_NOTICE_BODY}: 纯状态通知正文，仅在展开 Activities 时可见；没有工具结果、计时或真实子任务执行。` },
+      ],
+      source: {
+        kind: 'subagent-settled',
+        form: 'notice',
+        summary,
+        senderSessionId: DEMO_TASK_SAMPLE_CHILD_ID,
+      },
+    })
+    this.append('user/message', {
+      id: `demo-tasks-relay-${turn}`,
+      role: 'user',
+      content: [
+        { type: 'text', text: `Agent ${DEMO_TASK_SAMPLE_CHILD_ID} sent a message: ` },
+        { type: 'text', text: `${DEMO_TASK_RELAY_BODY}: 独立可见，不并入工具/状态组；Ctrl+O 展开 Activities，tasks next 推进。` },
+      ],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: DEMO_TASK_SAMPLE_CHILD_ID },
+    })
+  }
+
+  /** Bounded durable transcript for the fixed-dock layout; state unchanged. */
+  private appendTaskHistory(): void {
+    if (this.closed) return
+    const run = ++this.taskHistoryCounter
+    for (let index = 0; index < DEMO_TASKS_HISTORY_PAIRS; index += 1) {
+      const line = index + 1
+      this.append('user/message', {
+        id: `demo-task-history-user-${run}-${line}`,
+        role: 'user',
+        content: [{ type: 'text', text: `离线任务历史 fixture ${line}/${DEMO_TASKS_HISTORY_PAIRS}：检查固定停靠区位置，没有模型调用。` }],
+        source: { kind: 'user' },
+      })
+      this.append('assistant/message', {
+        turn: this.turnCounter,
+        step: 1,
+        message: {
+          id: `demo-task-history-assistant-${run}-${line}`,
+          role: 'assistant',
+          content: [{ type: 'text', text: `历史事实 ${line}/${DEMO_TASKS_HISTORY_PAIRS}：Todo/Goal/子 Agent 投影保持不变。` }],
+          source: { kind: 'model', provider: DEMO_PROVIDER, model: this.infoValue.model },
+        },
+        stream: [],
+      })
+    }
   }
 
   /**
@@ -1821,7 +2349,9 @@ export class DemoBackend implements Backend {
       status: 'running',
       lastActivity: delivery === 'steer' ? 'applying the steered prompt' : 'reading the follow-up prompt',
       lastRunId: runId,
-      timing: { settledMs: child.timing?.settledMs ?? 0, activeSince: this.now() },
+      // A row with no observed timing (the task fixture's children) must not
+      // gain one here: production formats it against Date.now().
+      ...(child.timing === undefined ? {} : { timing: { settledMs: child.timing.settledMs ?? 0, activeSince: this.now() } }),
     })
     void this.completeDemoChildPrompt(sessionId, runId, delivery)
     return {
@@ -1869,7 +2399,7 @@ export class DemoBackend implements Backend {
       ...current,
       status: 'idle',
       lastStopReason: 'completed',
-      timing: { settledMs: (timing?.settledMs ?? 0) + open, activeThrough: at, lastTurnCompleted: true },
+      ...(timing === undefined ? {} : { timing: { settledMs: (timing.settledMs ?? 0) + open, activeThrough: at, lastTurnCompleted: true } }),
     }
     delete next.lastActivity
     this.projectDemoChild(next)

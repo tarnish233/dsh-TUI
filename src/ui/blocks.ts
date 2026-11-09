@@ -40,11 +40,11 @@ import { ImageContentBody, type ContentRenderOptions } from './image-content.ts'
 import { imageMarkerLine } from './image-marker.ts'
 import { toolImageOccurrences } from './image-data.ts'
 import type { ImageDetailsRequest } from './image-view.ts'
-import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
+import { HitboxRegistry, hoverExitEvent, type MouseHitbox } from './mouse.ts'
 import { SubagentLinkHitboxes } from './subagent-link.ts'
 import { bold, cc, dim, italic, markdownTheme, t } from './theme.ts'
 import { fit, oneLine, plural, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
-import { ThinkingBlock, type ThinkingRun, type ThinkingScreen } from './thinking-block.ts'
+import { adoptThinkingExpansion, ThinkingBlock, type ThinkingRun, type ThinkingScreen } from './thinking-block.ts'
 import type { ToolGroupContext, ToolViewOptions } from './tool-view.ts'
 import { ToolBlock } from './tool-block.ts'
 import {
@@ -422,13 +422,14 @@ class UserBlock extends CachedBlock {
   }
 
   protected build(width: number): string[] {
-    // The ordered body keeps text/image positions; a legacy count-only message
-    // renders inert placeholders instead of pretending to be clickable.
+    // The ordered body keeps text/image/file positions; a legacy count-only
+    // message renders inert placeholders instead of pretending to be clickable,
+    // and a native file keeps its own read-only metadata row.
     const rendered = this.body.render(Math.max(1, width - 2), contentOptions(this.flags, this.hovered))
     const rows = rendered.lines.length === 0 ? [''] : rendered.lines
-    const imageRows = new Set(rendered.imageRows)
+    const markerRows = new Set(rendered.markerRows)
     const lines = rows.map((line, index) => {
-      const content = `${index === 0 ? t.muted('> ') : '  '}${imageRows.has(index) ? line : t.text(line)}`
+      const content = `${index === 0 ? t.muted('> ') : '  '}${markerRows.has(index) ? line : t.text(line)}`
       // A full-width mist-blue band makes human turns easy to distinguish from
       // assistant output. It is the DSH dark theme's selection color.
       return t.userBg(content + ' '.repeat(Math.max(0, width - visibleWidth(content))))
@@ -445,6 +446,7 @@ class AssistantBlock extends CachedBlock {
   private thinkingText = ''
   private runs: readonly TranscriptThinkingRun[] = []
   private interrupted = false
+  private interruptCause: AssistantTranscriptItem['interruptCause']
   private hovered: string | undefined
   private pendingBoxes: MouseHitbox[] = []
   private readonly body = new ImageContentBody('markdown')
@@ -454,6 +456,9 @@ class AssistantBlock extends CachedBlock {
   constructor(item: AssistantTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
     this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags))
+    // The durable item keeps its native id; only disclosure/render identity is
+    // inherited from the live attempt it replaced.
+    adoptThinkingExpansion(item.thinkingKey, item.id)
     this.assign(item)
   }
 
@@ -463,6 +468,7 @@ class AssistantBlock extends CachedBlock {
     this.thinkingText = item.thinking
     this.runs = thinkingRunsOf(item)
     this.interrupted = item.interrupted
+    this.interruptCause = item.interruptCause
     this.body.setItem(item)
   }
 
@@ -476,8 +482,24 @@ class AssistantBlock extends CachedBlock {
     else this.registry.sync(this.pendingBoxes)
   }
 
+  /**
+   * One hover owner inside the block.
+   *
+   * The reasoning section and the image-marker registry are two independent
+   * hitbox sets; forwarding motion only to the first one that claims it leaves
+   * the other's hover painted on an old row. A real `move` therefore sends the
+   * synthetic outside-rect exit to the target that just lost the pointer.
+   * Press pins, drags and click synthesis are untouched: this only runs for
+   * plain motion, and the real event still routes to the winning child.
+   */
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    return this.thinkingBlock.handleMouse(event) ?? this.registry.handleMouse(event)
+    const thinking = this.thinkingBlock.handleMouse(event)
+    if (thinking !== undefined) {
+      if (event.type === 'move') this.registry.handleMouse(hoverExitEvent(event))
+      return thinking
+    }
+    if (event.type === 'move') this.thinkingBlock.handleMouse(hoverExitEvent(event))
+    return this.registry.handleMouse(event)
   }
 
   clearMouse(): void {
@@ -498,12 +520,24 @@ class AssistantBlock extends CachedBlock {
     const content = assistantContent(width, this.thinkingText, this.runs, this.body, this.thinkingBlock, this.flags, this.hovered)
     this.pendingBoxes = imageHitboxes(this.itemId, content.markers, this.flags, (key, entering) => { this.hoverEvent(key, entering) })
     const out = [...content.lines]
-    if (this.interrupted) out.push(`${ELBOW}${t.redSoft('Interrupted by user')}`)
+    if (this.interrupted) out.push(`${ELBOW}${t.redSoft(interruptedLabel(this.interruptCause))}`)
     return out
   }
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * Interruption wording from the native cancellation cause only.
+ *
+ * A durable interrupted reply records the truncation marker but not its cause;
+ * until a recorded `turn/end{aborted}` supplies one, the line must stay neutral.
+ * External causes (parent agent, hook, disposal, imported legacy records) are
+ * never turned into a user action.
+ */
+function interruptedLabel(cause: AssistantTranscriptItem['interruptCause']): string {
+  return cause === 'user' ? 'Interrupted by user' : 'Interrupted'
+}
 
 class AttemptBlock extends CachedBlock {
   private text = ''
@@ -522,6 +556,7 @@ class AttemptBlock extends CachedBlock {
   constructor(item: AttemptTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
     this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags))
+    adoptThinkingExpansion(item.thinkingKey, item.id)
     this.assign(item)
   }
 
@@ -547,8 +582,24 @@ class AttemptBlock extends CachedBlock {
     else this.registry.sync(this.pendingBoxes)
   }
 
+  /**
+   * One hover owner inside the block.
+   *
+   * The reasoning section and the image-marker registry are two independent
+   * hitbox sets; forwarding motion only to the first one that claims it leaves
+   * the other's hover painted on an old row. A real `move` therefore sends the
+   * synthetic outside-rect exit to the target that just lost the pointer.
+   * Press pins, drags and click synthesis are untouched: this only runs for
+   * plain motion, and the real event still routes to the winning child.
+   */
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    return this.thinkingBlock.handleMouse(event) ?? this.registry.handleMouse(event)
+    const thinking = this.thinkingBlock.handleMouse(event)
+    if (thinking !== undefined) {
+      if (event.type === 'move') this.registry.handleMouse(hoverExitEvent(event))
+      return thinking
+    }
+    if (event.type === 'move') this.thinkingBlock.handleMouse(hoverExitEvent(event))
+    return this.registry.handleMouse(event)
   }
 
   clearMouse(): void {
@@ -590,13 +641,13 @@ class AttemptBlock extends CachedBlock {
     while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop()
     const limit = this.tentative ? Number.POSITIVE_INFINITY : (this.flags.expandTools ? 200 : 10)
     const visible = lines.slice(0, limit)
-    const imageRows = new Set(rendered.imageRows.map(row => row - trimStart))
+    const markerRows = new Set(rendered.markerRows.map(row => row - trimStart))
     const start = out.length
     for (let index = 0; index < visible.length; index += 1) {
       const line = visible[index]!
       // Tentative previews keep Markdown styling; capped settled previews use
       // the muted body style, while marker rows keep their own chrome.
-      const styled = imageRows.has(index + trimStart) ? line : this.tentative ? line : t.muted(line)
+      const styled = markerRows.has(index + trimStart) ? line : this.tentative ? line : t.muted(line)
       out.push(`  ${styled}`)
     }
     this.pendingBoxes = imageHitboxes(

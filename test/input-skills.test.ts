@@ -8,11 +8,12 @@ import {
   asTui,
   createFakeTui,
   loadInputModule,
+  press,
   renderAt,
   testEditorTheme,
   typeText,
 } from "../src/input/testing/harness.ts"
-import type { CcSubmitPayload } from "../src/input/index.ts"
+import type { CcSubmitPayload, NativeCommandEntry } from "../src/input/index.ts"
 import type { SkillCatalogEntry } from "../src/backend/types.ts"
 import {
   CombinedAutocompleteProvider,
@@ -27,7 +28,7 @@ type Provider = InstanceType<typeof mod.NativeAutocompleteProvider>
 const noopSignal = () => new AbortController().signal
 
 function makeProvider(options: {
-  commands?: readonly SlashCommand[]
+  commands?: readonly NativeCommandEntry[]
   skills?: readonly SkillCatalogEntry[]
   basePath?: string
   refreshSkills?: (signal: AbortSignal) => Promise<void>
@@ -120,6 +121,119 @@ test("commands keep native order and win a name collision with a skill", async (
   )
 })
 
+test("an exact name is ranked before a longer prefix sibling in the mixed command+skill catalog", async () => {
+  // Real production roster shape: UI commands, name-sorted native commands,
+  // then skills. A native command `review-all` and an exact native Skill
+  // `review` therefore arrive commands-first; typing `/review` must select the
+  // exact name, not the longer command that happens to be first.
+  const provider = makeProvider({
+    commands: [
+      { name: "help", description: "Display commands" },
+      { name: "review-all", description: "Run every review" },
+    ],
+    skills: [skill("review", "Review the diff")],
+  })
+
+  const typed = await suggest(provider, "/review")
+  assert.deepEqual(
+    typed?.items.map((item) => item.value),
+    ["review", "review-all"],
+    "the exact name is the first (default-selected) candidate",
+  )
+  assert.equal(typed?.prefix, "/review", "Pi's slash-name prefix/cursor namespace is unchanged")
+  assert.equal(typed?.items[1]?.description, "Run every review", "the longer command stays reachable")
+
+  // Prefix and fuzzy contexts still list their matches; only priority moved.
+  assert.deepEqual(
+    (await suggest(provider, "/review-a"))?.items.map((item) => item.value),
+    ["review-all"],
+  )
+  assert.deepEqual(
+    (await suggest(provider, "/rvw"))?.items.map((item) => item.value),
+    ["review-all", "review"],
+    "fuzzy-only matches keep the caller's roster order",
+  )
+
+  // The query is still exactly the text before the cursor (no whole-line
+  // lookup): with the cursor after `/rev` only the typed prefix matches, and
+  // both candidates are plain prefix matches like Pi's own reference order.
+  const midCursor = await provider.getSuggestions(["/review"], 0, 4, { signal: noopSignal() })
+  assert.equal(midCursor?.prefix, "/rev")
+  assert.deepEqual(
+    midCursor?.items.map((item) => item.value),
+    ["review-all", "review"],
+  )
+})
+
+test("pure native commands keep exact-name priority regardless of caller order", async () => {
+  // Native `commands.list()` is name-sorted, but the provider also merges UI
+  // commands and skill metadata, so exactness must not depend on caller order.
+  const unsorted = makeProvider({
+    commands: [
+      { name: "review-all", description: "Run every review" },
+      { name: "review", description: "Native review command" },
+    ],
+  })
+  assert.deepEqual(
+    (await suggest(unsorted, "/review"))?.items.map((item) => item.value),
+    ["review", "review-all"],
+  )
+
+  const sorted = makeProvider({
+    commands: [
+      { name: "review", description: "Native review command" },
+      { name: "review-all", description: "Run every review" },
+    ],
+  })
+  assert.deepEqual(
+    (await suggest(sorted, "/review"))?.items.map((item) => item.value),
+    ["review", "review-all"],
+    "the name-sorted native roster control keeps the same result",
+  )
+})
+
+test("an exact name keeps its native command entry when a Skill shares the name", async () => {
+  const provider = makeProvider({
+    commands: [{ name: "review", description: "Native review command" }],
+    skills: [skill("review", "Skill review body")],
+  })
+  const typed = await suggest(provider, "/review")
+  assert.deepEqual(typed?.items.map((item) => item.value), ["review"])
+  assert.equal(
+    typed?.items[0]?.description,
+    "Native review command",
+    "same-name native command priority is preserved",
+  )
+})
+
+test("native command input hints reach the menu (inputHint, Pi argumentHint fallback)", async () => {
+  const provider = makeProvider({
+    commands: [
+      {
+        name: "permission",
+        description: "Choose a permission preset",
+        inputHint: "<pre\u001b[31mset\u001b[0m>",
+      },
+      { name: "deploy", description: "Deploy", argumentHint: "[target]" },
+      { name: "goal", description: "", inputHint: "<objective>" },
+      { name: "both", description: "Both fields", inputHint: "", argumentHint: "[x]" },
+      { name: "plain", description: "No hint" },
+    ],
+  })
+
+  const items = await suggest(provider, "/")
+  const descriptions = new Map((items?.items ?? []).map((item) => [item.value, item.description]))
+  assert.equal(
+    descriptions.get("permission"),
+    "<preset> — Choose a permission preset",
+    "the App-mapped native input.hint is shown (and sanitized) instead of being dropped",
+  )
+  assert.equal(descriptions.get("deploy"), "[target] — Deploy", "Pi's argumentHint fallback still works")
+  assert.equal(descriptions.get("goal"), "<objective>", "a hint without a description is shown alone")
+  assert.equal(descriptions.get("both"), "[x] — Both fields", "an empty App hint falls back to Pi's field")
+  assert.equal(descriptions.get("plain"), "No hint")
+})
+
 test("user-only skills are labelled; model-invocable skills are not", async () => {
   const provider = makeProvider({
     skills: [skill("ask", "Ask a question", false), skill("review", "Review changes", true)],
@@ -183,7 +297,7 @@ test("skills are metadata only: no skill files are read or expanded", async () =
   }
 })
 
-test("file, @, argument and forced completion are delegated to Pi unchanged", async () => {
+test("plain paths, arguments and forced completion stay Pi-owned; @ has no local fallback", async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), "dsh-tui-skills-delegate-"))
   try {
     await mkdir(path.join(cwd, "src"), { recursive: true })
@@ -211,11 +325,13 @@ test("file, @, argument and forced completion are delegated to Pi unchanged", as
     })
     const reference = new CombinedAutocompleteProvider([...commands], cwd)
 
+    // Non-`@` contexts only: `@file` mentions have their own native provider
+    // tests (test/input-file-mentions.test.ts). Comparing them here would be a
+    // null === null parity, because neither side has a file source in this
+    // offline fixture (no `fd`, no index).
     const cases: Array<{ text: string; force?: boolean }> = [
       { text: "src/ma" },
       { text: "src/" },
-      { text: "@alpha" },
-      { text: "@src/ma" },
       { text: "/deploy st" },
       { text: "/set", force: true },
       { text: "/" , force: true },
@@ -229,6 +345,17 @@ test("file, @, argument and forced completion are delegated to Pi unchanged", as
       assert.deepEqual(actual, expected, `delegation mismatch for ${JSON.stringify(item)}`)
       assert.equal(refreshCalls, 0, "non-slash-name completion must not refresh skills")
     }
+
+    // Without a native `fileReferences` callback there is no local `@` index:
+    // every `@` request stays Pi's own (and empty here), never a hidden scan.
+    for (const text of ["@alpha", "@src/ma"]) {
+      assert.equal(
+        await provider.getSuggestions([text], 0, text.length, { signal: noopSignal() }),
+        null,
+        `${text} is not answered locally`,
+      )
+    }
+    assert.equal(refreshCalls, 0, "`@` requests still never refresh skills")
 
     // shouldTriggerFileCompletion keeps Pi's slash-name guard.
     assert.equal(provider.shouldTriggerFileCompletion(["/rev"], 0, 4), false)
@@ -607,6 +734,95 @@ test("CcEditor content path: the selected non-first candidate is what gets submi
   assert.equal(payloads.length, 1)
   assert.equal(payloads[0]?.text, "/review")
   assert.deepEqual(payloads[0]?.snapshot.lines, ["/review "])
+})
+
+test("CcEditor content path: an exact Skill in a mixed catalog submits /review, never the prefix command", async () => {
+  // The confirmed production shape: native commands first (`review-all`), then
+  // the exact native Skill (`review`). Enter previously accepted review-all.
+  const provider = makeProvider({
+    commands: [
+      { name: "help", description: "Display commands" },
+      { name: "review-all", description: "Run every review" },
+    ],
+    skills: [skill("review", "Review the diff")],
+  })
+  const { editor, payloads, legacy, blocked } = makeContentEditor(provider)
+
+  typeText(editor, "/review")
+  await sleep(20)
+  assert.equal(editor.isShowingAutocomplete(), true)
+  editor.handleInput("\r")
+
+  assert.equal(blocked.length, 0)
+  assert.equal(payloads.length, 1, "onSubmitContent receives exactly one payload")
+  assert.deepEqual(legacy, [], "the legacy text callback is not the proof path")
+  const payload = payloads[0]!
+  assert.equal(payload.text, "/review")
+  const textPart = payload.content.find((part) => part.type === "text")
+  assert.equal(
+    textPart?.type === "text" ? textPart.text.trim() : undefined,
+    "/review",
+    "the content-aware payload carries the exact native Skill literal",
+  )
+  assert.deepEqual(payload.snapshot.lines, ["/review "], "snapshot holds the completed draft")
+  assert.equal(editor.getText(), "")
+
+  // Positive control in the same mixed catalog: the longer native command is
+  // still reachable by its own exact name.
+  const control = makeContentEditor(provider)
+  typeText(control.editor, "/review-all")
+  await sleep(20)
+  assert.equal(control.editor.isShowingAutocomplete(), true)
+  control.editor.handleInput("\r")
+  assert.equal(control.payloads.length, 1)
+  assert.equal(control.payloads[0]?.text, "/review-all")
+})
+
+test("CcEditor content path: an exact native command wins over an earlier longer command", async () => {
+  // Pure-command control (both names are native commands). Native
+  // `commands.list()` is name-sorted, but Enter must still submit `/review`
+  // even if the roster handed to the menu is not.
+  const provider = makeProvider({
+    commands: [
+      { name: "review-all", description: "Run every review" },
+      { name: "review", description: "Native review command" },
+    ],
+  })
+  const { editor, payloads, legacy } = makeContentEditor(provider)
+
+  typeText(editor, "/review")
+  await sleep(20)
+  assert.equal(editor.isShowingAutocomplete(), true)
+  editor.handleInput("\r")
+
+  assert.equal(payloads.length, 1)
+  assert.deepEqual(legacy, [])
+  assert.equal(payloads[0]?.text, "/review")
+  assert.deepEqual(payloads[0]?.snapshot.lines, ["/review "])
+})
+
+test("CcEditor content path: deliberate navigation overrides the exact default; Tab still only edits", async () => {
+  const provider = makeProvider({
+    commands: [{ name: "review-all", description: "Run every review" }],
+    skills: [skill("review", "Review the diff")],
+  })
+
+  const tabbed = makeContentEditor(provider)
+  typeText(tabbed.editor, "/review")
+  await sleep(20)
+  assert.equal(tabbed.editor.isShowingAutocomplete(), true)
+  press(tabbed.editor, "\x1b[B") // Down: exact review -> review-all
+  tabbed.editor.handleInput("\t")
+  assert.equal(tabbed.editor.getText(), "/review-all ")
+  assert.equal(tabbed.payloads.length, 0, "Tab accepts into the draft only")
+
+  const submitted = makeContentEditor(provider)
+  typeText(submitted.editor, "/review")
+  await sleep(20)
+  submitted.editor.handleInput("\x0e") // Ctrl+N: exact review -> review-all
+  submitted.editor.handleInput("\r")
+  assert.equal(submitted.payloads.length, 1, "explicit user navigation still submits the highlighted item")
+  assert.equal(submitted.payloads[0]?.text, "/review-all")
 })
 
 test("CcEditor content path: rejected admission keeps the completed image-bearing draft", async () => {

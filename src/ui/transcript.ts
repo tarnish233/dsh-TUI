@@ -32,14 +32,19 @@ import {
   type TranscriptViewHints,
   type TranscriptViewOptions,
 } from './blocks.ts'
-import { dispatchToChild } from './mouse.ts'
+import { dispatchToChild, HoverOwnership, hoverRowSlot } from './mouse.ts'
 import {
   planTranscriptNodes,
   releaseToolGroupContext,
   ToolGroupBlock,
   type ToolGroupMember,
-  type TranscriptNode,
 } from './tool-group.ts'
+import {
+  ActivityGroupBlock,
+  planActivityGroupNodes,
+  type ActivityGroupMember,
+  type ActivityMemberItem,
+} from './activity-group.ts'
 import {
   planSubagentGroupNodes,
   SubagentGroupBlock,
@@ -133,6 +138,16 @@ export interface TranscriptViewOptionsShape extends ToolViewOptions {
    */
   groupSubagentMessages?: boolean
   /**
+   * Omit DSH's live todos checklist from this transcript.
+   *
+   * The native projection stays in the store (and in every durable event, tool
+   * card and notice); only the `TodosTranscriptItem` display node is skipped.
+   * The parent enables this while it hosts the same snapshot in the
+   * above-editor todo dock, so the checklist is not painted twice. Default
+   * `false` keeps the historical standalone transcript rendering byte-for-byte.
+   */
+  suppressLiveTodos?: boolean
+  /**
    * Click-driven viewport anchor for thinking expansion: the parent freezes
    * follow-end before an expanding click so the clicked row stays visible,
    * and restores follow on the collapsing click.
@@ -156,15 +171,25 @@ interface CachedSubagentGroupEntry {
   block: SubagentGroupBlock
 }
 
-type CacheEntry = CachedItemEntry | CachedGroupEntry | CachedSubagentGroupEntry
+interface CachedActivityGroupEntry {
+  readonly tag: 'activity-group'
+  block: ActivityGroupBlock
+}
+
+type CacheEntry = CachedItemEntry | CachedGroupEntry | CachedSubagentGroupEntry | CachedActivityGroupEntry
 
 /**
- * View flags plus the one projection-only extra: subagent record grouping is
- * independent from the tool grouping preference (`groupTools`), so it cannot be
- * smuggled through `ToolViewOptions`/`TranscriptViewOptions` (both owned by the
- * shared block contract) and is kept as view-local display state here.
+ * View flags plus projection-only extras: subagent record grouping is
+ * independent from the tool grouping preference (`groupTools`), and the parent
+ * may suppress only the live todos display node while it hosts the dock. Both
+ * are view-local display state and are not smuggled through
+ * `ToolViewOptions`/`TranscriptViewOptions` (owned by the shared block
+ * contract).
  */
-type TranscriptFlags = TranscriptViewOptions & { groupSubagentMessages?: boolean }
+type TranscriptFlags = TranscriptViewOptions & {
+  groupSubagentMessages?: boolean
+  suppressLiveTodos?: boolean
+}
 
 /** What the frame loop needs from either kind of cached block. */
 interface FrameBlock {
@@ -214,7 +239,20 @@ export class TranscriptView implements Component {
   private groupedKeys: ReadonlySet<string> = new Set()
   /** Item blocks of the last rendered frame plus their rows, used for mouse routing. */
   private spans: Array<{ block: FrameBlock; startRow: number; endRow: number }> = []
+  /**
+   * The one item block / group the pointer is inside right now.
+   *
+   * Pointer motion is only ever forwarded to the block under the row, so a block
+   * the pointer left would otherwise keep its `hovered` hitbox and paint a blue
+   * "click to expand" hint on a historical card. This helper releases that
+   * owner (and lets a group cascade the release to its own child) whenever
+   * motion moves to another row, a gap, a wheel scroll, or a frame that no
+   * longer shows the block at the same row.
+   */
+  private readonly hover = new HoverOwnership()
   private sessionId: string | undefined
+  /** Width of the last painted frame (`0` before the first render). */
+  private lastWidth = 0
   private liveTimer: ReturnType<typeof setInterval> | undefined
   private liveTimerMs = 0
   /** Set by {@link dispose}: the view is inert and never renders again. */
@@ -249,6 +287,9 @@ export class TranscriptView implements Component {
     // and an explicit `false` (the migrated setting) restores one row per
     // durable record without changing any native fact or shared disclosure.
     this.flags.groupSubagentMessages = this.options.groupSubagentMessages
+    // Parent-hosted dock only: this removes the live todos display node, never a
+    // durable tool/event/notice item and never the native store projection.
+    this.flags.suppressLiveTodos = this.options.suppressLiveTodos
     this.flags.onToolDetails = this.options.onToolDetails
     this.flags.onImageDetails = this.options.onImageDetails
     this.flags.imageDetailsHint = this.options.imageDetailsHint
@@ -289,15 +330,33 @@ export class TranscriptView implements Component {
   }
 
   /**
-   * Frame projection: tool grouping first, then consecutive durable subagent
-   * records. Both are display-only folds of the same declared item order; the
-   * store still holds every native item, seq and message text.
+   * Frame projection, in three display-only folds of the same declared order:
+   *
+   *   1. consecutive tool calls (`ToolGroupBlock`);
+   *   2. consecutive tools + pure runtime settlement notices
+   *      (`ActivityGroupBlock`) — only while BOTH grouping preferences are on,
+   *      so either one switched off restores the previous rows exactly;
+   *   3. consecutive durable subagent records (`SubagentGroupBlock`).
+   *
+   * Every fold is a view: the store still holds every native item, seq, sender,
+   * summary and exact message text in declaration order.
    */
   private frameNodes(): readonly SubagentFrameNode[] {
     const options = this.planOptions()
-    return planSubagentGroupNodes(planTranscriptNodes(this.store.items, options), {
+    const toolNodes = planTranscriptNodes(this.store.items, options)
+    // A mixed activity group is the conjunction of the two existing preferences:
+    // there is no third setting and no separate behaviour to explain.
+    const activityNodes = planActivityGroupNodes(toolNodes, {
+      groupActivities: options.groupTools && options.groupSubagentMessages,
+    })
+    const nodes = planSubagentGroupNodes(activityNodes, {
       groupRecords: options.groupSubagentMessages,
     })
+    if (options.suppressLiveTodos !== true) return nodes
+    // Grouping runs first so hiding the checklist does not change any tool,
+    // activity or subagent run boundary: the live todos item still separates
+    // runs exactly as it did before, only its own display node is dropped.
+    return nodes.filter(node => !(node.kind === 'item' && node.item.kind === 'todos'))
   }
 
   /** Root disclosure keys of the current projection (groups and ungrouped cards). */
@@ -305,6 +364,7 @@ export class TranscriptView implements Component {
     const keys: string[] = []
     for (const node of this.frameNodes()) {
       if (node.kind === 'group') keys.push(toolGroupExpansionKey(node.anchor.callId))
+      else if (node.kind === 'activity-group') keys.push(toolGroupExpansionKey(node.anchor.id))
       else if (node.kind === 'subagent-group') keys.push(toolGroupExpansionKey(node.anchor.id))
       else if (node.item.kind === 'tool') keys.push(toolExpansionKey(node.item.callId))
     }
@@ -342,7 +402,7 @@ export class TranscriptView implements Component {
         if (isToolExpanded(toolGroupExpansionKey(node.anchor.callId), this.flags.expandTools)) count += 1
         continue
       }
-      if (node.kind === 'subagent-group') {
+      if (node.kind === 'activity-group' || node.kind === 'subagent-group') {
         if (isToolExpanded(toolGroupExpansionKey(node.anchor.id), this.flags.expandTools)) count += 1
         continue
       }
@@ -354,20 +414,32 @@ export class TranscriptView implements Component {
       if (this.flags.showThinking && (item.kind === 'assistant' || item.kind === 'attempt')) {
         const runs = thinkingRunsOf(item)
         for (let index = 0; index < runs.length; index += 1) {
-          if (isThinkingExpanded(thinkingExpansionKey(item.id, index))) count += 1
+          // The new durable block adopts its live disclosure key on first
+          // paint. Count that pending handoff too, so viewport anchoring cannot
+          // observe a spurious collapse between the event and the render.
+          const current = thinkingExpansionKey(item.id, index)
+          const pending = item.thinkingKey === undefined ? undefined : thinkingExpansionKey(item.thinkingKey, index)
+          if (isThinkingExpanded(current) || (pending !== undefined && isThinkingExpanded(pending))) count += 1
         }
       }
     }
     return count
   }
 
-  private planOptions(): { groupTools: boolean; groupSubagentMessages: boolean; showThinking: boolean } {
+  private planOptions(): {
+    groupTools: boolean
+    groupSubagentMessages: boolean
+    showThinking: boolean
+    suppressLiveTodos: boolean
+  } {
     return {
       groupTools: this.flags.groupTools ?? true,
       // Independent display preference: default on for standalone rendering,
       // parent passes the migrated durable value.
       groupSubagentMessages: this.flags.groupSubagentMessages ?? true,
       showThinking: this.flags.showThinking,
+      // Opt-in parent-hosted dock only; default false preserves standalone use.
+      suppressLiveTodos: this.flags.suppressLiveTodos === true,
     }
   }
 
@@ -379,6 +451,29 @@ export class TranscriptView implements Component {
   /** Diagnostics/tests: row span of every item block in the last frame. */
   get rowSpans(): readonly TranscriptRowSpan[] {
     return this.spans.map(span => ({ itemId: span.block.itemId, startRow: span.startRow, endRow: span.endRow }))
+  }
+
+  /** Diagnostics/tests: the item block that currently owns the pointer hover. */
+  get hoverOwnerItemId(): string | undefined {
+    return (this.hover.current as FrameBlock | undefined)?.itemId
+  }
+
+  /** Diagnostics/tests: placement (`row 12`) of the current hover owner. */
+  get hoverOwnerPlacement(): string | undefined {
+    return this.hover.placement
+  }
+
+  /**
+   * Drop the ephemeral hover of the current pointer target (parent seam).
+   *
+   * The view only ever sees motion that lands inside its own box, so the parent
+   * calls this when the pointer leaves the transcript (editor, status dock,
+   * overlay), when *it* scrolls the viewport for a key press, and before a
+   * teardown it drives itself. Only hover paint is cleared: no press pin, no
+   * drag, no selection, no disclosure and no focus state is touched.
+   */
+  releaseHover(): void {
+    this.hover.release()
   }
 
   /** Diagnostics/tests: whether the live reasoning timer is armed. */
@@ -412,8 +507,11 @@ export class TranscriptView implements Component {
     if (this.disposed) return
     this.disposed = true
     this.stopLiveTimer()
+    // Release the pointer hover before the blocks forget their hitboxes: a card
+    // that vanished while still blue would otherwise never repaint neutral.
+    this.hover.release()
     for (const entry of this.cache.values()) {
-      if (entry.tag === 'group' || entry.tag === 'subagent-group') entry.block.dispose()
+      if (entry.tag === 'group' || entry.tag === 'subagent-group' || entry.tag === 'activity-group') entry.block.dispose()
       else entry.block.clearMouse?.()
     }
     this.cache.clear()
@@ -432,6 +530,7 @@ export class TranscriptView implements Component {
     // with it.
     if (this.store.sessionId !== this.sessionId) {
       this.sessionId = this.store.sessionId
+      this.hover.release()
       for (const entry of this.cache.values()) entry.block.clearMouse?.()
       this.cache.clear()
       this.groupedKeys = new Set()
@@ -440,6 +539,15 @@ export class TranscriptView implements Component {
       clearToolExpansion()
     }
     const safeWidth = Math.max(1, Math.floor(width))
+    // A modal owns the pointer: the transcript behind it must not keep a hint
+    // painted as if the pointer were still heading for it.
+    if (this.options.mouseBlocked === true) this.hover.release()
+    // A terminal resize re-flows every row: no hitbox the pointer was inside
+    // still occupies the same cells, so the hint reverts before the new paint.
+    if (safeWidth !== this.lastWidth) {
+      if (this.lastWidth !== 0) this.hover.release()
+      this.lastWidth = safeWidth
+    }
     const cwd = this.store.info?.cwd ?? ''
     // The projection is display-only: `store.items` keeps the declared order and
     // every tool card keeps its own item identity/cache. A group is one extra
@@ -462,6 +570,20 @@ export class TranscriptView implements Component {
         block = this.itemBlock(node.item, seen, cwd)
         const key = `${node.item.kind}|${node.item.id}`
         if (this.groupedKeys.has(key) && !grouped.has(key)) ungroupItem(block as ItemBlock)
+      } else if (node.kind === 'activity-group') {
+        const members: ActivityGroupMember[] = []
+        for (const item of node.members) {
+          // Tool members keep their own disclosure key (restored verbatim once
+          // the group dissolves) and are marked grouped so `ungroupItem` releases
+          // the delegated context when the mixed run breaks up.
+          if (item.kind === 'tool') {
+            disclosureKeys.push(toolExpansionKey(item.callId))
+            grouped.add(`tool|${item.id}`)
+          }
+          members.push({ item, block: this.itemBlock(item, seen, cwd) })
+        }
+        block = this.activityGroupBlock(node.anchor, members, seen, cwd)
+        disclosureKeys.push(toolGroupExpansionKey(node.anchor.id))
       } else if (node.kind === 'subagent-group') {
         const members: SubagentGroupMember[] = []
         for (const item of node.members) members.push({ item, block: this.itemBlock(item, seen, cwd) })
@@ -490,6 +612,9 @@ export class TranscriptView implements Component {
     // while a group key is only retained for as long as a group row exists.
     retainToolExpansion(new Set(disclosureKeys))
     this.spans = spans
+    // A repaint that re-based (or dropped) the hovered block moved its hitbox
+    // away from a pointer that did not move: the hint must go back to neutral.
+    this.hover.retain(spans.map(span => ({ component: span.block, slot: hoverRowSlot(span.startRow) })))
     this.syncLiveTimer()
     return out
   }
@@ -560,6 +685,34 @@ export class TranscriptView implements Component {
   }
 
   /**
+   * One cached mixed activity group per anchor item id, holding the reused member
+   * blocks (real tool cards and real settlement-notice blocks).
+   *
+   * The anchor is the first member, so the component, its disclosure state and
+   * its cache survive members joining, updating or leaving the run.
+   */
+  private activityGroupBlock(
+    anchor: ActivityMemberItem,
+    members: readonly ActivityGroupMember[],
+    seen: Set<string>,
+    cwd: string,
+  ): ActivityGroupBlock {
+    const key = `activity-group|${anchor.id}`
+    seen.add(key)
+    const entry = this.cache.get(key)
+    if (entry !== undefined && entry.tag === 'activity-group') {
+      entry.block.setCwd(cwd)
+      entry.block.setMembers(members)
+      return entry.block
+    }
+    const block = new ActivityGroupBlock(anchor, this.flags)
+    block.setCwd(cwd)
+    block.setMembers(members)
+    this.cache.set(key, { tag: 'activity-group', block })
+    return block
+  }
+
+  /**
    * Drop cached components that the frame no longer shows.
    *
    * A group releases its children's group contexts here, before the frame's own
@@ -569,7 +722,7 @@ export class TranscriptView implements Component {
   private evictUnplanned(planned: ReadonlySet<string>): void {
     for (const [key, entry] of [...this.cache]) {
       if (planned.has(key)) continue
-      if (entry.tag === 'group' || entry.tag === 'subagent-group') entry.block.clearMouse()
+      if (entry.tag === 'group' || entry.tag === 'subagent-group' || entry.tag === 'activity-group') entry.block.clearMouse()
       else entry.block.clearMouse?.()
       this.cache.delete(key)
     }
@@ -591,8 +744,26 @@ export class TranscriptView implements Component {
     // A disposed view (or one behind a modal overlay) owns no pointer target:
     // the transcript behind it stays inert instead of expanding a card or
     // collapsing a group nobody can see.
-    if (this.disposed || this.options.mouseBlocked === true) return undefined
+    if (this.disposed || this.options.mouseBlocked === true) {
+      this.hover.release()
+      return undefined
+    }
     const span = this.spans.find(entry => event.y >= entry.startRow && event.y <= entry.endRow)
+    // A wheel scroll moves every hitbox under a stationary pointer; the hint has
+    // to revert instead of pointing at whatever row is there after the scroll.
+    if (event.type === 'wheel') {
+      this.hover.release(event)
+      return undefined
+    }
+    const moving = event.type === 'move' || event.type === 'drag'
+    if (moving) {
+      // Exactly one visible target owns the hover: a new block (or the gap
+      // between blocks) releases the previous one before the event routes on.
+      this.hover.moveTo(
+        span === undefined ? undefined : { component: span.block, slot: hoverRowSlot(span.startRow) },
+        span === undefined ? event : { ...event, y: event.y - span.startRow },
+      )
+    }
     if (span === undefined) return undefined
     return dispatchToChild(span.block, { ...event, y: event.y - span.startRow })
   }
@@ -721,6 +892,11 @@ function plannedKeys(nodes: readonly SubagentFrameNode[]): ReadonlySet<string> {
   for (const node of nodes) {
     if (node.kind === 'item') {
       planned.add(`${node.item.kind}|${node.item.id}`)
+      continue
+    }
+    if (node.kind === 'activity-group') {
+      planned.add(`activity-group|${node.anchor.id}`)
+      for (const item of node.members) planned.add(`${item.kind}|${item.id}`)
       continue
     }
     if (node.kind === 'subagent-group') {

@@ -388,6 +388,23 @@ export interface SelectDialogOptions {
   error?: string
 }
 
+/** Opt-in selection survival policy for a native roster refresh. */
+export interface SelectItemsOptions {
+  /**
+   * Keep the row whose opaque `value` is identical (`Object.is`) to the row
+   * under the cursor instead of preserving the raw index. A native catalog
+   * refresh can insert or reorder rows, and an index-based survival would move
+   * the highlight onto a different native option.
+   *
+   * Only exact value identity counts: a row that is merely deep-equal is a
+   * different native option, so nothing is inferred from object structure. If
+   * several rows share the value, the first native row wins; if the value is
+   * gone the index is clamped as in the default policy. Neither branch selects,
+   * submits or focuses anything.
+   */
+  preserveValue?: boolean
+}
+
 export class SelectDialog implements Component, Focusable {
   readonly capturesViewportInput = true
   readonly modalSize: ModalSize = 'compact'
@@ -398,6 +415,7 @@ export class SelectDialog implements Component, Focusable {
   private items: DecisionOption[]
   private loadingState: boolean
   private errorState: string | undefined
+  private messageState: string | undefined
   private index = 0
   private hits: HitRange[] = []
   /** Content revision: a press recorded before a roster change cannot fire. */
@@ -437,16 +455,32 @@ export class SelectDialog implements Component, Focusable {
   // --- asynchronous roster updates (no auto-select, no auto-submit) ------
 
   /**
-   * Replace the native roster. The current selection survives by index while
-   * that index still exists; nothing is selected, submitted or focused as a
-   * side effect of late data.
+   * Replace the native roster. By default the current selection survives by
+   * index while that index still exists; with `{ preserveValue: true }` it
+   * survives by the exact opaque `value` under the cursor, so a native
+   * insert/reorder keeps the same row selected. Nothing is selected, submitted
+   * or focused as a side effect of late data, and a press recorded against the
+   * previous roster cannot fire against the new one.
    */
-  setItems(items: readonly DecisionOption[]): void {
+  setItems(items: readonly DecisionOption[], options: SelectItemsOptions = {}): void {
+    const previous = this.items[this.index]
     this.revision += 1
     this.press = undefined
     this.items = [...items]
     this.loadingState = false
-    this.index = this.items.length === 0 ? 0 : Math.min(this.index, this.items.length - 1)
+    const count = this.items.length
+    if (count === 0) {
+      this.index = 0
+      return
+    }
+    if (options.preserveValue === true && previous !== undefined) {
+      const exact = this.items.findIndex(item => Object.is(item.value, previous.value))
+      if (exact >= 0) {
+        this.index = exact
+        return
+      }
+    }
+    this.index = Math.min(this.index, count - 1)
   }
 
   /** Enter/leave the phase-1 loading state. */
@@ -460,6 +494,14 @@ export class SelectDialog implements Component, Focusable {
   setError(message?: string): void {
     this.revision += 1
     this.errorState = message === undefined || message.trim() === '' ? undefined : message
+  }
+
+  /** Replace native metadata feedback without changing selection, focus or editor state. */
+  setMessage(message?: string, error = false): void {
+    this.revision += 1
+    const text = message === undefined || message.trim() === '' ? undefined : message
+    this.messageState = error ? undefined : text
+    this.errorState = error ? text : undefined
   }
 
   get selectedIndex(): number {
@@ -597,7 +639,7 @@ export class SelectDialog implements Component, Focusable {
     return {
       title: this.options.title,
       ownerKey: this.ownerKey(),
-      ...(this.options.subtitle === undefined ? {} : { subtitle: this.options.subtitle }),
+      ...((this.messageState ?? this.options.subtitle) === undefined ? {} : { subtitle: this.messageState ?? this.options.subtitle }),
       actions: this.actions(),
       onClose: () => this.cancel(),
       maxHeight: modalHeight(this.tui, this.modalSize),

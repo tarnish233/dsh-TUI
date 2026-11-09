@@ -49,7 +49,11 @@
  *   where failures are reported), while an unknown stdout line stays `routine`
  *   (log-only) unless it plainly reads as a warning/failure — generic
  *   `console.log` chatter must not flood a transcript. The known periodic
- *   successful model-listing line is always `routine`. Records are plain
+ *   successful model-listing line is always `routine`, as is one exact piece of
+ *   Node's own startup noise: the `stripTypeScriptTypes` experimental warning
+ *   (and only its own adjacent companion hint) that the installed DSH PTC
+ *   runtime triggers once per process. Every other experimental warning keeps
+ *   surfacing. Records are plain
  *   sanitized text: never serialized objects, stack/cause dumps, session data or
  *   image bytes.
  * - The private log is bounded in memory and on disk. An over-long line is
@@ -157,6 +161,34 @@ const ROUTINE_LISTING = /^(?:\[[^\]\n]{1,64}\]\s+)?model listing from \S+ loaded
  * `<bin>: fatal load failure: …` / `<bin>: fatal uncaught exception: …`.
  */
 const FATAL_LABEL = /^(?:[^\s:]{1,64}:\s+)?fatal (?:load failure|uncaught exception):/
+
+/**
+ * One exact Node experimental warning that is routine for this application.
+ *
+ * Origin (read-only inspection of the installed packages, Node v26.13.0): DSH's
+ * `@deepseek-ai/dsh-ptc-runtime-node` imports `stripTypeScriptTypes` from
+ * `node:module` for its TypeScript execution modes and Node itself emits
+ * `(node:<pid>) ExperimentalWarning: stripTypeScriptTypes is an experimental
+ * feature and might change at any time` on stderr the first time it runs — once
+ * per process, as a direct `process.stderr.write`, i.e. inside this capture.
+ * That is successful DSH function, not a DSH failure, so it is stored
+ * (log-only) instead of becoming a transcript notice.
+ *
+ * The wording is matched exactly, not by prefix: any other experimental API,
+ * any other experimental wording, and any future Node wording change stays a
+ * `warning` (visible). The `(<title>:<pid>)` prefix varies per process and is
+ * bounded, not wildcarded across the rest of the line.
+ */
+const NODE_STRIP_TYPES_WARNING = /^\([^\s()]{1,64}:\d{1,10}\) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time$/
+
+/**
+ * Node's companion hint, written in the *same* stderr write directly after a
+ * warning unless `--trace-warnings` was passed. It carries no diagnostic value
+ * by itself, so it is demoted only when it unambiguously continues
+ * {@link NODE_STRIP_TYPES_WARNING} on the same stream with no line in between;
+ * a standalone hint (belonging to any other warning) keeps surfacing.
+ */
+const NODE_TRACE_HINT = /^\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)$/
 
 /** Marker used instead of a diagnostic line that exceeded {@link MAX_LINE_CHARS}. */
 const OVERFLOW_MARKER = '[dsh-tui] dropped an over-long diagnostic line'
@@ -349,6 +381,14 @@ function stripTerminalControls(text: string): string {
 }
 
 /**
+ * Whether a line is the one known routine Node warning this application accepts.
+ * Node writes warnings to stderr; the same text on stdout is not demoted.
+ */
+function isRoutineNodeWarning(channel: Channel, text: string): boolean {
+  return channel === 'stderr' && NODE_STRIP_TYPES_WARNING.test(text)
+}
+
+/**
  * Sanitize one captured line: strip terminal control text, trim, redact
  * credential-shaped values. Never returns a partial line.
  */
@@ -366,15 +406,23 @@ function sanitizeDiagnosticText(line: string): string {
  *
  * - the native fail-loud label is always `fatal` (see {@link forwardFatal});
  * - the exact periodic successful model listing is always `routine`;
+ * - the exact known Node `stripTypeScriptTypes` experimental warning, and its
+ *   companion hint only while {@link NODE_TRACE_HINT} directly follows it on the
+ *   same stream, are `routine` (log-only);
  * - unknown stderr is `warning`: native stderr is where failures are reported,
  *   so nothing there may be silently swallowed;
  * - unknown stdout is `routine` (log-only). Generic `console.log` chatter must
  *   not flood a transcript; a line that plainly reads as a warning/failure is
  *   still surfaced as `warning`.
+ *
+ * @param traceHintExpected - true only when the previous complete line on this
+ *   channel was exactly the known Node warning (one-line adjacency window).
  */
-function classify(channel: Channel, text: string): TerminalDiagnosticKind {
+function classify(channel: Channel, text: string, traceHintExpected: boolean): TerminalDiagnosticKind {
   if (FATAL_LABEL.test(text)) return 'fatal'
   if (ROUTINE_LISTING.test(text)) return 'routine'
+  if (isRoutineNodeWarning(channel, text)) return 'routine'
+  if (channel === 'stderr' && traceHintExpected && NODE_TRACE_HINT.test(text)) return 'routine'
   if (channel === 'stderr') return 'warning'
   return WARNING_TEXT.test(text) ? 'warning' : 'routine'
 }
@@ -437,6 +485,12 @@ export async function createTerminalOutputLease(options: TerminalOutputLeaseOpti
   // An over-long line is discarded up to the next newline: its continuation in
   // later writes must never be treated as a fresh diagnostic.
   const discarding: Record<Channel, boolean> = { stdout: false, stderr: false }
+  /**
+   * One-line adjacency window per channel for Node's companion trace hint. It is
+   * a constant-size flag (no queue, no timer): set by the exact known Node
+   * warning, cleared by the very next line on that channel, whatever it is.
+   */
+  const traceHintExpected: Record<Channel, boolean> = { stdout: false, stderr: false }
   const discardedChars: Record<Channel, number> = { stdout: 0, stderr: 0 }
   const discardPrefix: Record<Channel, string> = { stdout: '', stderr: '' }
   let stdoutOriginal: StreamWrite | undefined
@@ -599,6 +653,8 @@ export async function createTerminalOutputLease(options: TerminalOutputLeaseOpti
 
   /** Report and drop a line that exceeded the per-line bound: never a partial line. */
   function emitOverflowMarker(channel: Channel, chars: number, kind: TerminalDiagnosticKind = 'warning'): void {
+    // A dropped line still breaks the known-warning/hint adjacency.
+    traceHintExpected[channel] = false
     const record: TerminalDiagnosticRecord = {
       channel,
       kind,
@@ -691,7 +747,10 @@ export async function createTerminalOutputLease(options: TerminalOutputLeaseOpti
       return undefined
     }
     if (text.length === 0) return undefined
-    const kind = classify(channel, text)
+    const kind = classify(channel, text, traceHintExpected[channel])
+    // Only the exact known Node warning opens the hint window, and only until the
+    // next complete line on this channel; every other line closes it.
+    traceHintExpected[channel] = isRoutineNodeWarning(channel, text)
     report({ channel, kind, text })
     enqueue(`${kind === 'routine' ? 'info' : kind === 'fatal' ? 'fatal' : 'warn'} ${channel}: ${text}`)
     if (kind === 'fatal') forwardFatal(text)

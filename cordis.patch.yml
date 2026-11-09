@@ -50,6 +50,12 @@
 - id: hmr
   disabled: false
 - insert:
+    # Native path-only @file discovery. The provider follows each Agent's
+    # effective working directory and read-tool namespace; the TUI only renders
+    # its candidates and never scans/stages file bytes itself. A later user
+    # patch may disable or replace this canonical provider row.
+    - id: file-reference-local
+      name: '@deepseek-ai/dsh-file-reference-local'
     - id: dsh-tui-preset-registry
       name: '@deepseek-ai/dsh-agent-preset-registry'
       config:

@@ -76,8 +76,12 @@ import { fit, oneLine, sanitize, tildePath, truncateToWidth, visibleWidth, wrap 
 export interface SessionPickerItem {
   /** DSH session id (the opaque wire id, passed back verbatim on select). */
   id: string
-  /** Native LLM-generated title, when the session has one. */
-  title?: string
+  /**
+   * Native title projection: a string is a known title, `null` is a native
+   * confirmation that the session has none, and an omitted field is UNKNOWN
+   * (the header may simply not be enriched yet) — never read as "no title".
+   */
+  title?: string | null
   /** Recorded working directory of the session (may differ per session). */
   cwd: string
   /**
@@ -716,17 +720,25 @@ export class SessionPickerDialog implements Component, Focusable {
   }
 
   /**
-   * Effective title text: a streamed overlay entry wins over the DTO title, and
-   * `null` (confirmed none) or an empty string reads as no title at all.
+   * Effective title state: a streamed overlay entry wins over the DTO title.
+   * `known` separates a native "this session has none" (null or blank) from an
+   * omitted title, which is only not-yet-known and must not be presented as a
+   * fact about the session. Both empty states are searchable as empty text.
    */
+  private titleState(item: SessionPickerItem): { known: boolean; text: string } {
+    if (this.titleOverlay.has(item.id)) return { known: true, text: clean(this.titleOverlay.get(item.id) ?? '') }
+    if (item.title === undefined) return { known: false, text: '' }
+    return { known: true, text: clean(item.title ?? '') }
+  }
+
   private titleText(item: SessionPickerItem): string {
-    const raw = this.titleOverlay.has(item.id) ? this.titleOverlay.get(item.id) : item.title
-    return clean(raw ?? '')
+    return this.titleState(item).text
   }
 
   private rowTitle(item: SessionPickerItem): string {
-    const title = this.titleText(item)
-    return title === '' ? '(untitled)' : title
+    const state = this.titleState(item)
+    if (state.text !== '') return state.text
+    return state.known ? '(untitled)' : '(title unknown)'
   }
 
   /**

@@ -16,22 +16,34 @@
  * @module dsh-tui/backend/context
  */
 import { randomUUID } from 'node:crypto'
-import { imageAttachmentValue, isImageMediaType, sameImageAttachment, asImageAttachmentRef } from '../attachments.ts'
+import { imageAttachmentValue, sameImageAttachment, asImageAttachmentRef } from '../attachments.ts'
+import { nativeInstallationAnchor, nativeResourceURL } from '../plugin/native-resources.ts'
 import { backendError, backendErrorCodeOf, asBackendError, redactDiagnostic } from './errors.ts'
 import type { BackendError } from './errors.ts'
 import { makeTranscriptCodec } from './native-codec.ts'
 import { carriedEffort, modelRow, reasoningView, selectModelRow, type ModelReasoningView, type ModelRow } from './model-view.ts'
 import { SubagentBridge } from './subagents.ts'
+import { NativeInspection, goalChangedInvalidation, projectionInvalidationDomain } from './native-inspection.ts'
+import { NativeFileInput, normalizeCommandAttachments, normalizePromptContent as normalizeNativePromptContent, recallableParts, queueReplacementContent, commandOutcome } from './native-files.ts'
+import { fileReferenceService, listFileReferenceCandidates } from './native-file-references.ts'
+import { NativeQuestionAdapter, isUserQuestionProjectionKey } from './native-questions.ts'
+import { NativeManagement, buildInteractiveForkInput } from './native-management.ts'
+import type { InteractiveForkInputOutcome } from './native-management.ts'
+import type { NativeUiAccess, NativeUiScope } from './native-ui-scope.ts'
 import type {
   Backend,
   BackendEvent,
   DecisionOrigin,
   DecisionRequest,
   DisplayContentPart,
+  EncodedFileInput,
+  FileAttachmentRef,
+  FileReferenceCandidate,
   ImageAttachmentRef,
   ImageAttachmentValue,
   InputRoute,
   JsonRecord,
+  NativeUiDomain,
   PlanSnapshot,
   PromptContentPart,
   QueueEntry,
@@ -58,6 +70,9 @@ export interface DshHostContext {
 export interface DshNativeHelpers {
   createUserMessage(input: { content: readonly unknown[]; source: { kind: 'user' } }): unknown
   transcriptCodec: TranscriptCodec
+  /** Optional public helpers from the selected native installation. */
+  readPluginInventory?(host: unknown): Promise<unknown>
+  buildForkSeed?(events: readonly unknown[], boundary: number): readonly unknown[]
 }
 
 export interface DshContextBackendOptions {
@@ -81,6 +96,8 @@ interface Route {
 interface SessionLike {
   readonly id: string
   readonly header?: { readonly cwd?: string }
+  readonly seq?: number
+  snapshotEvents?(): readonly unknown[]
   requestHeader?(): { readonly config?: unknown } | undefined
 }
 
@@ -125,6 +142,8 @@ interface AgentRegistryLike {
   create(options: unknown): Promise<AgentHandleLike>
   resume(options: unknown): Promise<AgentHandleLike>
   get?(id: string): AgentLike | undefined
+  /** Owning domain read of the native turn-boundary projection for one Session. */
+  turnBoundaryOf?(session: SessionLike): unknown
 }
 
 interface CommandsLike {
@@ -181,9 +200,16 @@ interface SessionQueryLike {
   observeSession?(id: string, options?: { readonly signal?: AbortSignal; readonly projectionMode?: 'all' | 'none' }): Promise<ObservationLike>
 }
 
+/**
+ * Structural view of the public `ctx.sessionProjections` carrier read face.
+ *
+ * Only `snapshot(session, keys)` and the change feed are borrowed.
+ * `sessionProjections.stateOf` is the registry's deprecated raw fold read: this
+ * adapter never calls it, so a projection fact always arrives schema-validated
+ * from one consistent public cut.
+ */
 interface ProjectionsLike {
   onChanged?(listener: (session: unknown, key: string, value: unknown, seq: unknown) => void): () => void
-  stateOf?(session: unknown, key: string): unknown
   snapshot?(session: unknown, keys?: readonly string[]): unknown
 }
 
@@ -195,6 +221,17 @@ interface DefaultModelLike {
 interface PermissionPresetsLike {
   catalog?(): unknown
   current?(session: SessionLike): string
+}
+
+/**
+ * Structural view of the public `ctx.planMode` controller read face.
+ *
+ * Only `get(agent)` is borrowed: DSH owns logged plan state, the pending
+ * selection and its boundary; this adapter never selects, folds or caches plan
+ * state itself.
+ */
+interface PlanModeLike {
+  get(agent: AgentLike): unknown
 }
 
 interface AgentPresetsLike {
@@ -247,6 +284,8 @@ interface LoaderLike {
 }
 
 interface SessionTitleLike {
+  /** Owning domain read: the folded native title snapshot, or `undefined` before any. */
+  get?(session: SessionLike): unknown
   refresh?(...args: unknown[]): unknown
 }
 
@@ -265,6 +304,7 @@ interface LiveAgent {
 interface PendingSession {
   readonly sessionId: string
   readonly attachmentId: string
+  /** Adapter-pinned route; `undefined` keeps following the live native default. */
   route: Route | undefined
   preset: string | undefined
 }
@@ -300,6 +340,8 @@ const SESSIONLESS_COMMANDS = new Set([
   // `skills` is read-only metadata: it must never materialize the pending Agent.
   'new', 'resume', 'sessions', 'titles', 'models', 'presets', 'commands', 'skills',
   'state', 'auto-title', 'dequeue', 'cancel',
+  'native-jobs', 'native-job-output', 'native-goal', 'native-working-directory', 'native-inventory', 'native-tools',
+  'native-questions', 'native-question-answer', 'native-defaults', 'native-default-update', 'session-fork',
 ])
 const STAGEABLE_COMMANDS = new Set(['model', 'preset', 'effort'])
 const COMMAND_NAMES = new Set([
@@ -307,6 +349,8 @@ const COMMAND_NAMES = new Set([
   'presets', 'preset', 'efforts', 'effort', 'permissions', 'auto-title', 'state',
   'reload', 'dequeue', 'queue-remove', 'queue-replace', 'queue-send-now',
   'subagent-session', 'subagent-follow', 'subagent-interrupt', 'subagent-prompt',
+  'native-jobs', 'native-job-output', 'native-goal', 'native-working-directory', 'native-inventory', 'native-tools',
+  'native-questions', 'native-question-answer', 'native-defaults', 'native-default-update', 'session-rename', 'session-fork',
 ])
 const TITLE_PROVIDER_NAMES = [
   '@deepseek-ai/dsh-session-title-first-prompt-llm',
@@ -321,6 +365,8 @@ const STATS_FIELDS = ['turns', 'steps', 'llmMs', 'toolMs', 'ttftMs', 'ttftSteps'
 const MAX_SNAPSHOT_EVENTS = 8000
 const SNAPSHOT_BYTE_BUDGET = 4 * 1024 * 1024
 const MAX_CACHED_TOOL_CALLS = 2048
+/** Abandon uncooperative read-only SDK requests; never terminate native I/O. */
+const NATIVE_UI_READ_TIMEOUT_MS = 8_000
 const IDLE_SETTLE_TIMEOUT_MS = 15_000
 const COMMAND_DRAIN_TIMEOUT_MS = 15_000
 const CANCEL_SETTLE_TIMEOUT_MS = 2_000
@@ -567,6 +613,15 @@ function routeOf(value: unknown): Route | undefined {
   }
 }
 
+/** Complete native `AgentOptions` route snapshot for one adapter-pinned choice. */
+function routeOptions(route: Route): Route {
+  return {
+    provider: route.provider,
+    model: route.model,
+    ...(typeof route.reasoningEffort === 'string' ? { reasoningEffort: route.reasoningEffort } : {}),
+  }
+}
+
 function sameRoute(left: Route | undefined, right: Route | undefined): boolean {
   if (left === right) return true
   if (left === undefined || right === undefined) return false
@@ -583,9 +638,7 @@ function sameNumberRecord(a: Record<string, number> | undefined, b: Record<strin
 }
 
 function samePlanSnapshot(a: PlanSnapshot, b: PlanSnapshot): boolean {
-  if (a.active !== b.active || a.wanted !== b.wanted) return false
-  if (a.running === null || b.running === null) return a.running === b.running
-  return a.running.commandId === b.running.commandId && a.running.wanted === b.running.wanted
+  return a.active === b.active && a.pending === b.pending
 }
 
 function textOfBlock(block: unknown): string {
@@ -598,32 +651,9 @@ function messageText(message: Record<string, unknown>): string {
   return content.map(textOfBlock).filter(part => part.length > 0).join('\n')
 }
 
-/**
- * Ordered, byte-free recallable content of one native inbox message. Only a
- * human `source.kind === 'user'` message with text/image blocks is recallable;
- * injected context stays in the native inbox for the model.
- */
+/** Native ordered text/image/file references; no bytes and no injected context. */
 function recallableContent(message: Record<string, unknown>): DisplayContentPart[] | undefined {
-  const source = record(message.source)
-  if (source?.kind !== 'user') return undefined
-  if (!Array.isArray(message.content)) return undefined
-  const parts: DisplayContentPart[] = []
-  for (const block of message.content) {
-    const item = record(block)
-    if (item === undefined) return undefined
-    if (item.type === 'text') {
-      parts.push({ type: 'text', text: typeof item.text === 'string' ? item.text : '' })
-      continue
-    }
-    if (item.type === 'image') {
-      const attachment = asImageAttachmentRef(item.attachment)
-      if (attachment === undefined) return undefined
-      parts.push({ type: 'image', attachment })
-      continue
-    }
-    return undefined
-  }
-  return parts
+  return recallableParts(message)
 }
 
 function isRecallableMessage(message: UserMessageLike): boolean {
@@ -681,7 +711,11 @@ function normalizeAskAnswer(questions: readonly Record<string, unknown>[], value
       let custom: string | undefined
       for (const entry of values) {
         if (typeof entry !== 'string' || entry.length === 0) continue
-        if (labels.size === 0 || labels.has(entry)) selected.push(entry)
+        // Native meaning: `selected` holds chosen option labels, `custom` holds
+        // the free-text answer. Without declared options there is nothing to
+        // select, so typed text is a custom answer, never a fabricated label
+        // (an option-bearing answer that matches no label is custom too).
+        if (labels.has(entry)) selected.push(entry)
         else custom = custom === undefined ? entry : `${custom}\n${entry}`
       }
       return {
@@ -792,7 +826,9 @@ class ToolPresenter {
 }
 
 /** Load the public native helpers a bundle normally imports directly. */
-async function loadDefaultNative(): Promise<DshNativeHelpers> {
+async function loadDefaultNative(host: DshHostContext): Promise<DshNativeHelpers> {
+  const anchor = nativeInstallationAnchor(host)
+  const load = (specifier: string): Promise<unknown> => import(anchor === undefined ? specifier : nativeResourceURL(specifier, anchor))
   // Package names are computed so the project typechecks without those peer
   // dependencies in its own node_modules; the running bundle resolves them.
   const llmSpecifier: string = '@deepseek-ai/dsh-llm'
@@ -800,7 +836,7 @@ async function loadDefaultNative(): Promise<DshNativeHelpers> {
   let llm: unknown
   let session: unknown
   try {
-    llm = await import(llmSpecifier)
+    llm = await load(llmSpecifier)
   } catch {
     throw codedError(
       'STARTUP_FAILED',
@@ -808,7 +844,7 @@ async function loadDefaultNative(): Promise<DshNativeHelpers> {
     )
   }
   try {
-    session = await import(sessionSpecifier)
+    session = await load(sessionSpecifier)
   } catch {
     throw codedError(
       'STARTUP_FAILED',
@@ -820,9 +856,24 @@ async function loadDefaultNative(): Promise<DshNativeHelpers> {
   if (typeof createUserMessage !== 'function') {
     throw codedError('STARTUP_FAILED', '@deepseek-ai/dsh-llm does not expose createUserMessage')
   }
+  let readPluginInventory: DshNativeHelpers['readPluginInventory']
+  try {
+    const inventorySpecifier: string = '@deepseek-ai/dsh-host-plugin-inventory'
+    const helper = record(await load(inventorySpecifier))?.readPluginInventory
+    if (typeof helper === 'function') readPluginInventory = host => Promise.resolve(helper(host))
+  } catch {
+    // Optional read-only capability; never install a package or another frontend.
+  }
+  const buildForkSeed = record(session)?.buildForkSeed
   return {
     createUserMessage: input => createUserMessage(input),
     transcriptCodec: makeTranscriptCodec(llm, session),
+    ...(readPluginInventory === undefined ? {} : { readPluginInventory }),
+    ...(typeof buildForkSeed === 'function' ? { buildForkSeed: (events: readonly unknown[], boundary: number): readonly unknown[] => {
+      const seed: unknown = buildForkSeed(events, boundary)
+      if (!Array.isArray(seed)) throw codedError('RUNTIME_REQUEST_FAILED', 'the native fork helper returned no seed')
+      return seed
+    } } : {}),
   }
 }
 
@@ -841,8 +892,19 @@ export class DshContextBackend implements Backend {
   private skillsDirty = false
   private readonly planStates = new Map<string, PlanSnapshot>()
   private readonly metricsStates = new Map<string, { usage?: UsageSnapshot; stats?: StatsSnapshot }>()
+  /** One host diagnostic per process when the public projection read fails. */
+  private projectionReadWarned = false
   private readonly compactionCauses = new Map<string, string>()
   private readonly subagentBridge: SubagentBridge
+  private readonly nativeUiAccess: NativeUiAccess
+  private readonly nativeInspection: NativeInspection
+  private readonly nativeFiles: NativeFileInput
+  private readonly nativeQuestions: NativeQuestionAdapter
+  private readonly nativeManagement: NativeManagement
+  private readonly activeNativeUiReads = new Map<string, { scope: NativeUiScope; controller: AbortController }>()
+  private offNativeJobs?: () => void
+  private nativeJobsScopeSignature = ''
+  private nativeJobsService: unknown
   private readonly childPresenters = new Map<string, { readonly agent: AgentLike; readonly presenter: ToolPresenter }>()
   private bound = false
   private native: DshNativeHelpers | undefined
@@ -853,6 +915,8 @@ export class DshContextBackend implements Backend {
   private closedEmitted = false
   private decisionSeq = 0
   private modelFailureSignature = ''
+  private publishedRouteSignature: string | undefined
+  private configurationInvalidationQueued = false
   private toolPresenter: ToolPresenter | undefined
   private reloading: Promise<unknown> | undefined
   private codec: TranscriptCodec | undefined
@@ -863,11 +927,30 @@ export class DshContextBackend implements Backend {
   constructor(host: DshHostContext, options: DshContextBackendOptions) {
     this.host = host
     this.options = { ...options }
+    this.nativeUiAccess = {
+      host, service: name => this.service(name), current: () => this.nativeUiScope(),
+      isCurrent: scope => this.isNativeUiCurrent(scope), warn: message => this.warn(message),
+    }
+    this.nativeInspection = new NativeInspection({
+      access: this.nativeUiAccess,
+      readPluginInventory: nativeHost => {
+        const helper = this.native?.readPluginInventory
+        if (helper === undefined) throw codedError('CAPABILITY_UNAVAILABLE', 'the selected DSH installation exposes no plugin inventory helper')
+        return helper(nativeHost)
+      },
+    })
+    this.nativeFiles = new NativeFileInput(this.nativeUiAccess)
+    this.nativeQuestions = new NativeQuestionAdapter({ access: this.nativeUiAccess })
+    this.nativeManagement = new NativeManagement({ access: this.nativeUiAccess })
     this.subagentBridge = new SubagentBridge({
       host: {
         get: (name: string): unknown => this.service(name),
       },
-      emit: event => this.emit(event),
+      emit: event => {
+        this.emit(event)
+        // Enumeration availability can change without a manager mutation.
+        if (event.type === 'subagents') this.refreshSubagentControlCapabilities()
+      },
       warn: (message: string) => this.warn(message),
     })
     if (options.native !== undefined) {
@@ -898,6 +981,76 @@ export class DshContextBackend implements Backend {
     }
     const item = record(value)
     return item === undefined ? undefined : item as T
+  }
+
+  private nativeUiScope(): NativeUiScope | undefined {
+    if (this.closed) return undefined
+    const live = this.live
+    if (live !== undefined) return {
+      sessionId: live.agent.session.id, attachmentId: live.attachmentId,
+      session: live.agent.session, agent: live.agent,
+    }
+    const pending = this.pending
+    return pending === undefined ? undefined : { sessionId: pending.sessionId, attachmentId: pending.attachmentId }
+  }
+
+  private isNativeUiCurrent(scope: NativeUiScope): boolean {
+    const current = this.nativeUiScope()
+    return current !== undefined && current.sessionId === scope.sessionId && current.attachmentId === scope.attachmentId &&
+      (scope.agent === undefined || current.agent === scope.agent) && (scope.session === undefined || current.session === scope.session)
+  }
+
+  private emitNativeUiInvalidation(domain: NativeUiDomain): void {
+    const scope = this.nativeUiScope()
+    if (scope !== undefined) this.emit({ type: 'native_ui_changed', sessionId: scope.sessionId, attachmentId: scope.attachmentId, domain })
+  }
+
+  /** Owned request cancellation only; a public SDK without a signal continues natively. */
+  private async nativeUiRead<T>(label: string, task: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
+    const scope = this.nativeUiScope()
+    if (scope === undefined) throw codedError('NOT_CONNECTED', 'no native attachment is current')
+    if (external?.aborted === true) throw codedError('ABORTED', label + ' was cancelled')
+    const id = randomUUID(), controller = new AbortController()
+    const externalAbort = (): void => controller.abort()
+    external?.addEventListener('abort', externalAbort, { once: true })
+    this.activeNativeUiReads.set(id, { scope, controller })
+    let onAbort: () => void = () => {}
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(codedError('ABORTED', label + ' was cancelled'))
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      const result = await withTimeout(Promise.race([
+        Promise.resolve().then(() => {
+          if (controller.signal.aborted) throw codedError('ABORTED', label + ' was cancelled')
+          return task(controller.signal)
+        }), aborted,
+      ]), NATIVE_UI_READ_TIMEOUT_MS, label)
+      if (!this.isNativeUiCurrent(scope)) throw codedError('STALE_SESSION', 'the native attachment changed during ' + label)
+      return result
+    } finally {
+      external?.removeEventListener('abort', externalAbort)
+      controller.signal.removeEventListener('abort', onAbort)
+      controller.abort()
+      this.activeNativeUiReads.delete(id)
+    }
+  }
+
+  private abortNativeUiReads(sessionId?: string): void {
+    for (const entry of this.activeNativeUiReads.values()) {
+      if (sessionId === undefined || entry.scope.sessionId === sessionId) entry.controller.abort()
+    }
+  }
+
+  private syncNativeJobsSubscription(): void {
+    const scope = this.nativeUiScope()
+    const signature = scope === undefined ? '' : JSON.stringify([scope.sessionId, scope.attachmentId])
+    const service = this.service('jobs')
+    if (signature === this.nativeJobsScopeSignature && service === this.nativeJobsService) return
+    this.nativeJobsService = service
+    this.offNativeJobs?.(); this.offNativeJobs = undefined
+    this.nativeJobsScopeSignature = signature
+    if (scope !== undefined) this.offNativeJobs = this.nativeInspection.subscribeJobs(() => this.emitNativeUiInvalidation('jobs'))
   }
 
   private warn(message: string): void {
@@ -932,13 +1085,69 @@ export class DshContextBackend implements Backend {
     }
   }
 
+  /** Native catalog invalidations carry no owned rows; name only this current surface. */
+  private emitCatalogInvalidation(type: 'commands_changed' | 'models_changed' | 'presets_changed'): void {
+    if (this.closed) return
+    const live = this.live
+    if (live !== undefined) {
+      this.emit({ type, sessionId: live.agent.session.id, attachmentId: live.attachmentId })
+      return
+    }
+    const pending = this.pending
+    if (pending !== undefined) this.emit({ type, sessionId: pending.sessionId, attachmentId: pending.attachmentId })
+  }
+
+  private routeMetadataSignature(info: { sessionId: string; attachmentId?: string; provider: string; model: string; reasoningEffort?: string }): string {
+    return JSON.stringify([info.sessionId, info.attachmentId, info.provider, info.model, info.reasoningEffort])
+  }
+
+  /** Read native current/default getters only; never select or prepare a request. */
+  private publishCurrentModelRoute(): void {
+    if (this.closed) return
+    const live = this.live
+    const pending = this.pending
+    if (live === undefined && pending === undefined) return
+    const route = this.agentRoute()
+    const event = {
+      type: 'model_route' as const,
+      sessionId: live?.agent.session.id ?? pending!.sessionId,
+      attachmentId: live?.attachmentId ?? pending!.attachmentId,
+      provider: route?.provider ?? '',
+      model: route?.model ?? '',
+      ...(route?.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    }
+    const signature = this.routeMetadataSignature(event)
+    if (signature === this.publishedRouteSignature) return
+    this.publishedRouteSignature = signature
+    this.emit(event)
+  }
+
+  /** Settled native config/document signals may burst or announce pre/post writes. */
+  private invalidateNativeConfiguration(): void {
+    if (this.closed || this.configurationInvalidationQueued) return
+    this.configurationInvalidationQueued = true
+    queueMicrotask(() => {
+      this.configurationInvalidationQueued = false
+      if (this.closed) return
+      // Publish the getter result first so picker reads capture the current route.
+      this.publishCurrentModelRoute()
+      this.emitCatalogInvalidation('presets_changed')
+      this.emitCatalogInvalidation('models_changed')
+      this.emitNativeUiInvalidation('settings')
+      this.emitNativeUiInvalidation('inventory')
+      this.emitNativeUiInvalidation('tools')
+      this.syncNativeJobsSubscription()
+      this.refreshSubagentControlCapabilities()
+    })
+  }
+
   private assertOpen(): void {
     if (this.closed) throw codedError('CLOSED', 'the backend is closed')
   }
 
   private async ensureNative(): Promise<DshNativeHelpers> {
     if (this.native !== undefined) return this.native
-    this.native = await loadDefaultNative()
+    this.native = await loadDefaultNative(this.host)
     this.codec = this.native.transcriptCodec
     return this.native
   }
@@ -1043,6 +1252,40 @@ export class DshContextBackend implements Backend {
       this.skillsDirty = true
       this.emit({ type: 'skills_changed', sessionId: pending.sessionId, attachmentId: pending.attachmentId })
     }, { global: true })
+    // The native command registry declares `commands/change(): void` and emits
+    // it unfiltered with no payload (0.2.2-rc.1 `CommandRuntime` registration
+    // and disposal). The invalidation therefore names this adapter's current
+    // surface — the attached Agent when live, else the pending attachment —
+    // instead of trusting an event scope that does not exist on the wire. The
+    // roster itself stays native: a consumer re-reads `commands.list(agent)`,
+    // so no TUI command registry, snapshot comparison or poll is introduced.
+    // A child-Agent-scoped registration also reaches this root listener, so the
+    // invalidation is deliberately conservative: it names the current surface
+    // and claims nothing about which layer changed. Bursts are possible (one
+    // preset mount registers several commands) and stay one event each:
+    // consumers already single-flight the native listing.
+    keep('commands/change', () => this.emitCatalogInvalidation('commands_changed'), { global: true })
+    // Public native registry events, not provider polling or a TUI-owned catalog.
+    keep('llm/adapters-updated', () => this.emitCatalogInvalidation('models_changed'), { global: true })
+    keep('llm/models-updated', () => this.emitCatalogInvalidation('models_changed'), { global: true })
+    // Public, settled host signals; no hard-coded Web profile namespace and no
+    // pre-commit hmr/change/internal service hooks or private registry polling.
+    keep('app-boot/config-reload', () => this.invalidateNativeConfiguration(), { global: true })
+    keep('settings/document-updated', () => this.invalidateNativeConfiguration(), { global: true })
+    keep('goal/changed', payload => {
+      if (goalChangedInvalidation(payload, this.nativeUiScope()) !== undefined) this.emitNativeUiInvalidation('goal')
+    }, { global: true })
+    keep('goal/activation-changed', payload => {
+      if (this.live !== undefined && record(payload)?.agent === this.live.agent) this.emitNativeUiInvalidation('goal')
+    }, { global: true })
+    keep('tools/change', () => {
+      this.emitNativeUiInvalidation('tools')
+      this.refreshSubagentControlCapabilities()
+    }, { global: true })
+    keep('plugin-manager/changed', () => {
+      this.emitNativeUiInvalidation('inventory')
+      this.refreshSubagentControlCapabilities()
+    }, { global: true })
     keep('subagent/start', info => {
       this.refreshSubagentControlCapabilities()
       this.subagentBridge.noteStart(record(info) ?? {})
@@ -1079,9 +1322,15 @@ export class DshContextBackend implements Backend {
             return
           }
           if (key === 'plan') {
-            this.publishPlan(this.live.agent.session, this.planStateOf(this.live.agent.session))
+            // The projection change is only the invalidation signal; the fact
+            // itself comes from the native controller for this exact Agent.
+            const live = this.live
+            if (live !== undefined) this.publishPlan(live.agent.session, this.planFactOf(live.agent))
             return
           }
+          const domain = projectionInvalidationDomain(key)
+          if (domain !== undefined) this.emitNativeUiInvalidation(domain)
+          if (isUserQuestionProjectionKey(key)) this.emitNativeUiInvalidation('questions')
           if (METRICS_KEYS.has(key)) this.publishMetrics(this.live.agent.session)
         })
         this.disposers.push(dispose)
@@ -1152,6 +1401,26 @@ export class DshContextBackend implements Backend {
     }
     if (has('attachments', 'readImage')) caps.push('images')
     if (has('attachments', 'admitPromptContent')) caps.push('prompt-content')
+    // Path-only discovery is exactly the mounted provider's `list` method.
+    // Resolved live so an HMR replacement is visible without a reconnect.
+    if (fileReferenceService(this.service('fileReferences')) !== undefined) caps.push('file-references')
+    const fileCapabilities = this.nativeFiles.capabilities()
+    if (fileCapabilities.promptFiles) caps.push('file-input')
+    if (fileCapabilities.commandImages) caps.push('command-attachments')
+    if (fileCapabilities.commandFiles) caps.push('command-file-attachments')
+    if (has('jobs', 'list') && has('jobs', 'get') && has('jobs', 'readAt')) caps.push('native-jobs', 'native-job-output')
+    if (has('goals', 'get')) caps.push('native-goal')
+    if (has('workingDirectory', 'get')) caps.push('native-working-directory')
+    if (this.native?.readPluginInventory !== undefined && has('loader', 'entries')) caps.push('native-inventory')
+    if (has('tools', 'definitions') && has('tools', 'executable')) caps.push('native-tools')
+    const questionCapabilities = this.nativeQuestions.capabilities()
+    if (questionCapabilities.answer) caps.push('continued-questions', 'native-questions', 'native-question-answer')
+    const managementCapabilities = this.nativeManagement.capabilities()
+    if (managementCapabilities.rename) caps.push('session-rename')
+    if (managementCapabilities.defaultSettingsRead) caps.push('native-defaults')
+    if (managementCapabilities.defaultSettingsWrite) caps.push('native-default-update')
+    if (this.live !== undefined && this.native?.buildForkSeed !== undefined && typeof this.live.agent.session.snapshotEvents === 'function' &&
+        typeof this.live.agent.session.seq === 'number' && this.live.agent.session.seq > 0 && has('agents', 'create')) caps.push('session-fork')
     if (has('llm', 'listProviders') && has('llm', 'listModels')) caps.push('models')
     if (has('sessionQuery', 'readSession')) caps.push('sessions', 'titles')
     if (has('permissionPresets', 'catalog')) caps.push('permissions')
@@ -1176,11 +1445,12 @@ export class DshContextBackend implements Backend {
   }
 
   private async enterPending(): Promise<PendingSession> {
-    const route = await this.routeForPending()
     this.pending = {
       sessionId: randomUUID(),
       attachmentId: randomUUID(),
-      route,
+      // Only an explicit CLI pair pins a new session. Without one the route
+      // follows the live native default until DSH records a selection.
+      route: this.explicitConfigRoute(),
       preset: undefined,
     }
     this.live = undefined
@@ -1192,7 +1462,7 @@ export class DshContextBackend implements Backend {
   private pendingInfo(): SessionInfo {
     const pending = this.pending
     if (pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    const route = pending.route
+    const route = this.pendingRoute(pending)
     return {
       attachmentId: pending.attachmentId,
       sessionId: pending.sessionId,
@@ -1208,7 +1478,7 @@ export class DshContextBackend implements Backend {
   private pendingState(): Record<string, unknown> {
     const pending = this.pending
     if (pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    const route = pending.route
+    const route = this.pendingRoute(pending)
     return {
       sessionId: pending.sessionId,
       cwd: this.options.cwd,
@@ -1280,7 +1550,7 @@ export class DshContextBackend implements Backend {
     kind: 'new' | 'resume',
     sessionId: string,
     presetId: string | undefined,
-    options: { attachmentId?: string; route?: Route } = {},
+    options: { attachmentId?: string; route?: Route; fork?: Extract<InteractiveForkInputOutcome, { ok: true }> } = {},
   ): Promise<LiveAgent> {
     const agents = this.service<AgentRegistryLike>('agents')
     if (agents === undefined || typeof agents.create !== 'function' || typeof agents.resume !== 'function') {
@@ -1312,10 +1582,17 @@ export class DshContextBackend implements Backend {
       if (id !== undefined) await presets.mount(agentCtx, id)
     }
     if (kind === 'resume') {
+      // A resumed Session keeps its own logged selection/request as the native
+      // authority (`agent.model.current()` reads it first). The live default is
+      // only the fallback for a Session that recorded neither, exactly like the
+      // packaged DSH session controller resumes. An explicit CLI pair pins new
+      // sessions; it never rewrites a resumed conversation's route.
+      const agentOptions = this.defaultRouteOptions()
       let handle: AgentHandleLike
       try {
         handle = await agents.resume({
           resumeSessionId: sessionId,
+          ...(agentOptions === undefined ? {} : { agentOptions }),
           setup: async (agentCtx: unknown, agent: AgentLike) => {
             await mountPreset(agentCtx, agent, undefined)
           },
@@ -1323,13 +1600,16 @@ export class DshContextBackend implements Backend {
       } catch (error) {
         throw nativeAgentFailure(`DSH could not resume session ${JSON.stringify(sessionId)}`, error)
       }
-      const route = routeFromLogged(handle.agent.session.requestHeader?.()) ??
-        this.defaultModelSelection() ?? this.explicitConfigRoute()
+      // Display/pin record only: the durable header stays the logged truth.
+      const route = routeFromLogged(handle.agent.session.requestHeader?.())
       return { handle, agent: handle.agent, attachmentId: randomUUID(), route }
     }
-    const route = Object.prototype.hasOwnProperty.call(options, 'route')
-      ? options.route
-      : await this.resolveRoute(undefined)
+    // An adapter-pinned choice (explicit CLI pair or a staged /model or
+    // /effort selection) becomes a complete native option snapshot. Without
+    // one, DSH receives live accessors so the creation route keeps following
+    // later native default changes until a selection or request pins it.
+    const pinned = options.route
+    const agentOptions = pinned === undefined ? this.defaultRouteOptions() : routeOptions(pinned)
     const attachmentId = typeof options.attachmentId === 'string' && options.attachmentId.length > 0
       ? options.attachmentId
       : randomUUID()
@@ -1357,17 +1637,13 @@ export class DshContextBackend implements Backend {
     try {
       handle = await agents.create({
         sessionId,
+        ...(options.fork === undefined ? {} : { seed: options.fork.seed, inheritedEventCount: options.fork.inheritedEventCount }),
         meta: {
           cwd: this.options.cwd,
+          ...(options.fork === undefined ? {} : options.fork.meta),
           ...(resolvedPreset === undefined ? {} : { agentPreset: resolvedPreset }),
         },
-        ...(route === undefined ? {} : {
-          agentOptions: {
-            provider: route.provider,
-            model: route.model,
-            ...(typeof route.reasoningEffort === 'string' ? { reasoningEffort: route.reasoningEffort } : {}),
-          },
-        }),
+        ...(agentOptions === undefined ? {} : { agentOptions }),
         setup: async (agentCtx: unknown, agent: AgentLike) => {
           await mountPreset(agentCtx, agent, resolvedPreset)
         },
@@ -1375,7 +1651,7 @@ export class DshContextBackend implements Backend {
     } catch (error) {
       throw nativeAgentFailure(`DSH could not create session ${JSON.stringify(sessionId)}`, error)
     }
-    return { handle, agent: handle.agent, attachmentId, route }
+    return { handle, agent: handle.agent, attachmentId, route: pinned }
   }
 
   private async discardAgent(prepared: LiveAgent): Promise<void> {
@@ -1401,6 +1677,7 @@ export class DshContextBackend implements Backend {
     // The attachment epoch ends here: a metadata read that started against it
     // must reject rather than deliver a catalog for a retired Agent.
     this.abortSkillQueries(reason, sessionId)
+    this.abortNativeUiReads(sessionId)
     this.closePendingDecisions(reason, sessionId)
     try {
       target.agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1412,7 +1689,9 @@ export class DshContextBackend implements Backend {
     } catch {
       /* proceed */
     }
-    if (!this.blankSessionOf(target.agent.session)) {
+    // A blank session has nothing to flush. An unknown blank stays conservative
+    // and flushes: a failed turn-boundary read must never skip a real write.
+    if (this.blankSessionOf(target.agent.session) !== true) {
       try {
         await this.service<SessionsLike>('sessions')?.flush?.(target.agent.session)
       } catch {
@@ -1446,32 +1725,72 @@ export class DshContextBackend implements Backend {
     return undefined
   }
 
-  private async resolveRoute(loggedRoute: Route | undefined): Promise<Route | undefined> {
-    const explicit = this.explicitConfigRoute()
-    if (explicit !== undefined) return explicit
-    if (loggedRoute !== undefined) return loggedRoute
-    return this.defaultModelSelection()
+  /**
+   * The route this session follows now: an adapter-pinned choice, else the
+   * live native default selection.
+   *
+   * A pin exists only after an explicit choice reached this adapter (the CLI
+   * pair for a new session, or a staged/live `/model`//`/effort` selection).
+   * Everything else stays unknown-or-live: DSH owns the default, and a failed
+   * or absent `currentSelection()` read is reported as unknown rather than
+   * guessed from the last route this adapter saw.
+   * @param pinned - the adapter-pinned route, if any.
+   * @returns the effective route, or `undefined` when it is unknown.
+   */
+  private followedRoute(pinned: Route | undefined): Route | undefined {
+    return pinned ?? this.defaultModelSelection()
   }
 
-  private async routeForPending(): Promise<Route | undefined> {
-    try {
-      return await this.resolveRoute(undefined)
-    } catch {
-      return undefined
+  private pendingRoute(pending: PendingSession | undefined = this.pending): Route | undefined {
+    return pending === undefined ? undefined : this.followedRoute(pending.route)
+  }
+
+  /**
+   * Native `AgentOptions` route fallback built from live getters, matching the
+   * packaged DSH session controller (`dsh-api-session-controller`
+   * `agentOptions()`): a Session that records no selection or request follows
+   * later native default changes on its next step preparation.
+   *
+   * The getters are the SDK's documented accessor form
+   * (`AgentOptions` route fields "may be live accessors until the Session
+   * records a selection or request"). They read the native service per access,
+   * so this adapter never caches, polls or re-announces the default. A failed
+   * read stays unknown (the native loop then reports its own missing route)
+   * instead of throwing out of unrelated display reads that also consult
+   * `agent.options`.
+   * @returns live option accessors, or `undefined` when no native default service is mounted.
+   */
+  private defaultRouteOptions(): Record<string, string | undefined> | undefined {
+    const defaults = this.service<DefaultModelLike>('agentDefaultModel')
+    if (typeof defaults?.currentSelection !== 'function') return undefined
+    const currentSelection = defaults.currentSelection.bind(defaults)
+    const selection = (): Route | undefined => {
+      try {
+        return routeOf(currentSelection())
+      } catch {
+        return undefined
+      }
+    }
+    return {
+      get provider() { return selection()?.provider },
+      get model() { return selection()?.model },
+      get reasoningEffort() { return selection()?.reasoningEffort },
     }
   }
 
   private agentRoute(agent: AgentLike | undefined = this.live?.agent): Route | undefined {
     if (agent !== undefined && typeof agent.model?.current === 'function') {
       try {
+        // Native authority: a recorded selection/request wins, else the live
+        // `AgentOptions` accessors above.
         const current = routeOf(agent.model.current())
         if (current !== undefined) return current
       } catch {
-        /* fall through to the creation fallback */
+        /* fall through to the adapter's own record */
       }
     }
-    if (agent === this.live?.agent && this.live !== undefined) return this.live.route
-    if (agent === undefined && this.live === undefined) return this.pending?.route
+    if (agent === this.live?.agent && this.live !== undefined) return this.followedRoute(this.live.route)
+    if (agent === undefined && this.live === undefined) return this.pendingRoute()
     return undefined
   }
 
@@ -1479,11 +1798,7 @@ export class DshContextBackend implements Backend {
     if (typeof agent.model?.select !== 'function') {
       throw codedError('CAPABILITY_UNAVAILABLE', 'this session has no native model-selection slot; the route was not changed')
     }
-    agent.model.select({
-      provider: route.provider,
-      model: route.model,
-      ...(typeof route.reasoningEffort === 'string' ? { reasoningEffort: route.reasoningEffort } : {}),
-    })
+    agent.model.select(routeOptions(route))
     if (this.live !== undefined && this.live.agent === agent) this.live.route = route
   }
 
@@ -1562,7 +1877,6 @@ export class DshContextBackend implements Backend {
   private async startPendingSession(presetArg: string | undefined): Promise<SessionInfo> {
     const requested = typeof presetArg === 'string' && presetArg.trim().length > 0 ? presetArg.trim() : undefined
     if (requested !== undefined) await this.resolvePresetId(requested)
-    const route = await this.routeForPending()
     return await this.serialize(async () => {
       const previous = this.live
       if (previous !== undefined) {
@@ -1575,7 +1889,9 @@ export class DshContextBackend implements Backend {
       this.pending = {
         sessionId: randomUUID(),
         attachmentId: randomUUID(),
-        route,
+        // Same rule as the initial attachment: only the explicit CLI pair pins,
+        // every other new session follows the live native default.
+        route: this.explicitConfigRoute(),
         preset: requested,
       }
       if (previous !== undefined) await this.closeAgent(previous, 'session switched')
@@ -1599,8 +1915,10 @@ export class DshContextBackend implements Backend {
   }
 
   private emitAnnouncement(info: SessionInfo): void {
+    this.publishedRouteSignature = this.routeMetadataSignature(info)
     this.subagentControlCapabilities = this.subagentControlCapabilitySignature()
     this.emit({ type: 'ready', info })
+    this.syncNativeJobsSubscription()
     // A provider registration during preset mount can precede the ready for
     // this very attachment. Replay it now so a consumer that cached the pending
     // observation refetches against the committed native scope.
@@ -1620,14 +1938,13 @@ export class DshContextBackend implements Backend {
   }
 
   private subagentControlCapabilitySignature(): string {
-    return this.capabilities().filter(capability =>
-      capability === 'subagent-interrupt' || capability === 'subagent-prompt',
-    ).join(' ')
+    // All mounted read/control faces can change during native composition.
+    return this.capabilities().join(' ')
   }
 
   /**
-   * Re-publish a same-attachment ready when DSH activates the native mutation
-   * service after the initial pending/root announcement. No snapshot, Editor,
+   * Re-publish a same-attachment ready when native discovery/read/control
+   * availability changes after the initial pending/root announcement. No snapshot, Editor,
    * session id or attachment id is replaced; without a real change this is inert.
    */
   private refreshSubagentControlCapabilities(): void {
@@ -2036,36 +2353,76 @@ export class DshContextBackend implements Backend {
     this.assertOpen()
     if (mode !== 'followup' && mode !== 'steer') throw codedError('INVALID_ARGUMENT', `unsupported send mode: ${String(mode)}`)
     const parts = normalizePromptContent(content)
-    const hasImage = parts.some(part => part.type === 'image')
-    if (!parts.some(part => part.type === 'image' || part.text.trim().length > 0)) {
-      throw codedError('INVALID_ARGUMENT', 'sendContent requires non-whitespace text or an image')
+    if (!parts.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
+      throw codedError('INVALID_ARGUMENT', 'sendContent requires non-whitespace text, an image or a file')
     }
-    if (!hasImage) {
+    if (parts.every(part => part.type === 'text')) {
       await this.send(parts.map(part => part.type === 'text' ? part.text : '').join('\n'), mode)
       return
     }
-    const attachments = this.service<AttachmentsLike>('attachments')
-    if (typeof attachments?.admitPromptContent !== 'function') {
-      throw codedError(
-        'CAPABILITY_UNAVAILABLE',
-        'this runtime mounts no native attachment admission (ctx.attachments.admitPromptContent); the prompt was not sent',
-      )
+    if (!this.nativeFiles.capabilities().promptContent) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'this runtime mounts no native prompt attachment admission; the prompt was not sent')
     }
     await this.ensureNative()
     await this.ensureCurrent()
     const live = this.live
     if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    let admitted: readonly unknown[]
-    try {
-      admitted = await attachments.admitPromptContent(parts)
-    } catch (error) {
-      throw codedError('RUNTIME_REQUEST_FAILED', `the native attachment store refused the prompt: ${errorMessage(error)}`)
-    }
+    const admitted = await this.nativeFiles.admitPrompt(parts)
     if (this.live !== live) throw codedError('STALE_SESSION', 'the DSH Agent attachment changed during prompt admission; the prompt was not sent')
-    const native = await this.ensureNative()
-    const message = native.createUserMessage({ content: admitted, source: { kind: 'user' } })
+    const message = this.native!.createUserMessage({ content: admitted, source: { kind: 'user' } })
     if (mode === 'steer') await live.agent.steer(message)
     else await live.agent.followup(message)
+  }
+
+  async stageFile(input: EncodedFileInput, signal?: AbortSignal): Promise<FileAttachmentRef> {
+    this.assertOpen()
+    return this.nativeUiRead('native file staging', owned => this.nativeFiles.stageFile(input, owned), signal)
+  }
+
+  /**
+   * Cancellable path-only `@file` discovery through the mounted provider.
+   *
+   * `ctx.fileReferences.list(agent, query, signal)` is the only source: this
+   * adapter never scans a workspace, resolves a path, reads or stages file
+   * bytes, or keeps a provider/catalog. A pending first prompt materializes its
+   * own native Agent through the ordinary lazy path (no model turn) only after
+   * the provider is confirmed mounted, so a composition without discovery is
+   * never failed by creating an Agent. The exact live Agent and the owned
+   * cancellation signal reach that call, and the ordinary native-UI identity
+   * check rejects a result whose attachment is no longer current.
+   */
+  async listFileReferences(query: string, signal?: AbortSignal): Promise<readonly FileReferenceCandidate[]> {
+    this.assertOpen()
+    if (typeof query !== 'string') {
+      throw codedError('INVALID_ARGUMENT', 'listFileReferences requires the native @path query text')
+    }
+    if (signal?.aborted === true) throw codedError('ABORTED', 'the native file-reference query was cancelled')
+    // Capability first: a query that cannot be served must never materialize
+    // the pending Agent merely to reject it.
+    if (fileReferenceService(this.service('fileReferences')) === undefined) {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'this runtime mounts no native file-reference provider')
+    }
+    if (this.live === undefined && this.pending === undefined) {
+      throw codedError('NOT_CONNECTED', 'no native attachment is current')
+    }
+    // A provider addresses one concrete Agent. The pending root is materialized
+    // through the existing lazy path, which creates the Agent and sends nothing.
+    if (this.live === undefined) await this.ensureCurrent()
+    this.assertOpen()
+    const live = this.live
+    if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+    return await this.nativeUiRead('native file-reference query', async (owned) => {
+      // HMR: resolve the mounted service again for this exact call; a retained
+      // instance could belong to an unloaded composition.
+      const service = fileReferenceService(this.service('fileReferences'))
+      if (service === undefined) {
+        throw codedError('CAPABILITY_UNAVAILABLE', 'the native file-reference provider was unmounted before the query')
+      }
+      if (this.live !== live) {
+        throw codedError('STALE_SESSION', 'the DSH Agent attachment changed before file-reference discovery')
+      }
+      return await listFileReferenceCandidates(service, live.agent, query, owned)
+    }, signal)
   }
 
   async readImage(attachment: ImageAttachmentRef, signal?: AbortSignal): Promise<ImageAttachmentValue> {
@@ -2108,73 +2465,129 @@ export class DshContextBackend implements Backend {
 
   // -------------------------------------------------------- projections/etc
 
-  private projectionValuesOf(session: SessionLike, keys: readonly string[]): Record<string, unknown> {
+  /**
+   * One public session-projection cut for the exact session.
+   *
+   * `sessionProjections.snapshot(session, keys)` is the supported carrier read:
+   * it validates every value through that unit's own wire schema and serves one
+   * consistent watermark. `sessionProjections.stateOf` is the deprecated raw
+   * registry fold, so this adapter never reads it.
+   *
+   * `undefined` means the projection face is unmounted or the read failed. A
+   * present record holds exactly the keys DSH materialized, so an absent key
+   * stays "no native fact" and never becomes a fabricated zero or `null`.
+   *
+   * @param session - exact Session whose committed events are folded.
+   * @param keys - client-visible projection keys this read needs.
+   * @returns the native view values, or `undefined` when unavailable.
+   */
+  private projectionSnapshotOf(session: SessionLike, keys: readonly string[]): Record<string, unknown> | undefined {
     const projections = this.service<ProjectionsLike>('sessionProjections')
-    const read = (key: string): unknown => {
-      try {
-        return projections?.stateOf?.(session, key)
-      } catch {
-        return undefined
+    if (typeof projections?.snapshot !== 'function') return undefined
+    try {
+      return record(record(projections.snapshot(session, keys))?.values)
+    } catch (error) {
+      if (!this.projectionReadWarned) {
+        this.projectionReadWarned = true
+        this.warn(`DSH session-projection snapshot is unavailable: ${errorMessage(error)}`)
       }
+      return undefined
     }
-    if (typeof projections?.snapshot === 'function') {
-      try {
-        const values = record(projections.snapshot(session, keys))?.values
-        if (record(values) !== undefined) return values as Record<string, unknown>
-      } catch {
-        /* fall back to host reads */
-      }
-    }
-    const values: Record<string, unknown> = {}
-    for (const key of keys) values[key] = read(key)
-    return values
   }
 
-  private planStateOf(session: SessionLike): unknown {
-    const projections = this.service<ProjectionsLike>('sessionProjections')
-    if (typeof projections?.stateOf !== 'function') return undefined
+  private projectionValuesOf(session: SessionLike, keys: readonly string[]): Record<string, unknown> {
+    return this.projectionSnapshotOf(session, keys) ?? {}
+  }
+
+  /**
+   * The native plan-mode fact for one exact Agent, in the public shape.
+   *
+   * `ctx.planMode.get(agent)` returns `{active, pending?}`: the logged mode in
+   * force plus the selection a user has requested but the native boundary has
+   * not applied yet (`pending: false` is a real pending-off request, not
+   * busy-ness). The host fold's `wanted`/`running.commandId` are internal state
+   * and are neither read nor reconstructed here. An unmounted, absent or
+   * throwing service stays `undefined` (unavailable), never an inactive fact.
+   */
+  private planSnapshotOf(value: unknown): PlanSnapshot | undefined {
+    const fact = record(value)
+    if (fact === undefined || typeof fact.active !== 'boolean') return undefined
+    return typeof fact.pending === 'boolean'
+      ? { active: fact.active, pending: fact.pending }
+      : { active: fact.active }
+  }
+
+  /**
+   * Resolve the plan-mode controller for one exact Agent like the desktop
+   * Remote does: the Agent's preset-isolated `planMode` instance first, then the
+   * host-plane service. A lookup failure stays visible and falls back; a
+   * composition with neither reports the capability absent.
+   */
+  private planModeFor(agent: AgentLike): PlanModeLike | undefined {
+    const presets = this.service<AgentPresetsLike>('agentPresets')
+    if (typeof presets?.serviceFor === 'function') {
+      try {
+        const scoped = record(presets.serviceFor(agent, 'planMode'))
+        if (scoped !== undefined && typeof scoped.get === 'function') return scoped as unknown as PlanModeLike
+      } catch (error) {
+        this.warn(`DSH preset plan-mode lookup failed: ${errorMessage(error)}`)
+      }
+    }
+    const host = this.service<PlanModeLike>('planMode')
+    return typeof host?.get === 'function' ? host : undefined
+  }
+
+  /**
+   * One native plan-mode read for the exact attached Agent.
+   * @returns the public `{active, pending?}` fact, or `undefined` when the
+   *   composition mounts no plan-mode controller or the read failed.
+   */
+  private planFactOf(agent: AgentLike): PlanSnapshot | undefined {
+    const planMode = this.planModeFor(agent)
+    if (planMode === undefined) return undefined
     try {
-      return projections.stateOf(session, 'plan')
+      return this.planSnapshotOf(planMode.get(agent))
     } catch {
       return undefined
     }
   }
 
   /**
-   * One native title projection read. `null` is a real no-title value; any
-   * unavailable read stays `undefined` so callers omit the field rather than
-   * inventing a local title. No query, provider call or log scrape here.
+   * One native title fact for the exact session.
+   *
+   * `ctx.sessionTitle.get(session)` is the owning domain read: it folds the very
+   * log the `title` projection folds, so `undefined` there is the native
+   * no-title fact (`null`) while an unmounted service or a failed read stays
+   * unknown and callers omit the field. When a composition mounts no title
+   * service, the public `title` projection view is the same tri-state fallback:
+   * an absent key is capability absence, `null` is native no-title. No query,
+   * provider call or log scrape here.
    */
   private titleOf(session: SessionLike): string | null | undefined {
-    const projections = this.service<ProjectionsLike>('sessionProjections')
-    if (typeof projections?.stateOf !== 'function') return undefined
-    try {
-      const value = projections.stateOf(session, 'title')
-      return value === null || typeof value === 'string' ? value : undefined
-    } catch {
-      return undefined
+    const titles = this.service<SessionTitleLike>('sessionTitle')
+    if (typeof titles?.get === 'function') {
+      try {
+        const value = titles.get(session)
+        if (value === undefined) return null
+        const snapshot = record(value)
+        return typeof snapshot?.title === 'string' ? snapshot.title : undefined
+      } catch {
+        return undefined
+      }
     }
+    const values = this.projectionSnapshotOf(session, ['title'])
+    if (values === undefined || !Object.hasOwn(values, 'title')) return undefined
+    const value = values.title
+    return value === null || typeof value === 'string' ? value : undefined
   }
 
-  private planSnapshotOf(value: unknown): PlanSnapshot {
-    const state = record(value) ?? {}
-    const running = record(state.running)
-    return {
-      active: state.active === true,
-      wanted: typeof state.wanted === 'boolean' ? state.wanted : null,
-      running: running !== undefined && typeof running.commandId === 'string' && typeof running.wanted === 'boolean'
-        ? { commandId: running.commandId, wanted: running.wanted }
-        : null,
-    }
-  }
-
-  private publishPlan(session: SessionLike, state: unknown): boolean {
-    if (state === undefined) return false
-    const snapshot = this.planSnapshotOf(state)
+  private publishPlan(session: SessionLike, value: unknown): boolean {
+    const snapshot = this.planSnapshotOf(value)
+    if (snapshot === undefined) return false
     const previous = this.planStates.get(session.id)
     if (previous !== undefined && samePlanSnapshot(previous, snapshot)) return false
     this.planStates.set(session.id, snapshot)
-    const engaged = snapshot.active || snapshot.wanted !== null || snapshot.running !== null
+    const engaged = snapshot.active || snapshot.pending !== undefined
     if (previous === undefined && !engaged) return false
     this.emit({ type: 'plan', sessionId: session.id, value: snapshot })
     return true
@@ -2249,33 +2662,43 @@ export class DshContextBackend implements Backend {
   }
 
   private emitProjectionSnapshots(): void {
-    const session = this.live?.agent.session
-    if (session === undefined) return
-    const projections = this.service<ProjectionsLike>('sessionProjections')
-    if (typeof projections?.stateOf !== 'function' && typeof projections?.snapshot !== 'function') return
-    const read = (key: string): unknown => {
-      try {
-        return projections?.stateOf?.(session, key)
-      } catch {
-        return undefined
-      }
+    const live = this.live
+    if (live === undefined) return
+    // Each frame is skipped when its native read is unavailable rather than
+    // published as an invented empty value.
+    const todos = this.projectionSnapshotOf(live.agent.session, ['todos'])
+    if (todos !== undefined && todos.todos !== undefined) {
+      this.emit({ type: 'todos', sessionId: live.agent.session.id, value: this.todosSnapshotOf(todos.todos) })
     }
-    const todos = read('todos')
-    if (todos !== undefined) this.emit({ type: 'todos', sessionId: session.id, value: this.todosSnapshotOf(todos) })
-    this.publishPlan(session, read('plan'))
-    this.publishMetrics(session)
+    this.publishPlan(live.agent.session, this.planFactOf(live.agent))
+    this.publishMetrics(live.agent.session)
   }
 
-  private blankSessionOf(session: SessionLike): boolean {
-    const projections = this.service<ProjectionsLike>('sessionProjections')
-    if (projections === undefined) return false
+  /**
+   * Whether the exact session has no turn yet, from the native Agent registry.
+   *
+   * `ctx.agents.turnBoundaryOf(session)` is the owning domain read of the
+   * turn-boundary projection. `true` proves a blank session, `false` proves a
+   * recorded turn (or an open one), and `undefined` is unknown: an unmounted
+   * registry or an unreadable fold never becomes a local "blank" or "locked"
+   * claim.
+   */
+  private blankSessionOf(session: SessionLike): boolean | undefined {
+    const agents = this.service<AgentRegistryLike>('agents')
+    if (typeof agents?.turnBoundaryOf !== 'function') return undefined
+    let boundary: Record<string, unknown> | undefined
     try {
-      const boundary = record(projections.stateOf?.(session, 'turnBoundary'))
-      if (boundary === undefined) return false
-      return boundary.openTurnStartSeq === null && boundary.lastTurn === 0
+      boundary = record(agents.turnBoundaryOf(session))
     } catch {
-      return false
+      return undefined
     }
+    if (boundary === undefined) return undefined
+    const open = boundary.openTurnStartSeq
+    if (typeof open === 'number') return false
+    const lastTurn = boundary.lastTurn
+    if (typeof lastTurn !== 'number') return undefined
+    if (lastTurn > 0) return false
+    return open === null ? true : undefined
   }
 
   // --------------------------------------------------------------- commands
@@ -2308,6 +2731,15 @@ export class DshContextBackend implements Backend {
     if (name === 'input-route' && !isNativeInputName(params.name)) {
       throw codedError('INVALID_ARGUMENT', 'input-route requires a native lower-kebab name without a slash')
     }
+    if (name === 'session-rename' || name === 'session-fork') {
+      const scope = this.nativeUiScope()
+      if (typeof params.sessionId !== 'string' || params.sessionId === '') throw codedError('INVALID_ARGUMENT', 'an explicit sessionId is required')
+      if (scope === undefined || params.sessionId !== scope.sessionId ||
+          (params.attachmentId !== undefined && params.attachmentId !== scope.attachmentId)) throw codedError('STALE_SESSION', 'the explicit native session is no longer current')
+      if (name === 'session-rename' && (typeof params.title !== 'string' || params.title.trim() === '')) throw codedError('INVALID_ARGUMENT', 'rename requires a non-empty title')
+      if (name === 'session-fork' && params.atSeq !== undefined &&
+          (typeof params.atSeq !== 'number' || !Number.isSafeInteger(params.atSeq) || params.atSeq < 0)) throw codedError('INVALID_ARGUMENT', 'fork requires a non-negative native boundary')
+    }
     if (name === 'reload') return await this.reloadRuntime()
     if (!SESSIONLESS_COMMANDS.has(name) && !STAGEABLE_COMMANDS.has(name)) await this.ensureCurrent()
     switch (name) {
@@ -2337,8 +2769,72 @@ export class DshContextBackend implements Backend {
       case 'subagent-follow': return await this.subagentFollow(params)
       case 'subagent-interrupt': return await this.subagentInterrupt(params)
       case 'subagent-prompt': return await this.subagentPrompt(params)
+      case 'native-jobs': return this.nativeUiRead('native jobs', () => this.nativeInspection.jobs())
+      case 'native-job-output': {
+        if (typeof params.jobId !== 'string' || params.jobId === '' ||
+            (params.from !== undefined && (typeof params.from !== 'number' || !Number.isSafeInteger(params.from) || params.from < 0))) {
+          throw codedError('INVALID_ARGUMENT', 'native-job-output requires a jobId and a non-negative byte offset')
+        }
+        return this.nativeUiRead('native job output', () => this.nativeInspection.jobOutput(params.jobId as string, params.from as number | undefined))
+      }
+      case 'native-goal': return this.nativeUiRead('native goal', () => this.nativeInspection.goal())
+      case 'native-working-directory': return this.nativeUiRead('native working directory', () => this.nativeInspection.workingDirectory())
+      case 'native-inventory': return this.nativeUiRead('native plugin inventory', () => this.nativeInspection.pluginInventory())
+      case 'native-tools': return this.nativeUiRead('native tool catalog', () => this.nativeInspection.toolCatalog())
+      case 'native-questions': return this.nativeQuestions.read()
+      case 'native-question-answer': {
+        if (typeof params.callId !== 'string' || params.callId === '') throw codedError('INVALID_ARGUMENT', 'native-question-answer requires callId')
+        return this.nativeQuestions.answer({ callId: params.callId, answer: params.answer })
+      }
+      case 'native-defaults': return this.nativeUiRead('native defaults', () => this.nativeManagement.defaultSettings())
+      case 'native-default-update': {
+        const target = params.target, value = params.value, expectedRevision = params.expectedRevision
+        if ((target !== 'agent-preset-default' && target !== 'permission-default-preset') || typeof value !== 'string' ||
+            typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 ||
+            (params.attachmentId !== undefined && typeof params.attachmentId !== 'string')) throw codedError('INVALID_ARGUMENT', 'native default update requires a target, value and confirmed revision')
+        return this.nativeManagement.updateDefault({ target, value, expectedRevision,
+          ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
+      }
+      case 'session-rename': return this.nativeManagement.renameCurrent({ sessionId: params.sessionId as string, title: params.title as string,
+        ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
+      case 'session-fork': return this.forkInteractive(params)
       default: throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
     }
+  }
+
+  /** Native controller parity: a complete public seed + one native Agent create. */
+  private async forkInteractive(params: Record<string, unknown>): Promise<SessionInfo> {
+    return this.serialize(async () => {
+      this.assertOpen()
+      const source = this.live
+      if (source === undefined) throw codedError('CAPABILITY_UNAVAILABLE', 'start a native conversation before forking its durable boundary')
+      if (params.sessionId !== source.agent.session.id ||
+          (params.attachmentId !== undefined && params.attachmentId !== source.attachmentId)) throw codedError('STALE_SESSION', 'the source session changed before fork')
+      const header = record(source.agent.session.header)
+      if (header?.origin === 'subagent' || (typeof header?.delegationDepth === 'number' && header.delegationDepth > 0)) {
+        throw codedError('CAPABILITY_UNAVAILABLE', 'interactive fork is a current-root action, not independent child recovery')
+      }
+      const builder = this.native?.buildForkSeed
+      const seq = source.agent.session.seq
+      if (builder === undefined || typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 1) throw codedError('CAPABILITY_UNAVAILABLE', 'the current native session has no forkable durable boundary')
+      const childSessionId = randomUUID(), preset = this.currentPreset()
+      const input = buildInteractiveForkInput({
+        sourceSession: source.agent.session, childSessionId, atSeq: typeof params.atSeq === 'number' ? params.atSeq : seq - 1,
+        buildForkSeed: builder, ...(preset === undefined ? {} : { agentPreset: preset }),
+      })
+      if (!input.ok) throw codedError(input.reason === 'boundary-invalid' || input.reason === 'invalid-request' ? 'INVALID_ARGUMENT' : 'RUNTIME_REQUEST_FAILED', input.message ?? 'the native fork seed is unavailable')
+      const prepared = await this.prepareAgent('new', childSessionId, preset, { fork: input })
+      try {
+        this.assertOpen()
+        if (this.live !== source) throw codedError('STALE_SESSION', 'the source attachment changed during native fork preparation')
+        this.commitAgent(prepared)
+      } catch (error) { await this.discardAgent(prepared); throw error }
+      this.retirePendingQueries('session forked'); this.pending = undefined
+      await this.closeAgent(source, 'session forked')
+      const info = await this.sessionInfo(true)
+      this.emitAnnouncement(info)
+      return info
+    })
   }
 
   private controlCommands(): unknown[] {
@@ -2373,18 +2869,22 @@ export class DshContextBackend implements Backend {
       throw codedError('INVALID_ARGUMENT', 'execute requires a non-empty command line')
     }
     if (!line.trimStart().startsWith('/')) throw codedError('INVALID_ARGUMENT', 'execute requires a slash command line')
+    const attachments = normalizeCommandAttachments(params.attachments ?? [])
+    const submitted = this.nativeFiles.commandSubmitParts(attachments)
     const requestId = randomUUID()
     const controller = new AbortController()
     let settle: () => void = () => {}
     const settled = new Promise<void>(resolve => { settle = resolve })
     this.activeCommands.set(requestId, { requestId, controller, sessionId: live.agent.session.id, settled, settle })
     try {
-      const execution = record(await commands.execute(live.agent, line, [], controller.signal))
+      const execution = record(await commands.execute(live.agent, line, submitted, controller.signal))
       if (execution === undefined) {
         const commandName = line.trimStart().slice(1).split(/\s/, 1)[0]
         throw codedError('UNSUPPORTED_COMMAND', `unknown or malformed command: /${commandName}`)
       }
-      return jsonSafe({ commandId: execution.commandId, result: this.commandResult(line, execution, live.agent.session.id) })
+      const outcome = commandOutcome(execution)
+      return jsonSafe({ commandId: execution.commandId, result: this.commandResult(line, execution, live.agent.session.id),
+        ...(attachments.length === 0 ? {} : { attachmentOutcome: outcome?.kind ?? 'unknown' }) })
     } finally {
       this.activeCommands.delete(requestId)
       settle()
@@ -2592,7 +3092,10 @@ export class DshContextBackend implements Backend {
   /** Retire pending reads before their captured pending observation disappears. */
   private retirePendingQueries(reason: string): void {
     const pending = this.pending
-    if (pending !== undefined) this.abortSkillQueries(reason, pending.sessionId)
+    if (pending !== undefined) {
+      this.abortSkillQueries(reason, pending.sessionId)
+      this.abortNativeUiReads(pending.sessionId)
+    }
   }
 
   /** Abort in-flight metadata reads for close, attachment retirement or preset changes. */
@@ -2762,14 +3265,24 @@ export class DshContextBackend implements Backend {
 
   // ---------------------------------------------------------------- models
 
+  /**
+   * Build the model rows from the mounted native LLM registry.
+   *
+   * The `default` marker is one native fact and only one: the value of the
+   * public default-model service (`ctx.agentDefaultModel.currentSelection()`),
+   * which is what DSH reports as its deployment default. It is deliberately
+   * NOT the session's current route — neither the live Agent's
+   * `agent.model.current()` nor a pending/CLI route — because an explicit
+   * session or `--provider/--model` selection is a different native fact and
+   * does not change the default. An absent or failing default read marks no row
+   * (unknown), rather than promoting the current route into a false default.
+   */
   private async modelCatalog(): Promise<{ items: ModelRow[]; failures: string[]; defaultSelection: Route | undefined }> {
     const llm = this.service<LlmLike>('llm')
     if (typeof llm?.listProviders !== 'function' || typeof llm.listModels !== 'function') {
       throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no LLM provider catalog (ctx.llm.listProviders/listModels)')
     }
-    const defaults = this.live !== undefined
-      ? this.agentRoute(this.live.agent)
-      : this.pending?.route ?? this.defaultModelSelection()
+    const defaults = this.defaultModelSelection()
     const items: ModelRow[] = []
     const failures: string[] = []
     let providers: readonly { readonly id: string; readonly name?: string }[]
@@ -2778,16 +3291,33 @@ export class DshContextBackend implements Backend {
     } catch (error) {
       throw codedError('MODELS_UNAVAILABLE', `the native LLM provider registry failed: ${errorMessage(error)}`)
     }
-    for (const provider of providers) {
-      try {
-        const models = await withTimeout(Promise.resolve(llm.listModels(provider.id)), 8_000, `listModels(${provider.id})`)
-        for (const model of models) {
-          const row = modelRow(provider.id, model, defaults)
-          if (row !== undefined) items.push(row)
+    // Native catalogs remain native-owned. Bound concurrent reads instead of
+    // serially paying every provider's deadline, then flatten in registry order
+    // so completion timing cannot change grouping/defaults/failure ordering.
+    const results = new Array<{ rows: ModelRow[]; failure?: string }>(providers.length)
+    let nextProvider = 0
+    const readProvider = async (): Promise<void> => {
+      for (;;) {
+        const index = nextProvider++
+        if (index >= providers.length) return
+        const provider = providers[index]!
+        try {
+          const models = await withTimeout(Promise.resolve(llm.listModels(provider.id)), 8_000, `listModels(${provider.id})`)
+          const rows: ModelRow[] = []
+          for (const model of models) {
+            const row = modelRow(provider.id, model, defaults)
+            if (row !== undefined) rows.push(row)
+          }
+          results[index] = { rows }
+        } catch (error) {
+          results[index] = { rows: [], failure: `${provider.id}: ${errorMessage(error)}` }
         }
-      } catch (error) {
-        failures.push(`${provider.id}: ${errorMessage(error)}`)
       }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, providers.length) }, readProvider))
+    for (const result of results) {
+      items.push(...result.rows)
+      if (result.failure !== undefined) failures.push(result.failure)
     }
     return { items, failures, defaultSelection: defaults }
   }
@@ -2812,22 +3342,30 @@ export class DshContextBackend implements Backend {
     if (this.live === undefined) {
       const pending = this.pending
       if (pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
+      // Captured before the native catalog/metadata reads: the exact route this
+      // selection started from (an adapter pin, or the live native default).
+      const previousRoute = this.pendingRoute(pending)
       const { items } = await this.modelCatalog()
       const entry = selectModelRow(items, args)
       if (entry === undefined) throw codedError('UNKNOWN_MODEL', unknownModelMessage(args))
       // The target's reasoning metadata belongs to resolveModelInfo, not the
       // list DTO. Read it only for the selected target, after selection.
       const targetReasoning = await this.effortReasoningFor(entry)
-      if (this.pending !== pending || this.live !== undefined) {
-        throw codedError('STALE_SESSION', 'the Agent attachment changed during model selection')
+      // Same-attachment async race: another surface may have staged a pin or
+      // moved the native default while the catalog was read. The obsolete
+      // selection is neither pinned nor saved.
+      if (this.pending !== pending || this.live !== undefined ||
+          !sameRoute(this.pendingRoute(pending), previousRoute)) {
+        throw codedError('STALE_SESSION', 'the Agent attachment or model route changed during model selection')
       }
-      const effort = carriedEffort(targetReasoning, pending.route?.reasoningEffort)
-      pending.route = {
+      const effort = carriedEffort(targetReasoning, previousRoute?.reasoningEffort)
+      const route: Route = {
         provider: String(entry.provider),
         model: String(entry.model),
         ...(typeof effort === 'string' && effort.length > 0 ? { reasoningEffort: effort } : {}),
       }
-      const saved = await this.saveDefaultSelection(pending.route)
+      pending.route = route
+      const saved = await this.saveDefaultSelection(route)
       return {
         ...entry,
         ...(typeof effort === 'string' && effort.length > 0 ? { reasoningEffort: effort } : {}),
@@ -2907,9 +3445,14 @@ export class DshContextBackend implements Backend {
     const pending = this.live === undefined ? this.pending : undefined
     const current = pending !== undefined ? undefined : this.currentPreset()
     const defaultId = typeof presets.defaultId === 'string' ? presets.defaultId : undefined
+    // `blank` is a native fact, not a TUI gate: a pending attachment is blank by
+    // construction, a live one only when the native turn-boundary read proves
+    // it. An unreadable boundary omits the field (unknown); the picker then
+    // stages the selection instead of switching the running Agent.
+    const blank = pending !== undefined ? true : this.isBlankSession()
     return jsonSafe({
       current: current ?? null,
-      blank: pending !== undefined ? true : this.isBlankSession(),
+      ...(blank === undefined ? {} : { blank }),
       ...(defaultId === undefined ? {} : { default: defaultId }),
       presets: (Array.isArray(roster) ? roster : []).flatMap((row) => {
         const item = record(row)
@@ -2923,8 +3466,9 @@ export class DshContextBackend implements Backend {
     })
   }
 
-  private isBlankSession(): boolean {
-    return this.blankSessionOf(this.live?.agent.session as SessionLike)
+  private isBlankSession(): boolean | undefined {
+    const session = this.live?.agent.session
+    return session === undefined ? undefined : this.blankSessionOf(session)
   }
 
   private async setPreset(args: Record<string, unknown>): Promise<unknown> {
@@ -2943,12 +3487,17 @@ export class DshContextBackend implements Backend {
       return this.pendingInfo()
     }
     const live = this.live
-    if (!this.isBlankSession()) return { id, current: this.currentPreset() ?? null, locked: true }
     const presets = this.presetService()
+    if (typeof presets?.select !== 'function') {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no native agent-preset selector')
+    }
+    // The native selector owns the blank/locked rule and decides against the
+    // exact Agent it guards. This adapter neither pre-judges blankness nor
+    // synthesizes a lock: it captures the Agent, resolves the id and forwards.
     const resolvedId = await this.resolvePresetId(id)
     if (this.live !== live) throw codedError('STALE_SESSION', 'the Agent attachment changed during preset selection')
     try {
-      await withTimeout(Promise.resolve(presets?.select?.(live.agent, resolvedId)), 15_000, 'agent preset selection')
+      await withTimeout(Promise.resolve(presets.select(live.agent, resolvedId)), 15_000, 'agent preset selection')
     } catch (error) {
       if (record(error)?.code === 'agent-preset/locked') {
         return { id: resolvedId, current: this.currentPreset() ?? null, locked: true }
@@ -3040,7 +3589,7 @@ export class DshContextBackend implements Backend {
     if (this.live === undefined) {
       const pending = this.pending
       if (pending === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-      const route = pending.route ?? this.defaultModelSelection()
+      const route = this.pendingRoute(pending)
       if (route === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'this session has no model route')
       const reasoning = record((await this.effortMetadata(route)).reasoning)
       if (reasoning === undefined) {
@@ -3048,16 +3597,20 @@ export class DshContextBackend implements Backend {
       }
       const efforts = Array.isArray(reasoning.efforts) ? reasoning.efforts : []
       const requested = this.requestedEffort(args.id, efforts, route)
-      if (this.pending !== pending || this.live !== undefined) {
-        throw codedError('STALE_SESSION', 'the Agent attachment changed during effort selection')
+      // Same-attachment async race: the exact route this effort choice was
+      // validated against must still be the followed one.
+      if (this.pending !== pending || this.live !== undefined ||
+          !sameRoute(this.pendingRoute(pending), route)) {
+        throw codedError('STALE_SESSION', 'the Agent attachment or model route changed during effort selection')
       }
-      pending.route = {
+      const pinned: Route = {
         provider: route.provider,
         model: route.model,
         ...(requested === undefined ? {} : { reasoningEffort: requested }),
       }
+      pending.route = pinned
       const effective = requested ?? (typeof reasoning.defaultEffort === 'string' ? reasoning.defaultEffort : undefined)
-      const saved = await this.saveDefaultSelection(pending.route)
+      const saved = await this.saveDefaultSelection(pinned)
       return {
         provider: route.provider,
         model: route.model,
@@ -3125,13 +3678,18 @@ export class DshContextBackend implements Backend {
       .filter((item): item is Record<string, unknown> => item !== undefined && record(item.header) !== undefined)
       .filter(item => record(item.header)?.origin !== 'subagent')
       .slice(0, limit)
-    const titles = args.titles === false ? undefined : await this.titlesOf(query, visible.map(item => String(record(item.header)?.id)))
+    const titles = args.titles === false ? undefined : await this.titleFactsOf(query, visible.map(item => String(record(item.header)?.id)))
     return visible.map((item) => {
       const header = record(item.header) ?? {}
       const id = String(header.id)
+      const title = titles?.titles.get(id)
       return {
         id,
-        ...(titles === undefined ? {} : { title: titles.get(id) ?? null }),
+        // A known native title is a string; a fulfilled observation without a
+        // folded title snapshot is the native no-title fact (`null`); an
+        // unavailable read (service absent, batch failure, per-session
+        // rejection) stays unknown and is omitted, exactly like SessionInfo.
+        ...(title === undefined ? {} : { title }),
         cwd: typeof header.cwd === 'string' ? header.cwd : '',
         createdAt: header.createdAt,
         live: item.live === true,
@@ -3139,25 +3697,53 @@ export class DshContextBackend implements Backend {
     })
   }
 
-  private titleMapOf(observations: unknown): Map<string, string> {
-    const titles = new Map<string, string>()
+  /**
+   * Fold one native batch title observation into per-session facts.
+   *
+   * The native result is `{sessionId,status:'fulfilled',value:{title?}}` or
+   * `{sessionId,status:'rejected',reason}`. Only a fulfilled observation is a
+   * fact: `value.title` absent means DSH folded no title (`null`), and a
+   * fulfilled title means that exact title. A rejected row, a missing row and a
+   * whole failed or unmounted batch are all *unknown*, which callers omit
+   * rather than rendering as "this session has no title".
+   *
+   * @param query - the mounted native session query service.
+   * @param ids - the session ids to observe in one call.
+   * @returns the known title facts; ids absent from `titles` stay unknown.
+   */
+  private async titleFactsOf(query: SessionQueryLike, ids: readonly string[]): Promise<{ titles: Map<string, string | null> }> {
+    const titles = new Map<string, string | null>()
+    if (ids.length === 0) return { titles }
+    if (typeof query.readTitleSnapshots !== 'function') return { titles }
+    const requested = new Set(ids)
+    let observations: unknown
+    try {
+      observations = await query.readTitleSnapshots(ids)
+    } catch (error) {
+      // Host-owned diagnostics only: the UI never invents a title fact, and an
+      // unavailable store must not surface as a conversation error.
+      this.warn(`could not read native session titles: ${errorMessage(error)}`)
+      return { titles }
+    }
     for (const observation of Array.isArray(observations) ? observations : []) {
       const item = record(observation)
       if (item?.status !== 'fulfilled') continue
+      const sessionId = typeof item.sessionId === 'string' ? item.sessionId : undefined
+      if (sessionId === undefined || !requested.has(sessionId)) continue
       const value = record(item.value)
-      const title = record(value?.title)?.title
-      if (typeof item.sessionId === 'string' && typeof title === 'string' && title.length > 0) titles.set(item.sessionId, title)
+      if (value === undefined) continue
+      const snapshot = value.title
+      // `value.title` absent is the native "folded no title" fact. A present but
+      // unrecognized snapshot stays unknown instead of being flattened to null.
+      if (snapshot === undefined) {
+        titles.set(sessionId, null)
+        continue
+      }
+      const title = record(snapshot)?.title
+      if (typeof title !== 'string') continue
+      titles.set(sessionId, title.length > 0 ? title : null)
     }
-    return titles
-  }
-
-  private async titlesOf(query: SessionQueryLike, ids: readonly string[]): Promise<Map<string, string>> {
-    if (typeof query.readTitleSnapshots !== 'function') return new Map()
-    try {
-      return this.titleMapOf(await query.readTitleSnapshots(ids))
-    } catch {
-      return new Map()
-    }
+    return { titles }
   }
 
   private async listTitles(args: Record<string, unknown>): Promise<unknown> {
@@ -3166,8 +3752,13 @@ export class DshContextBackend implements Backend {
     if (ids.length === 0) return []
     const query = this.service<SessionQueryLike>('sessionQuery')
     if (query === undefined) throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no session query service')
-    const titles = await this.titlesOf(query, ids)
-    return ids.map(sessionId => ({ sessionId, title: titles.get(sessionId) ?? null }))
+    const facts = await this.titleFactsOf(query, ids)
+    // Same unknown/absent discipline as the listing: a row whose title cannot be
+    // observed omits `title` instead of claiming the native no-title value.
+    return ids.map((sessionId) => {
+      const title = facts.titles.get(sessionId)
+      return { sessionId, ...(title === undefined ? {} : { title }) }
+    })
   }
 
   // ------------------------------------------------------------- subagents
@@ -3381,7 +3972,10 @@ export class DshContextBackend implements Backend {
         throw codedError('INVALID_ARGUMENT', 'subagent-prompt requires text or content')
       }
       content = normalizePromptContent(contentValue as readonly PromptContentPart[], 'subagent-prompt')
-      if (!content.some(part => part.type === 'image' || part.text.trim().length > 0)) {
+      if (content.some(part => part.type === 'file')) {
+        throw codedError('CAPABILITY_UNAVAILABLE', 'the mounted native subagent prompt accepts text/images, not files; the reply was not sent')
+      }
+      if (!content.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
         throw codedError('INVALID_ARGUMENT', 'subagent-prompt content requires non-whitespace text or an image')
       }
     }
@@ -3602,6 +4196,7 @@ export class DshContextBackend implements Backend {
           text: messageText(raw),
           target,
           images: content.filter(part => part.type === 'image').length,
+          files: content.filter(part => part.type === 'file').length,
         })
       }
     }
@@ -3639,13 +4234,11 @@ export class DshContextBackend implements Backend {
     if (messageId === '') throw codedError('INVALID_ARGUMENT', 'queue-replace requires messageId')
     const existing = this.findRecallable(agent, messageId)
     const raw = existing as unknown as Record<string, unknown>
-    const kept = (recallableContent(raw) ?? []).filter(part => part.type === 'image')
-    if (text.trim() === '' && kept.length === 0) {
-      throw codedError('INVALID_ARGUMENT', 'queue-replace requires text or an existing image')
+    const original = recallableContent(raw) ?? []
+    const content = queueReplacementContent(original, text)
+    if (!content.some(part => part.type !== 'text' || part.text.trim() !== '')) {
+      throw codedError('INVALID_ARGUMENT', 'queue-replace requires text or an existing attachment')
     }
-    const content: unknown[] = []
-    if (text.trim() !== '') content.push({ type: 'text', text })
-    for (const part of kept) content.push({ type: 'image', attachment: part.attachment })
     const replacement = this.asUserMessage(this.userMessageFromContent(content))
     if (!agent.inbox.replace(messageId, replacement)) throw codedError('INVALID_ARGUMENT', 'queued message is gone')
     return { messageId: replacement.id }
@@ -3724,10 +4317,10 @@ export class DshContextBackend implements Backend {
   }
 
   private async admitUserMessage(parts: readonly PromptContentPart[]): Promise<UserMessageLike> {
-    if (!parts.some(part => part.type === 'image' || part.text.trim().length > 0)) {
-      throw codedError('INVALID_ARGUMENT', 'queue-send-now requires non-whitespace text or an image')
+    if (!parts.some(part => part.type !== 'text' || part.text.trim().length > 0)) {
+      throw codedError('INVALID_ARGUMENT', 'queue-send-now requires non-whitespace text, an image or a file')
     }
-    if (!parts.some(part => part.type === 'image')) {
+    if (parts.every(part => part.type === 'text')) {
       return this.asUserMessage(this.userMessage(parts.map(part => part.type === 'text' ? part.text : '').join('\n')))
     }
     const attachments = this.service<AttachmentsLike>('attachments')
@@ -3739,12 +4332,7 @@ export class DshContextBackend implements Backend {
     }
     const live = this.live
     if (live === undefined) throw codedError('RUNTIME_REQUEST_FAILED', 'no live session')
-    let admitted: readonly unknown[]
-    try {
-      admitted = await attachments.admitPromptContent(parts)
-    } catch (error) {
-      throw codedError('RUNTIME_REQUEST_FAILED', `the native attachment store refused the prompt: ${errorMessage(error)}`)
-    }
+    const admitted = await this.nativeFiles.admitPrompt(parts)
     if (this.live !== live) throw codedError('STALE_SESSION', 'the DSH Agent attachment changed during prompt admission; the prompt was not sent')
     await this.ensureNative()
     return this.asUserMessage(this.userMessageFromContent(admitted))
@@ -3841,6 +4429,9 @@ export class DshContextBackend implements Backend {
       return
     }
     this.closed = true
+    this.abortNativeUiReads()
+    this.activeNativeUiReads.clear()
+    this.offNativeJobs?.(); this.offNativeJobs = undefined
     this.subagentBridge.close()
     this.childPresenters.clear()
     for (const dispose of this.disposers.splice(0)) {
@@ -3912,37 +4503,8 @@ function oneLineDiagnostic(text: string): string | undefined {
 }
 
 function normalizePromptContent(value: readonly PromptContentPart[], label = 'sendContent'): PromptContentPart[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw backendError('INVALID_ARGUMENT', `${label} requires a non-empty ordered content list`)
-  }
-  const parts: PromptContentPart[] = []
-  for (const entry of value) {
-    const part = record(entry)
-    if (part?.type === 'text') {
-      if (typeof part.text !== 'string') throw backendError('INVALID_ARGUMENT', 'prompt text parts require a text string')
-      parts.push({ type: 'text', text: part.text })
-      continue
-    }
-    if (part?.type === 'image') {
-      if (!isImageMediaType(part.mediaType)) throw backendError('INVALID_ARGUMENT', 'prompt image parts require a supported mediaType')
-      const data = part.data
-      if (typeof data !== 'string' || data.length === 0 || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
-        throw backendError('INVALID_ARGUMENT', 'prompt image parts require canonical base64 data')
-      }
-      if (part.name !== undefined && typeof part.name !== 'string') {
-        throw backendError('INVALID_ARGUMENT', 'prompt image part name must be a string when present')
-      }
-      parts.push({
-        type: 'image',
-        mediaType: part.mediaType,
-        data,
-        ...(part.name === undefined ? {} : { name: part.name }),
-      })
-      continue
-    }
-    throw backendError('INVALID_ARGUMENT', `unsupported prompt content part: ${JSON.stringify(part?.type)}`)
-  }
-  return parts
+  if (!Array.isArray(value) || value.length === 0) throw backendError('INVALID_ARGUMENT', `${label} requires a non-empty ordered content list`)
+  return normalizeNativePromptContent(value)
 }
 
 function unknownModelMessage(args: Record<string, unknown>): string {

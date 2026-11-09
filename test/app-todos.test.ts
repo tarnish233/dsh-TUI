@@ -10,8 +10,8 @@ import { delay, until, VirtualTerminal } from './helpers/terminal.ts'
 
 /**
  * Parent-owned acceptance for the native todos/plan projections: the bridge
- * forwards DSH's own folds as events; the transcript shows the live checklist
- * and plan-mode transitions, and Ctrl+T summarizes the tracked snapshot.
+ * forwards DSH's own folds as events; the bottom dock shows the live checklist
+ * while plan transitions stay notices. Ctrl+T toggles without writing history.
  */
 class ProjectionBackend implements Backend {
   readonly transcriptCodec = DEMO_TRANSCRIPT_CODEC
@@ -39,7 +39,7 @@ class ProjectionBackend implements Backend {
     this.emit({ type: 'todos', sessionId: this.info.sessionId, value })
   }
   plan(active: boolean): void {
-    this.emit({ type: 'plan', sessionId: this.info.sessionId, value: { active, wanted: null, running: null } })
+    this.emit({ type: 'plan', sessionId: this.info.sessionId, value: { active } })
   }
 }
 
@@ -79,7 +79,7 @@ test('parent projections: the native todos fold renders a single live checklist'
   }
 })
 
-test('parent projections: Ctrl+T summarizes the tracked todos snapshot', async () => {
+test('parent projections: Ctrl+T toggles the tracked todos without appending notices', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-parent-todos-'))
   const backend = new ProjectionBackend(directory)
   const terminal = new VirtualTerminal(110, 32)
@@ -88,12 +88,18 @@ test('parent projections: Ctrl+T summarizes the tracked todos snapshot', async (
     await app.start()
     terminal.type('\x14') // Ctrl+T (app.todo)
     await paint(terminal)
-    assert.ok(terminal.screen().includes('No todos in this session yet.'), 'the empty summary is honest')
+    assert.ok(!terminal.screen().includes('No todos in this session yet.'), 'an empty CC toggle is quiet')
     backend.todos([{ content: 'only one todo', status: 'in_progress' }])
     await until(() => terminal.screen().includes('only one todo'), 'the checklist renders')
+    const before = app.store.items.length
     terminal.type('\x14')
     await paint(terminal)
-    assert.match(terminal.screen(), /1\. \[~\] only one todo/, 'the summary lists the tracked snapshot')
+    assert.ok(!terminal.screen().includes('only one todo'), 'first press hides the dock')
+    assert.equal(app.store.items.length, before, 'hide appends no transcript summary')
+    terminal.type('\x14')
+    await paint(terminal)
+    assert.ok(terminal.screen().includes('only one todo'), 'second press shows the same native snapshot')
+    assert.equal(app.store.items.length, before, 'show appends no transcript summary')
   } finally {
     try { await app.shutdown() } finally { terminal.dispose(); await rm(directory, { recursive: true, force: true }) }
   }

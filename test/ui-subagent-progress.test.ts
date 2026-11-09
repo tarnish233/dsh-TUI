@@ -1216,3 +1216,228 @@ test('every width keeps flattened native text single-row at the hard budget', ()
     assertWidths(lines, width, `width ${width}`)
   }
 })
+
+// ---------------------------------------------------------------------------
+// Native live-child presence for the parent's dock height allocation
+
+test('hasActiveEntries reports live presence exactly like render filters it', () => {
+  const h = mount()
+  assert.equal(h.progress.hasActiveEntries, false, 'an empty catalog has no live child')
+  assert.deepEqual(h.progress.render(80), [])
+
+  // Both live native statuses count; nothing is measured locally.
+  for (const status of ['running', 'initializing'] as SubagentStatus[]) {
+    h.progress.entries = [entry({ id: `live-${status}`, status })]
+    assert.equal(h.progress.hasActiveEntries, true, `${status} is live presence`)
+  }
+
+  // Every settled status is history: no row and no reserved dock row.
+  const settled: SubagentStatus[] = [
+    'idle', 'completed', 'failed', 'stopped', 'max-tokens', 'refusal', 'unknown', 'external',
+  ]
+  for (const status of settled) {
+    h.progress.entries = [entry({ id: 'settled', label: 'Settled', status, lastActivity: 'stale prose' })]
+    assert.equal(h.progress.hasActiveEntries, false, `${status} is not current work`)
+    assert.deepEqual(h.progress.render(80), [], `${status} paints nothing`)
+  }
+
+  // One live child among settled history is enough for the dock to be needed.
+  h.progress.entries = [
+    entry({ id: 'done', status: 'completed' }),
+    entry({ id: 'init', status: 'initializing' }),
+    entry({ id: 'idle', status: 'idle' }),
+  ]
+  assert.equal(h.progress.hasActiveEntries, true)
+  assert.notEqual(h.progress.render(80).length, 0)
+  // Dropping the live child retires the presence together with the widget.
+  h.progress.entries = [entry({ id: 'done', status: 'completed' }), entry({ id: 'idle', status: 'idle' })]
+  assert.equal(h.progress.hasActiveEntries, false)
+  assert.deepEqual(h.progress.render(80), [])
+})
+
+test('hasActiveEntries uses the render dedupe: first catalog entry per id wins', () => {
+  const h = mount()
+  // A live duplicate cannot resurrect a child whose first row settled...
+  h.progress.entries = [
+    entry({ id: 'dup', label: 'Settled first', status: 'completed' }),
+    entry({ id: 'dup', label: 'Live second', status: 'running' }),
+  ]
+  assert.equal(h.progress.hasActiveEntries, false)
+  assert.deepEqual(h.progress.render(80), [])
+
+  // ...and a settled duplicate cannot retire a child that is live first.
+  h.progress.entries = [
+    entry({ id: 'dup', label: 'Live first', status: 'running' }),
+    entry({ id: 'dup', label: 'Settled second', status: 'idle' }),
+  ]
+  assert.equal(h.progress.hasActiveEntries, true)
+  const lines = plain(h.progress.render(80))
+  assert.ok(lines[1]?.includes('Live first'), lines.join('\n'))
+  assert.ok(!lines.join('\n').includes('Settled second'))
+})
+
+test('hasActiveEntries is budget- and mouse-block independent presence', () => {
+  const state = { budget: 8 }
+  const h = mount({ maxRows: () => state.budget })
+  h.progress.entries = [entry({ id: 'live', status: 'running' })]
+  assert.equal(h.progress.hasActiveEntries, true)
+
+  // A zero budget hides the rows but never invents "no live child": the parent
+  // may still need to know that a dock would consume rows.
+  state.budget = 0
+  assert.deepEqual(h.progress.render(80), [])
+  assert.equal(h.progress.hasActiveEntries, true)
+  h.progress.maxRows = 0
+  assert.equal(h.progress.hasActiveEntries, true)
+
+  // Another surface owning input is a paint concern only.
+  h.progress.mouseBlocked = true
+  assert.equal(h.progress.hasActiveEntries, true)
+  h.progress.mouseBlocked = false
+
+  // With any real budget the getter and the painted widget agree exactly.
+  const catalogs: SubagentEntry[][] = [
+    [],
+    [entry({ id: 'a', status: 'running' })],
+    [entry({ id: 'b', status: 'idle' })],
+    [entry({ id: 'c', status: 'initializing' }), entry({ id: 'd', status: 'completed' })],
+    [entry({ id: 'e', status: 'external' }), entry({ id: 'f', status: 'refusal' })],
+  ]
+  for (const entries of catalogs) {
+    h.progress.entries = entries
+    for (const budget of [1, 2, 8, 15]) {
+      h.progress.maxRows = budget
+      assert.equal(
+        h.progress.hasActiveEntries,
+        h.progress.render(80).length > 0,
+        `budget ${budget} / ${entries.map(item => item.status).join(',')}`,
+      )
+    }
+  }
+})
+
+test('hasActiveEntries stays honest for truncated, settled-target and disposed catalogs', () => {
+  const h = mount()
+  h.progress.entries = [entry({ id: 'idle', label: 'Idle', status: 'idle' })]
+  h.progress.truncated = true
+  h.progress.replyTargetId = 'idle'
+  // An incomplete catalog with only known settled children is still no current work.
+  assert.equal(h.progress.hasActiveEntries, false)
+  assert.deepEqual(h.progress.render(80), [])
+
+  // A live child under the same flags is presence.
+  h.progress.entries = [entry({ id: 'idle', status: 'idle' }), entry({ id: 'live', status: 'running' })]
+  assert.equal(h.progress.hasActiveEntries, true)
+  h.progress.truncated = false
+  h.progress.replyTargetId = undefined
+
+  // dispose is terminal for the presence fact even though the catalog reference
+  // is not cleared by the component.
+  h.progress.dispose()
+  assert.equal(h.progress.isDisposed, true)
+  assert.equal(h.progress.hasActiveEntries, false)
+  assert.deepEqual(h.progress.render(80), [])
+})
+
+test('hasActiveEntries reads a frozen native catalog without mutating it', () => {
+  const frozenEntries: readonly SubagentEntry[] = Object.freeze([
+    Object.freeze(entry({ id: 'settled', label: 'Settled', status: 'completed' as const })),
+    Object.freeze(entry({ id: 'live', label: 'Live', status: 'running' as const })),
+  ])
+  const h = mount({ maxRows: 6 })
+  h.progress.entries = frozenEntries
+  assert.equal(h.progress.hasActiveEntries, true)
+  const first = h.progress.render(80)
+  assert.deepEqual(h.progress.render(80), first, 'repeat paints are deterministic')
+  // The presence getter is read-only: no reordering, dedupe by mutation or
+  // status rewrite ever reaches the native snapshot.
+  assert.equal(Object.isFrozen(frozenEntries), true)
+  assert.equal(Object.isFrozen(frozenEntries[0]), true)
+  assert.equal(frozenEntries.length, 2)
+  assert.deepEqual(frozenEntries.map(item => item.status), ['completed', 'running'])
+  h.progress.entries = Object.freeze([Object.freeze(entry({ id: 'only', status: 'idle' as const }))])
+  assert.equal(h.progress.hasActiveEntries, false)
+})
+
+// ---------------------------------------------------------------------------
+// Root composition seams: pure height facts and separator ownership
+
+test('preferred/comfortable/compact rows use the native active-only projection', () => {
+  const h = mount({ maxRows: 8 })
+  assert.deepEqual(
+    [h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows],
+    [0, 0, 0],
+    'empty catalog',
+  )
+  h.progress.entries = [entry({ id: 'settled', status: 'idle' }), entry({ id: 'done', status: 'completed' })]
+  assert.deepEqual(
+    [h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows],
+    [0, 0, 0],
+    'settled-only history reserves nothing',
+  )
+
+  h.progress.entries = [entry({ id: 'live', status: 'running' })]
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [2, 2, 1])
+  // Native activity lines exist only for `running` rows; initializing stays one line.
+  h.progress.entries = [entry({ id: 'live', status: 'initializing', lastActivity: 'starting native child' })]
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [2, 2, 1])
+  h.progress.entries = [entry({ id: 'live', status: 'running', lastActivity: 'starting native child' })]
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [3, 2, 1])
+  h.progress.entries = [
+    entry({ id: 'a', status: 'running', lastActivity: 'reading src/app.ts' }),
+    entry({ id: 'b', status: 'initializing' }),
+  ]
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [4, 2, 1])
+
+  // Duplicate ids collapse exactly like the widget: first native occurrence wins.
+  h.progress.entries = [
+    entry({ id: 'dup', status: 'completed' }),
+    entry({ id: 'dup', status: 'running', lastActivity: 'hidden by dedupe' }),
+  ]
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [0, 0, 0])
+
+  // Budget is a paint fact only; the natural height stays honest at budget 0.
+  h.progress.entries = [entry({ id: 'live', status: 'running' })]
+  h.progress.maxRows = 0
+  assert.equal(h.progress.preferredRows, 2)
+  assert.equal(h.progress.hasActiveEntries, true)
+  h.progress.dispose()
+  assert.deepEqual([h.progress.preferredRows, h.progress.comfortableRows, h.progress.compactRows], [0, 0, 0])
+})
+
+test('the pure row facts never render and never churn hitboxes or hover', () => {
+  const h = mount({ maxRows: 8 })
+  h.progress.entries = [entry({ id: 'live', status: 'running', lastActivity: 'busy' })]
+  const original = h.progress.render.bind(h.progress)
+  let renders = 0
+  h.progress.render = (width: number) => {
+    renders += 1
+    return original(width)
+  }
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(h.progress.preferredRows, 3)
+    assert.equal(h.progress.comfortableRows, 2)
+    assert.equal(h.progress.compactRows, 1)
+  }
+  assert.equal(renders, 0, 'planning height must not re-render live blocks')
+})
+
+test('a root stack can disable the standalone trailing separator', () => {
+  const h = mount({ maxRows: 8 })
+  h.progress.entries = [entry({ id: 'live', status: 'running' })]
+  assert.equal(plain(h.progress.render(80)).at(-1), '', 'standalone default keeps its gap')
+
+  const root = new SubagentProgress({
+    keymap: keymap(),
+    now: () => NOW,
+    maxRows: 8,
+    trailingSeparator: false,
+  })
+  root.entries = [entry({ id: 'live', label: 'review', status: 'running' })]
+  const lines = plain(root.render(80))
+  assert.equal(lines.length, 2, 'header + child, no blank row charged to the root stack')
+  assert.ok(!lines.includes(''))
+  // An impossible-to-miss budget still emits no separator on the root seam.
+  root.maxRows = 40
+  assert.equal(root.render(80).length, 2)
+})

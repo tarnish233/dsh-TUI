@@ -75,10 +75,48 @@ import type { ImageUploadPart } from "./src/ui/image-view.ts"
 editor.insertImage(image: ImageUploadPart): number            // -> [Image #N] marker id
 editor.getImageAttachments(): Array<{ id: number; image: ImageUploadPart }>
 editor.hasImageAttachments(): boolean
-editor.getPromptContent(): PromptContentPart[]                // ordered text/image parts
+editor.getPromptContent(): PromptContentPart[]                // ordered text/image/file parts
 editor.onSubmitContent?: (payload: CcSubmitPayload) => void
 editor.onSubmitBlocked?: (error: Error) => void
 ```
+
+### File attachments (native refs, memory only)
+
+```ts
+import type { FileAttachmentRef, PromptContentPart } from "./src/backend/types.ts"
+
+/** The shared `PromptContentPart.file` member (parent-owned native shape). */
+type CcFilePromptPart = Extract<PromptContentPart, { type: "file" }>
+// { type: "file", attachment: { attachmentId, name, bytes } }
+
+editor.insertFile(upload: { part: CcFilePromptPart } | CcFilePromptPart): number // -> [File #N]
+editor.addFile(same): number                                  // alias of insertFile
+editor.getFileAttachments(): Array<{ id: number; part: CcFilePromptPart; attachment: FileAttachmentRef }>
+editor.hasFileAttachments(): boolean
+editor.getAttachmentOccurrences(): CcAttachmentOccurrence[]   // mixed image/file, draft order
+editor.getAttachmentCounts(): { images: number; files: number }
+```
+
+- `[File #N]` is a **file** marker: its own atomic marker family, its own
+  monotonic id space and its own registry — never a relabelled image. Marker
+  atomicity/undo/kill/yank/history/snapshot behaviour is identical to images.
+- The parent stages bytes (`Backend.stageFile({ data, name })` → durable
+  `FileAttachmentRef`) and passes the ready part; the input layer never reads a
+  file/path/URL, never calls `readImage` for a file and never attaches pasted
+  path text. `/attach <local path>` is an explicit App action.
+- A durable native `FileBlock` ref recalled from the DSH queue is already
+  admissible: re-insert the ready part (`{ type: "file", attachment: ref }`)
+  directly — no `readFile`/`readImage`, no bytes, no re-upload.
+- Ids are never reused. A hand-typed `[File #N]` reserves its id before the next
+  `insertFile` (so a new attachment can never silently resolve marker text it
+  did not come from); the typed marker itself stays unresolved and blocks the
+  send with `CcUnresolvedFileAttachmentError` (`.markerIds`).
+- Empty files are valid (`bytes: 0`). Metadata (`name`, `bytes`) is display data
+  only; the attachment id is opaque. Malformed parts/refs throw before the draft
+  changes (`asCcFileUpload`/`isCcFilePromptPart` are exported for hosts).
+- The shared attachment budget (`imageBudgets`, name kept for compatibility) now
+  bounds both families and measures what the editor holds, not the declared file
+  size; refusal is `CcFileBudgetError` before any draft edit.
 
 - One editor state: the draft keeps an atomic `[Image #N]` marker; the encoded
   upload lives in the editor's in-memory payload registry. Nothing image-related
@@ -111,30 +149,43 @@ editor.onSubmitBlocked?: (error: Error) => void
   throws `CcImageBudgetError` before touching the draft, so a new paste is
   refused instead of destroying an image that Ctrl+_ / Ctrl+Y can restore.
 
-Submit contract (all paths: Enter, backslash-Enter, `ccSubmit`, autocomplete
-confirm):
+Submit contract (all paths: Enter, backslash-Enter, autocomplete confirm, and a
+direct `editor.ccSubmit()` — the App uses the latter for send-now, steer,
+follow-up and queue delivery):
 
 | situation | behaviour |
 | --- | --- |
 | `onSubmitContent` set | payload delivered after the draft is cleared, `onSubmit` is not also called |
-| no `onSubmitContent`, no images | legacy `onSubmit(text)` unchanged |
-| no `onSubmitContent`, draft has images | blocked: `onSubmitBlocked(error)`, draft preserved |
-| unresolved marker in the draft | blocked: `onSubmitBlocked(CcUnresolvedImageMarkerError)`, draft preserved |
+| no `onSubmitContent`, no attachments | legacy `onSubmit(text)` unchanged |
+| no `onSubmitContent`, draft has images **or files** | blocked: `onSubmitBlocked(error)`, draft preserved |
+| unresolved image/file marker in the draft | blocked: `onSubmitBlocked(CcUnresolvedImageMarkerError)` / `CcUnresolvedFileAttachmentError`, draft preserved |
+
+`ccSubmit()` is overridden in `CcEditor` so every submit entry point captures the
+same pre-clear payload. A direct App call can therefore never hand literal
+`[Image #N]`/`[File #N]` marker text to the plain `onSubmit(text)` consumer while
+the draft holds attachments; production installs both consumers, and only the
+multipart one can receive an attachment draft. `pendingSubmit` is set exactly
+while one capture is in flight, so a re-entrant call is not captured twice.
 
 ```ts
 interface CcSubmitPayload {
-  text: string                              // draft text with visible [Image #N] markers, pastes expanded
-  content: readonly PromptContentPart[]     // image parts replace their marker in place
-  snapshot: CcDraftSnapshot                 // full pre-clear state, images included (memory only)
+  text: string                              // draft text with visible attachment markers, pastes expanded
+  content: readonly PromptContentPart[]     // image/file parts replace their own marker in place
+  snapshot: CcDraftSnapshot                 // full pre-clear state, attachments included (memory only)
   images: readonly { id: number; image: ImageUploadPart }[]
+  files: readonly { id: number; part: CcFilePromptPart; attachment: FileAttachmentRef }[]
   wasBrowsingHistory: boolean
 }
 ```
 
 `getPromptContent()` throws `CcUnresolvedImageMarkerError` (`.markerIds`) for
-markers without an upload; `content` never contains `[Image #N]` text, and an
-image-only draft is a valid submit (no dependence on trimmed text). The app
-restores `payload.snapshot` with `restoreDraft()` when native admission fails.
+image markers without an upload, then `CcUnresolvedFileAttachmentError` for file
+markers without a native part (deterministic order for mixed drafts). `content`
+never contains `[Image #N]`/`[File #N]` text, and an image-only or file-only draft
+is a valid submit (no dependence on trimmed text). Every attachment without an
+`onSubmitContent` consumer is refused with the draft kept. The app restores
+`payload.snapshot` with `restoreDraft()` when native admission fails; the App's
+send gate must count file parts too (`part.type === 'image' || part.type === 'file'`).
 
 ### `CcActionEvent`
 
@@ -162,7 +213,7 @@ restores `payload.snapshot` with `restoreDraft()` when native admission fails.
 | `tool.details.next-section` | `tab`, `right` | `toolDetails` only |
 | `tool.details.previous-section` | `shift+tab`, `left` | `toolDetails` only; cannot cycle permission presets while the modal owns the key |
 | `tool.details.copy` | `c` | `toolDetails` only; `c` stays plain text in the main editor |
-| `app.todo` | `ctrl+t` | CC Ctrl+T is todo, not transpose |
+| `app.todo` | `ctrl+t` | CC Ctrl+T is todo, not transpose. The App now uses it as the live dock visibility toggle for native todos above the editor; the binding id/default are unchanged. |
 | `app.thinking.toggle` | (unbound) | DSH/Pi concept; bind explicitly |
 | `app.model.select` | `alt+p` | Ctrl+P stays history |
 | `app.mode.cycle` | `shift+tab` | legacy config ID retained; executes native `/permission` only, never `/plan` |
@@ -257,19 +308,25 @@ effect. Preferred: `editor.getKeymap().resolve(data, context)`.
 import { NativeAutocompleteProvider, createNativeAutocompleteProvider } from "./src/input/index.ts"
 
 const provider = new NativeAutocompleteProvider({
-  commands: () => [...uiCommands, ...nativeCommands], // readonly SlashCommand[] (#pi-tui)
+  commands: () => [...uiCommands, ...nativeCommands], // readonly NativeCommandEntry[]
   skills: () => skillEntries,                          // readonly SkillCatalogEntry[] (backend/types.ts)
   basePath: cwd,
   refreshSkills: async (signal) => { /* parent single-flight/dirty query */ },
+  // Optional native @file domain (DSH file-reference discovery behind the backend):
+  fileReferences: async (query, signal) =>
+    backend.listFileReferences(query, signal),         // readonly FileReferenceCandidate[]
 })
 editor.setAutocompleteProvider(provider)
 ```
 
 Both the class and `createNativeAutocompleteProvider(options)` return the same
-object; the options object is the stable API. `commands`/`skills` are **getters**
-called on every request, so asynchronous metadata updates need no cache
-invalidation here. Nothing else is cached (no catalog, no Editor state, no
-timers, no raw stdin).
+object; the options object is the stable API. A command entry is Pi's
+`SlashCommand` plus the App-mapped native descriptor field `inputHint`
+(`input.hint`); Pi's `argumentHint` remains valid as a fallback. The roster
+shape is the existing command catalog, not a second registry.
+`commands`/`skills` are **getters** called on every request, so asynchronous
+metadata updates need no cache invalidation here. Nothing else is cached (no
+catalog, no Editor state, no timers, no raw stdin).
 
 Behavior:
 
@@ -277,17 +334,29 @@ Behavior:
   native names only — `/name`. There is no `/skill` wrapper and no Pi
   `skill:` / `skill:name` alias; a skill entry never becomes a fake command and
   its body is never read or expanded.
-- Order is native: commands in roster order, then skills in catalog order. A
-  name collision shows only the command (command wins).
+- Order is exact name first, then name-prefix matches, then fuzzy-only
+  matches; ties keep the roster order (commands in roster order, then skills
+  in catalog order). Pi's editor selects by comparing `item.value` with the
+  suggestion `prefix`, and this provider's slash prefix includes `/`, so the
+  provider itself must rank in the name namespace. Typing an exact `/name`
+  therefore highlights that name even when an earlier command is only a prefix
+  sibling (`/review` with a `review-all` command and an exact `review` Skill).
+  Explicit `Up`/`Down`/`Ctrl+P`/`Ctrl+N` still moves the highlight and Enter
+  submits the highlighted item. A name collision shows only the command
+  (command wins).
+- Command descriptions prefix the native/`argumentHint` hint when present
+  (`<preset> — Choose a permission preset`); metadata is sanitized exactly like
+  descriptions.
 - Skill descriptions are labelled with `Skill — …`; `modelInvocable: false`
   (and any non-`true` value) is labelled `Skill (user-only) — …`. Description /
   name metadata is stripped of ANSI escapes, C0/C1 control characters and
   Unicode line separators before it reaches the menu; names that cannot be
   invoked as `/name` (whitespace, `/`, `\`) are omitted.
-- Everything else is delegated unchanged to Pi's
-  `CombinedAutocompleteProvider`: `@` attachments, relative/absolute/`~` paths,
-  quoted paths, command argument completion, forced (`Tab`) completion, the
-  insertion/cursor rules and `shouldTriggerFileCompletion`.
+- `@file` mentions are native when `fileReferences` is configured (see below);
+  everything else is delegated unchanged to Pi's `CombinedAutocompleteProvider`:
+  relative/absolute/`~` paths, quoted paths, command argument completion,
+  forced (`Tab`) completion, the insertion/cursor rules and
+  `shouldTriggerFileCompletion`.
 - Slash-name requests **start** `refreshSkills(signal)` and return immediately
   from the current getters (never awaiting the parent query); menu data remains
   usable if the refresh rejects. It is strictly single-flight: while one parent
@@ -303,6 +372,58 @@ Behavior:
   must not cancel the parent's catalog query.
 - Diagnostics: `provider.isRefreshingSkills()`; `provider.dispose()` is
   idempotent and late refresh results are ignored.
+
+### Native `@file` mentions (`fileReferences`)
+
+`@` completion has two mutually exclusive shapes. Both are pure prompt text:
+a mention is a **path reference** for the model, the input layer never reads the
+file, never stages/attaches it, never uploads anything and never turns a path
+into a `[File #N]` attachment (`/attach` is the only attachment path).
+
+1. **No `fileReferences` callback** (offline `--demo`, or a backend without
+   `listFileReferences`): `@` stays exactly Pi's own behavior — no local index,
+   no filesystem scan, no `fd` fallback, no skill refresh. In practice this
+   yields no `@` rows and never fabricates a candidate.
+2. **With `fileReferences(query, signal)`**: the provider asks the parent and
+   maps its rows. Call `editor.setAutocompleteProvider(provider)` once; every
+   other context (slash, argument, plain path, forced Tab) is untouched.
+
+Grammar, not local tokenization: the provider calls DSH's public
+`activeAtToken(line, cursorCol)` from `@deepseek-ai/dsh-file-reference/grammar`
+to decide whether the cursor is inside an `@path` or `@"path with spaces"` token,
+and `formatFileMention(candidate, token.quoted)` to spell the accepted mention.
+No regex, quoting rule or path format is re-implemented here.
+
+- Trigger: only DSH grammar tokens — an `@` at the start of the line or after
+  whitespace, optionally opened with `@"`. `abc@def`, `(@src` and `@` inside
+  another word never open the file menu (they keep their existing path/argument
+  behavior).
+- Menu mapping, in the **callback's own order** (no local sort, no fuzzy, no
+  re-ranking): `label` = entry name (`dir/` for directories, Pi's directory
+  marker), `description` = parent path (omitted for workspace-root entries),
+  `value` = `formatFileMention` output, `prefix` = the active token prefix
+  (`@foo` / `@"foo`). A candidate the grammar cannot spell (quote or C0/C1
+  control character in the path) or a malformed record contributes no row.
+- Accept keeps Pi's single edit state: a file inserts `@path ` (one trailing
+  space); an unquoted directory inserts `@dir/` with the cursor after the slash;
+  a quoted directory inserts `@"my dir/"` — a complete, submittable mention whose
+  cursor stops **before** the closing quote, so the next keystroke continues
+  inside the token and drills another level. Pi's own
+  `applyCompletion`/undo/`[Image #N]`/getPath registry are the only paths.
+- Tab and Enter accept/fill only, never submit an `@` candidate (only slash-name
+  confirm submits); a second Enter submits the completed draft. Esc, Up/Down,
+  Ctrl+P/N and mouse keep Pi's menu behavior.
+- Failure is silent: a rejection, a synchronous throw, a non-array result, a
+  cancelled request or an already-stale answer produces **no rows** (the menu
+  closes) and never a message in the prompt or transcript. A cancelled/older
+  request cannot reopen the menu (Pi's request identity is the only apply gate).
+- The `@file` grammar is loaded **lazily** (cached `import()`) and only for a
+  non-slash draft containing `@` while `fileReferences` is configured. Slash
+  menus, argument completion and plain-path completion never import it, and a
+  load failure is treated as an unavailable native domain: the provider, the
+  `--demo` entry and every non-`@` completion keep working.
+- `fileReferences` is never called for slash/argument/path/forced completion, and
+  `@` completion never starts the `refreshSkills` parent query.
 
 When metadata settles, the parent re-triggers Pi's completion with the seam
 method below (not with a Tab/accept path), so the open menu re-reads the getters.

@@ -14,21 +14,39 @@ export interface ImageAttachmentRef {
   readonly originalDimensions?: { readonly width: number; readonly height: number }
 }
 
+/** DSH's durable verbatim file reference; metadata only, never a host path or inline bytes. */
+export interface FileAttachmentRef {
+  readonly attachmentId: string
+  readonly name: string
+  readonly bytes: number
+}
+
 /** One lazily read, DSH-verified image. Bytes never travel in transcript events. */
 export interface ImageAttachmentValue {
   readonly attachment: ImageAttachmentRef
   readonly data: string
 }
 
-/** Public Host-style prompt parts; DSH owns image admission and durable promotion. */
+/** Public in-process admission parts; DSH owns storage, admission and durable promotion. */
 export type PromptContentPart =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'image'; readonly mediaType: ImageMediaType; readonly data: string; readonly name?: string }
+  | { readonly type: 'file'; readonly attachment: FileAttachmentRef }
+
+/** Frontend-read local bytes, never a path; native storage returns the durable identity. */
+export interface EncodedFileInput {
+  readonly data: string
+  readonly name?: string
+}
+
+/** Neutral command input; native execute owns admission and descriptor restrictions. */
+export type CommandAttachmentPart = Exclude<PromptContentPart, { readonly type: 'text' }>
 
 /** Ordered, already admitted content used only for display projection. */
 export type DisplayContentPart =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'image'; readonly attachment: ImageAttachmentRef }
+  | { readonly type: 'file'; readonly attachment: FileAttachmentRef }
 
 /**
  * One recallable human inbox row. `next-turn` waits for a turn boundary;
@@ -39,6 +57,8 @@ export interface QueueEntry {
   readonly text: string
   readonly target: 'next-turn' | 'next-step'
   readonly images: number
+  /** Optional for older/demo rows; production preserves native file counts. */
+  readonly files?: number
 }
 
 export type SurfaceOperation = 'append' | { op: 'replace'; startSeq: number; endSeq: number }
@@ -109,6 +129,14 @@ export interface InputRoute {
   readonly kind: 'command' | 'prompt'
   readonly sessionId: string
   readonly attachmentId?: string
+}
+
+/** One path-only candidate owned and ranked by DSH's mounted file-reference provider. */
+export interface FileReferenceCandidate {
+  /** Workspace/tool-facing spelling inserted into an ordinary `@path` mention. */
+  readonly path: string
+  /** Directories keep completion open; files finish the mention. */
+  readonly kind: 'file' | 'directory'
 }
 
 export interface SessionInfo {
@@ -196,16 +224,13 @@ export interface TodoItem {
  * DSH's native `todos` projection: the whole list, or null before the first
  * `todo/write` of a turn (the fold clears on `turn/start`).
  */
-export type TodosSnapshot = TodoItem[] | null
+export type TodosSnapshot = readonly TodoItem[] | null
 
-/**
- * DSH's native `plan` projection, trimmed to presentation-relevant fields:
- * plan mode is active / was requested and which command run toggled it.
- */
+/** Native public planMode.get() view, not the internal command/fold state. */
 export interface PlanSnapshot {
   active: boolean
-  wanted: boolean | null
-  running: { commandId: string; wanted: boolean } | null
+  /** Selected target awaiting the native boundary; false is a real pending-off intent. */
+  pending?: boolean
 }
 
 export type SubagentMode = 'one-shot' | 'continuable' | 'external' | 'unknown'
@@ -258,10 +283,19 @@ export interface SubagentEntry {
   timing?: SubagentTiming
 }
 
+/** Read-only native branch diagnostic; no raw error text or synthetic child authority. */
+export interface SubagentDiagnostic {
+  readonly id: string
+  readonly parentSessionId: string
+  readonly depth: number
+  readonly reason: 'corrupt' | 'unsupported' | 'unavailable'
+}
+
 export interface SubagentSnapshot {
   entries: readonly SubagentEntry[]
   /** True only when native data is known to be incomplete; never a guess from an empty list. */
   truncated?: boolean
+  diagnostics?: readonly SubagentDiagnostic[]
 }
 
 export interface DecisionOrigin {
@@ -283,6 +317,9 @@ export interface DecisionRequest {
   origin?: DecisionOrigin
 }
 
+/** Read-only native UI invalidations; not a second domain event bus. */
+export type NativeUiDomain = 'jobs' | 'goal' | 'working-directory' | 'questions' | 'settings' | 'inventory' | 'tools'
+
 /**
  * Live frames use attemptId as identity. revision increases on every frame
  * within an attached DSH Agent lifecycle (and restarts after replacement);
@@ -294,13 +331,20 @@ export type BackendEvent =
   /** Read-only native title projection; identity is the supplied host attachment, not a local title writer. */
   | { type: 'title'; sessionId: string; attachmentId?: string; value: string | null }
   | { type: 'permissions'; sessionId: string; value: PermissionSelection }
-  | { type: 'todos'; sessionId: string; value: TodosSnapshot }
+  | { type: 'todos'; sessionId: string; attachmentId?: string; value: TodosSnapshot }
   | { type: 'plan'; sessionId: string; value: PlanSnapshot }
   | { type: 'metrics'; sessionId: string; usage?: UsageSnapshot; stats?: StatsSnapshot }
   | { type: 'subagents'; sessionId: string; value: SubagentSnapshot }
   | { type: 'subagent'; sessionId: string; value: SubagentEntry }
   /** Unfiltered native invalidation: consumers refetch metadata for their current attachment. */
   | { type: 'skills_changed'; sessionId: string; attachmentId?: string }
+  | { type: 'commands_changed'; sessionId: string; attachmentId?: string }
+  | { type: 'models_changed'; sessionId: string; attachmentId?: string }
+  | { type: 'presets_changed'; sessionId: string; attachmentId?: string }
+  /** Public native service notifications only invalidate the current attachment's read-only views. */
+  | { type: 'native_ui_changed'; sessionId: string; attachmentId?: string; domain: NativeUiDomain }
+  /** Public native current-route view; never a local model selection or transport setter. */
+  | { type: 'model_route'; sessionId: string; attachmentId?: string; provider: string; model: string; reasoningEffort?: string }
   | { type: 'stream_start'; sessionId: string; attemptId: string; revision: number; turn: number; step: number }
   | { type: 'stream_chunk'; sessionId: string; attemptId: string; revision: number; index: number; chunk: JsonRecord; /** DSH wall-clock timestamp (epoch ms) of the frame; optional on the wire. */ time?: number }
   | { type: 'stream_end'; sessionId: string; attemptId: string; revision: number; outcome: 'committed' | 'abandoned'; seq?: number }
@@ -319,7 +363,15 @@ export interface Backend {
   send(text: string, mode?: 'followup' | 'steer'): Promise<void>
   /** Native multimodal prompt admission; optional when a backend has no attachment capability. */
   sendContent?(content: readonly PromptContentPart[], mode?: 'followup' | 'steer'): Promise<void>
-  /** Read-only attachment retrieval, independent from model vision and session creation. */
+  /** Explicit local-file input staging via the native content-addressed attachment store. */
+  stageFile?(input: EncodedFileInput, signal?: AbortSignal): Promise<FileAttachmentRef>
+  /**
+   * Cancellable path-only `@file` discovery through the mounted native provider.
+   * It may materialize the pending native Agent, but never reads/stages file bytes
+   * or starts a model turn.
+   */
+  listFileReferences?(query: string, signal?: AbortSignal): Promise<readonly FileReferenceCandidate[]>
+  /** Read-only image retrieval, independent from model vision and session creation. */
   readImage?(attachment: ImageAttachmentRef, signal?: AbortSignal): Promise<ImageAttachmentValue>
   cancel(): Promise<void>
   /** Control methods plus commands (native descriptors) and execute ({line}, native CommandExecution). */

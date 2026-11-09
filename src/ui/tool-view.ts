@@ -23,6 +23,16 @@ export interface ToolSummaryInfo {
   readonly label: string
   /** Includes the label once, e.g. "Bash npm test" or "Read src/a.ts". */
   readonly text: string
+  /**
+   * Payload after {@link label}, e.g. `npm test` or `/Users/x.png`; `''` when
+   * the summary is just the label.
+   *
+   * A card header paints `label` and this payload as two segments separated by
+   * a real space, so a native title that repeats the tool name (in any case)
+   * can never glue onto the label or be printed twice. Never re-derived from
+   * `text` by string surgery: ANSI/wide/CJK/emoji titles stay intact.
+   */
+  readonly detail: string
   readonly durationMs?: number
 }
 

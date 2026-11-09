@@ -17,6 +17,10 @@ interface Harness {
   backend: DshContextBackend
   events: BackendEvent[]
   savedDefaults: Array<Record<string, unknown>>
+  /** Native turn-boundary fact the fake Agent registry reports for the live session. */
+  turns: { openTurnStartSeq: number | null; lastTurn: number }
+  /** Exact Agents the native preset selector was asked about. */
+  presetSelects: unknown[]
 }
 
 function defaultModelService(saved: Array<Record<string, unknown>>): Record<string, unknown> {
@@ -34,6 +38,11 @@ function harness(extra: (host: FakeDshHost) => void = () => {}): Harness {
   const host = new FakeDshHost()
   const agents = new FakeAgentRegistry()
   const savedDefaults: Array<Record<string, unknown>> = []
+  const turns = { openTurnStartSeq: null as number | null, lastTurn: 0 }
+  const presetSelects: unknown[] = []
+  // Native-shaped turn boundary: the blank check is a registry read, never a
+  // projection stateOf guess.
+  Object.assign(agents, { turnBoundaryOf: () => ({ ...turns, lastStepStartSeq: null, lastStepBoundary: null }) })
   host.use('agents', agents)
   host.use('agentDefaultModel', defaultModelService(savedDefaults))
   host.use('llm', {
@@ -80,7 +89,15 @@ function harness(extra: (host: FakeDshHost) => void = () => {}): Harness {
       if (resolved === 'unknown') return { id: 'unknown', broken: 'not declared' }
       return { id: resolved }
     },
-    select: async () => 'standard',
+    select: async (agent: unknown) => {
+      presetSelects.push(agent)
+      // The native selector owns the locked rule: a session that already started
+      // a turn keeps its composition.
+      if (turns.lastTurn > 0 || turns.openTurnStartSeq !== null) {
+        throw Object.assign(new Error('agent preset is locked to the started session'), { code: 'agent-preset/locked' })
+      }
+      return 'standard'
+    },
     presetForSession: () => null,
     composedPreset: () => undefined,
   })
@@ -92,7 +109,7 @@ function harness(extra: (host: FakeDshHost) => void = () => {}): Harness {
   })
   const events: BackendEvent[] = []
   backend.onEvent(event => events.push(event))
-  return { host, agents, backend, events, savedDefaults }
+  return { host, agents, backend, events, savedDefaults, turns, presetSelects }
 }
 
 function latestAgent(harnessValue: { agents: FakeAgentRegistry }): FakeAgentState {
@@ -301,7 +318,7 @@ test('native command catalog and execution are forwarded without a second regist
 })
 
 test('model, effort and preset stage on a pending session and write the native slot when live', async () => {
-  const { backend, agents, savedDefaults } = await connected()
+  const { backend, agents, savedDefaults, turns, presetSelects } = await connected()
   const llmCalls: string[] = []
   const metadataCalls: string[] = []
   const host = (backend as unknown as { host: FakeDshHost }).host
@@ -338,11 +355,12 @@ test('model, effort and preset stage on a pending session and write the native s
   assert.equal(pendingState.model, 'm2')
 
   const presets = await backend.command('presets') as Record<string, unknown>
-  assert.equal(presets.blank, true)
+  assert.equal(presets.blank, true, 'a pending attachment is blank by construction')
   assert.equal(presets.default, 'standard')
   const stagedPreset = await backend.command('preset', { id: 'minimal' }) as SessionInfo
   assert.equal(stagedPreset.preset, 'minimal')
   assert.equal(agents.createCalls.length, 0)
+  assert.deepEqual(presetSelects, [], 'a pending preset only stages; no Agent is selected')
 
   await backend.send('go')
   const agent = agents.agents[0]
@@ -364,8 +382,25 @@ test('model, effort and preset stage on a pending session and write the native s
   assert.deepEqual(metadataCalls, ['p1/m1'], 'the live target resolves reasoning after selection')
   assert.equal(live.model, 'm1')
   assert.deepEqual(agent.route, { provider: 'p1', model: 'm1', reasoningEffort: 'high' })
-  const livePreset = await backend.command('preset', { id: 'standard' }) as Record<string, unknown>
-  assert.equal(livePreset.locked, true)
+  const livePresets = await backend.command('presets') as Record<string, unknown>
+  assert.equal(livePresets.blank, true, 'the native turn boundary proves this session never started a turn')
+
+  // The adapter never pre-judges the blank/locked rule: it forwards to the
+  // native selector on the exact captured Agent, and only the native rejection
+  // (code `agent-preset/locked`) becomes a locked answer.
+  const blankSwitch = await backend.command('preset', { id: 'standard' }) as Record<string, unknown>
+  assert.equal(presetSelects.at(-1), agent, 'the native selector receives the exact live Agent')
+  assert.equal(blankSwitch.locked, undefined, 'a blank session switches without a fabricated lock')
+  assert.equal((blankSwitch.preset as string | undefined) ?? 'standard', 'standard')
+
+  turns.lastTurn = 1
+  turns.openTurnStartSeq = 7
+  const started = await backend.command('presets') as Record<string, unknown>
+  assert.equal(started.blank, false, 'a recorded turn is a native non-blank fact')
+  const livePreset = await backend.command('preset', { id: 'minimal' }) as Record<string, unknown>
+  assert.equal(livePreset.locked, true, 'the native selector owns the lock')
+  assert.equal(livePreset.id, 'minimal')
+  assert.equal(presetSelects.length, 2, 'the locked answer still came from one native select call')
   assert.equal((await backend.command('permissions') as Record<string, unknown>).currentValue, 'workspace-write')
   await backend.close()
 })

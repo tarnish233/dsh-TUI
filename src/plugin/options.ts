@@ -50,7 +50,7 @@ export function tuiCommand(alias = false): Command {
     .option('--config-dir <directory>', 'TUI preferences and keybindings directory')
     .addHelpText('after', '\nFullscreen is the default; --inline selects native terminal scrollback.\nSaved screen preferences apply when no screen flag is supplied.\nModels, tools, permissions, credentials and sessions belong to DSH.\nConfigure them through the native DSH profile; Pi auth/catalogs are never read.\n')
   if (alias) command
-    .addHelpText('after', 'The alias attaches this local application through native DSH plugin management when needed.\nOther frontends and explicit bundle disables are never overridden.\n')
+    .addHelpText('after', 'Offline task showcase: dsh-tui --demo tasks (Todo + Goal + Subagents).\nUse tasks next / tasks done / tasks clear / tasks history inside that demo.\nThe alias attaches this local application through native DSH plugin management when needed.\nOther frontends and explicit bundle disables are never overridden.\n')
     .option('--profile <name>', 'native DSH profile (local application attached automatically)', DEFAULT_PROFILE)
     .option('--dsh <executable>', 'native DSH command/path', 'dsh')
     .option('--dsh-home <directory>', 'DSH native home for this invocation')

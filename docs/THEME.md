@@ -164,7 +164,101 @@ semantic red. The bridge's wire-level `agent error:` prefix is presented as the
 `API Error` label (presentation only — the error text itself is not rewritten).
 Info notices keep the quiet muted bullet.
 
+## Semantic surfaces（canvas / dialog / raised / selected / overlay）
+
+Colors above name *values*; a **surface** names where a background is allowed.
+`src/ui/theme.ts` exports the small stable API every component (and the parent's
+root render) must use instead of inventing a plate color:
+
+```ts
+export type SurfaceRole = 'canvas' | 'dialog' | 'raised' | 'selected' | 'overlay'
+export interface Surface {
+  readonly role: SurfaceRole
+  readonly color?: string   // undefined while the terminal background shows through
+  readonly open: string     // ANSI background open sequence ('' when transparent)
+  readonly close: string    // ANSI background close sequence ('' when transparent)
+  readonly transparent: boolean
+  readonly style: Style     // inline paint; a nested \x1b[0m re-opens the surface
+  fill(text: string, width: number): string  // exactly `width` columns, width-safe
+}
+export const surfaces: Readonly<Record<SurfaceRole, Surface>>
+```
+
+| role | background | responsibility |
+| --- | --- | --- |
+| `canvas` | transparent — the terminal's own background | the application background; no full-screen plate is painted |
+| `dialog` | transparent, derived from `canvas` | modal/popup plate (Settings, Keybindings, pickers, tool details) |
+| `overlay` | transparent | overlay body: no plate and no dimming/scrim |
+| `raised` | `palette.canvasSubtle` `#1c2033` | inset card/banner inside a dialog |
+| `selected` | `palette.accentBg` `#1a4480` | selection/focus band (the same blue as the human-turn `userBg`) |
+
+`canvas` and `dialog` derive from one private constant (`canvasBackground`), so a
+popup can never disagree with the surface it floats over.
+
+### Why the plate is transparent, not black
+
+`src/ui/modal.ts` used to wrap every framed row in a private `bg('#111113')`.
+That hex was in no palette, and the rest of the UI paints no background at all
+(the only other `bg()` sites are the human-turn band and `cc.chip`), so the
+transcript showed the terminal's background while Settings/Keybindings/tool
+details put an unrelated near-black slab on top. That is the reported "Settings
+panel is pure black". It is fixed at the surface layer — `surfaces.dialog` — not
+by tweaking that one literal.
+
+The terminal background is authoritative, which is what Pi's `system` theme does
+when it reports `""` (terminal default) for its canvas/background roles; see the
+installed Pi docs `themes.md` ("Terminal default") and `tui.md` ("Apply themes
+correctly"). No OSC palette/theme mutation and no private renderer patch is
+involved: `#pi-tui` public helpers only.
+
+**Tradeoff, stated explicitly.** A transparent plate means modal contrast follows
+the user's terminal background, exactly like every other row this app already
+renders with a fixed light foreground. That is why a *consistent* painted canvas
+is not a one-line change: it would need `canvasBackground = palette.canvas` **and**
+the App root painting every root row through `surfaces.canvas.fill(...)` in the
+same change. Painting only the popup (or only the root) is what produced the
+black-slab mismatch. Until then, `palette.canvas` `#0d1117` is the *nominal* dark
+canvas used for contrast math and documentation — it is never painted; and a
+component must never pass a background hex to `bg()` for a plate.
+
+### Painting rules
+
+- Full-width bands go through `surfaces.<role>.fill(text, width)`: it clips with
+  Pi's width helpers, pads in terminal columns (CJK/emoji/combining width safe),
+  keeps the surface under right-edge padding, and closes the surface at the end.
+  Transparent roles preserve the caller's foreground/clip reset rather than
+  stripping it.
+- Internal full resets (`\x1b[0m`), background closes (`\x1b[49m`) and combined
+  resets re-open the outer surface. Nested `cc.chip`/human bands cannot cancel
+  the parent padding; zero RGB channels are not mistaken for SGR resets.
+  `style()` uses the same rule for inline composition.
+- 256-color mode and transparency share the same geometry: only the escape
+  encoding changes, and a transparent surface emits no background at all (also
+  the safe behavior for no-color terminals).
+- `fg`, `bg`, `bold`, `dim`, `italic`, `underline`, `strike`, `inverse`, `t`, `cc`,
+  `palette` and `ccPalette` are unchanged and still exported; existing call sites
+  keep working until they migrate.
+- Dialog chrome keeps its foreground/border roles (`cc.inactive` borders, bright
+  品牌蓝 titles, brand-blue actions, semantic red/green status) so focus vs
+  non-focus and error vs success stay readable on the inherited surface.
+
 ## Verification
+
+- `test/ui-surface.test.ts`: the surface contract — no hardcoded modal plate
+  (source audit), transparent `canvas`/`dialog`/`overlay`, one source for
+  canvas+dialog, `raised`/`selected` values, `fill()` right-edge padding and
+  clipping by display width (CJK/emoji), surface kept after Pi's clip reset,
+  truecolor vs 256-color escapes, and zero ANSI on transparent fills.
+- `test/ui-surface-modal.test.ts`: rendered dialogs (Settings + Keybindings +
+  a plain `ModalFrame`) emit no background SGR at all, every row is exactly the
+  requested width, focus/unfocused rows and error/status rows keep their
+  semantic foregrounds, and no private black fallback remains in the frame or
+  list helpers.
+- `test/modal-render.test.ts`, `test/ui-modal-list.test.ts`,
+  `test/ui-settings.test.ts`, `test/ui-settings-modal.test.ts`,
+  `test/app-modal.test.ts`, `test/app-settings-feedback.test.ts`,
+  `test/input-settings-navigation.test.ts`: geometry, mouse, settings
+  input/navigation and feedback regressions, unaffected by the surface change.
 
 - `test/ui-welcome.test.ts` (7): independent terminal-cell decoding of all 384
   quadrant samples (blue, white, transparency, 48 white samples), identical
@@ -185,9 +279,10 @@ Info notices keep the quiet muted bullet.
   `pty-cancel-smoke.py`, `pty-smoke.py`: the existing CLI/PTY groups were rerun
   after the change.
 
-Latest full check: **898/898**, no failures/skips/cancellations; build and strict
-TypeScript pass. Tests use temporary config and offline data; no real
-model/credential/config changes.
+Historical palette/identity acceptance: **898/898**, no failures/skips/cancellations;
+build and strict TypeScript passed. Current native-batch/surface/Todo acceptance is
+tracked in `docs/ACCEPTANCE.md`. Tests use temporary configuration and offline data;
+no real model/credential/config changes.
 
 Restart dsh-tui to load source changes. `/reload` does not replace already loaded
 TUI JavaScript.

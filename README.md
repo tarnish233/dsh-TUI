@@ -6,9 +6,11 @@
 
 当前版本为 **v0.1.4**（`private: true`），收录原生 Skills 补全与 Enter 提交修复、连续单页 Settings、统一弹窗与队列／工具／图片查看优化，以及 Rex／Ghostty 终端协议适配；保留已验收的 Subagent 进度、分组、名字导航与原生 Stop/Reply。按用户确认，仅创建本地版本提交和 annotated `v0.1.4` tag，**未推送或发布**，不改全局安装。当前验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照。
 
+**该 tag 后的当前工作树**已完成 A1–A10 修复、当前 SDK 内适配层收敛，以及两批原生 UI 功能／Todo 固定区／共享配色和三状态区共存修复，并新增 `--demo tasks` 离线交互场景及固定区／混合活动组的展示层整体收敛，以及 Node 精确诊断／Thinking handoff／hover／标题四项现场修复及精确 Thinking 尾窗缓存优化；最新完整 `pnpm check` **2323/2323**（190 测试文件）。Jobs／Goal、显式 rename/fork、安全原生默认设置、能力摘要、文件输入／命令图片、continued questions 和有效目录已接入；DSH 业务所有权不变。原生专项 10 cases、新增双模式 PTY 通过。前次 1833/1861/1910 是独立历史验收。改动尚未提交或打新 tag，版本仍为 0.1.4；见 [两批完成记录](docs/NATIVE-UI-BATCHES.zh-CN.md)、[修复对照](docs/NATIVE-API-FIXES.zh-CN.md) 与 [收敛完成记录](docs/ADAPTER-CONVERGENCE-COMPLETE.zh-CN.md)。
+
 Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
 
-**已知未解决问题：** 用户报告的退出卡住仍未确认现场触发步骤。常规 native 退出与隔离故障注入已有调查证据，但 v0.1.4 不把它标成已修复，也没有擅自改变 DSH 的退出策略。
+**现场问题边界：** 用户报告的退出卡住仍未确认具体触发步骤。当前工作树已用真实 native plugin PTY 故障注入验证并修复“本地清理卡住会延后 native 退出请求”的缺口；它复用 DSH 既有退出保护，不把历史现场问题的根因或全部退出故障标成已解决。
 
 ## 安装与启动（当前本机边界）
 
@@ -39,13 +41,15 @@ dsh-tui
 
 ```bash
 dsh-tui --demo                 # 默认 fullscreen + tools 场景
+dsh-tui --demo tasks           # Todo + Goal + 多 Subagent，共存／更新／结束／小屏
+dsh-tui --demo --inline tasks  # 同一场景，主屏／原生 scrollback
 dsh-tui --demo tools-group     # 连续工具分组、I/O 详情与独立 Diff
 dsh-tui --demo images          # 用户/assistant/工具图片与重复附件
 dsh-tui --demo subagent        # 编辑框上方进度、子会话与原生 Reply/Stop 的离线 fixture
 dsh-tui --demo subagent-many   # 同一 fixture + 并行活动项，演示有限高度的 +N more
 ```
 
-demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型、不执行真实工具。它不会在真实连接失败时自动启用。
+demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型、不执行真实工具。它不会在真实连接失败时自动启用。任务区启动即展示 `Activities: 1 tool · 1 update` 和独立子任务消息，Ctrl+O 对照通知展开／收起，固定区同时显示三类任务。提交 `tasks next`／`tasks done`／`tasks clear`／`tasks history` 手动推进，`tasks` 重新开始；也可在本项目执行 `pnpm demo tasks`。完整交互与临时配置隔离示例见 [Demo 指南](docs/DEMO.md)。
 
 ## 原生同进程边界
 
@@ -63,15 +67,20 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 
 ## 当前能力
 
+相邻工具与纯原生子任务状态通知可进入 `Activities` 混合展示组，分别统计 tools／updates，保留原始身份、顺序与原文；真实子任务消息、用户输入／可见文本／todo／diff 等不被混入。两个分组设置都开启才启用，Ctrl+O／点击展开复用原有 disclosure。规则见 [展示层整体收敛](docs/PRESENTATION-COMPOSITION.zh-CN.md)。
+
 - CC 风格主输入、历史搜索、kill/yank、undo、原子大段粘贴、外部编辑器、Unix 挂起恢复；一套可热更新的键位设置。
+- `@` 文件／目录 mention 直接消费 DSH 原生 `fileReferences` provider：根输入候选跟随当前根 Agent 的 effective cwd 与工具命名空间，支持模糊路径、目录下钻和带空格引号；接受候选只填草稿，不读取或 stage 文件。子任务 Reply 不借用根目录候选。`@path` 是由模型按原生指引调用 `read` 的普通文本，和显式 `/attach` FileBlock 分开。
 - inline / fullscreen 两种 Pi renderer；工具卡、Markdown、原生 Diff、连续工具分组、Input/Output 预览与只读 Inspector；思考折叠摘要。
 - 真实模型流式上屏与结算、排队/steering、取消、权限预设、审批与问题；`/model` 模型选择器（搜索、provider 分组、effort 保留）。
 - 原生 preset 选择、原生命令透传、会话新建/恢复与启动会话选择器；`/reload` 走 native HMR 配置重组合。
-- 图片：`[Image #N]` 原子附件输入、显式只读查看器、用户/assistant/工具/历史图片保序投影；`history.json` 只存文字，不写 base64；队列图片 refs 需要显式 Up 取回重试，不新增调度器。
+- 附件：`[Image #N]`／`[File #N]` 在同一 Editor 中原子编辑、undo／stash／history；`/attach [local-path]` 显式经 DSH 存储输入一般文件，32 MiB 是本地 frontend transfer-memory budget，不是 native 文件规则。文件-only／mixed／重复 refs 保序；queue 显示 image/file counts，文件 refs 直接恢复 ready，图片仍按原生引用读取；`history.json` 只存文字，不写 bytes/base64。原生命令图片按 descriptor 准入，当前未挂载 receipt owner 的命令文件明确不可用。
 - Subagents：编辑框上方的 Pi 风格两行活动进度树，运行图标与 Working 共用动态帧，根会话 ready 时也转但不改根状态。名字链接立即打开只读子会话／加载界面；连续目录／结算／任务消息分组，正文与非名字单元不导航。已结算项退场，目录／历史通过 `/agent`／Agents 树查看；保留原生 Stop/Reply 与子审批来源。
-- 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、cwd 与 git 只读状态。
+- Todo／Goal／Subagent 固定区：由一个 `StatusDockStack` 统一顺序、预算、间距和鼠标行区间；先保留有用内容，宽裕时统一一行间距，紧凑时全部零间距，最后一个区域后没有空行。完整 Todo 最多五项，一行预算保留 counts／首个未完成项，空／隐藏／完成／settled 区域不占位。Ctrl+T 显隐不追加历史、不改原生事实；[整体编排](docs/PRESENTATION-COMPOSITION.zh-CN.md) 与 [CC 边界](docs/TODO-UX.md)。
+- 原生 UI：`/jobs` 只读列表／非消费式输出；Goal phase／rounds 固定展示；`/rename [title]`、确认 `/fork` 到可继续输入的 native root；Settings 中两个 allowlisted 原生默认值以确认＋revision guard 修改；`/inspect` 只读能力摘要，`/questions` 只回答原生 continued call，不增加 timeout／loop。
+- 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、workspace／native effective cwd 区分，以及 git 只读状态。
 - 终端集成：通用 OSC 7501 根／子状态、原生 DSH 标题、OSC 7 workspace、Ghostty 焦点安全的 OSC 777 通知及兼容进度；Rex 使用用户接受的 `app=terminal` 通用活动分类，以显示原生 `>_` 图标（Terminal status On）；标题只保留静态 `🐳`，已去掉鲸鱼前的星号／工作符号及标题动画时钟接缝；Terminal title 可关闭标题展示，普通 UI 动画不变。Rex 默认由其 Program Activity 决定提醒，不叠加通知。取消／历史／尝试结算不冒充成功，原生 command 完成与 turn 完成分开。
-- 品牌蓝主题与静态字符块 DeepSeek logo；无启动动画、无原生图片 logo。
+- 品牌蓝主题与共享 semantic surfaces：Settings／弹窗继承主界面的终端 canvas，不再使用独立黑板；foreground、raised／selected 和 syntax/diff 分层，嵌套 ANSI reset／padding 统一处理。静态字符块 DeepSeek logo，无启动动画、无原生图片 logo。
 - 应用图标资产：蓝底白色像素鲸鱼 SVG／512px／64px PNG。它不是终端图片上传协议；Rex 当前使用内置通用 `>_` 图标，正式像素鲸鱼图片仍需终端侧收录，见 [图标与限制](docs/APP-ICON.md)。
 
 ## 常用键
@@ -79,6 +88,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | 键 | 行为 |
 | --- | --- |
 | Enter | 空闲发送，工作中排队；补全打开时先接受候选 |
+| `@` | 打开 DSH 原生工作区文件／目录候选；Tab／Enter 接受，Esc 关闭 |
 | Shift+Enter / Alt+Enter / Ctrl+J | 换行 |
 | Ctrl+P / Ctrl+N | 视觉行导航，到边界浏览历史；列表导航；空输入可取回排队文本 |
 | Ctrl+A / E / B / F | 当前逻辑行首尾 / 字符左右 |
@@ -94,6 +104,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | Ctrl+D | 有文本删字符，空输入重复确认退出 |
 | Ctrl+L | 重绘，保留草稿和会话 |
 | Ctrl+G / Ctrl+X Ctrl+E | 外部编辑器（VISUAL / EDITOR / nano） |
+| Ctrl+T | 显示／隐藏编辑器上方原生 Todo 清单（不追加对话摘要） |
 | Ctrl+O | 全局工具折叠 / 展开 |
 | Ctrl+X Ctrl+O | 工具 Inspector；`[` / `]` 或 Alt+Left/Right 浏览调用，Tab 切 Input/Output，c 复制 |
 | Alt+P | 模型选择 |
@@ -132,6 +143,7 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 
 - **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；`Settings → Agents → Group agent messages` 独立控制这一展示，旧版本首次读取会沿用当时 `Group tool calls` 的值，迁移后与 Tools 完全独立，恢复默认也不回读 Tools。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
 
+- **原生能力入口**：`/jobs`、`/inspect`、`/questions`、`/rename [title]`、`/fork`、`/attach [local-path]` 只按当前 mounted capability 开放；已读到的同名原生命令优先。Settings 的默认 agent/permission preset 仍是安全 allowlist，不提供 raw profile、credentials 或 tool-policy 编辑。Goal 和 permission／Plan 不合并；timed 工具未挂载时不自动启用。完整边界见 [两批记录](docs/NATIVE-UI-BATCHES.zh-CN.md)。
 - **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
 - **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。
 - **`/preset`**：原生 Agent preset 名册；空白会话可原地切换，已开始的会话保留给下一次 `/new`，底栏用 `next preset` 区分。

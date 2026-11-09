@@ -2,6 +2,7 @@ import type { Context, Plugin } from '@deepseek-ai/cordis'
 import { composeEntries, loadOverlayPatches, resolvePluginResource } from '@deepseek-ai/dsh-app-boot'
 import type { Config as PresetConfig } from '@deepseek-ai/dsh-agent-preset'
 import { pathToFileURL } from 'node:url'
+import { nativeInstallationAnchor } from './native-resources.ts'
 
 const PRESETS = ['standard', 'ptc', 'minimal', 'cordis'] as const
 const WEB_APP = '@deepseek-ai/dsh-web-app'
@@ -23,16 +24,8 @@ function objectOf(value: unknown): Record<string, unknown> | undefined {
  * embedded host without the profile launcher.
  */
 function installationAnchor(ctx: Context): string {
-  const profileContext = objectOf(ctx.get('profileContext'))
-  const installAnchor = profileContext?.installAnchor
-  if (typeof installAnchor === 'string' && installAnchor.length > 0) return pathToFileURL(installAnchor).href
-  const packages = objectOf(ctx.get('pluginPackages'))
-  const lookup = packages?.packageOf
-  if (packages !== undefined && typeof lookup === 'function') {
-    const located: unknown = (lookup as (this: unknown, specifier: string, parentURL: string) => unknown).call(packages, WEB_APP, import.meta.url)
-    const manifestPath = objectOf(located)?.manifestPath
-    if (typeof manifestPath === 'string' && manifestPath.length > 0) return pathToFileURL(manifestPath).href
-  }
+  const anchor = nativeInstallationAnchor(ctx)
+  if (anchor !== undefined) return anchor
   throw new Error('The native DSH launcher did not supply profileContext.installAnchor or a pluginPackages lookup, so the packaged DSH presets cannot be resolved')
 }
 

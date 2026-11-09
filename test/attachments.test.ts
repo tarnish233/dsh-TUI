@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { asImageAttachmentRef, displayContentParts, imageAttachmentKey, imageAttachmentValue, imageAttachments, imageMediaTypeFromBytes, sameImageAttachment } from '../src/attachments.ts'
+import { asFileAttachmentRef, asImageAttachmentRef, displayContentParts, imageAttachmentKey, imageAttachmentValue, imageAttachments, imageMediaTypeFromBytes, sameImageAttachment } from '../src/attachments.ts'
 import { imageFixture } from './helpers/images.ts'
 
 for (const mediaType of ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const) {
@@ -19,6 +19,37 @@ test('parent attachment projection: keeps mixed order and repeated image occurre
   assert.deepEqual(displayContentParts(blocks), blocks)
   assert.equal(imageAttachments(blocks).length, 2)
   assert.deepEqual(displayContentParts([{ type: 'image', data: fixture.value.data, mimeType: 'image/png' }]), [], 'legacy inline test shapes are not fake durable references')
+})
+
+test('parent attachment projection: preserves native file-only, mixed and repeated references without bytes', async () => {
+  const { attachment: image } = await imageFixture()
+  const file = Object.freeze({ attachmentId: 'native-file-ref', name: '测试.csv', bytes: 32 })
+  const blocks = Object.freeze([
+    Object.freeze({ type: 'text', text: 'before' }),
+    Object.freeze({ type: 'file', attachment: file }),
+    Object.freeze({ type: 'image', attachment: image }),
+    Object.freeze({ type: 'file', attachment: file }),
+    Object.freeze({ type: 'text', text: 'after' }),
+  ])
+  const before = JSON.stringify(blocks)
+  assert.deepEqual(displayContentParts(blocks), blocks)
+  assert.deepEqual(displayContentParts([{ type: 'file', attachment: file }]), [{ type: 'file', attachment: file }])
+  assert.deepEqual(imageAttachments(blocks), [image], 'files never become image occurrences')
+  assert.equal(JSON.stringify(blocks), before, 'durable facts are never mutated')
+  assert.deepEqual(asFileAttachmentRef({ ...file, data: 'not-inline', path: '/not-a-read-path' }), file)
+})
+
+test('parent attachment projection: validates file metadata and admits empty native files', () => {
+  const empty = { attachmentId: 'native-empty-file', name: 'empty.txt', bytes: 0 }
+  assert.deepEqual(asFileAttachmentRef(empty), empty)
+  for (const bad of [null, [], {}, { ...empty, attachmentId: '' }, { ...empty, name: '' },
+    { ...empty, name: {} }, { ...empty, bytes: -1 }, { ...empty, bytes: NaN },
+    { ...empty, bytes: Infinity }, { ...empty, bytes: 1.5 }, { ...empty, bytes: Number.MAX_SAFE_INTEGER + 1 }]) {
+    assert.equal(asFileAttachmentRef(bad), undefined)
+    assert.deepEqual(displayContentParts([{ type: 'file', attachment: bad }]), [])
+  }
+  assert.deepEqual(displayContentParts([{ type: 'file', name: 'inline.txt', data: 'aGVsbG8=' }]), [],
+    'an inline upload or host path is not a native admitted reference')
 })
 
 test('parent attachment transport: malformed references never become filesystem paths', async () => {

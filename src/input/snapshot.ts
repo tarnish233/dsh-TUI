@@ -10,6 +10,7 @@
 
 import type { CcEditorSnapshot, CcUndoSnapshot } from "./pi-tui-seam-types.ts"
 import type { ImageUploadPart } from "../ui/image-view.ts"
+import { asCcFileUpload, type CcFileUpload } from "./file-attachment.ts"
 
 export type CcDraftSnapshot = CcEditorSnapshot
 
@@ -55,6 +56,29 @@ function isImageAttachmentEntries(value: unknown): value is Array<[number, Image
   })
 }
 
+/**
+ * File attachment payloads in a snapshot.
+ *
+ * Each entry is `[markerId, { part: { type: "file", attachment } }]`. Only the
+ * native metadata shape is validated here; DSH remains the authority for the
+ * attachment itself, exactly as for a live `/attach`. A snapshot with file
+ * payloads is memory-only and must never be persisted.
+ */
+function isFileAttachmentEntries(value: unknown): value is Array<[number, CcFileUpload]> {
+  if (!Array.isArray(value)) return false
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 2) return false
+    const id = entry[0]
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) return false
+    try {
+      asCcFileUpload(entry[1])
+      return true
+    } catch {
+      return false
+    }
+  })
+}
+
 function isUndoSnapshot(value: unknown): value is CcUndoSnapshot {
   if (!isRecord(value)) return false
   return (
@@ -82,10 +106,13 @@ export function isCcDraftSnapshot(value: unknown): value is CcDraftSnapshot {
     Array.isArray(value.undoStack) &&
     value.undoStack.every(isUndoSnapshot) &&
     isStringArray(value.killRing) &&
-    // Older snapshots (pre image attachments) simply carry no image payloads.
+    // Older snapshots (pre image/file attachments) simply carry no payloads.
     (value.imageAttachments === undefined || isImageAttachmentEntries(value.imageAttachments)) &&
     (value.imageCounter === undefined ||
-      (typeof value.imageCounter === "number" && Number.isSafeInteger(value.imageCounter) && value.imageCounter >= 0))
+      (typeof value.imageCounter === "number" && Number.isSafeInteger(value.imageCounter) && value.imageCounter >= 0)) &&
+    (value.fileAttachments === undefined || isFileAttachmentEntries(value.fileAttachments)) &&
+    (value.fileCounter === undefined ||
+      (typeof value.fileCounter === "number" && Number.isSafeInteger(value.fileCounter) && value.fileCounter >= 0))
   )
 }
 
@@ -100,6 +127,8 @@ export function parseCcDraftSnapshot(value: unknown): CcDraftSnapshot {
     ...value,
     imageAttachments: value.imageAttachments ?? [],
     imageCounter: value.imageCounter ?? 0,
+    fileAttachments: value.fileAttachments ?? [],
+    fileCounter: value.fileCounter ?? 0,
   }
 }
 

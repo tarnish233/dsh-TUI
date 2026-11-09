@@ -34,23 +34,28 @@ this avoids pnpm patches and keeps the upstream source easy to refresh.
      late or change it (font zoom) keep correct image dimensions. The query and
      the `CSI 6;height;width t` reply still use the existing write/input path —
      no second stdin reader and no direct tty control.
-2. `src/components/editor.ts` — atomic image attachment markers.
-   - `[Image #N]` markers are merged in `segmentWithMarkers` alongside
-     `[paste #n]` markers, so every upstream editing path (cursor movement,
-     deletion, kill, transpose, wrapping, word navigation) already treats them
-     as one unit without per-call-site special cases.
-   - The editor keeps an opaque, host-owned payload registry
-     (`insertImageAttachment`, `getImageAttachment*`, `setImageAttachmentEntries`),
-     an in-session history registry, and a monotonic id high-water mark that is
-     raised by marker text from restored drafts and persisted history. Undo
-     snapshots stay text-only, so encoded bytes are never cloned per keystroke.
-   - `findImageMarkerIds()` is exported for the host layer.
+2. `src/components/editor.ts` — atomic image and file attachment markers.
+   - `[Image #N]` / `[File #N]` markers join `[paste #n]` in
+     `segmentWithMarkers`, so cursor movement, deletion, kill/yank, transpose,
+     wrapping and word navigation treat each as one unit without per-action
+     marker surgery or a second Editor.
+   - Opaque host-owned image/file payload families have separate monotonic ids,
+     registries and in-session history. Shared marker insertion/reachability
+     helpers keep them symmetric; restored/persisted/hand-typed ids raise the
+     high-water marks and cannot accidentally bind to a later attachment.
+     Undo snapshots remain text-only; native file refs hold metadata, not bytes.
+   - `findImageMarkerIds()` / `findFileMarkerIds()` are host helpers; the
+     app-specific capture/restore/submit policies remain in
+     `src/input/pi-tui-seam.js` and `CcEditor`, not a native business backend.
    - Exit condition: upstream exposes an atomic-marker extension point that the
-     seam can use instead.
+     seam can use instead. File support was a parent-approved narrow extension,
+     not a global Pi edit or a pnpm patch.
 
-Both deviations are covered by DSH TUI's offline tests
+Rendering/marker deviations are covered by offline tests
 (`test/input-image-screen.test.ts`, `test/input-image.test.ts`,
-`test/input-image-details.test.ts`); refresh them with every Pi TUI upgrade.
+`test/input-image-details.test.ts`, `test/input-file.test.ts`); refresh them with
+every Pi TUI upgrade. File tests include direct/keyboard dual-consumer multipart,
+atomic undo/kill/history, snapshot high-water ids and unresolved-marker blocking.
 
 3. `src/terminal.ts` — idempotent `ProcessTerminal.start()` / `stop()` attach.
    - `start()` returns immediately when the input wiring is already attached, so

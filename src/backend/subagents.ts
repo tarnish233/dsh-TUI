@@ -1,13 +1,22 @@
 /**
  * Native subagent-tree bridge.
  *
- * DSH owns every durable subagent fact: the parent-owned `subagent/catalog`
- * projection, each child's `subagent` identity, `subagentTiming` and
- * `tokenUsage` projections, the `subagent/start` / `subagent/end` lifecycle
- * pair and the child Agent/ Session events. This module only reads those public
- * projections (through `sessionQuery.observeSession`, a cold-safe live-preferred
- * observation that creates no Agent) and folds them into the neutral
- * {@link SubagentEntry} rows the TUI renders.
+ * DSH owns every durable subagent fact: directory enumeration (stable pre-order,
+ * per-catalog event order, branch diagnostics), the parent-owned
+ * `subagent/catalog` projection, each child's `subagent` identity,
+ * `subagentTiming` and `tokenUsage` projections, the `subagent/start` /
+ * `subagent/end` lifecycle pair and the child Agent/Session events.
+ *
+ * Structure and diagnostics come from the public `ctx.subagents`
+ * `listDescendants` / `listChildren` methods, which own the recursive catalog
+ * walk, the observation lease per branch and the external-leaf rule; this
+ * adapter never re-walks catalogs itself. Per-row display facts that native rows
+ * do not carry (identity, timing, usage, route) come from the public resident
+ * surface — `ctx.sessions.get(id)` identity plus
+ * `sessionProjections.snapshot(session, keys)` over exactly the keys a row folds
+ * — and only a child that is not resident takes the `sessionQuery.observeSession`
+ * lease, a cold-safe live-preferred observation that creates no Agent. The live
+ * projection change feed still updates rows between reads.
  *
  * Nothing here creates, resumes, prompts, interrupts or persists a subagent.
  * `runId` is process-local: it is kept for the lifetime of this adapter and is
@@ -20,6 +29,7 @@ import { backendError } from './errors.ts'
 import type {
   BackendEvent,
   DecisionOrigin,
+  SubagentDiagnostic,
   SubagentEntry,
   SubagentMode,
   SubagentSnapshot,
@@ -100,6 +110,28 @@ interface AgentsLike {
   get?(id: string): AgentLike | undefined
 }
 
+/**
+ * One native branch diagnostic for the current root.
+ *
+ * This is the shared metadata-only wire row `{id, parentSessionId, depth,
+ * reason}`: opaque ids, the edge distance and the native diagnostic class. It
+ * never carries a raw native error string or any credential.
+ */
+export type SubagentBranchDiagnostic = SubagentDiagnostic
+
+/**
+ * Structural view of the public `ctx.subagents` discovery surface.
+ *
+ * The recursive walk (pre-order, catalog event order, external leaves, branch
+ * diagnostics and the per-branch observation release) belongs to DSH; this
+ * adapter only validates the rows it receives. Optional methods keep a smaller
+ * composition loadable and make {@link SubagentBridge.available} honest.
+ */
+interface SubagentListingLike {
+  listDescendants?(rootSessionId: string, signal?: AbortSignal): Promise<unknown>
+  listChildren?(parentSessionId: string, signal?: AbortSignal): Promise<unknown>
+}
+
 interface ProjectionsLike {
   snapshot?(session: unknown, keys?: readonly string[]): { readonly values?: unknown } | undefined
   restore?(
@@ -129,7 +161,14 @@ interface ChildNode {
   readonly depth: number
   readonly catalogMode: SubagentMode
   readonly catalogLabel?: string
-  readonly createdAt?: number
+  /**
+   * Catalog row creation time when native reported it, else the observed child
+   * Session's own `createdAt` (the descendant listing drops the catalog row's
+   * value). Never invented.
+   */
+  createdAt?: number
+  /** Native branch diagnostic when this directory row itself could not be read. */
+  readonly diagnostic?: SubagentDiagnosticReason
   catalogSeq?: number
   header?: SubagentHeader
   /** `null` is the projection's explicit "no valid descriptor" sentinel. */
@@ -141,19 +180,50 @@ interface ChildNode {
 
 interface TreeRead {
   readonly nodes: ChildNode[]
+  /** Native branch diagnostics retained independently of the display rows. */
+  readonly diagnostics: readonly SubagentBranchDiagnostic[]
   readonly truncated: boolean
 }
 
-interface CatalogRow {
+/**
+ * One row read served entirely from the resident public surface.
+ *
+ * `header` is the exact immutable `SessionHeader` of the resident Session and
+ * `values` are the validated wire views of {@link ROW_PROJECTION_KEYS} at the
+ * same cut — content-identical to what a live `observeSession` lease carries.
+ */
+interface ResidentRowRead {
+  readonly header: SubagentHeader
+  readonly values?: Record<string, unknown>
+}
+
+  /** Native branch-diagnostic vocabulary for an incomplete subagent subtree. */
+type SubagentDiagnosticReason = SubagentDiagnostic['reason']
+
+/** One validated native listing row: a catalog child or a branch diagnostic. */
+interface ListedRow {
+  readonly kind: 'child' | 'diagnostic'
   readonly id: string
-  readonly mode: SubagentMode
+  readonly parentId: string
+  readonly depth: number
+  /** Present on `child` rows only; an `unknown` mode is a native diagnostic. */
+  readonly mode?: SubagentMode
   readonly label?: string
   readonly createdAt?: number
+  readonly reason?: SubagentDiagnosticReason
+}
+
+/** One validated listing payload: accepted rows plus the rejected row count. */
+interface ListedTree {
+  readonly rows: ListedRow[]
+  readonly rejected: number
 }
 
 /** Bound on one tree snapshot; beyond it the native data is incomplete. */
 const MAX_TREE_ENTRIES = 200
 const MAX_TREE_DEPTH = 8
+/** Bound on one native listing call; the native walk releases its own leases. */
+const MAX_LISTING_MS = 15_000
 const MAX_SESSION_READ_MS = 5_000
 const MAX_PENDING_RUNS = 64
 const MAX_RUN_ENDS = 256
@@ -165,9 +235,27 @@ const MAX_CATALOG_SEQS = 512
 const MAX_LINEAGE_HOPS = 16
 const REFRESH_DEBOUNCE_MS = 30
 const PUBLISH_DEBOUNCE_MS = 15
-const FORCED_REFRESH_INTERVAL_MS = 750
 
-const SUBAGENT_KEYS = new Set(['subagentCatalog', 'subagent', 'subagentTiming', 'tokenUsage'])
+/**
+ * Native failure codes that prove the mounted enumeration cannot work at all:
+ * they name a missing service or a missing projection registration, not a
+ * transient per-session read problem. Any other failure stays per-read.
+ */
+const UNUSABLE_LISTING_CODES: ReadonlySet<string> = new Set([
+  'SUBAGENT_CONTROL_QUERY_UNAVAILABLE',
+  'SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE',
+  'SUBAGENT_CONTROL_SESSION_STORE_UNAVAILABLE',
+])
+
+/**
+ * The wire keys one display row folds.
+ *
+ * A resident row read asks the native registry for exactly these units, so the
+ * projection cut neither computes nor advances unrelated client-visible units.
+ */
+const ROW_PROJECTION_KEYS: readonly string[] = ['subagent', 'subagentTiming', 'tokenUsage', 'modelSelection']
+/** Every projection key whose change frame can move a display row. */
+const SUBAGENT_KEYS: ReadonlySet<string> = new Set<string>(['subagentCatalog', ...ROW_PROJECTION_KEYS])
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -278,20 +366,93 @@ function headerOf(value: unknown): SubagentHeader | undefined {
   }
 }
 
-function catalogRows(value: unknown): CatalogRow[] | undefined {
-  if (value === undefined) return undefined
+/** One validated direct-child catalog row from `listChildren`. */
+interface CatalogRow {
+  readonly id: string
+  readonly mode: SubagentMode
+  readonly label?: string
+  readonly createdAt?: number
+}
+
+/**
+ * Validate one `listChildren` payload (parent-owned catalog rows).
+ *
+ * Unlike a descendant row these carry no `kind`/`parentId`/`depth`; they are the
+ * exact direct children of the requested parent in native event order.
+ */
+function catalogRows(value: unknown): { readonly rows: CatalogRow[]; readonly rejected: number } | undefined {
   if (!Array.isArray(value)) return undefined
   const rows: CatalogRow[] = []
+  let rejected = 0
   for (const raw of value) {
     const item = record(raw)
     const id = text(item?.id)
     const mode = modeOf(item?.mode)
-    if (item === undefined || id === undefined || mode === undefined) continue
+    if (item === undefined || id === undefined || mode === undefined) {
+      rejected += 1
+      continue
+    }
     const label = text(item.label)
     const createdAt = integer(item.createdAt)
     rows.push({ id, mode, ...(label === undefined ? {} : { label }), ...(createdAt === undefined ? {} : { createdAt }) })
   }
-  return rows
+  return { rows, rejected }
+}
+
+/**
+ * Validate one native listing payload.
+ *
+ * The public service returns typed rows; this adapter still validates them,
+ * because a partial/older composition or a transport-shaped fake is untrusted
+ * input here. Rejected rows are counted, never silently dropped, so the tree can
+ * be reported incomplete instead of complete.
+ */
+function listedTree(value: unknown): ListedTree | undefined {
+  if (!Array.isArray(value)) return undefined
+  const rows: ListedRow[] = []
+  let rejected = 0
+  for (const raw of value) {
+    const item = record(raw)
+    const id = text(item?.id)
+    const parentId = text(item?.parentId)
+    const depth = integer(item?.depth)
+    if (item === undefined || id === undefined || parentId === undefined || depth === undefined) {
+      rejected += 1
+      continue
+    }
+    if (item.kind === 'child') {
+      const mode = modeOf(item.mode)
+      if (mode === undefined || mode === 'unknown') {
+        rejected += 1
+        continue
+      }
+      const label = text(item.label)
+      const createdAt = integer(item.createdAt)
+      rows.push({
+        kind: 'child',
+        id,
+        parentId,
+        depth,
+        mode,
+        ...(label === undefined ? {} : { label }),
+        ...(createdAt === undefined ? {} : { createdAt }),
+      })
+      continue
+    }
+    const reason = item.reason
+    if (item.kind !== 'diagnostic' || (reason !== 'corrupt' && reason !== 'unsupported' && reason !== 'unavailable')) {
+      rejected += 1
+      continue
+    }
+    rows.push({ kind: 'diagnostic', id, parentId, depth, reason })
+  }
+  return { rows, rejected }
+}
+
+/** Native failure code of a foreign rejection, when it carries one. */
+function errorCode(error: unknown): string | undefined {
+  const code = record(error)?.code
+  return typeof code === 'string' ? code : undefined
 }
 
 function disposeObservation(value: unknown): void {
@@ -360,6 +521,34 @@ function sameEntry(left: SubagentEntry, right: SubagentEntry): boolean {
 }
 
 /**
+ * Build one snapshot from display rows plus the native metadata the neutral
+ * contract carries.
+ *
+ * `diagnostics` is the approved metadata-only wire field: it holds native
+ * `{id,parentSessionId,depth,reason}` rows and never a raw native error string
+ * or credential. A complete tree keeps the field absent instead of empty, so a
+ * consumer can tell "no diagnostic" from "diagnostics not read".
+ */
+function withSnapshotMetadata(
+  entries: readonly SubagentEntry[],
+  truncated: boolean,
+  diagnostics: readonly SubagentBranchDiagnostic[],
+): SubagentSnapshot {
+  return {
+    entries,
+    ...(truncated ? { truncated: true } : {}),
+    ...(diagnostics.length === 0 ? {} : { diagnostics }),
+  }
+}
+
+/** Stable comparison key for the native branch-diagnostic metadata. */
+function diagnosticsKey(diagnostics: readonly SubagentBranchDiagnostic[]): string {
+  return diagnostics.length === 0
+    ? ''
+    : diagnostics.map(entry => `${entry.id}>${entry.parentSessionId}@${entry.depth}:${entry.reason}`).join('|')
+}
+
+/**
  * Read one current-root subagent tree from native projections, publish
  * idempotent snapshots/upserts and remember which children the App follows.
  */
@@ -379,15 +568,20 @@ export class SubagentBridge {
   private root: string | undefined
   private cache: SubagentSnapshot | undefined
   private cacheRoot: string | undefined
+  private diagnostics: readonly SubagentBranchDiagnostic[] = []
   private truncated = false
   private lastPublished: SubagentSnapshot | undefined
   private publishedRoot: string | undefined
+  /** Stable key of the diagnostics on the last published snapshot. */
+  private publishedDiagnosticsKey: string | undefined
   private announcedRoot: string | undefined
   private refreshing: Promise<void> | undefined
   private refreshQueued = false
   private refreshTimer: ReturnType<typeof setTimeout> | undefined
   private publishTimer: ReturnType<typeof setTimeout> | undefined
-  private lastForcedRefresh = 0
+  private abortController = new AbortController()
+  /** Set once a native listing proves the mounted enumeration unusable. */
+  private listingBroken = false
   private closed = false
   private generation = 0
 
@@ -412,6 +606,40 @@ export class SubagentBridge {
     return service === undefined ? undefined : service as unknown as SessionQueryLike & Record<string, unknown>
   }
 
+  private listing(): SubagentListingLike | undefined {
+    const service = this.service('subagents')
+    return service === undefined ? undefined : service as unknown as SubagentListingLike
+  }
+
+  /** The root attachment epoch's cancellation signal for native reads. */
+  private signal(): AbortSignal {
+    return this.abortController.signal
+  }
+
+  /** End the current epoch's native reads and start a fresh one. */
+  private nextEpoch(): void {
+    if (!this.abortController.signal.aborted) this.abortController.abort()
+    this.abortController = new AbortController()
+  }
+
+  /** Whether a native read failed because this epoch was cancelled locally. */
+  private cancelled(error: unknown): boolean {
+    if (this.signal().aborted) return true
+    const code = errorCode(error)
+    return code === 'ABORTED' || code === 'CANCELLED' || code === 'SESSION_QUERY_ABORTED'
+  }
+
+  /**
+   * Cancellation for one bounded native read: the root attachment epoch plus a
+   * local deadline. A native read that supports cancellation is therefore
+   * aborted on `setRoot`/`invalidate`/`close` and at its deadline instead of
+   * being merely abandoned; the wait bound stays as the second line of defence
+   * for reads without a signal parameter.
+   */
+  private readSignal(ms: number): AbortSignal {
+    return AbortSignal.any([this.signal(), AbortSignal.timeout(ms)])
+  }
+
   private warnOnce(key: string, message: string): void {
     if (this.warned.has(key)) return
     this.warned.add(key)
@@ -423,13 +651,23 @@ export class SubagentBridge {
   }
 
   /**
-   * Whether this composition can read the native subagent projections at all.
+   * Whether this composition can read the native subagent directory at all.
+   *
+   * Both halves are required: the public `ctx.subagents` listing service and the
+   * Session query the per-row projections and durable child reads come from.
    * Detection stays live so an HMR composition change is observed on the next
-   * call instead of freezing a startup decision.
+   * call instead of freezing a startup decision. A listing that reported a
+   * missing service/projection registration is remembered until the next
+   * invalidation, because it is a composition fact, not a transient read error.
    */
   available(): boolean {
+    if (this.listingBroken) return false
     const query = this.query()
-    return query !== undefined && typeof query.observeSession === 'function'
+    const listing = this.listing()
+    return query !== undefined &&
+      typeof query.observeSession === 'function' &&
+      listing !== undefined &&
+      typeof listing.listDescendants === 'function'
   }
 
   // --------------------------------------------------------------- lifecycle
@@ -443,6 +681,7 @@ export class SubagentBridge {
     if (this.root === sessionId) return
     this.root = sessionId
     this.generation += 1
+    this.nextEpoch()
     this.nodes.clear()
     this.nodeOrder.length = 0
     this.runStarts.clear()
@@ -455,23 +694,26 @@ export class SubagentBridge {
     this.followed.clear()
     this.cache = undefined
     this.cacheRoot = undefined
+    this.diagnostics = []
     this.truncated = false
     this.lastPublished = undefined
     this.publishedRoot = undefined
     this.announcedRoot = undefined
-    this.lastForcedRefresh = 0
     this.clearTimers()
   }
 
   /** Drop cached facts after an HMR recomposition; the next event rebuilds. */
   invalidate(): void {
     this.generation += 1
+    this.nextEpoch()
+    this.listingBroken = false
     this.nodes.clear()
     this.nodeOrder.length = 0
     this.rootSeqs.clear()
     this.headers.clear()
     this.cache = undefined
     this.cacheRoot = undefined
+    this.diagnostics = []
     this.truncated = false
     this.lastPublished = undefined
     this.publishedRoot = undefined
@@ -484,6 +726,7 @@ export class SubagentBridge {
     this.closed = true
     this.clearTimers()
     this.setRoot(undefined)
+    if (!this.abortController.signal.aborted) this.abortController.abort()
     this.followed.clear()
   }
 
@@ -534,24 +777,40 @@ export class SubagentBridge {
     try {
       const read = await this.readTree(rootSessionId, seqs)
       if (read === undefined) return undefined
-      return {
-        entries: read.nodes.map(node => this.entryFor(node)),
-        ...(read.truncated ? { truncated: true } : {}),
-      }
+      return withSnapshotMetadata(
+        read.nodes.map(node => this.entryFor(node)),
+        read.truncated,
+        read.diagnostics,
+      )
     } catch (error) {
       this.warnOnce(`tree:${rootSessionId}`, `the native subagent catalog for ${JSON.stringify(rootSessionId)} could not be read: ${messageOf(error)}`)
       return undefined
     }
   }
 
+  /**
+   * Native branch diagnostics for the current root, as validated metadata only.
+   *
+   * These are the rows the mounted `ctx.subagents.listDescendants` already
+   * returned as diagnostics; the bridge never derives them from raw native
+   * error strings. The same list travels on every snapshot as
+   * `SubagentSnapshot.diagnostics`, so this is only the direct read face.
+   */
+  branchDiagnostics(): readonly SubagentBranchDiagnostic[] {
+    const root = this.root
+    if (root === undefined || this.cacheRoot !== root) return []
+    return this.diagnostics
+  }
+
   /** One cold-safe durable read of a child Session for the transcript command. */
   async readSession(sessionId: string): Promise<SubagentSessionRead | undefined> {
+    if (this.closed) return undefined
     const query = this.query()
     if (query === undefined) return undefined
     if (typeof query.observeSession === 'function') {
       let observation: ObservationLike | undefined
       try {
-        const pending = query.observeSession(sessionId, {})
+        const pending = query.observeSession(sessionId, { signal: this.readSignal(MAX_SESSION_READ_MS) })
         observation = await timeoutAfter(pending, MAX_SESSION_READ_MS, 'subagent session observation', disposeObservation)
         const header = headerOf(observation.header)
         const events = observation.events
@@ -563,7 +822,11 @@ export class SubagentBridge {
           values: record(observation.projections?.values),
         }
       } catch (error) {
-        this.warnOnce(`read:${sessionId}`, `the durable child session ${JSON.stringify(sessionId)} could not be observed: ${messageOf(error)}`)
+        // A cancellation (root switch, teardown, deadline) is not a failure of
+        // the bundle and must not become a diagnostic message.
+        if (!this.cancelled(error)) {
+          this.warnOnce(`read:${sessionId}`, `the durable child session ${JSON.stringify(sessionId)} could not be observed: ${messageOf(error)}`)
+        }
         return undefined
       } finally {
         if (observation !== undefined) disposeObservation(observation)
@@ -603,6 +866,7 @@ export class SubagentBridge {
 
   /** Durable header of one child (bounded cache; never creates an Agent). */
   async headerOf(sessionId: string): Promise<SubagentHeader | undefined> {
+    if (this.closed) return undefined
     const cached = this.headers.get(sessionId)
     if (cached !== undefined) return cached
     const live = this.liveHeader(sessionId)
@@ -614,7 +878,15 @@ export class SubagentBridge {
     if (query === undefined || typeof query.observeSession !== 'function') return undefined
     let observation: ObservationLike | undefined
     try {
-      observation = await timeoutAfter(query.observeSession(sessionId, { projectionMode: 'none' }), MAX_SESSION_READ_MS, 'subagent header observation', disposeObservation)
+      observation = await timeoutAfter(
+        query.observeSession(sessionId, {
+          projectionMode: 'none',
+          signal: this.readSignal(MAX_SESSION_READ_MS),
+        }),
+        MAX_SESSION_READ_MS,
+        'subagent header observation',
+        disposeObservation,
+      )
       const header = headerOf(observation.header)
       this.rememberHeader(header)
       return header
@@ -649,24 +921,128 @@ export class SubagentBridge {
 
   // -------------------------------------------------------------- membership
 
-  /** Prove one child belongs to the current root tree (catalog first, lineage second). */
+  /**
+   * Prove one child belongs to the current root tree.
+   *
+   * Order: the verified display row, then the exact durable direct-parent
+   * catalog row through the public `listChildren` API, then the bounded lineage
+   * walk, then (only when the child header is unreadable) a fresh native
+   * descendant listing. Every step proves membership against the *current* root,
+   * so nothing here can authorize an id from another tree. No display refresh
+   * throttle participates: a control action never depends on when the UI last
+   * rebuilt its tree, and a failed lookup still fails closed.
+   */
   async membership(sessionId: string): Promise<SubagentMembership | undefined> {
     const root = this.root
     if (this.closed || root === undefined || sessionId === root || sessionId.length === 0) return undefined
     const known = this.membershipOfNode(sessionId)
     if (known !== undefined) return known
-    if (this.available()) {
-      const now = Date.now()
-      if (now - this.lastForcedRefresh >= FORCED_REFRESH_INTERVAL_MS) {
-        this.lastForcedRefresh = now
-        await this.refresh()
-        const refreshed = this.membershipOfNode(sessionId)
-        if (refreshed !== undefined) return refreshed
-      }
-    }
+    if (!this.available()) return undefined
     const lineage = await this.lineageOf(sessionId)
-    if (lineage === undefined) return undefined
-    return { parentSessionId: lineage.parentSessionId, mode: 'unknown', local: true, untracked: true }
+    if (lineage !== undefined) {
+      const row = await this.directRow(lineage.parentSessionId, sessionId)
+      if (row !== undefined) {
+        return {
+          parentSessionId: lineage.parentSessionId,
+          mode: row.mode,
+          local: row.mode !== 'external',
+          ...(row.label === undefined ? {} : { label: row.label }),
+        }
+      }
+      return { parentSessionId: lineage.parentSessionId, mode: 'unknown', local: true, untracked: true }
+    }
+    const listed = await this.listedRow(root, sessionId)
+    if (listed === undefined) return undefined
+    return {
+      parentSessionId: listed.parentId,
+      mode: this.nativeRowMode(listed),
+      local: listed.mode !== 'external',
+      ...(listed.label === undefined ? {} : { label: listed.label }),
+    }
+  }
+
+  /** Native mode of one directory row; an unreadable branch stays honestly unknown. */
+  private nativeRowMode(row: ListedRow | CatalogRow): SubagentMode {
+    if ('kind' in row) return row.kind === 'child' ? row.mode ?? 'unknown' : 'unknown'
+    return row.mode
+  }
+
+  /** Read one direct parent's native catalog and return its row for `sessionId`. */
+  private async directRow(parentSessionId: string, sessionId: string): Promise<CatalogRow | undefined> {
+    const listing = this.listing()
+    const listChildren = listing?.listChildren
+    if (listing === undefined || typeof listChildren !== 'function') return undefined
+    let rows: unknown
+    try {
+      rows = await timeoutAfter(
+        Promise.resolve(listChildren.call(listing, parentSessionId,
+          AbortSignal.any([this.signal(), AbortSignal.timeout(MAX_LISTING_MS)]))),
+        MAX_LISTING_MS,
+        'native subagent catalog read',
+      )
+    } catch (error) {
+      this.noteListingFailure(error)
+      return undefined
+    }
+    const parsed = catalogRows(rows)
+    if (parsed === undefined) return undefined
+    if (parsed.rejected > 0) {
+      this.warnOnce('catalog:shape', `the native direct-child catalog returned ${parsed.rejected} unusable row(s); membership is unproven`)
+    }
+    return parsed.rows.find(row => row.id === sessionId)
+  }
+
+  /** Read the whole current tree's native listing and return one row. */
+  private async listedRow(rootSessionId: string, sessionId: string): Promise<ListedRow | undefined> {
+    try {
+      const tree = await this.listed(rootSessionId)
+      return tree.rows.find(row => row.id === sessionId)
+    } catch (error) {
+      this.noteListingFailure(error)
+      return undefined
+    }
+  }
+
+  /**
+   * One unbounded-by-presentation native descendant listing.
+   *
+   * Native owns the walk, the visited guard and the lease release; a non-array
+   * payload or a rejected call is a failure, never an empty tree.
+   */
+  private async listed(rootSessionId: string): Promise<ListedTree> {
+    const listing = this.listing()
+    const listDescendants = listing?.listDescendants
+    if (listing === undefined || typeof listDescendants !== 'function') {
+      throw backendError('CAPABILITY_UNAVAILABLE', 'the runtime mounts no native subagent listing (ctx.subagents.listDescendants)')
+    }
+    const raw = await timeoutAfter(
+      Promise.resolve(listDescendants.call(listing, rootSessionId,
+        AbortSignal.any([this.signal(), AbortSignal.timeout(MAX_LISTING_MS)]))),
+      MAX_LISTING_MS,
+      'native subagent listing',
+    )
+    const parsed = listedTree(raw)
+    if (parsed === undefined) {
+      throw backendError('RUNTIME_REQUEST_FAILED', 'the native subagent listing returned no row array')
+    }
+    if (parsed.rejected > 0) {
+      this.warnOnce('listing:shape', `the native subagent listing returned ${parsed.rejected} unusable row(s); the tree is incomplete`)
+    }
+    return parsed
+  }
+
+  /**
+   * Remember a native listing failure that proves the enumeration unusable.
+   *
+   * Only the native "missing service/projection" codes are sticky; every other
+   * failure stays a per-read problem so a transient error never hides the tree.
+   */
+  private noteListingFailure(error: unknown): boolean {
+    const code = errorCode(error)
+    if (code === undefined || !UNUSABLE_LISTING_CODES.has(code)) return false
+    this.listingBroken = true
+    this.warnOnce('listing', `the native subagent listing is unavailable in this composition (${code}); the subagent tree stays closed`)
+    return true
   }
 
   private membershipOfNode(sessionId: string): SubagentMembership | undefined {
@@ -832,9 +1208,13 @@ export class SubagentBridge {
       const node = this.nodes.get(sessionId)
       if (node === undefined) return
       if (key === 'subagentCatalog') {
+        // A branch may have become readable again; only a fresh listing decides.
         this.scheduleRefresh()
         return
       }
+      // A native branch diagnostic is not a child row: value frames from an
+      // unreadable branch must not upgrade it into a continuable identity.
+      if (node.diagnostic !== undefined) return
       if (key === 'subagent') {
         this.applyIdentity(node, value)
         this.schedulePublish()
@@ -966,6 +1346,9 @@ export class SubagentBridge {
     this.announcedRoot = rootSessionId
     this.lastPublished = snapshot
     this.publishedRoot = rootSessionId
+    // The announced snapshot already carried this metadata cut; recording it
+    // here keeps the next publish an upsert instead of a redundant full replay.
+    this.publishedDiagnosticsKey = diagnosticsKey(this.diagnostics)
     this.schedulePublish()
   }
 
@@ -1010,7 +1393,7 @@ export class SubagentBridge {
         const read = await this.readTree(root, this.rootSeqs)
         if (this.closed || this.root !== root || this.generation !== generation) return
         if (read === undefined) {
-          this.warnOnce('catalog', 'the mounted DSH composition exposes no readable subagentCatalog projection; the subagent tree is unavailable')
+          this.warnOnce('catalog', 'the mounted DSH composition exposes no readable native subagent directory; the subagent tree is unavailable')
           return
         }
         this.nodes.clear()
@@ -1020,10 +1403,13 @@ export class SubagentBridge {
           this.nodeOrder.push(node)
         }
         this.truncated = read.truncated
+        this.diagnostics = read.diagnostics
         this.cacheRoot = root
         this.publish()
       } catch (error) {
-        if (this.closed || this.root !== root) return
+        if (this.closed || this.root !== root || this.generation !== generation) return
+        if (this.signal().aborted || errorCode(error) === 'ABORTED' || errorCode(error) === 'CANCELLED') return
+        if (this.noteListingFailure(error)) return
         this.warnOnce('refresh', `the native subagent tree could not be refreshed: ${messageOf(error)}`)
       }
     })()
@@ -1041,75 +1427,119 @@ export class SubagentBridge {
 
   // --------------------------------------------------------------- tree read
 
+  /**
+   * Fold the public native descendant listing into display rows.
+   *
+   * Native owns the traversal: pre-order, per-catalog event order, external
+   * leaves, the visited guard and one released observation per branch. This
+   * method only validates rows, applies the UI presentation bounds, retains the
+   * native branch diagnostics as metadata and enriches each readable local
+   * child with the projections native rows do not carry.
+   *
+   * A native diagnostic is never a child: it stays read-only `unknown` unless
+   * the very same id also arrived as a valid child row, in which case the child
+   * row keeps its exact membership/mode and the diagnostic is retained only as
+   * separate branch metadata.
+   */
   private async readTree(rootSessionId: string, seqs: Map<string, number>): Promise<TreeRead | undefined> {
     const query = this.query()
     if (query === undefined || typeof query.observeSession !== 'function') return undefined
-    const rootObservation = await this.observe(query, rootSessionId)
-    if (rootObservation === undefined) return undefined
-    const rootValues = rootObservation.values ?? {}
-    const rootCatalog = catalogRows(rootValues.subagentCatalog)
-    if (rootCatalog === undefined) return undefined
-    const nodes: ChildNode[] = []
-    let truncated = false
-    const visited = new Set<string>([rootSessionId])
-    const walk = async (parentId: string, rows: readonly CatalogRow[], depth: number): Promise<void> => {
-      for (const row of rows) {
-        if (nodes.length >= MAX_TREE_ENTRIES) {
+    const listing = await this.listed(rootSessionId)
+    let truncated = listing.rejected > 0
+    const diagnostics: SubagentBranchDiagnostic[] = []
+    const children = new Map<string, ListedRow>()
+    const diagnosticRows = new Map<string, ListedRow>()
+    const order: string[] = []
+    const known = new Set<string>([rootSessionId])
+    for (const row of listing.rows) {
+      if (row.kind === 'diagnostic') {
+        if (diagnostics.length < MAX_TREE_ENTRIES) {
+          diagnostics.push({
+            id: row.id,
+            parentSessionId: row.parentId,
+            depth: row.depth,
+            reason: row.reason ?? 'unavailable',
+          })
+          this.warnOnce(
+            `branch:${row.id}:${row.reason}`,
+            row.reason === 'unsupported'
+              ? `native subagent ${JSON.stringify(row.id)} under ${JSON.stringify(row.parentId)} is cataloged with an unsupported mode; its row stays unknown and that branch is incomplete`
+              : `native subagent ${JSON.stringify(row.id)} under ${JSON.stringify(row.parentId)} has an unreadable catalog (${row.reason}); that branch is incomplete`,
+          )
+        } else {
           truncated = true
-          return
         }
-        if (visited.has(row.id)) continue
-        visited.add(row.id)
-        const node: ChildNode = {
-          id: row.id,
-          parentSessionId: parentId,
-          depth,
-          catalogMode: row.mode,
-          ...(row.label === undefined ? {} : { catalogLabel: row.label }),
-          ...(row.createdAt === undefined ? {} : { createdAt: row.createdAt }),
-          ...(seqs.get(row.id) === undefined ? {} : { catalogSeq: seqs.get(row.id)! }),
-        }
-        nodes.push(node)
-        if (row.mode === 'external') continue
-        if (depth >= MAX_TREE_DEPTH) {
-          truncated = true
-          continue
-        }
-        const observation = await this.observe(query, row.id)
-        if (observation === undefined) {
-          // Membership is native and already known; only its projections are missing.
-          truncated = true
-          this.warnOnce(`child:${row.id}`, `the native projections of subagent ${JSON.stringify(row.id)} could not be read`)
-          continue
-        }
-        const header = observation.header
-        if (header !== undefined) {
-          if (header.parentSession !== undefined && header.parentSession !== parentId) {
-            truncated = true
-            this.warnOnce(`lineage:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(parentId)} but its durable parent is ${JSON.stringify(header.parentSession)}; the inconsistent row was omitted`)
-            nodes.pop()
-            continue
-          }
-          if (header.origin !== undefined && header.origin !== 'subagent') {
-            truncated = true
-            this.warnOnce(`origin:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(parentId)} but its session header is not a subagent origin; the inconsistent row was omitted`)
-            nodes.pop()
-            continue
-          }
-          node.header = header
-          this.rememberHeader(header)
-        }
-        this.applyValues(node, observation.values)
-        const children = catalogRows(observation.values?.subagentCatalog)
-        if (children === undefined) {
-          truncated = true
-          continue
-        }
-        if (children.length > 0) await walk(row.id, children, depth + 1)
+        if (!diagnosticRows.has(row.id)) diagnosticRows.set(row.id, row)
+      } else if (!children.has(row.id)) {
+        children.set(row.id, row)
+      } else {
+        // A repeated valid row is a contradiction, never a second child.
+        truncated = true
+      }
+      if (!known.has(row.id)) {
+        known.add(row.id)
+        order.push(row.id)
       }
     }
-    await walk(rootSessionId, rootCatalog, 1)
-    return { nodes, truncated }
+    const nodes: ChildNode[] = []
+    for (const id of order) {
+      if (this.closed) return undefined
+      if (this.signal().aborted) throw backendError('ABORTED', 'the native subagent listing was cancelled')
+      if (nodes.length >= MAX_TREE_ENTRIES) {
+        truncated = true
+        break
+      }
+      const child = children.get(id)
+      const row = child ?? diagnosticRows.get(id)
+      if (row === undefined) continue
+      if (row.depth > MAX_TREE_DEPTH) {
+        truncated = true
+        continue
+      }
+      if (child === undefined) truncated = true
+      const node: ChildNode = {
+        id: row.id,
+        parentSessionId: row.parentId,
+        depth: row.depth,
+        catalogMode: child === undefined ? 'unknown' : child.mode ?? 'unknown',
+        ...(row.label === undefined ? {} : { catalogLabel: row.label }),
+        ...(row.createdAt === undefined ? {} : { createdAt: row.createdAt }),
+        ...(seqs.get(row.id) === undefined ? {} : { catalogSeq: seqs.get(row.id)! }),
+        ...(child === undefined ? { diagnostic: row.reason ?? 'unavailable' } : {}),
+      }
+      nodes.push(node)
+      if (child === undefined || child.mode === 'external') continue
+      // A resident child is read from the public resident surface (no lease,
+      // only this row's projection keys); everything else takes the native
+      // `observeSession` lease with the epoch/deadline cancellation signal.
+      const observation = this.residentRow(row.id) ?? await this.observe(query, row.id)
+      if (observation === undefined) {
+        // Membership is native and already known; only its projections are missing.
+        truncated = true
+        this.warnOnce(`child:${row.id}`, `the native projections of subagent ${JSON.stringify(row.id)} could not be read`)
+        continue
+      }
+      const header = observation.header
+      if (header !== undefined) {
+        if (header.parentSession !== undefined && header.parentSession !== row.parentId) {
+          truncated = true
+          this.warnOnce(`lineage:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(row.parentId)} but its durable parent is ${JSON.stringify(header.parentSession)}; the inconsistent row was omitted`)
+          nodes.pop()
+          continue
+        }
+        if (header.origin !== undefined && header.origin !== 'subagent') {
+          truncated = true
+          this.warnOnce(`origin:${row.id}`, `subagent ${JSON.stringify(row.id)} is cataloged under ${JSON.stringify(row.parentId)} but its session header is not a subagent origin; the inconsistent row was omitted`)
+          nodes.pop()
+          continue
+        }
+        node.header = header
+        if (node.createdAt === undefined && header.createdAt !== undefined) node.createdAt = header.createdAt
+        this.rememberHeader(header)
+      }
+      this.applyValues(node, observation.values)
+    }
+    return { nodes, diagnostics, truncated }
   }
 
   private async observe(
@@ -1120,20 +1550,74 @@ export class SubagentBridge {
     let observation: ObservationLike | undefined
     try {
       observation = await timeoutAfter(
-        query.observeSession(sessionId, {}),
+        query.observeSession(sessionId, {
+          signal: this.readSignal(MAX_SESSION_READ_MS),
+        }),
         MAX_SESSION_READ_MS,
         'subagent session observation',
         disposeObservation,
       )
+      const header = headerOf(observation.header)
+      const values = record(observation.projections?.values)
       return {
-        ...(headerOf(observation.header) === undefined ? {} : { header: headerOf(observation.header)! }),
-        ...(record(observation.projections?.values) === undefined ? {} : { values: record(observation.projections?.values)! }),
+        ...(header === undefined ? {} : { header }),
+        ...(values === undefined ? {} : { values }),
       }
     } catch {
       return undefined
     } finally {
       if (observation !== undefined) disposeObservation(observation)
     }
+  }
+
+  /**
+   * Read one row from the resident public surface, or report "needs a lease".
+   *
+   * A child whose Session is already resident (`ctx.sessions.get`) carries the
+   * same immutable `SessionHeader` and the same wire projection views that the
+   * live `observeSession` lease would return, but the native observation would
+   * fold **every** client-visible unit and hand back an asynchronous lease. This
+   * read asks `sessionProjections.snapshot(session, keys)` for exactly the keys
+   * a row folds instead, and owns no lease.
+   *
+   * `undefined` means "not resident, or the resident surface is not trustworthy":
+   * the caller then takes the native `observeSession` lease, so a cold child, a
+   * missing registry, a rejected or non-object snapshot and a stale resident
+   * identity all keep the previous facts and failure modes instead of inventing
+   * a header or silently dropping projection values. No `Session` internals are
+   * touched: `id` and `header` are public, immutable session identity metadata.
+   */
+  private residentRow(sessionId: string): ResidentRowRead | undefined {
+    const sessions = this.service('sessions') as unknown as SessionsLike | undefined
+    if (sessions === undefined || typeof sessions.get !== 'function') return undefined
+    let session: unknown
+    try {
+      session = sessions.get(sessionId)
+    } catch {
+      return undefined
+    }
+    const resident = record(session)
+    // The resident object must be the exact requested Session: a stale or
+    // foreign entry never contributes this row's identity.
+    if (resident === undefined || text(resident.id) !== sessionId) return undefined
+    const header = headerOf(resident.header)
+    if (header === undefined || header.id !== sessionId) return undefined
+    const registry = this.service('sessionProjections') as unknown as ProjectionsLike | undefined
+    // No registry at all means no projection values — exactly what the live
+    // observation reports in that composition. A registry that exists but
+    // cannot cut one snapshot is a real read failure: keep the native path.
+    if (registry === undefined) return { header }
+    if (typeof registry.snapshot !== 'function') return undefined
+    let cut: { readonly values?: unknown } | undefined
+    try {
+      cut = registry.snapshot(session, ROW_PROJECTION_KEYS)
+    } catch {
+      return undefined
+    }
+    const snapshot = record(cut)
+    if (snapshot === undefined) return undefined
+    const values = record(snapshot.values)
+    return { header, ...(values === undefined ? {} : { values }) }
   }
 
   private applyIdentity(node: ChildNode, value: unknown): void {
@@ -1232,7 +1716,9 @@ export class SubagentBridge {
     const active = this.runStarts.get(node.id)
     const ended = this.runEnds.get(node.id)
     const route = this.liveRoute(node.id) ?? node.route
-    const local = mode === 'external' ? false : true
+    // A native branch diagnostic proves neither a local Session nor an external
+    // leaf, so `local` stays absent instead of being guessed either way.
+    const local = node.diagnostic !== undefined ? undefined : mode !== 'external'
     return {
       id: node.id,
       parentSessionId: node.parentSessionId,
@@ -1243,7 +1729,7 @@ export class SubagentBridge {
       ...(route?.provider === undefined ? {} : { provider: route.provider }),
       ...(route?.model === undefined ? {} : { model: route.model }),
       ...(route?.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-      local,
+      ...(local === undefined ? {} : { local }),
       status: this.statusOf(node, mode),
       ...(this.activities.get(node.id) === undefined ? {} : { lastActivity: this.activities.get(node.id)! }),
       ...(active === undefined && ended === undefined ? {} : { lastRunId: active?.runId ?? ended?.runId }),
@@ -1263,10 +1749,11 @@ export class SubagentBridge {
    * and every publish must recompute instead of serving a stale row array.
    */
   private snapshotEntries(): SubagentSnapshot {
-    const snapshot: SubagentSnapshot = {
-      entries: this.nodeOrder.map(node => this.entryFor(node)),
-      ...(this.truncated ? { truncated: true } : {}),
-    }
+    const snapshot = withSnapshotMetadata(
+      this.nodeOrder.map(node => this.entryFor(node)),
+      this.truncated,
+      this.diagnostics,
+    )
     this.cache = snapshot
     return snapshot
   }
@@ -1282,7 +1769,11 @@ export class SubagentBridge {
     if (this.publishedRoot !== root) {
       this.lastPublished = undefined
       this.publishedRoot = root
+      this.publishedDiagnosticsKey = undefined
     }
+    const nextDiagnosticsKey = diagnosticsKey(this.diagnostics)
+    const diagnosticsChanged = this.publishedDiagnosticsKey !== nextDiagnosticsKey
+    this.publishedDiagnosticsKey = nextDiagnosticsKey
     const previous = this.lastPublished
     if (previous === undefined) {
       this.lastPublished = next
@@ -1293,6 +1784,7 @@ export class SubagentBridge {
     const previousKeys = previous.entries.map(structuralKey)
     const nextKeys = next.entries.map(structuralKey)
     const structural = truncationChanged ||
+      diagnosticsChanged ||
       previousKeys.length !== nextKeys.length ||
       previousKeys.some((key, index) => key !== nextKeys[index])
     if (structural) {

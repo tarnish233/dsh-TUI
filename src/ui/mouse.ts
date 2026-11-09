@@ -253,6 +253,137 @@ export class HitboxRegistry {
   }
 }
 
+/**
+ * The synthetic `move` that means "the pointer is no longer over you".
+ *
+ * It is deliberately a plain motion outside every declarable rect (rows and
+ * columns are 0-based, so `-1` can never be inside a hitbox) and never a
+ * `press`/`click`/`drag`: a receiving registry reports the hover exit through
+ * `onHover(false)` and keeps its pressed row, drag and native selection state
+ * exactly as they were. Nothing is parsed and no paint happens here.
+ */
+export function hoverExitEvent(base: TuiMouseEvent): TuiMouseEvent {
+  return {
+    ...base,
+    type: 'move',
+    button: 'none',
+    x: -1,
+    y: -1,
+    screenX: -1,
+    screenY: -1,
+    ...(base.wheelDelta === undefined ? {} : { wheelDelta: undefined }),
+    ...(base.clickCount === undefined ? {} : { clickCount: undefined }),
+  }
+}
+
+/**
+ * Is this the synthetic out-of-rect leave handed to a previous hover owner?
+ *
+ * Hosts use it to tell "the pointer left the host" (only release local hover)
+ * apart from "the pointer moved to a different target here" (adopt the new one).
+ */
+export function isHoverExit(event: TuiMouseEvent): boolean {
+  return event.type === 'move' && (event.x < 0 || event.y < 0)
+}
+
+/**
+ * One ephemeral hover owner per visible pointer target.
+ *
+ * A host that routes each pointer event to *one* child at a time (the
+ * transcript to its row span, a group to the child that painted the row) can
+ * only forward motion to the child currently under the pointer. A
+ * `HitboxRegistry` — or `SubagentLinkHitboxes` — can therefore only learn about
+ * a hover exit it is told about: the child the pointer just left would keep its
+ * `hovered` id forever and paint a blue "click to expand" hint on a historical
+ * card that nobody is pointing at.
+ *
+ * This helper keeps that single owner and, whenever the pointer's target
+ * changes, asks the previous owner to drop its hover with
+ * {@link hoverExitEvent}. A target is a component plus the host-defined
+ * placement slot it was painted at (`row` of its first line, `header`, …): the
+ * same child re-based by a repaint is a *different* target, so a scroll/stream
+ * that moved the hitbox away cannot leave the hint painted where the pointer
+ * no longer is.
+ *
+ * It never claims or routes an event and never touches a press pin, a drag, a
+ * selection, a disclosure, focus or cached lines: a hover callback in the owner
+ * requests its own repaint, exactly as it does for a real exit.
+ */
+export interface HoverSlot {
+  /** Component that paints the target (a child block, or the host itself). */
+  readonly component: Component
+  /** Host-local placement of the target; a re-based target is a new target. */
+  readonly slot: string
+}
+
+/** Placement token of a target painted from `row` downward. */
+export function hoverRowSlot(row: number): string {
+  return `row ${row}`
+}
+
+export class HoverOwnership {
+  private owner: HoverSlot | undefined
+  /** Last real motion, reused to shape the synthetic exit (coordinates are ignored). */
+  private base: TuiMouseEvent | undefined
+
+  /** The component that currently believes the pointer is inside it, if any. */
+  get current(): Component | undefined {
+    return this.owner?.component
+  }
+
+  /** Placement of the current owner inside its host (`header`, `row 7`, …). */
+  get placement(): string | undefined {
+    return this.owner?.slot
+  }
+
+  /**
+   * Point motion at `next` (a child, `this` for the host's own controls, or
+   * `undefined` for a gap). Any different previous owner is released first.
+   */
+  moveTo(next: HoverSlot | undefined, event: TuiMouseEvent): void {
+    this.base = event
+    const previous = this.owner
+    if (previous?.component === next?.component && previous?.slot === next?.slot) return
+    // Clear the owner *before* releasing it: the release is delivered as a
+    // nested `handleMouse`, and a host that forwards it to its own ownership
+    // (a group re-entering this helper for the synthetic leave) would otherwise
+    // see — and drop — the target that is being adopted right now.
+    this.owner = undefined
+    if (previous !== undefined) this.leave(previous.component)
+    this.owner = next
+  }
+
+  /** The pointer left the host (gap, wheel scroll, overlay, teardown). */
+  release(event?: TuiMouseEvent): void {
+    if (event !== undefined) this.base = event
+    const previous = this.owner
+    this.owner = undefined
+    if (previous !== undefined) this.leave(previous.component)
+  }
+
+  /**
+   * Drop the hover when the freshly composed frame no longer paints the owner
+   * at the slot it was entered in — the owner left the frame, or the repaint
+   * re-based its rows away from the stationary pointer.
+   */
+  retain(slots: Iterable<HoverSlot>): void {
+    const owner = this.owner
+    if (owner === undefined) return
+    for (const slot of slots) {
+      if (slot.component === owner.component && slot.slot === owner.slot) return
+    }
+    this.release()
+  }
+
+  private leave(component: Component): void {
+    const base = this.base
+    if (base === undefined || typeof component.handleMouse !== 'function') return
+    // The result is intentionally dropped: the owner's `onHover(false)` asks for
+    // its own repaint, while the real event still routes to the new target.
+    component.handleMouse(hoverExitEvent(base))
+  }
+}
+
 /** Does the cell fall inside the hitbox rect? */
 function contains(box: MouseHitbox, row: number, col: number): boolean {
   return (
