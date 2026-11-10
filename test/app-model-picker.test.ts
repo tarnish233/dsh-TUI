@@ -209,7 +209,10 @@ test('parent model picker: fragmented query paste containing Ctrl+C does not rea
     assert.deepEqual(f.backend.modelCalls, [])
     assert.deepEqual(f.backend.sends, [])
     f.terminal.type('\x03')
-    await until(() => f.backend.cancels === 1 && !f.app.isBusy, 'real Ctrl+C outside paste remains global')
+    await paint(f.terminal)
+    assert.equal(f.backend.cancels, 0, 'real Ctrl+C cancels the focused picker, not the running turn')
+    assert.equal(f.app.isBusy, true)
+    assert.equal(f.app.editor.focused, true)
   } finally { await f.close() }
 })
 

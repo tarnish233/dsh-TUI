@@ -50,6 +50,12 @@
 - id: hmr
   disabled: false
 - insert:
+    # Official read-only projections/recorders. No Web frontend, scheduler,
+    # session controller or second durable store is mounted by this bundle.
+    - id: session-turn-outline
+      name: '@deepseek-ai/dsh-session-turn-outline'
+    - id: workspace-changes
+      name: '@deepseek-ai/dsh-workspace-changes'
     # Native path-only @file discovery. The provider follows each Agent's
     # effective working directory and read-tool namespace; the TUI only renders
     # its candidates and never scans/stages file bytes itself. A later user

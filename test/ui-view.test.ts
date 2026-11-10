@@ -60,8 +60,8 @@ const toolResult = (callId: string, text: string, extra: Record<string, unknown>
 }, { surfaceOp: 'append' })
 
 /** The store consumes the backend's codec; tests use the offline fixture one. */
-function newStore(events: SessionEvent[] = []): TranscriptStore {
-  const store = new TranscriptStore({ codec: DEMO_TRANSCRIPT_CODEC })
+function newStore(events: SessionEvent[] = [], now?: () => number): TranscriptStore {
+  const store = new TranscriptStore({ codec: DEMO_TRANSCRIPT_CODEC, ...(now === undefined ? {} : { now }) })
   store.reset(info(events))
   return store
 }
@@ -412,9 +412,9 @@ test('generic fallback keeps the CC tool summary when no native card is forwarde
 
 test('live text renders directly, with no empty attempt row or settlement layout jump', () => {
   for (const showThinking of [false, true]) {
-    const store = newStore([])
-    // Layout is under test, not elapsed time: pin the renderer clock so a
-    // millisecond crossed between synthetic live and untimed settlement frames
+    const store = newStore([], () => 0)
+    // Layout is under test, not elapsed time: pin BOTH the store duration clock
+    // and the renderer clock. A millisecond crossed between synthetic live and untimed settlement frames
     // cannot produce a spurious "Thought for 1ms" comparison. Timing has its own tests.
     const view = new TranscriptView(store, { showThinking, expandTools: false, now: () => 0, thinkingLiveTimerMs: 0 })
     store.handle({ type: 'stream_start', sessionId: 's1', attemptId: 'plain-live', revision: 1, turn: 1, step: 1 })

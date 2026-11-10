@@ -526,6 +526,20 @@ export class Editor implements Component, Focusable {
 	// to.
 	private snappedFromCursorCol: number | null = null;
 
+	// Display column the last vertical move asked for, kept even when the
+	// caret had to be clamped backwards to a grapheme boundary (a desired
+	// column inside a 2-column CJK/emoji grapheme) or to an atomic marker
+	// start. The caret's measured column is then smaller than the goal, so
+	// measuring it on the next move would look like a horizontal move and
+	// silently drop the sticky column. Cleared by every non-vertical
+	// movement/state change, exactly like `preferredVisualCol`.
+	//
+	// `width` stamps the layout width (`lastWidth`) the goal was measured in.
+	// A resize rewraps the text, so the same cursorLine/cursorCol can belong to
+	// a different visual chunk: the stale goal must not override the freshly
+	// recomputed source column in that case (see moveToVisualLine()).
+	private verticalGoal: { cursorLine: number; cursorCol: number; visualCol: number; width: number } | null = null;
+
 	// Undo support
 	private undoStack = new UndoStack<EditorSnapshot>();
 
@@ -2026,11 +2040,75 @@ export class Editor implements Component, Focusable {
 		this.state.cursorCol = col;
 		this.preferredVisualCol = null;
 		this.snappedFromCursorCol = null;
+		this.verticalGoal = null;
+	}
+
+	/**
+	 * Display column of `col` inside the chunk `[startCol, endCol)`, counted in
+	 * whole graphemes so a cursor that somehow sits inside a grapheme still maps
+	 * to the column where that grapheme starts.
+	 */
+	private visualColumnInChunk(line: string, startCol: number, endCol: number, col: number): number {
+		const from = Math.max(0, Math.min(startCol, line.length));
+		const to = Math.max(from, Math.min(endCol, line.length));
+		const chunk = line.slice(from, to);
+		const limit = Math.max(0, Math.min(col - from, chunk.length));
+		let column = 0;
+		for (const seg of this.segment(chunk, "grapheme")) {
+			if (seg.index + seg.segment.length > limit) break;
+			column += visibleWidth(seg.segment);
+		}
+		return column;
+	}
+
+	/**
+	 * UTF-16 column inside the chunk `[startCol, endCol)` whose grapheme starts at
+	 * (or before) the requested display column. Rounding down keeps the cursor on
+	 * a grapheme boundary: a target column in the middle of a wide glyph or a
+	 * multi-codepoint cluster resolves to the start of that cluster.
+	 */
+	private columnInChunkAtVisualColumn(line: string, startCol: number, endCol: number, targetColumn: number): number {
+		const from = Math.max(0, Math.min(startCol, line.length));
+		const to = Math.max(from, Math.min(endCol, line.length));
+		const chunk = line.slice(from, to);
+		if (targetColumn <= 0) return from;
+		let column = 0;
+		for (const seg of this.segment(chunk, "grapheme")) {
+			const next = column + visibleWidth(seg.segment);
+			if (targetColumn < next) return from + seg.index;
+			column = next;
+		}
+		return to;
+	}
+
+	/**
+	 * Largest display column the cursor may occupy inside a chunk. Non-final
+	 * visual lines stop at the start of their last grapheme, because the column
+	 * after it belongs to the wrapped continuation.
+	 */
+	private chunkMaxVisualColumn(
+		line: string,
+		startCol: number,
+		endCol: number,
+		includeEnd: boolean,
+	): number {
+		const from = Math.max(0, Math.min(startCol, line.length));
+		const to = Math.max(from, Math.min(endCol, line.length));
+		const chunk = line.slice(from, to);
+		const width = visibleWidth(chunk);
+		if (includeEnd || chunk.length === 0) return width;
+		let lastWidth = 0;
+		for (const seg of this.segment(chunk, "grapheme")) lastWidth = visibleWidth(seg.segment);
+		return Math.max(0, width - lastWidth);
 	}
 
 	/**
 	 * Move cursor to a target visual line, applying sticky column logic.
 	 * Shared by moveCursor() and pageScroll().
+	 *
+	 * Every column in this method (cursor column, sticky column, visual-line
+	 * extent) is a terminal display column; only the final assignment converts
+	 * back to a UTF-16 offset at a grapheme boundary.
 	 */
 	private moveToVisualLine(
 		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
@@ -2040,6 +2118,8 @@ export class Editor implements Component, Focusable {
 		const currentVL = visualLines[currentVisualLine];
 		const targetVL = visualLines[targetVisualLine];
 		if (!(currentVL && targetVL)) return;
+		const currentLine = this.state.lines[currentVL.logicalLine] || "";
+		const targetLine = this.state.lines[targetVL.logicalLine] || "";
 
 		// When the cursor was snapped to a segment start, resolve the pre-snap
 		// position against the VL it belongs to. This gives the correct visual
@@ -2047,34 +2127,93 @@ export class Editor implements Component, Focusable {
 		let currentVisualCol: number;
 		if (this.snappedFromCursorCol !== null) {
 			const vlIndex = this.findVisualLineAt(visualLines, currentVL.logicalLine, this.snappedFromCursorCol);
-			currentVisualCol = this.snappedFromCursorCol - visualLines[vlIndex].startCol;
+			const vl = visualLines[vlIndex]!;
+			currentVisualCol = this.visualColumnInChunk(
+				currentLine,
+				vl.startCol,
+				vl.startCol + vl.length,
+				this.snappedFromCursorCol,
+			);
 		} else {
-			currentVisualCol = this.state.cursorCol - currentVL.startCol;
+			currentVisualCol = this.visualColumnInChunk(
+				currentLine,
+				currentVL.startCol,
+				currentVL.startCol + currentVL.length,
+				this.state.cursorCol,
+			);
 		}
 
-		// For non-last segments, clamp to length-1 to stay within the segment
+		// The caret may sit *left* of the column the previous move asked for:
+		// a desired column inside a wide grapheme rounds down to the cluster
+		// start, and an atomic marker snap moves to the marker start. Treat the
+		// recorded goal as the current column in that case, so the next move
+		// continues from the desired column instead of the clamped one (a
+		// "cursor in the middle of the line" reset would otherwise drop it).
+		// The goal is only meaningful in the layout it was measured in: after a
+		// resize the same caret position sits in a different visual chunk, and
+		// the source column above was deliberately recomputed for the new
+		// wrapping. Reusing a stale goal there would undo that recalculation, so
+		// a width mismatch falls back to the measured column (the goal is
+		// replaced by the next move's own goal anyway).
+		const goal = this.verticalGoal;
+		if (
+			goal &&
+			goal.width === this.lastWidth &&
+			goal.cursorLine === this.state.cursorLine &&
+			goal.cursorCol === this.state.cursorCol &&
+			goal.visualCol > currentVisualCol
+		) {
+			currentVisualCol = goal.visualCol;
+		}
+
+		// A non-final visual line owns its content up to the start of its last
+		// grapheme; the position after the chunk belongs to the continuation.
 		const isLastSourceSegment =
 			currentVisualLine === visualLines.length - 1 ||
 			visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
-		const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+		const sourceMaxVisualCol = this.chunkMaxVisualColumn(
+			currentLine,
+			currentVL.startCol,
+			currentVL.startCol + currentVL.length,
+			isLastSourceSegment,
+		);
 
 		const isLastTargetSegment =
 			targetVisualLine === visualLines.length - 1 ||
 			visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
-		const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+		const targetMaxVisualCol = this.chunkMaxVisualColumn(
+			targetLine,
+			targetVL.startCol,
+			targetVL.startCol + targetVL.length,
+			isLastTargetSegment,
+		);
 
 		const moveToVisualCol = this.computeVerticalMoveColumn(currentVisualCol, sourceMaxVisualCol, targetMaxVisualCol);
 
-		// Set cursor position
+		// Convert the display column back to a UTF-16 offset on a grapheme
+		// boundary of the target chunk.
 		this.state.cursorLine = targetVL.logicalLine;
-		const targetCol = targetVL.startCol + moveToVisualCol;
-		const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-		this.state.cursorCol = Math.min(targetCol, logicalLine.length);
+		this.state.cursorCol = this.columnInChunkAtVisualColumn(
+			targetLine,
+			targetVL.startCol,
+			targetVL.startCol + targetVL.length,
+			moveToVisualCol,
+		);
+		// Record the unrounded display goal for the next vertical move. When the
+		// conversion had to round down (a 2-column grapheme owns the requested
+		// column), the caret stays on the boundary but the goal survives, so
+		// Down/Up through the clamped caret still targets the original column.
+		this.verticalGoal = {
+			cursorLine: this.state.cursorLine,
+			cursorCol: this.state.cursorCol,
+			visualCol: moveToVisualCol,
+			width: this.lastWidth,
+		};
 
 		// Snap cursor to atomic segment boundary (e.g. paste markers)
 		// so the cursor never lands in the middle of a multi-grapheme unit.
 		// Single-grapheme segments don't need snapping.
-		const segments = [...this.segment(logicalLine, "grapheme")];
+		const segments = [...this.segment(targetLine, "grapheme")];
 		for (const seg of segments) {
 			if (seg.index > this.state.cursorCol) break;
 			if (seg.segment.length <= 1) continue;
@@ -2106,6 +2245,7 @@ export class Editor implements Component, Focusable {
 				// resolve it to the correct visual column.
 				this.snappedFromCursorCol = this.state.cursorCol;
 				this.state.cursorCol = seg.index;
+				if (this.verticalGoal) this.verticalGoal.cursorCol = seg.index;
 				return;
 			}
 		}
@@ -2478,7 +2618,14 @@ export class Editor implements Component, Focusable {
 					// At end of last line - can't move, but set preferredVisualCol for up/down navigation
 					const currentVL = visualLines[currentVisualLine];
 					if (currentVL) {
-						this.preferredVisualCol = this.state.cursorCol - currentVL.startCol;
+						// Sticky columns are display columns, like every other column
+						// in vertical movement (see moveToVisualLine()).
+						this.preferredVisualCol = this.visualColumnInChunk(
+							currentLine,
+							currentVL.startCol,
+							currentVL.startCol + currentVL.length,
+							this.state.cursorCol,
+						);
 					}
 				}
 			} else {
@@ -2682,6 +2829,8 @@ export class Editor implements Component, Focusable {
 		this.pasteCounter = snapshot.pasteCounter;
 		this.lastAction = null;
 		this.preferredVisualCol = null;
+		this.snappedFromCursorCol = null;
+		this.verticalGoal = null;
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}

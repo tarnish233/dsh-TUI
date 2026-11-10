@@ -55,9 +55,10 @@ import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { ToolTranscriptItem, TranscriptItem } from '../state/transcript.ts'
 import { type ItemBlock, thinkingRunsOf, type TranscriptViewOptions } from './blocks.ts'
 import { dispatchToChild, HitboxRegistry, HoverOwnership, hoverControlAt, hoverRowSlot, type MouseHitbox } from './mouse.ts'
+import { countCacheKeyBuild } from './render-counters.ts'
 import { fit, visibleWidth } from './text.ts'
 import { t } from './theme.ts'
-import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
+import { requestToolExpansion, toolDisclosureExpanded, toolExpansionRevision, toolGroupExpansionKey } from './tool-expansion.ts'
 import { formatToolDuration, getToolSummary, isTerminalTool, toolDisplayName } from './tool-io.ts'
 import type { ToolGroupContext } from './tool-view.ts'
 
@@ -369,7 +370,16 @@ export class ToolGroupBlock implements Component {
   private hoveredHeader = false
   private cwd = ''
   private disposed = false
-  private cache: { key: string; lines: string[]; paints: readonly (readonly string[])[] } | undefined
+  private cache: {
+    width: number
+    key: string
+    lines: string[]
+    paints: readonly (readonly string[])[]
+    /** Disclosure generation this frame was composed from. */
+    expansions: number
+    /** Child paint generations this frame was composed from (expanded only). */
+    readonly memberPaints: readonly number[]
+  } | undefined
   private frameBoxes: MouseHitbox[] = []
 
   constructor(anchor: ToolTranscriptItem, flags: TranscriptViewOptions) {
@@ -378,9 +388,14 @@ export class ToolGroupBlock implements Component {
     this.flags = flags
   }
 
-  /** Group expansion state, shared with the whole transcript. */
+  /** Read-only projection: no module-level disclosure is read or written. */
+  private get readonly(): boolean {
+    return this.flags.readonlyDisclosure === true
+  }
+
+  /** Group expansion state, shared with the whole transcript (live views only). */
   get expanded(): boolean {
-    return isToolExpanded(this.key, this.flags.expandTools)
+    return toolDisclosureExpanded(this.flags, this.key)
   }
 
   get memberCount(): number {
@@ -466,6 +481,7 @@ export class ToolGroupBlock implements Component {
 
   /** Flip the whole group through the shared disclosure helper (viewport anchor first). */
   toggle(): void {
+    if (this.readonly) return
     requestToolExpansion(this.flags, this.key, !this.expanded)
   }
 
@@ -568,11 +584,22 @@ export class ToolGroupBlock implements Component {
   render(width: number): string[] {
     if (this.disposed) return []
     const safeWidth = Math.max(1, Math.floor(width))
+    // Fast path: a group with no running member has no key input that can change
+    // between paints without `invalidate()`/`setMembers` — hover, preferences,
+    // cwd, member versions and width all reach this cache, a disclosure flip
+    // moves the shared generation, and an expanded frame also requires every
+    // child's own paint generation to be unchanged (a hovered child repaints
+    // itself but not this group's cache).
+    if (this.liveStamp() === '' && this.cache !== undefined && this.cache.width === safeWidth
+      && this.cache.expansions === toolExpansionRevision() && this.membersUnchanged()) {
+      return this.cache.lines
+    }
     const expanded = this.expanded
     // Children are always rendered first in expanded mode: their own cache makes
     // it cheap, and the returned line arrays are the identity that tells this
     // group whether anything it composed has actually changed.
     const paints = expanded ? this.members.map(member => member.block.render(this.childWidth(safeWidth))) : []
+    countCacheKeyBuild()
     const key = this.frameKey(safeWidth, expanded)
     if (this.cache !== undefined && this.cache.key === key && sameLines(this.cache.paints, paints)) {
       this.syncMouse(expanded)
@@ -580,7 +607,7 @@ export class ToolGroupBlock implements Component {
     }
     const lines = expanded ? this.buildExpanded(safeWidth, paints) : this.buildCollapsed(safeWidth)
     const fitted = lines.map(line => fit(line, safeWidth))
-    this.cache = { key, lines: fitted, paints }
+    this.cache = { width: safeWidth, key, lines: fitted, paints, expansions: toolExpansionRevision(), memberPaints: this.memberPaints(expanded) }
     this.syncMouse(expanded)
     return fitted
   }
@@ -589,10 +616,27 @@ export class ToolGroupBlock implements Component {
     return Math.max(1, width - PREFIX_WIDTH)
   }
 
+  /** Paint generation of every member block (empty while collapsed). */
+  private memberPaints(expanded: boolean): readonly number[] {
+    return expanded ? this.members.map(member => member.block.paintRevision ?? 0) : []
+  }
+
+  /** Do the members still paint the frame this cache was composed from? */
+  private membersUnchanged(): boolean {
+    const cached = this.cache
+    if (cached === undefined) return false
+    const current = this.members
+    if (cached.memberPaints.length !== (this.expanded ? current.length : 0)) return false
+    for (let index = 0; index < cached.memberPaints.length; index += 1) {
+      if ((current[index]?.block.paintRevision ?? 0) !== cached.memberPaints[index]) return false
+    }
+    return true
+  }
+
   private syncMouse(expanded: boolean): void {
     const height = this.cache?.lines.length ?? 0
     const boxes: MouseHitbox[] = []
-    if (height > 0) {
+    if (height > 0 && !this.readonly) {
       // Small control: the header claims the press so a repaint between press
       // and release cannot move the click onto another row.
       boxes.push({
@@ -664,6 +708,7 @@ export class ToolGroupBlock implements Component {
   // --- header ----------------------------------------------------------------
 
   private hintText(expanded: boolean): string {
+    if (this.readonly) return ''
     const screen = this.flags.screen ?? 'inline'
     const key = this.flags.hints?.expand?.trim() ?? ''
     if (screen === 'fullscreen') return expanded ? 'click to collapse' : 'click to show more'

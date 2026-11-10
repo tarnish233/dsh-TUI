@@ -175,8 +175,8 @@ test("R09: paste bytes cannot trigger global actions or chords", () => {
   assert.equal(editor.getText(), "safe")
   assert.equal(editor.getKeymap().isPendingChord(), false)
 
-  press(editor, "\x03") // now a real Ctrl+C
-  assert.deepEqual(actionIds(events), ["app.interrupt"])
+  press(editor, "\x03") // now a real Ctrl+C: Pi-style draft clear, not interrupt
+  assert.deepEqual(actionIds(events), ["app.clear"])
 })
 
 test("R09: focus and binding/config changes cancel a pending chord consistently", () => {
@@ -341,7 +341,7 @@ test("R12: Esc restoring the history draft is consumed and does not emit app.can
   assert.deepEqual(actionIds(events), ["app.cancel"])
 })
 
-test("R12: cancellation UX — completion Esc is local, Ctrl+C stays global", async () => {
+test("R12: cancellation UX — completion Esc is local, Ctrl+C clears the root draft once", async () => {
   const { editor, events } = makeEditor()
   const provider: AutocompleteProvider = {
     triggerCharacters: ["@"],
@@ -370,11 +370,15 @@ test("R12: cancellation UX — completion Esc is local, Ctrl+C stays global", as
   editor.handleInput("@")
   await sleep(60)
   assert.equal(editor.isShowingAutocomplete(), true)
-  press(editor, "\x03") // Ctrl+C is global even with local completion UI
-  assert.deepEqual(actionIds(events), ["app.interrupt"])
+  // Installed Pi CustomEditor checks Ctrl+C before base autocomplete
+  // handling: the entire root draft clears once and the stale menu closes.
+  press(editor, "\x03")
+  assert.equal(editor.isShowingAutocomplete(), false, "the cleared draft closes the stale menu")
+  assert.deepEqual(actionIds(events), ["app.clear"], "one root clear, not a completion-only cancel")
 
-  // Ctrl+C while history-browsing is still a global interrupt (never a local
-  // draft restore that silently swallows the key).
+  // Ctrl+C while browsing root history is the Pi-style clear action: the App
+  // receives app.clear and owns the draft replacement/exit arm. It is not a
+  // hidden interrupt and no local draft restore silently swallows the key.
   editor.ccCancelAutocomplete()
   editor.addToHistory("history entry")
   editor.replaceDraftText("draft")
@@ -382,22 +386,22 @@ test("R12: cancellation UX — completion Esc is local, Ctrl+C stays global", as
   assert.equal(editor.ccIsBrowsingHistory(), true)
   events.length = 0
   press(editor, "\x03")
-  assert.deepEqual(actionIds(events), ["app.interrupt"])
+  assert.deepEqual(actionIds(events), ["app.clear"])
 })
 
-test("R12: Ctrl+C interrupts through a pending chord and jump mode", () => {
+test("R12: Ctrl+C clears once through a pending chord and jump mode", () => {
   const chord = makeEditor()
   press(chord.editor, "\x18") // Ctrl+X pending
   press(chord.editor, "\x03")
   assert.equal(chord.editor.getKeymap().isPendingChord(), false)
-  assert.deepEqual(actionIds(chord.events), ["app.interrupt"])
+  assert.deepEqual(actionIds(chord.events), ["app.clear"], "the prefix is dropped and clear fires once")
   assert.equal(chord.chordPrefixes.at(-1), null)
 
   const jump = makeEditor()
   press(jump.editor, "\x1d") // jump mode
   press(jump.editor, "\x03")
   assert.equal(jump.editor.ccGetJumpMode(), null)
-  assert.deepEqual(actionIds(jump.events), ["app.interrupt"])
+  assert.deepEqual(actionIds(jump.events), ["app.clear"], "jump cancel and clear produce one action")
 })
 test("R11: Backspace (DEL) during jump cancels the jump and deletes through CcKeymap", () => {
   const { editor } = makeEditor()

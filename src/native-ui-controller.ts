@@ -7,6 +7,8 @@ import type { GoalRead, WorkingDirectoryRead } from './backend/native-inspection
 import type { ContinuedQuestionRow } from './backend/native-questions.ts'
 import type { DefaultSettingTarget, NativeDefaultSettingView, NativeDefaultSettingsRead } from './backend/native-management.ts'
 import { DecisionDialog, SelectDialog } from './ui/dialogs.ts'
+import type { InteractionPlacement } from './ui/interaction.ts'
+import type { DecisionDetailContent } from './ui/decision-details.ts'
 import { JobsDialog } from './ui/jobs-dialog.ts'
 import { NativeInspectionDialog } from './ui/native-inspection-dialog.ts'
 import { continuedQuestionChoices, continuedQuestionAnswerable, continuedQuestionsNote } from './ui/continued-questions-dialog.ts'
@@ -32,13 +34,14 @@ export interface NativeViewHost {
   capture(): NativeViewContext
   isCurrent(context: NativeViewContext): boolean
   dialog(): Component | undefined
-  show(dialog: Component): void
+  show(dialog: Component, placement?: InteractionPlacement): void
   dismiss(): void
   render(): void
   report(message: string, error?: boolean): void
   interrupt(): Promise<void>
   returnToSettings(): void
   settingsOpen(): boolean
+  details?(parent: DecisionDialog, content: DecisionDetailContent): void
   goal(value: GoalRead | undefined): void
   directory(value: WorkingDirectoryRead | undefined): void
   renamed(sessionId: string, title: string): void
@@ -112,7 +115,9 @@ export class NativeUiController {
   private mount(kind: ViewKind, dialog: Component, context = this.host.capture()): View | undefined {
     if (this.disposed || !this.host.isCurrent(context)) return undefined
     const view: View = { kind, dialog, context, generation: this.generation }
-    this.host.show(dialog)
+    const placement: InteractionPlacement = kind === 'answer' ||
+      ((kind === 'rename' || kind === 'fork') && !this.host.settingsOpen()) ? 'composer' : 'workspace'
+    this.host.show(dialog, placement)
     if (this.host.dialog() !== dialog) return undefined
     this.view = view
     return view
@@ -308,11 +313,13 @@ export class NativeUiController {
       const row = snapshot.active.find(row => row.callId === callId)
       if (row === undefined || !continuedQuestionAnswerable(row)) { this.refresh(view, true); return }
       let answerView: View | undefined
-      const dialog = new DecisionDialog(this.host.tui, {
+      let dialog: DecisionDialog
+      dialog = new DecisionDialog(this.host.tui, {
         request: { id: 'continued:' + callId, kind: 'question', title: 'Answer native continued question',
           questions: row.questions.map(q => ({ ...q, options: [...(q.options ?? [])] })) },
         keymap: this.host.keymap, onCancel: () => this.close(answerView), onInterrupt: () => { void this.host.interrupt() },
         onSubmit: value => { if (answerView !== undefined) void this.answerQuestion(answerView, callId, value) },
+        ...(this.host.details === undefined ? {} : { onDetails: (content: DecisionDetailContent) => this.host.details?.(dialog, content) }),
       })
       answerView = this.mount('answer', dialog, view.context)
       if (answerView !== undefined) answerView.row = row

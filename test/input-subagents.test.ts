@@ -191,7 +191,7 @@ test("subagent.reply and subagent.interrupt are overlay-local configurable actio
     assert.equal(actionId(keymap, "r", context), "subagent.reply")
     assert.equal(actionId(keymap, "s", context), "subagent.interrupt")
     // The existing globals are untouched by the overlay-local keys.
-    assert.equal(actionId(keymap, "\x03", context), "app.interrupt", "Ctrl+C stays global interrupt")
+    assert.equal(actionId(keymap, "\x03", context), "list.cancel", "default Ctrl+C cancels the overlay locally")
     assert.equal(actionId(keymap, "\x04", context), "app.exit", "Ctrl+D stays global exit")
     assert.equal(actionId(keymap, "\x1b", context), "list.cancel", "Esc still closes the surface")
   }
@@ -354,10 +354,17 @@ test("overlay actions keep conflict and pending-chord semantics", () => {
     assert.equal(mismatch.kind === "cancelled-chord" ? mismatch.passthrough : "", "s")
     assert.equal(actionId(chorded, "s", context), "subagent.interrupt")
 
-    // Ctrl+C keeps interrupt priority over the overlay chord.
+    // Default Ctrl+C drops the overlay chord and then cancels the surface; an
+    // explicit interrupt override is the only priority takeover.
     assertPending(chorded, "\x18", context, 3_000)
-    assert.equal(actionId(chorded, "\x03", context, 3_010), "app.interrupt")
+    const cancelledByClear = chorded.resolve("\x03", context, 3_010)
+    assert.equal(cancelledByClear.kind, "cancelled-chord")
+    assert.equal(
+      cancelledByClear.kind === "cancelled-chord" ? cancelledByClear.passthrough : "",
+      "\x03",
+    )
     assert.equal(chorded.isPendingChord(), false)
+    assert.equal(actionId(chorded, "\x03", context), "list.cancel")
 
     // The reply chord still works afterwards.
     assertPending(chorded, "\x18", context, 4_000)
@@ -497,9 +504,10 @@ test("both subagent surfaces reuse list, dialog and global keys with no editor l
     assert.equal(actionId(keymap, "\n", context), "list.select", "legacy ^J/^M share the Enter byte group")
     assert.equal(actionId(keymap, "\x1b", context), "list.cancel")
 
-    // global fallback and the shared interrupt.
-    assert.equal(actionId(keymap, "\x03", context), "app.interrupt")
-    assert.equal(actionId(keymap, "\x0f", context), "app.tools.expand")
+    // global fallback and the shared local cancel.
+    assert.equal(actionId(keymap, "\x03", context), "list.cancel")
+    // Ctrl+O is the dialog-local native-details row in every modal chain.
+    assert.equal(actionId(keymap, "\x0f", context), "dialog.details")
     assert.equal(actionId(keymap, "\x14", context), "app.todo")
     assert.equal(actionId(keymap, "\x04", context), "app.exit")
     assertPending(keymap, "\x18", context, 1_000)
@@ -540,8 +548,10 @@ test("the fallback chain really passes through list, then dialog, then global", 
     assert.equal(actionId(dialogLayer, "\x1b", context), "dialog.cancel")
     assert.equal(actionId(dialogLayer, "\r", context), "dialog.confirm")
     assert.equal(actionId(globalLayer, "\x1b", context), "app.cancel")
-    // app.interrupt priority does not depend on the lower layers.
-    assert.equal(actionId(globalLayer, "\x03", context), "app.interrupt")
+    // With every local cancel layer disabled, the resolver would reach the
+    // global app.clear; CcEditor fails that closed on read-only surfaces (the
+    // next block exercises it). app.interrupt ships unbound, not a phantom row.
+    assert.equal(actionId(globalLayer, "\x03", context), "app.clear")
   }
 
   // app.cancel still reaches the App through a CcEditor when the local close
@@ -554,6 +564,18 @@ test("the fallback chain really passes through list, then dialog, then global", 
   press(appCancel.editor, "\x1b")
   assert.deepEqual(actionIds(appCancel.events), ["app.cancel"])
   assert.equal(appCancel.editor.getText(), "keep")
+
+  // Disabling every local cancel row must not clear hidden root state via the
+  // global app.clear fallback (and must not invent another unconfigured row).
+  const noClear = makeEditor({
+    context: "subagentList",
+    bindings: { "list.cancel": null, "dialog.cancel": null },
+  })
+  noClear.editor.setText("keep")
+  const beforeClear = noClear.editor.captureDraft()
+  press(noClear.editor, "\x03")
+  assert.deepEqual(actionIds(noClear.events), [])
+  assert.deepEqual(noClear.editor.captureDraft(), beforeClear)
 })
 
 // --- read-only bytes ----------------------------------------------------
@@ -645,9 +667,10 @@ test("root-prompt app commands fail closed on read-only subagent surfaces", () =
     assert.deepEqual(actionIds(events), [], `${context}: root-prompt commands are consumed`)
     assert.deepEqual(editor.captureDraft(), before, `${context}: the hidden root draft is untouched`)
     assert.equal(editor.getText(), "root draft", `${context}: Ctrl+D cannot quit on a non-empty root draft`)
-    // App-level globals that are not root-editor commands still flow.
+    // App-level globals that are not root-editor commands still flow. Ctrl+O
+    // is the dialog-local native-details row, not the root app.tools.expand.
     press(editor, "\x0f", "\x14")
-    assert.deepEqual(actionIds(events), ["app.tools.expand", "app.todo"])
+    assert.deepEqual(actionIds(events), ["dialog.details", "app.todo"])
   }
 })
 
@@ -751,8 +774,9 @@ test("app.subagents.details can be remapped, disabled and reset without resurrec
 
 // --- interrupt priority -------------------------------------------------
 
-test("Ctrl+C keeps priority over pending chords and list.cancel in both contexts", () => {
+test("default Ctrl+C is local; an explicit interrupt keeps priority over chords in both contexts", () => {
   const keymap = mod.createCcKeymap({ platform: "posix" })
+  assert.deepEqual(keymap.getBindings("app.interrupt"), [])
   const changes: Array<readonly string[] | null> = []
   keymap.onChordChange((prefix) => changes.push(prefix))
 
@@ -761,23 +785,26 @@ test("Ctrl+C keeps priority over pending chords and list.cancel in both contexts
     changes.length = 0
     assert.equal(keymap.resolve("\x18", context, 1_000).kind, "pending")
     assert.deepEqual(keymap.getPendingChord(), ["ctrl+x"])
-    assert.equal(actionId(keymap, "\x03", context, 1_010), "app.interrupt")
+    const cancelled = keymap.resolve("\x03", context, 1_010)
+    assert.equal(cancelled.kind, "cancelled-chord")
+    assert.equal(cancelled.kind === "cancelled-chord" ? cancelled.passthrough : "", "\x03")
     assert.equal(keymap.isPendingChord(), false, `${context}: the chord is cancelled, not completed`)
     assert.deepEqual(changes, [["ctrl+x"], null], `${context}: the hint clears exactly once`)
+    assert.equal(actionId(keymap, "\x03", context), "list.cancel")
   }
 
-  // A remapped interrupt key moves the priority with it; old Ctrl+C then
-  // reaches the shared list.cancel.
-  const remapped = mod.createCcKeymap({ platform: "posix", bindings: { "app.interrupt": "ctrl+q" } })
+  // An explicitly remapped interrupt key moves the priority with it; old
+  // Ctrl+C then reaches the shared list.cancel.
+  const remapped = mod.createCcKeymap({ platform: "posix", bindings: { "app.interrupt": "alt+q" } })
   for (const context of SUBAGENT_CONTEXTS) {
     assert.equal(remapped.resolve("\x18", context, 2_000).kind, "pending")
-    assert.equal(actionId(remapped, "\x11", context, 2_010), "app.interrupt")
+    assert.equal(actionId(remapped, "\x1bq", context, 2_010), "app.interrupt")
     assert.equal(remapped.isPendingChord(), false)
     assert.equal(actionId(remapped, "\x03", context), "list.cancel")
   }
 
-  // Disabling the action exposes list.cancel; a pending chord is cancelled
-  // and its passthrough is resolved fresh.
+  // Disabling the explicit interrupt never invents an interrupt fallback; the
+  // local cancel row receives Ctrl+C and a pending chord is dropped first.
   const disabled = mod.createCcKeymap({ platform: "posix", bindings: { "app.interrupt": null } })
   for (const context of SUBAGENT_CONTEXTS) {
     assert.equal(actionId(disabled, "\x03", context), "list.cancel")
@@ -794,7 +821,7 @@ test("Ctrl+C keeps priority over pending chords and list.cancel in both contexts
   assert.equal(actionId(keymap, "\x03", "list"), "list.cancel")
 })
 
-test("CcEditor in a subagent surface emits the global interrupt, not the overlay interrupt", () => {
+test("CcEditor in a subagent surface emits the local cancel, never the overlay interrupt", () => {
   for (const context of SUBAGENT_CONTEXTS) {
     const { editor, events, chordPrefixes } = makeEditor({ context })
     editor.setText("readonly content")
@@ -803,18 +830,28 @@ test("CcEditor in a subagent surface emits the global interrupt, not the overlay
     press(editor, "\x18")
     assert.equal(editor.getKeymap().isPendingChord(), true)
     press(editor, "\x03")
-    assert.deepEqual(actionIds(events), ["app.interrupt"])
+    assert.deepEqual(actionIds(events), ["list.cancel"])
     assert.equal(events[0]?.context, context)
-    assert.notEqual(events[0]?.id, "subagent.interrupt", "Ctrl+C stays the global interrupt")
+    assert.notEqual(events[0]?.id, "subagent.interrupt", "Ctrl+C is not the overlay child stop")
+    assert.notEqual(events[0]?.id, "app.clear", "Ctrl+C never clears hidden root state")
     assert.equal(editor.getKeymap().isPendingChord(), false)
     assert.deepEqual(chordPrefixes.at(-1), null)
     assert.deepEqual(editor.captureDraft(), before)
 
-    // A disabled interrupt is not a phantom event; Esc still closes via list.cancel.
+    // Esc still closes via list.cancel.
     events.length = 0
     press(editor, "\x1b")
     assert.deepEqual(actionIds(events), ["list.cancel"])
     assert.equal(editor.getText(), "readonly content")
+  }
+
+  // An explicit interrupt override is the documented priority takeover.
+  for (const context of SUBAGENT_CONTEXTS) {
+    const { editor, events } = makeEditor({ context, bindings: { "app.interrupt": "alt+q" } })
+    press(editor, "\x18")
+    press(editor, "\x1bq")
+    assert.deepEqual(actionIds(events), ["app.interrupt"])
+    assert.equal(editor.getKeymap().isPendingChord(), false)
   }
 })
 

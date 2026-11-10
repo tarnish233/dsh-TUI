@@ -383,6 +383,7 @@ function itemSeq(item: TranscriptItem): number | undefined {
     case 'attempt':
     case 'subagent-message':
     case 'subagent':
+    case 'workspace-changes':
       return item.seq
     case 'notice':
     case 'todos':

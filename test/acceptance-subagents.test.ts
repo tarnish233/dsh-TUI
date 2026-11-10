@@ -111,7 +111,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       const child = app.store.subagentEntries[0]!
       terminal.type('\x18'); terminal.type('\x01')
       await until(() => terminal.screen().includes('Agents'), 'Agents before native interrupt')
-      terminal.type(params.screen === 'inline' ? 's' : '\x03')
+      terminal.type('s') // explicit native Stop in either renderer; Ctrl+C now only closes this surface
       try {
         await until(() => app.store.subagentEntry(child.id)?.lastStopReason === 'aborted' && app.store.subagentEntry(child.id)?.status === 'stopped', 'native interrupt lifecycle settles', 20_000)
       } catch (error) {

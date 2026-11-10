@@ -193,6 +193,66 @@ atomic undo/kill/history, snapshot high-water ids and unresolved-marker blocking
      a typed marker. Pi's marker deletion/renumbering path is untouched.
    - Exit condition: upstream reserves paste ids from existing marker text.
 
+10. `src/components/editor.ts` — vertical cursor movement uses terminal
+    **display columns** and grapheme boundaries, not UTF-16 offsets.
+    - `buildVisualLineMap()`/`wordWrapLine()` wrap by `visibleWidth`, but
+      `moveToVisualLine()` (shared by `moveCursor()` and `pageScroll()`) used
+      `cursorCol - vl.startCol`, `vl.length` and `vl.length - 1` — UTF-16
+      units. On CJK (1 unit / 2 columns), emoji ZWJ families (11 units / 2
+      columns) or combining marks (2 units / 1 column) the caret lost its
+      column: it jumped sideways, clamped to the wrong place, dropped the
+      desired column after a short line, and could land **inside** a multi-unit
+      grapheme cluster (the snap loop then collapsed the caret to the cluster
+      start, and any other mid-cluster path would split the cluster on the next
+      keystroke).
+    - New private helpers: `visualColumnInChunk()` (caret -> display column,
+      counted in whole graphemes), `columnInChunkAtVisualColumn()` (display
+      column -> UTF-16 offset, rounded down to a grapheme boundary) and
+      `chunkMaxVisualColumn()` (display extent; a non-final visual line ends at
+      the base column of its last grapheme). `moveToVisualLine()` now works
+      entirely in display columns; the sticky `preferredVisualCol` is a display
+      column too (also where `moveCursor()` records it for the end-of-last-line
+      case). Widths come from the existing `visibleWidth`, so movement and
+      layout share one measure — no second width implementation, no new
+      dependency.
+    - `moveToVisualLine()` also records `verticalGoal`
+      (`{cursorLine, cursorCol, visualCol}`): the **unrounded** display column
+      the last vertical move asked for. Rounding down to a grapheme boundary (a
+      desired column inside a 2-column CJK/emoji/ZWJ grapheme) or snapping to an
+      atomic marker start leaves the caret left of the goal, and measuring that
+      clamped caret on the next move looked like a horizontal move, so
+      `computeVerticalMoveColumn()`'s `cursorInMiddle` reset dropped the sticky
+      column (Down/Up through the clamp drifted one column left per pass). The
+      next vertical move continues from the goal when the caret still sits at
+      the recorded position and left of it; `setCursorCol()`, history-draft
+      restore and `undo()` clear it, so horizontal moves, typing, cursor
+      placement (`setText`/click) and undo are still explicit resets.
+    - The goal is stamped with the layout width it was measured in
+      (`verticalGoal.width === lastWidth`). A resize rewraps the text, so the
+      same `cursorLine/cursorCol` can belong to a different visual chunk; a
+      stale goal must not override the source column `moveToVisualLine()`
+      recomputes for the new wrapping (otherwise Down after a rewrap jumps to
+      the target line end). A width mismatch falls back to the measured column,
+      and the ordinary same-width clamp and atomic-marker behaviour is
+      unchanged. Draft snapshots carry the width too: restoring at a different
+      render width drops the goal instead of guessing.
+    - Unchanged: logical lines, soft wrapping, history browsing, desired-column
+      stickiness across short lines, atomic marker snapping, undo/kill/paste
+      state and every keybinding. `preferredVisualCol`,
+      `snappedFromCursorCol` and `verticalGoal` stay opaque JSON data in
+      snapshots (`CcEditor.captureDraft()`/`restoreDraft()` round-trip them), so
+      a stash or external-editor trip does not silently lose the sticky column.
+      There is no unused width helper: widths come from `visibleWidth` only.
+    - Exit condition: upstream computes vertical movement in display columns
+      and lands on grapheme boundaries itself. Covered by
+      `test/input-vertical-columns.test.ts` (CJK, emoji, variation selectors,
+      mid-wide-grapheme clamp round trips, repeated clamping lines, short lines,
+      softwrapped chunks, page scroll, horizontal/edit/cursor-placement resets,
+      resize-after-clamp against no-goal geometry controls and draft-snapshot
+      restore at both the same and a different width,
+      ZWJ families, combining marks, narrow widths, shorter-line stickiness and
+      wrapped mixed-width text); refresh it with every Pi TUI upgrade.
+
 All deviations are covered by DSH TUI's offline tests
 (`test/input-lifecycle.test.ts` covers the lifecycle one with a private PTY and
 a fake terminal; `test/input-terminal-output.test.ts` covers writer injection
@@ -203,4 +263,7 @@ title-stack balance, progress policy, after-stop write gating and the bounded
 reply reassembly; `test/input-regressions.test.ts` covers deviations 7-9 —
 history-browsing payload survival for both attachment families, the 1-3 column
 CJK/emoji/ZWJ and paste-marker wrap layouts, recall-at-end, and paste-id
-reservation); refresh them with every Pi TUI upgrade.
+reservation; `test/input-vertical-columns.test.ts` covers deviation 10 —
+display-column and grapheme-boundary vertical movement on CJK, emoji, ZWJ,
+variation-selector, combining-mark and wrapped mixed-width text); refresh them
+with every Pi TUI upgrade.

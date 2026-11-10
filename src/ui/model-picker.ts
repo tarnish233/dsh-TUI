@@ -305,8 +305,8 @@ export class ModelPickerDialog implements Component, Focusable {
 
   /**
    * Fragmented bracketed-paste state of the single query editor. The App's
-   * global Ctrl+C listener checks this before cancelling a busy turn, because
-   * a Ctrl+C byte inside a paste is query text, not an interrupt.
+   * global `app.clear` listener checks this before clearing the root draft,
+   * because a Ctrl+C byte inside a paste is query text, not a clear/interrupt.
    */
   get isPasting(): boolean {
     return this.search.editor.isPasting()

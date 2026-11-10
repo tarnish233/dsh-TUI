@@ -476,7 +476,7 @@ test("CC app overrides emit contextual actions and never insert text", () => {
   press(editor, "\x1a") // Ctrl+Z suspend
   press(editor, "\x1bp") // Alt+P model
   press(editor, "\x1b[Z") // Shift+Tab mode
-  press(editor, "\x03") // Ctrl+C interrupt
+  press(editor, "\x03") // Ctrl+C Pi-style draft clear (app.clear)
   assert.deepEqual(
     events.map((event) => event.id),
     [
@@ -490,7 +490,7 @@ test("CC app overrides emit contextual actions and never insert text", () => {
       "app.suspend",
       "app.model.select",
       "app.mode.cycle",
-      "app.interrupt",
+      "app.clear",
     ],
   )
   assert.equal(editor.getText(), "")

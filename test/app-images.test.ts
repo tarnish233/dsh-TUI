@@ -202,13 +202,15 @@ test('parent image App: same-session attachment replacement retires pending view
   } finally { await f.close() }
 })
 
-test('parent image App: native decisions preempt viewing and busy Ctrl+C cancels once', async () => {
+test('parent image App: native decisions preempt viewing and busy Ctrl+C only closes the viewer', async () => {
   const f = await fixture()
   try {
     const image = await imageFixture(); f.backend.values.set(image.attachment.attachmentId, image.value)
     f.backend.user([{ type: 'image', attachment: image.attachment }]); await open(f.terminal); await ready(f.terminal)
     f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'running' })
-    f.terminal.type('\x03'); await paint(f.terminal); assert.equal(f.backend.cancelCount, 1)
+    f.terminal.type('\x03'); await paint(f.terminal); assert.equal(f.backend.cancelCount, 0)
+    assert.equal(f.app.isBusy, true)
+    assert.doesNotMatch(f.terminal.screen(), /Image details/)
     await open(f.terminal); await ready(f.terminal)
     f.backend.emit({ type: 'decision', sessionId: f.backend.info.sessionId, request: { id: 'image-decision', kind: 'approval', title: 'Native image permission', options: [{ label: 'No', value: false }] } })
     await paint(f.terminal)
@@ -325,17 +327,20 @@ test('parent image App: text clipboard fallback remains atomic and never submits
   } finally { await f.close() }
 })
 
-test('parent image App: cancelling clipboard read prevents late insertion and does not arm exit', async () => {
+test('parent image App: Pi clear retires clipboard read, prevents late insertion and arms only the short clear window', async () => {
   const image = await imageFixture(), pending = deferred<Uint8Array | null>()
   const f = await fixture('fullscreen', { clipboard: { getImage: () => pending.promise, getText: async () => null } })
   try {
     f.terminal.type('\x16'); await paint(f.terminal)
     assert.match(f.terminal.screen(), /Pasting/)
-    f.terminal.type('\x03'); await paint(f.terminal)
+    f.terminal.type('\x03')
+    assert.equal((f.app as unknown as { exitArm?: { id: string } }).exitArm?.id, 'app.clear')
+    await paint(f.terminal)
     pending.resolve(image.bytes); await paint(f.terminal)
     assert.equal(f.app.editor.getExpandedText(), '')
     assert.equal(f.app.editor.getImageAttachments().length, 0)
-    assert.doesNotMatch(f.terminal.screen(), /again to exit/)
+    assert.equal(f.backend.cancelCount, 0)
+    assert.equal(f.terminal.stopped, false)
   } finally { await f.close() }
 })
 

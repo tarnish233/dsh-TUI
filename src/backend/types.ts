@@ -73,6 +73,82 @@ export interface SessionEvent {
   sourceEventSeqs?: number[]
   /** Ephemeral render intent from the exact DSH tool definition; never persisted by this TUI. */
   toolPresentation?: JsonRecord
+  /** Live-only native workspace summary keyed by this announcing event's seq. */
+  workspaceChanges?: WorkspaceChangesSummary
+}
+
+/** One native turn-outline row; `seq` is the exact readEvent anchor. */
+export interface HistoryTurnEntry {
+  readonly turn: number
+  readonly seq: number
+  readonly prompt: string
+  readonly response: string
+}
+
+/** One consistent native projection cut; unavailable is never an empty outline. */
+export interface HistoryTurnsResult {
+  readonly available: boolean
+  readonly sessionId: string
+  readonly attachmentId?: string
+  readonly asOfSeq?: number
+  readonly entries: readonly HistoryTurnEntry[]
+}
+
+/** Bounded exact native event window; no TUI pagination or durable mirror. */
+export interface HistoryWindowResult {
+  readonly sessionId: string
+  readonly attachmentId?: string
+  readonly targetSeq: number
+  readonly startSeq: number
+  readonly endSeq: number
+  readonly inheritedEventCount: number
+  readonly hasOlder: boolean
+  readonly events: readonly SessionEvent[]
+}
+
+export interface WorkspaceChangeFile {
+  readonly path: string
+  readonly display: string
+  readonly added: number
+  readonly deleted: number
+  readonly binary?: boolean
+  readonly oversized?: boolean
+}
+
+/** Host-local live-turn summary; cwd and snapshot ids never cross this DTO. */
+export interface WorkspaceChangesSummary {
+  readonly turn: number
+  readonly files: readonly WorkspaceChangeFile[]
+  readonly total: number
+  readonly added: number
+  readonly deleted: number
+}
+
+export type WorkspaceFileDiff =
+  | {
+      readonly kind: 'text'
+      readonly path: string
+      readonly display: string
+      readonly before: boolean
+      readonly after: boolean
+      readonly coarse: boolean
+      readonly hunks: readonly {
+        readonly oldStart: number
+        readonly oldLines: number
+        readonly newStart: number
+        readonly newLines: number
+        readonly lines: readonly string[]
+      }[]
+    }
+  | { readonly kind: 'binary' | 'oversized'; readonly path: string; readonly display: string }
+
+/** Validated native diff response scoped to the exact live session/attachment. */
+export interface WorkspaceChangeDiffResult {
+  readonly sessionId: string
+  readonly attachmentId?: string
+  readonly seq: number
+  readonly index: number
+  readonly diff?: WorkspaceFileDiff
 }
 
 export interface StreamPresentation {
@@ -315,6 +391,10 @@ export interface DecisionRequest {
   questions?: Question[]
   /** Present when DSH attributes this exact decision to a child in the current tree. */
   origin?: DecisionOrigin
+  /** Native call identity for a pre-execution decision; durable tool/call may already be logged. */
+  callId?: string
+  /** Pure native presentCall intent (a proposal, never an applied result). */
+  toolPresentation?: JsonRecord
 }
 
 /** Read-only native UI invalidations; not a second domain event bus. */

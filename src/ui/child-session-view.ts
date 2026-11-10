@@ -26,6 +26,13 @@
  * second composer exists. The global quit action (`app.exit`) is forwarded to
  * the parent through `onGlobalAction` instead of being swallowed.
  *
+ * Pi-style Ctrl+C: the default Ctrl+C locally resolves `list.cancel` in this
+ * read-only context, so it closes this surface (or, in the focused search
+ * field, resolves the local text-field cancel) without a native stop and
+ * without reaching a hidden root clear. A disabled/remapped local cancel is
+ * inert (no global `app.clear` alias). Only an explicit `app.interrupt`
+ * override keeps the native stop/interrupt path and its priority.
+ *
  * No timer is created: native timing is folded from `settledMs`/`activeSince`
  * on each frame, and the parent's renderer decides when to repaint.
  *
@@ -96,7 +103,7 @@ export interface ChildSessionViewOptions {
    * local and `running`/`initializing`.
    */
   onStop?: (entry: SubagentEntry) => void
-  /** `app.interrupt` inside the child view; defaults to closing it. */
+  /** `app.interrupt` override inside the child view; defaults to closing it. */
   onInterrupt?: () => void
   /**
    * Reserved for truly global app actions (`app.exit`). Parent tool/model/
@@ -337,8 +344,9 @@ export class ChildSessionView implements Component, Focusable {
     if (this.loadingValue && id.startsWith('list.')) return
     switch (id) {
       case 'app.interrupt':
-        // Ctrl+C stops an active child; it never closes the surface. A child
-        // that cannot be stopped keeps the historical interrupt/close path.
+        // Explicit native interrupt override: stop an active child; it never
+        // closes the surface. With the Pi-style default Ctrl+C this action is
+        // unbound, so Ctrl+C stays a local list/dialog close (no child stop).
         if (this.stopChild()) return
         if (this.options.onInterrupt !== undefined) this.options.onInterrupt()
         else this.close()

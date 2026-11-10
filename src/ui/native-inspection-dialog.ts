@@ -83,7 +83,10 @@ export interface NativeInspectionDialogOptions {
   keymap?: CcKeymap
   maxHeight?: number
   onClose: () => void
-  /** Global turn cancellation (`app.interrupt`); defaults to closing. */
+  /**
+   * Explicit native interrupt (a configured `app.interrupt`, no shipped
+   * default); defaults to closing. Default Ctrl+C is the local cancel.
+   */
   onInterrupt?: () => void
   /** Optional repaint hook for hosts that own rendering. */
   onRenderRequest?: () => void
@@ -108,7 +111,6 @@ interface InspectionSection {
 }
 
 const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
-
 const phaseLabel = (phase: unknown): string => {
   if (phase === null || phase === undefined) return 'no fiber'
   const text = oneLine(sanitize(String(phase)), 40)

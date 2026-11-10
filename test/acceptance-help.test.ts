@@ -58,8 +58,17 @@ export function apply(ctx) {
         scene.assert.match(view, /Commands.*Custom commands/)
         scene.assert.match(view, /\/help-native-custom/)
         scene.assert.match(view, /<native-argument>/)
-        scene.assert.match(view, /\/permission/)
         scene.assert.doesNotMatch(view, /Enter choose|Enter to select|This must never execute/)
+        // /history legitimately consumes one more row on the first page. Use
+        // Help's existing read-only search instead of assuming /permission is
+        // always above the fold at this viewport.
+        terminal.type('\x06')
+        terminal.type('permission')
+        await paint()
+        scene.assert.match(terminal.screen(), /\/permission/)
+        terminal.type('\x1b') // leave search first; the Help panel stays open
+        await paint()
+        scene.assert.equal(app.editor.focused, false)
         for (const key of ['\r', '1', '9', '\t', '\x1b[Z']) terminal.type(key)
         await paint()
         scene.assert.equal(app.editor.focused, false, 'inert keys leave the display panel open')

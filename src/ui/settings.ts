@@ -171,11 +171,12 @@ export interface SettingsDialogOptions {
   initialState?: SettingsViewState
   /** Bounded modal height (defaults to the shared standard modal budget). */
   maxHeight?: number
-  /** Local dismissal (Esc / list.cancel). */
+  /** Local dismissal (`list.cancel` / Esc; default Ctrl+C is also local). */
   onCancel: () => void
   /**
-   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). When omitted
-   * the interrupt key closes this surface through `onCancel`.
+   * Explicit native interrupt (a configured `app.interrupt`; no shipped
+   * default key). When omitted the interrupt key closes this surface through
+   * `onCancel`. Default Ctrl+C never lands here: it is the local cancel.
    */
   onInterrupt?: () => void
 }
@@ -199,6 +200,24 @@ interface PickerEntry {
 const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 const CANCEL_ACTIONS = CLOSE_ACTIONS
+
+/**
+ * The one embedded text field in this surface (numeric value entry) runs on the
+ * CC editor context, where default Ctrl+C resolves `app.clear` instead of a
+ * list cancel. It consumes that key as its own local cancel, but only under the
+ * same rule the list layers use: the *physical* key must still be an enabled
+ * single-key binding of a local cancel action, checked non-mutatingly (no
+ * resolution, no chord state). A remapped-away or disabled cancel row therefore
+ * leaves Ctrl+C inert instead of inventing a close/back, and the hidden root
+ * draft is never cleared and the native turn is never interrupted.
+ */
+function cancelFallback(keymap: CcKeymap, data: string): boolean {
+  if (keymap.isPendingChord()) return false
+  const simple = (binding: string): boolean =>
+    !binding.includes(' ') && matchesKey(data, binding as Parameters<typeof matchesKey>[1])
+  if (!keymap.getBindings('app.clear').some(simple)) return false
+  return [...CANCEL_ACTIONS].some(id => keymap.getBindings(id).some(simple))
+}
 
 const TOOL_LABELS: Record<typeof TOOL_SETTING_KEYS[number], string> = {
   groupTools: 'Group tool calls',
@@ -1306,7 +1325,9 @@ export class SettingsDialog implements Component, Focusable {
   }
 
   private inputSearch(raw: string): void {
-    const action = this.resolve(raw)
+    // A fragmented bracketed paste owns the bytes while it arrives: a pasted
+    // Ctrl+C/Esc byte stays query content and never blurs or closes the surface.
+    const action = this.search.editor.isPasting() ? undefined : this.resolve(raw)
     if (action !== undefined) {
       switch (action.id) {
         case 'list.select':
@@ -1391,6 +1412,14 @@ export class SettingsDialog implements Component, Focusable {
   private inputNumber(raw: string): void {
     const answer = this.numberAnswer
     if (answer === undefined) {
+      this.closeNumberEditor()
+      return
+    }
+    // Ctrl+C is `app.clear` in this embedded editor context: cancel the entry
+    // layer locally instead of dropping the key on a hidden root draft. This is
+    // the same local cancel the list layers get from `list.cancel`; pasted bytes
+    // stay content, and a remapped/disabled cancel row gets no fallback.
+    if (!answer.editor.isPasting() && cancelFallback(this.keymap, raw)) {
       this.closeNumberEditor()
       return
     }

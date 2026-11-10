@@ -67,6 +67,18 @@ const INDENT = '  '
  */
 const expansion = new Map<string, boolean>()
 
+/**
+ * Monotone generation of the reasoning disclosure map (see
+ * `toolExpansionRevision`): a block that cached its lines also cached this
+ * generation, so a flip repaints it even without a new item version.
+ */
+let expansionRevision = 0
+
+/** Generation of the reasoning disclosure map. */
+export function thinkingExpansionRevision(): number {
+  return expansionRevision
+}
+
 /** Stable expansion key for one reasoning run of one transcript item. */
 export function thinkingExpansionKey(itemId: string, runIndex: number): string {
   return `${itemId}:${runIndex}`
@@ -77,13 +89,17 @@ export function isThinkingExpanded(key: string): boolean {
 }
 
 export function setThinkingExpanded(key: string, expanded: boolean): void {
+  const before = expansion.has(key)
   if (expanded) expansion.set(key, true)
   else expansion.delete(key)
+  if (before !== expanded) expansionRevision += 1
 }
 
 /** Drop every expanded run (session switch / resume). */
 export function clearThinkingExpansion(): void {
+  if (expansion.size === 0) return
   expansion.clear()
+  expansionRevision += 1
 }
 
 /**
@@ -99,13 +115,16 @@ export function clearThinkingExpansion(): void {
 export function adoptThinkingExpansion(fromItemId: string | undefined, toItemId: string): void {
   if (fromItemId === undefined || fromItemId === '' || fromItemId === toItemId) return
   const prefix = `${fromItemId}:`
+  let moved = false
   for (const [key, expanded] of [...expansion]) {
     if (!key.startsWith(prefix)) continue
     const run = key.slice(prefix.length)
     if (!/^\d+$/.test(run)) continue
     expansion.delete(key)
     if (expanded) expansion.set(`${toItemId}:${run}`, true)
+    moved = true
   }
+  if (moved) expansionRevision += 1
 }
 
 /** Diagnostics/tests: how many runs are currently expanded. */
@@ -180,6 +199,12 @@ export interface ThinkingBlockOptions {
    * `expanding` is true when the click is about to EXPAND the run.
    */
   readonly onViewportAnchor?: (expanding: boolean) => void
+  /**
+   * Read-only projection (historical detail): never read the module-level
+   * expanded-run map and never write it. Runs stay collapsed and a click is
+   * inert, so a second view cannot collapse or inherit live reasoning state.
+   */
+  readonly readonly?: boolean
 }
 
 interface RunPlan {
@@ -221,6 +246,16 @@ export class ThinkingBlock {
     return (this.options.now ?? Date.now)()
   }
 
+  /**
+   * Effective expansion of one run for this block.
+   *
+   * Read-only projections are always collapsed: they neither inherit a
+   * same-key live override nor mutate the shared map.
+   */
+  private expandedOf(key: string): boolean {
+    return this.options.readonly === true ? false : isThinkingExpanded(key)
+  }
+
   private requestRender(): void {
     this.options.onRenderRequest?.()
   }
@@ -248,7 +283,7 @@ export class ThinkingBlock {
     ]
     input.runs.forEach((run, index) => {
       const key = thinkingExpansionKey(this.itemId, index)
-      parts.push(`${isThinkingExpanded(key) ? 'open' : 'closed'}:${this.elapsed(run)}:${formatThinkingDuration(run.durationMs)}`)
+      parts.push(`${this.expandedOf(key) ? 'open' : 'closed'}:${this.elapsed(run)}:${formatThinkingDuration(run.durationMs)}`)
     })
     return parts.join('|')
   }
@@ -274,7 +309,7 @@ export class ThinkingBlock {
 
   private plan(run: ThinkingRun, index: number, input: ThinkingRenderInput, row: number): RunPlan | undefined {
     const key = thinkingExpansionKey(this.itemId, index)
-    const expanded = isThinkingExpanded(key)
+    const expanded = this.expandedOf(key)
     const bodyWidth = Math.max(4, input.width - INDENT.length)
     // Reasoning text is model output: the cache sanitizes it (ANSI/control bytes
     // stripped, tabs expanded) before wrapping, so the counted lines are exactly
@@ -315,6 +350,7 @@ export class ThinkingBlock {
    * keyboard path through {@link TranscriptView.toggleLatestThinking}).
    */
   private toggle(key: string): void {
+    if (this.options.readonly === true) return
     const expanded = isThinkingExpanded(key)
     this.options.onViewportAnchor?.(!expanded)
     setThinkingExpanded(key, !expanded)

@@ -21,6 +21,10 @@ import { nativeInstallationAnchor, nativeResourceURL } from '../plugin/native-re
 import { backendError, backendErrorCodeOf, asBackendError, redactDiagnostic } from './errors.ts'
 import type { BackendError } from './errors.ts'
 import { makeTranscriptCodec } from './native-codec.ts'
+import { clampEventWindow, eventWindowOf, nativeEventWindowLimit, turnOutlineCut, windowHasOlder } from './native-history.ts'
+import { validatedToolCallView } from './native-presentation.ts'
+import { nativeSeq } from './native-seq.ts'
+import { workspaceChangesSummaryOf, workspaceFileDiffOf } from './native-workspace.ts'
 import { carriedEffort, modelRow, reasoningView, selectModelRow, type ModelReasoningView, type ModelRow } from './model-view.ts'
 import { SubagentBridge } from './subagents.ts'
 import { NativeInspection, goalChangedInvalidation, projectionInvalidationDomain } from './native-inspection.ts'
@@ -39,6 +43,8 @@ import type {
   EncodedFileInput,
   FileAttachmentRef,
   FileReferenceCandidate,
+  HistoryTurnsResult,
+  HistoryWindowResult,
   ImageAttachmentRef,
   ImageAttachmentValue,
   InputRoute,
@@ -56,6 +62,7 @@ import type {
   TodosSnapshot,
   TranscriptCodec,
   UsageSnapshot,
+  WorkspaceChangeDiffResult,
 } from './types.ts'
 
 /** Structural view of the host Cordis context used by this adapter. */
@@ -198,6 +205,31 @@ interface SessionQueryLike {
   listSessions(signal?: AbortSignal): Promise<readonly unknown[]>
   readTitleSnapshots(ids: readonly string[], signal?: AbortSignal): Promise<readonly unknown[]>
   observeSession?(id: string, options?: { readonly signal?: AbortSignal; readonly projectionMode?: 'all' | 'none' }): Promise<ObservationLike>
+  /**
+   * One full event plus a bounded raw-log context window of the live-preferred
+   * logical session. The native read takes an owned cancellation signal.
+   */
+  readEvent?(request: {
+    readonly sessionId: string
+    readonly seq: number
+    readonly before?: number
+    readonly after?: number
+  }, signal?: AbortSignal): Promise<unknown>
+}
+
+/**
+ * Structural view of the public `ctx.workspaceChanges` read faces.
+ *
+ * DSH records the summary and every comparison for the live Session only; the
+ * adapter validates/whitelists them and never reads a file, resolves a path,
+ * runs git or watches the tree. Both methods are optional so an older or
+ * partial composition stays loadable and advertises only what it mounts.
+ */
+interface WorkspaceChangesLike {
+  /** Synchronous lookup of the summary one `workspace/changes` event announced. */
+  summary?(sessionId: string, seq: number): unknown
+  /** Compare one listed file; the native read accepts an owned signal. */
+  diff?(sessionId: string, seq: number, index: number, signal: AbortSignal): Promise<unknown>
 }
 
 /**
@@ -360,6 +392,13 @@ interface ActiveDurableRead {
   readonly sessionId: string | undefined
 }
 
+/** One proven native `readWindowMax`, bound to the exact reader it describes. */
+interface LearnedEventWindowLimit {
+  /** Exact `readEvent` method object; a hot-patched method invalidates the entry. */
+  readonly readEvent: unknown
+  readonly limit: number
+}
+
 const BASE_CAPABILITIES = ['stream', 'followup', 'steer', 'cancel', 'new', 'resume', 'state', 'dequeue']
 
 /**
@@ -423,6 +462,11 @@ const COMMAND_DECLARATIONS: readonly CommandDeclaration[] = [
   { name: 'native-defaults', sessionless: true },
   { name: 'native-default-update', sessionless: true },
   { name: 'session-fork', sessionless: true },
+  // Read-only durable/live history faces: they answer the current attachment
+  // (or explicitly `available:false`) and never materialize a pending Agent.
+  { name: 'history-turns', sessionless: true },
+  { name: 'history-window', sessionless: true },
+  { name: 'workspace-change-diff', sessionless: true },
   // Pending-staged selections; live application goes through DSH's own owners.
   { name: 'model', stageable: true },
   { name: 'preset', stageable: true },
@@ -460,6 +504,8 @@ const MAX_CACHED_TOOL_CALLS = 2048
 const NATIVE_UI_READ_TIMEOUT_MS = 8_000
 /** Bound on one durable session-query read; same order as the subagent reads. */
 const SESSION_QUERY_READ_TIMEOUT_MS = 5_000
+/** Native `sessionQuery.readEvent` raw-window bound (`SESSION_QUERY_READ_WINDOW_MAX` default). */
+const MAX_EVENT_WINDOW = 50
 const IDLE_SETTLE_TIMEOUT_MS = 15_000
 const COMMAND_DRAIN_TIMEOUT_MS = 15_000
 const CANCEL_SETTLE_TIMEOUT_MS = 2_000
@@ -916,6 +962,19 @@ class ToolPresenter {
   of(event: SessionEvent): JsonRecord | undefined {
     const data = record(event.data)
     if (data === undefined) return undefined
+    // An assistant message is the tool-call *proposal*. The native scheduler
+    // appends the durable `tool/call` first and only then runs the
+    // `tools/pre-execute` approval gate (`dsh-tools` `BatchSettlement.start`
+    // precedes `pipeline.prepare`), but this adapter may receive the approval
+    // decision before it has mapped that `tool/call` event. So the proposal's
+    // pure call view is cached here, keyed by the provider's call id, for the
+    // later approval decision. The durable event existing never means the call
+    // ran: nothing is executed before the human answers. The event itself
+    // carries several calls, so it is never given one event-level view.
+    if (event.type === 'assistant/message') {
+      this.rememberProposals(record(data.message)?.content)
+      return undefined
+    }
     if (event.type === 'tool/call') {
       if (typeof data.name !== 'string' || data.callId === undefined) return undefined
       const args = parseToolArguments(data)
@@ -938,6 +997,47 @@ class ToolPresenter {
       ...(cached.call === undefined ? {} : { call: cached.call }),
       ...(result === undefined ? {} : { result }),
     } as JsonRecord
+  }
+
+  /**
+   * The cached pure call view for one proposed call, validated for a decision.
+   *
+   * @param callId - exact native `ToolCallId` from the approval request.
+   * @returns `{call}` only when this presenter really computed that view.
+   */
+  presentationOf(callId: string): JsonRecord | undefined {
+    const cached = this.calls.get(callId)
+    if (cached === undefined) return undefined
+    const call = validatedToolCallView(cached.call)
+    if (call === undefined) return undefined
+    // Detach the decision's copy from the cache: a UI mutation must never
+    // alter the later durable `tool/call`/`tool/result` presentation.
+    const detached = jsonSafe(call)
+    return record(detached) === undefined ? undefined : { call: detached as JsonRecord }
+  }
+
+  /**
+   * Cache the pure `presentCall(args)` view of every tool-call block in one
+   * assistant message. Only the definition's own presenter is called; nothing
+   * is executed and no result view, file or diff is derived here.
+   *
+   * @param content - raw assistant message content blocks.
+   */
+  private rememberProposals(content: unknown): void {
+    if (!Array.isArray(content)) return
+    for (const block of content) {
+      const item = record(block)
+      if (item?.type !== 'tool-call') continue
+      if (typeof item.id !== 'string' || item.id.length === 0) continue
+      if (typeof item.name !== 'string' || item.name.length === 0) continue
+      // The raw JSON string exactly as the model produced it; an unparsable
+      // proposal has no honest args, so no view is computed from a guess.
+      const args = parseToolArguments(item)
+      if (args === undefined) continue
+      const definition = this.definitionOf(item.name)
+      const call = this.callViewOf(definition, args)
+      this.remember(item.id, { name: item.name, args, call })
+    }
   }
 
   private definitionOf(name: string): unknown {
@@ -1043,6 +1143,13 @@ export class DshContextBackend implements Backend {
   private readonly activeCommands = new Map<string, ActiveCommand>()
   /** In-flight bounded durable session-query reads (root snapshot/listing/titles). */
   private readonly activeDurableReads = new Map<string, ActiveDurableRead>()
+  /**
+   * Proven native `readWindowMax` per mounted session-query object + `readEvent`
+   * identity. Runtime adapter state only: a replaced service or a hot-patched
+   * method is a different contract and starts over, and the entry never
+   * outlives the service it describes.
+   */
+  private readonly learnedEventWindowLimits = new WeakMap<object, LearnedEventWindowLimit>()
   private readonly activeImageReads = new Map<string, AbortController>()
   /** In-flight skill metadata reads; metadata only, never a model turn. */
   private readonly activeSkillQueries = new Map<string, ActiveSkillQuery>()
@@ -1073,6 +1180,11 @@ export class DshContextBackend implements Backend {
   /** First owned cleanup; every later `close()` joins it instead of returning early. */
   private closing: Promise<void> | undefined
   private closedEmitted = false
+  /** One synchronous append window whose recorder publishes its summary after session/event returns. */
+  private workspaceBarrier: {
+    readonly sessionId: string
+    readonly items: Array<{ readonly event: BackendEvent; readonly raw?: unknown }>
+  } | undefined
   private decisionSeq = 0
   private modelFailureSignature = ''
   private publishedRouteSignature: string | undefined
@@ -1299,6 +1411,24 @@ export class DshContextBackend implements Backend {
   }
 
   private emit(event: BackendEvent): void {
+    const barrier = this.workspaceBarrier
+    if (barrier !== undefined) {
+      // Close and a newly attached session invalidate the old live projection;
+      // neither may be trapped behind its short append-time barrier.
+      const nextSession = event.type === 'ready' ? event.info.sessionId : 'sessionId' in event ? event.sessionId : undefined
+      const switched = nextSession !== undefined && nextSession !== barrier.sessionId
+        && this.live?.agent.session.id !== barrier.sessionId
+      if (event.type === 'closed' || switched) {
+        this.workspaceBarrier = undefined
+      } else {
+        barrier.items.push({ event })
+        return
+      }
+    }
+    this.emitNow(event)
+  }
+
+  private emitNow(event: BackendEvent): void {
     if (event.type === 'closed') this.closedEmitted = true
     // Adapter diagnostics are redacted; native session events, decisions and
     // tool presentation stay exactly as DSH produced them.
@@ -1416,7 +1546,9 @@ export class DshContextBackend implements Backend {
         this.rememberCompactionCause(event)
         this.subagentBridge.noteRootEvent(this.live.agent.session.id, event)
         const wire = sessionEventWire(event, this.toolPresenter?.of(event as SessionEvent))
-        this.emit({ type: 'session_event', sessionId: this.live.agent.session.id, event: wire })
+        const outgoing = { type: 'session_event' as const, sessionId: this.live.agent.session.id, event: wire }
+        if (this.deferWorkspaceChanges(event, outgoing)) return
+        this.emit(outgoing)
         return
       }
       if (sessionId === undefined) return
@@ -1654,6 +1786,14 @@ export class DshContextBackend implements Backend {
         typeof this.live.agent.session.seq === 'number' && this.live.agent.session.seq > 0 && has('agents', 'create')) caps.push('session-fork')
     if (has('llm', 'listProviders') && has('llm', 'listModels')) caps.push('models')
     if (has('sessionQuery', 'readSession')) caps.push('sessions', 'titles')
+    // Exact native history read faces; each names only the method it needs.
+    if (has('sessionProjections', 'snapshot')) caps.push('history-turns')
+    if (has('sessionQuery', 'readEvent')) caps.push('history-window')
+    // The live-turn summary rides on `workspace/changes` events; the per-file
+    // comparison is a separate command, so each is advertised only when its
+    // own native method is mounted.
+    if (has('workspaceChanges', 'summary')) caps.push('workspace-changes')
+    if (has('workspaceChanges', 'diff')) caps.push('workspace-change-diff')
     if (has('permissionPresets', 'catalog')) caps.push('permissions')
     if (has('agentPresets', 'list')) caps.push('presets', 'preset')
     if (has('llm', 'resolveModelInfo')) caps.push('efforts', 'effort')
@@ -2415,6 +2555,82 @@ export class DshContextBackend implements Backend {
     return { events: kept, truncated: kept.length < wire.length, totalEvents: wire.length }
   }
 
+  /**
+   * Hold the synchronous append window until the native recorder publishes.
+   *
+   * DSH appends `workspace/changes` first and inserts its in-memory record
+   * immediately afterwards. Reading in the listener therefore observes an
+   * absent summary even though the record is ready when append() returns.
+   * One microtask is sufficient; all events emitted meanwhile retain order.
+   */
+  private deferWorkspaceChanges(raw: unknown, outgoing: Extract<BackendEvent, { type: 'session_event' }>): boolean {
+    if (outgoing.event.type !== 'workspace/changes') return false
+    const live = this.live
+    const seq = nativeSeq(record(raw)?.seq)
+    const changes = this.service<WorkspaceChangesLike>('workspaceChanges')
+    if (live === undefined || seq === undefined || typeof changes?.summary !== 'function') return false
+    let barrier = this.workspaceBarrier
+    if (barrier !== undefined && (barrier.sessionId !== live.agent.session.id || this.closed)) {
+      this.workspaceBarrier = undefined
+      barrier = undefined
+    }
+    if (barrier === undefined) {
+      const created = { sessionId: live.agent.session.id, items: [] }
+      this.workspaceBarrier = created
+      queueMicrotask(() => this.flushWorkspaceChanges(created))
+      barrier = created
+    }
+    barrier.items.push({ raw, event: outgoing })
+    return true
+  }
+
+  /** Release one append window in native order, or drop it after close/switch. */
+  private flushWorkspaceChanges(barrier: NonNullable<DshContextBackend['workspaceBarrier']>): void {
+    if (this.workspaceBarrier !== barrier) return
+    this.workspaceBarrier = undefined
+    if (this.closed || this.live?.agent.session.id !== barrier.sessionId) return
+    for (const item of barrier.items) {
+      const event = item.raw !== undefined && item.event.type === 'session_event'
+        ? { ...item.event, event: this.withWorkspaceChanges(item.raw, item.event.event) }
+        : item.event
+      this.emitNow(event)
+    }
+  }
+
+  /**
+   * Attach the native live-turn workspace summary to its announcing event.
+   *
+   * Only a live `workspace/changes` event is considered: the recorder keeps
+   * summaries for the Session in this Host process, and no durable replay can
+   * serve them (a resumed log therefore gets no fabricated summary). The
+   * lookup is keyed by the exact native event seq — never the wire's `0`
+   * missing-seq fallback — and scoped to the exact live session id. A missing,
+   * malformed or throwing summary leaves the event unchanged; it is never
+   * flattened into `files: []`.
+   *
+   * @param raw - the native event as DSH emitted it.
+   * @param event - the neutral wire event already mapped for the UI.
+   * @returns the same event, plus `workspaceChanges` only when native data exists.
+   */
+  private withWorkspaceChanges(raw: unknown, event: SessionEvent): SessionEvent {
+    if (event.type !== 'workspace/changes') return event
+    const live = this.live
+    if (live === undefined) return event
+    const seq = nativeSeq(record(raw)?.seq)
+    if (seq === undefined) return event
+    const changes = this.service<WorkspaceChangesLike>('workspaceChanges')
+    if (typeof changes?.summary !== 'function') return event
+    let summary: unknown
+    try {
+      summary = changes.summary(live.agent.session.id, seq)
+    } catch {
+      // A live-only convenience read never breaks transcript delivery.
+      return event
+    }
+    const value = workspaceChangesSummaryOf(summary)
+    return value === undefined ? event : { ...event, workspaceChanges: value }
+  }
+
   // -------------------------------------------------------------- decisions
 
   private nextDecisionId(kind: string): string {
@@ -2468,6 +2684,15 @@ export class DshContextBackend implements Backend {
     const message = typeof request.reason === 'string'
       ? request.reason
       : typeof display?.en === 'string' ? display.en : undefined
+    // The proposal's exact identity and its already-computed pure call view.
+    // The durable `tool/call` is appended *before* this approval gate, yet the
+    // decision can still arrive before this adapter has mapped that event, so
+    // the assistant-message proposal cache remains the reliable source. Either
+    // missing field stays a normal approval: no preview is synthesized, no tool
+    // is run and no file/diff is read. A durable call is never evidence that the
+    // call executed before the human answered.
+    const callId = typeof request.callId === 'string' && request.callId.length > 0 ? request.callId : undefined
+    const toolPresentation = callId === undefined ? undefined : this.presenterFor(request.agent)?.presentationOf(callId)
     this.emit({
       type: 'decision',
       sessionId: owner.eventSessionId,
@@ -2481,6 +2706,8 @@ export class DshContextBackend implements Backend {
           { label: 'Reject', description: 'Decline the action.', value: 'rejected' },
         ],
         ...(origin === undefined ? {} : { origin }),
+        ...(callId === undefined ? {} : { callId }),
+        ...(toolPresentation === undefined ? {} : { toolPresentation }),
       },
     })
     const signal = request.signal instanceof AbortSignal ? request.signal : undefined
@@ -2660,6 +2887,26 @@ export class DshContextBackend implements Backend {
     }
     this.childPresenters.set(sessionId, { agent, presenter })
     return presenter
+  }
+
+  /**
+   * The ephemeral presenter that may have cached one approval's proposal.
+   *
+   * Identity, never a session id alone: only the exact root Agent or an exact
+   * cached followed-child Agent can own a proposal view. No presenter is
+   * created here, so an approval can never materialize tool lookups for an
+   * Agent that never proposed anything in this process.
+   *
+   * @param agent - the native Agent that raised the approval request.
+   * @returns that Agent's presenter, or undefined.
+   */
+  private presenterFor(agent: unknown): ToolPresenter | undefined {
+    if (agent === undefined) return undefined
+    if (this.live !== undefined && agent === this.live.agent) return this.toolPresenter
+    for (const entry of this.childPresenters.values()) {
+      if (entry.agent === agent) return entry.presenter
+    }
+    return undefined
   }
 
   // ----------------------------------------------------------------- stream
@@ -3224,6 +3471,9 @@ export class DshContextBackend implements Backend {
       }
       case 'session-rename': return this.nativeManagement.renameCurrent({ sessionId: params.sessionId as string, title: params.title as string,
         ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
+      case 'history-turns': return this.historyTurns(params)
+      case 'history-window': return await this.historyWindow(params)
+      case 'workspace-change-diff': return await this.workspaceChangeDiff(params)
       case 'session-fork': return this.forkInteractive(params)
       default: throw codedError('UNSUPPORTED_COMMAND', `unsupported command: ${name}`)
     }
@@ -4287,6 +4537,279 @@ export class DshContextBackend implements Backend {
     })
   }
 
+  // ----------------------------------------------------------- history reads
+
+  /**
+   * Validate the optional exact-session/attachment parameters of one read.
+   *
+   * These commands name the caller's current attachment; a supplied id that is
+   * not that attachment can never be served from the live read faces, so it is
+   * a stale request instead of a silent read of a different session.
+   *
+   * @param params - caller-supplied command arguments.
+   * @param scope - the exact current session/attachment identity.
+   */
+  private assertReadScopeParams(
+    params: Record<string, unknown>,
+    scope: { readonly sessionId: string; readonly attachmentId?: string },
+  ): void {
+    for (const key of ['sessionId', 'attachmentId'] as const) {
+      const value = params[key]
+      if (value === undefined) continue
+      if (typeof value !== 'string' || value.length === 0) {
+        throw codedError('INVALID_ARGUMENT', `${key} must be a non-empty native identity string`)
+      }
+      if (value !== scope[key]) {
+        throw codedError('STALE_SESSION', `the requested native ${key} is not the current attachment`)
+      }
+    }
+  }
+
+  /**
+   * Read the native whole-log turn outline for the exact live attachment.
+   *
+   * Only the public carrier read face is used — one consistent
+   * `sessionProjections.snapshot(session,['turnOutline'])` cut. A pending
+   * attachment and a composition without the projection/mounted unit answer
+   * `available:false`; they never create an Agent, call the deprecated
+   * `stateOf` fold read, or present an unavailable outline as empty.
+   *
+   * @param params - optional exact `sessionId`/`attachmentId` guard.
+   * @returns the validated outline cut bound to the current attachment.
+   */
+  private historyTurns(params: Record<string, unknown>): HistoryTurnsResult {
+    const live = this.live
+    const pending = live === undefined ? this.pending : undefined
+    const scope = live !== undefined
+      ? { sessionId: live.agent.session.id, attachmentId: live.attachmentId }
+      : pending === undefined ? undefined : { sessionId: pending.sessionId, attachmentId: pending.attachmentId }
+    if (scope === undefined) throw codedError('NOT_CONNECTED', 'no native attachment is current')
+    this.assertReadScopeParams(params, scope)
+    const unavailable: HistoryTurnsResult = {
+      available: false,
+      sessionId: scope.sessionId,
+      attachmentId: scope.attachmentId,
+      entries: [],
+    }
+    if (live === undefined) return unavailable
+    const projections = this.service<ProjectionsLike>('sessionProjections')
+    if (typeof projections?.snapshot !== 'function') return unavailable
+    let snapshot: unknown
+    try {
+      snapshot = projections.snapshot(live.agent.session, ['turnOutline'])
+    } catch (error) {
+      this.warn(`the native turn outline could not be read: ${errorMessage(error)}`)
+      return unavailable
+    }
+    const cut = turnOutlineCut(snapshot)
+    return {
+      available: cut.available,
+      sessionId: scope.sessionId,
+      attachmentId: scope.attachmentId,
+      ...(cut.available && cut.asOfSeq !== undefined ? { asOfSeq: cut.asOfSeq } : {}),
+      entries: cut.entries,
+    }
+  }
+
+  /**
+   * Read one exact event plus a bounded native raw-log window.
+   *
+   * `sessionQuery.readEvent` is the owning durable read; the adapter only
+   * validates the request/response, forwards the neutral event envelope
+   * (including the existing tool presentation path) and proves `hasOlder`
+   * from the native `startSeq`. The read runs through the existing 5 s
+   * `durableRead` carrier, so `close()` and attachment retirement abort the
+   * wait and a late window is never published for a replaced attachment.
+   *
+   * The runtime's effective `readWindowMax` is profile configuration, not a
+   * readable service fact: `@deepseek-ai/dsh-session-query` declares only the
+   * configuration input and keeps the resolved bound private, so the adapter
+   * asks for the documented TUI cap (`<= 50`) and adapts to one proven smaller
+   * native bound. A rejection carrying exactly
+   * `SESSION_QUERY_INVALID_WINDOW` + `<before|after> must be an integer between
+   * 0 and N` proves `N`; both sides are then clamped to `N` in **one** retry
+   * inside this same `durableRead` signal/deadline. The proven bound is cached
+   * per mounted service object plus `readEvent` identity (a replaced service or
+   * a hot-patched method starts over) and narrows later requests before they
+   * are dispatched. Anything else — a generic failure, a malformed or widened
+   * bound, a bound that changes nothing, an already-aborted or switched
+   * attachment — fails closed without a second native call.
+   *
+   * @param params - `{sessionId?, attachmentId?, seq, before?, after?}`.
+   * @returns the validated window bound to the exact live attachment.
+   */
+  private async historyWindow(params: Record<string, unknown>): Promise<HistoryWindowResult> {
+    const live = this.live
+    if (live === undefined) {
+      throw codedError('NOT_CONNECTED', 'no live native session has durable history yet')
+    }
+    const scope = { sessionId: live.agent.session.id, attachmentId: live.attachmentId }
+    this.assertReadScopeParams(params, scope)
+    const seq = nativeSeq(params.seq)
+    if (seq === undefined) throw codedError('INVALID_ARGUMENT', 'history-window requires a native event seq')
+    const before = this.eventWindowBound(params.before, 'before')
+    const after = this.eventWindowBound(params.after, 'after')
+    const query = this.service<SessionQueryLike>('sessionQuery')
+    if (typeof query?.readEvent !== 'function') {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no native session event reader')
+    }
+    const readEvent = query.readEvent
+    const read = readEvent.bind(query)
+    // A bound proven for this exact service/method pair narrows the request
+    // before it is dispatched; nothing is inferred from a replaced service.
+    let dispatched = clampEventWindow(
+      this.learnedEventWindowLimit(query, readEvent),
+      { before, after },
+      MAX_EVENT_WINDOW,
+    ) ?? { before, after }
+    let raw: unknown
+    try {
+      raw = await this.durableRead(
+        'native session event window',
+        async signal => {
+          try {
+            return await read({ sessionId: scope.sessionId, seq, before: dispatched.before, after: dispatched.after }, signal)
+          } catch (error) {
+            const proven = nativeEventWindowLimit(error)
+            const narrowed = clampEventWindow(proven, dispatched, MAX_EVENT_WINDOW)
+            // Not a proven smaller native bound: the ORIGINAL rejection keeps
+            // its normal normalization below and is never retried.
+            if (proven === undefined || narrowed === undefined) throw error
+            // Cancellation, close and attachment retirement are re-proved
+            // before a second native call is issued.
+            if (signal.aborted) throw codedError('ABORTED', 'the native session event window was cancelled')
+            if (this.closed) throw codedError('CLOSED', 'the backend closed during the native session event window')
+            if (this.live !== live) {
+              throw codedError('STALE_SESSION', 'the DSH attachment changed while its history window was read')
+            }
+            this.rememberEventWindowLimit(query, readEvent, proven)
+            dispatched = narrowed
+            return await read({ sessionId: scope.sessionId, seq, before: narrowed.before, after: narrowed.after }, signal)
+          }
+        },
+        scope.sessionId,
+      )
+    } catch (error) {
+      if (backendErrorCodeOf(error) !== undefined) throw error
+      throw nativeAgentFailure('the native session event window failed', error)
+    }
+    // A window for a retired attachment is never a fresh fact.
+    if (this.closed) throw codedError('CLOSED', 'the backend closed during the native session event window')
+    if (this.live !== live) throw codedError('STALE_SESSION', 'the DSH attachment changed while its history window was read')
+    // Validate against the bounds that were actually dispatched, so a wider
+    // response can never claim events this request did not ask for.
+    const facts = eventWindowOf(raw, { sessionId: scope.sessionId, seq, before: dispatched.before, after: dispatched.after })
+    if (!facts.ok) {
+      throw codedError('RUNTIME_REQUEST_FAILED', `the native session event window was malformed: ${facts.reason}`)
+    }
+    const presenter = this.toolPresenter
+    const events = facts.window.events.map(event => sessionEventWire(event, presenter?.of(event as SessionEvent)))
+    return {
+      sessionId: scope.sessionId,
+      attachmentId: scope.attachmentId,
+      targetSeq: seq,
+      startSeq: facts.window.startSeq,
+      endSeq: facts.window.endSeq,
+      inheritedEventCount: facts.window.inheritedEventCount,
+      hasOlder: windowHasOlder(facts.window),
+      events,
+    }
+  }
+
+  /**
+   * The proven native raw-event maximum for one mounted reader, if any.
+   *
+   * Keyed by the exact service object and `readEvent` identity: service
+   * replacement and hot-patched methods are different native contracts, so a
+   * stale bound is dropped instead of applied. This is adapter runtime state,
+   * never durable profile/session state.
+   */
+  private learnedEventWindowLimit(service: object, readEvent: unknown): number | undefined {
+    const entry = this.learnedEventWindowLimits.get(service)
+    if (entry === undefined) return undefined
+    if (entry.readEvent !== readEvent) {
+      this.learnedEventWindowLimits.delete(service)
+      return undefined
+    }
+    return entry.limit
+  }
+
+  /** Record one proven native raw-event maximum for this exact reader. */
+  private rememberEventWindowLimit(service: object, readEvent: unknown, limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 0 || limit >= MAX_EVENT_WINDOW) return
+    // Successful read-bound adaptation is routine metadata, not a warning:
+    // production warning sinks can append notices to the live transcript.
+    this.learnedEventWindowLimits.set(service, { readEvent, limit })
+  }
+
+  /**
+   * Validate one `before`/`after` raw-event window bound.
+   *
+   * Native `readEvent` accepts an integer in `0..readWindowMax` (50 by default)
+   * and treats omission as 0. The adapter never widens the documented bound and
+   * never coerces a string/fraction.
+   */
+  private eventWindowBound(value: unknown, name: 'before' | 'after'): number {
+    if (value === undefined) return 0
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > MAX_EVENT_WINDOW) {
+      throw codedError('INVALID_ARGUMENT', `history-window ${name} must be an integer between 0 and ${MAX_EVENT_WINDOW}`)
+    }
+    return value
+  }
+
+  /**
+   * Compare one listed file of one native live-turn workspace summary.
+   *
+   * The exact live session/attachment is validated before the call; the
+   * comparison itself is DSH's (`workspaceChanges.diff(sessionId,seq,index,
+   * signal)`), run under the adapter's owned native-UI signal/bound. No file is
+   * read, no path is resolved, no git/watcher is involved and no diff is
+   * inferred by this adapter. Native `undefined` is the honest "no comparison"
+   * outcome, so the DTO omits `diff` instead of inventing an empty one.
+   *
+   * @param params - `{sessionId?, attachmentId?, seq, index}`.
+   * @returns the validated comparison bound to the exact live attachment.
+   */
+  private async workspaceChangeDiff(params: Record<string, unknown>): Promise<WorkspaceChangeDiffResult> {
+    const live = this.live
+    if (live === undefined) {
+      throw codedError('NOT_CONNECTED', 'no live native session has a recorded workspace turn')
+    }
+    const scope = { sessionId: live.agent.session.id, attachmentId: live.attachmentId }
+    this.assertReadScopeParams(params, scope)
+    const seq = nativeSeq(params.seq)
+    if (seq === undefined) {
+      throw codedError('INVALID_ARGUMENT', 'workspace-change-diff requires the native workspace/changes event seq')
+    }
+    const index = params.index
+    if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0) {
+      throw codedError('INVALID_ARGUMENT', 'workspace-change-diff requires a non-negative integer file index')
+    }
+    const changes = this.service<WorkspaceChangesLike>('workspaceChanges')
+    if (typeof changes?.diff !== 'function') {
+      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no native workspace comparison reader')
+    }
+    const diff = changes.diff.bind(changes)
+    let raw: unknown
+    try {
+      raw = await this.nativeUiRead('native workspace change diff', signal => diff(scope.sessionId, seq, index, signal))
+    } catch (error) {
+      if (backendErrorCodeOf(error) !== undefined) throw error
+      throw nativeAgentFailure('the native workspace comparison failed', error)
+    }
+    const validated = workspaceFileDiffOf(raw)
+    if (validated.kind === 'malformed') {
+      throw codedError('RUNTIME_REQUEST_FAILED', `the native workspace comparison was malformed: ${validated.reason}`)
+    }
+    return {
+      sessionId: scope.sessionId,
+      attachmentId: scope.attachmentId,
+      seq,
+      index,
+      ...(validated.kind === 'diff' ? { diff: validated.diff } : {}),
+    }
+  }
+
   // ------------------------------------------------------------- subagents
 
   /**
@@ -5112,23 +5635,6 @@ function wireBytes(value: unknown): number {
   } catch {
     return 0
   }
-}
-
-/**
- * One non-negative safe native event sequence, or `undefined`.
- *
- * DSH's own surface validator accepts exactly `Number.isSafeInteger(value) &&
- * value >= 0 && !Object.is(value, -0)`. This adapter never widens that: a
- * non-finite, non-integer, negative or negative-zero seq is not a native seq
- * and must never reach the UI as one.
- *
- * @param value - raw wire value from a native event.
- * @returns the exact native seq, or undefined when it is not one.
- */
-function nativeSeq(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0)
-    ? value
-    : undefined
 }
 
 /**

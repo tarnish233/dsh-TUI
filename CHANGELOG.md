@@ -1,5 +1,63 @@
 # 版本记录
 
+## v0.1.6（本地 annotated tag）
+
+- **版本范围**：收录 v0.1.5 之后已验收的输入、原生能力、性能与 Review 修复；按用户授权创建本地版本提交与 `v0.1.6` tag，保持 `private:true`，不 push、不发布 registry、不更换全局程序。
+- **交互**：问卷／审批／搜索／短选择靠近编辑框，浏览／管理保留独立页；完整 native detail／Proposal 只读查看并保留原问卷状态。
+- **Pi Ctrl+C**：主输入一次清空并保留可恢复草稿，后台继续；500ms 内再按安全退出。局部 Ctrl+C 只取消／拒绝当前交互，Esc 与显式原生中断保留。
+- **原生能力与修复**：历史大纲／窗口、Workspace summary/diff、Proposal；原生 seq/index/path 与 attachment 身份守卫、只读 disclosure 隔离、显示列／快捷键诊断、渲染／高亮／测量缓存。Schedule 继续暂缓。
+- **验收**：功能源码完整 `pnpm check` **2772/2772**（224 文件）；标记版本前再次核验全部 541 个输入与已验收工作树完全一致。版本调整仅涉及版本标识与文档；重新 build＋strict TypeScript，CLI／welcome／真实 source-only pack／native Pi clear／App／composer／局部取消专项 **106/106**，源码、编译产物、manifest 与既有软链 CLI 一致为 **0.1.6**。专项期间工作树指纹一致，详见 `docs/ACCEPTANCE.md` 与 `.cache/release-v0.1.6/verification.log`。
+
+> 下方“未发布／未提交”等描述保留各实施阶段的当时状态，不表示本地 v0.1.6 tag 缺少这些修复；旧阶段的测试数字不是当前完整门禁。
+
+## 未发布：输入邻近弹窗分层与 Pi 式 Ctrl+C
+
+- **呈现分层**：原生问卷／审批、继续问题的实际回答、Ctrl+R 搜索、快速 preset／permission／effort 和 `/attach`／主命令短表单进入编辑框上方；Settings 子操作继承父工作页。Model／Resume／Help／历史／Workspace／Queue／Jobs／检查／Tool／Image／Agents／子会话详情保留独立面板。
+- **单 Editor 与高度预算**：新 `ComposerInteractionHost` 只承载呈现；纯 `measureRows` 与绘制同一几何，短内容不撑满最大 cap。状态 dock／队列摘要／frozen 主输入／footer 与 transcript 共用真实行预算，保留原 Editor、undo、marker、cursor；不是简单把居中 overlay 改成 bottom。
+- **原生完整详情**：`dialog.details`（默认 Ctrl+O）打开 supplied native question.detail／pure Proposal 的只读全内容，返回保留原问卷实例、选中项和自定义回答；请求关闭／attachment 更换同步退休，不能显示 Applied、执行工具、调用 presentResult 或读文件。
+- **Pi 清空／中断分工**：`app.clear` 默认 Ctrl+C，无 busy 分支，清空并保存可撤销草稿，不取消原生 Agent／工具／子 Agent；500ms 内再按退出。Esc 保留局部优先与原生中断；`app.interrupt` 默认未绑定，显式用户绑定仍可中断，旧绑定冲突可见而不改用户文件。其余 CC/readline／Ctrl+D 不改。局部 Ctrl+C 只取消／拒绝当前面板或请求，取消键禁用／移走时不伪造 fallback。
+- **恢复与隔离**：分片粘贴的 Ctrl+C 是内容，扩展协议 release/repeat 不产生第二次退出；清空退休 clipboard／file／queue-read 结果而不取消后台执行。无 native human inbox 时 busy Up 恢复清空前草稿，不被空 dequeue 覆盖。
+- **最终验收**：四个 `cloudagent/glm-5.3` 分域完成，新增正式回归 **94** 项；完整冻结 `pnpm check` **2772/2772**（224 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，553357ms，EXIT 0），`.cache/composer-full-check-final.log`，运行前后完整工作树指纹一致。Parent 原生 composition 19/19；Ctrl+C／Esc／退出／恢复 PTY 10/10，通用 CLI／Settings PTY 2/2；22/22 实际变异断言 red、立即恢复/hash。首轮唯一真实时钟测试差异以固定 store＋renderer clock 修正，原画面全等断言保留，20/20 重复通过。
+- **边界**：无真实模型／Provider、凭据或用户 profile/session 操作；服务器仅只读确认 CC 2.1.318 并在隔离 namespace 空 HOME 跑 `--version`，未做模型探针。没有第二 Harness／模式／配置层／Schedule、全局替换、commit/tag/push/publish。
+
+## 未发布：全面 Review 修复闭环（8 项 P2、3 项 P3）
+
+- **最终完整门禁**：`pnpm check` **2678/2678**（216 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，541365ms，EXIT 0），`.cache/review-fix-full-check-final.log`；运行前后整个 source/test/doc 工作树指纹一致，之后只补本验收数字。
+- **工作区身份**：卡片与 details request 捕获 exact session/attachment；App 验证来源、当前 turn/seq 和 file path，并向原生 diff 命令传入 captured scope。切换立即退休 pointer targets；稳定 turn 卡片替换或 affordance 消失后，旧 press 的 generation 不能在重绘后被重新解释成另一文件／snapshot 的点击。
+- **原生文件索引与 latest-turn**：不再过滤后重编号 `files`；合法空白文件名保留原始 native index、显示为安全引号标签；任何 unusable row 整体 fail closed，text/binary/oversized diff 都交叉验证 native path。同 turn 的 higher seq 替换原卡片并更新 diff seq，lower late seq 不复活旧汇总，latest zero-files 是真实原生事实。
+- **只读历史**：`readonlyDisclosure` 隔离详情投影的 Tool／Thinking／group 展开读取与所有 clear/retain/transfer/toggle；包括自定义 `createView`。不 backup/restore 全局状态，主 transcript 的展开与唯一 editor/draft 始终保留。
+- **输入**：保留跨 CJK／emoji／ZWJ clamp 的 unrounded display goal；goal 带实际 layout width stamp，resize／不同宽度的 snapshot 恢复不重放旧视觉列。快捷键按完整 chord 与真实 resolver 优先级分析新增冲突，sibling suffix 不误报，Settings 拒绝偷走默认 chord 的保存；prefix 单键诊断改为 unreachable／timeout drops prefix，不改变原取消语义。
+- **原生读取与降级**：每侧 TUI cap 仍为 50；仅接受官方 `SESSION_QUERY_INVALID_WINDOW` 的 exact bounded lower-limit 证明，至多一次 narrowing retry，共享原 5 秒 signal/deadline，按 native service/method identity 缓存，严格校验实际 dispatched bounds。成功适配不 warning、不污染主 transcript；native max=0 无法前进时显示真实 partial marker，而非假称完成。Workspace diff 缺 capability 时卡片保持纯汇总，history 需要两条能力才广告；同 attachment 失去能力关闭旧 dialog，恢复后重新启用。
+- **Hover／时序**：Activity/Subagent header hover 先失效 cache；无变化帧仍复用。校正原生时序：durable `tool/call` 是 dispatch admission，早于 prepare／approval，却不证明工具已执行；真实验收确认 pending Proposal 时 owned 文件仍不存在。
+- **回归与变异**：新增正式回归 **61** 项。四域加 Parent 共 **24/24** 定向变异变红、恢复并核对源文件 hash，含重绘后 press retirement、zero-window partial、静默 bound 和 resize scope。Parent 全部 Backend／Input／UI＋App native 复验 **1966/1966**（`.cache/review-fix-final-focused.log`），native **9/9**＋Help **2/2**＋source-only pack **1/1**（`.cache/review-fix-final-native-pack.log`），build／strict TypeScript clean。完整冻结门禁已获本批 2678/2678，不用旧 2617/2617 替代。
+- **边界**：只用 owned HOME/workspace、hermetic stream／fake host；不调用真实 Provider，不改用户 profile／凭据／session，不引入新 Harness／IPC／Pi AgentSession／auth 或 schedule 子系统。Schedule 继续暂缓；未 commit／tag／push／publish／全局安装。
+
+## 未发布：DSH 原生历史、工作区变更与审批 Proposal
+
+- **最终完整门禁**：`pnpm check` **2617/2617**（214 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，532824ms，EXIT 0），`.cache/native-capabilities-full-check-final.log`。首轮 **2615/2617** 仅两项 Help 首屏假设失败：新增 `/history` 后 `/permission` 移到次页；改用现有只读搜索后双模式 **2/2**，再获完整全绿，生产命令路由未改。
+
+- **历史**：挂载官方 `session-turn-outline`，`/history` 通过 `sessionProjections.snapshot(session,['turnOutline'])` 读取整段大纲，并以 `sessionQuery.readEvent` 的每侧最多 50 条窗口打开独立只读 transcript；合并按原生 seq 去重，页数／事件／字节有界，live transcript 不被修改。pending 会话不因只读历史创建 Agent，close／switch／late page 均有身份守卫。
+- **Workspace**：挂载官方 `workspace-changes`，只在 live `workspace/changes` 事件上展示原生汇总，并通过 `workspace-change-diff {seq,index}` 读取原生 text/binary/oversized/coarse 比较；不读文件、不跑 git、不解析宿主机路径，resumed history 不伪造变更。修复官方 recorder 先 append 事件、后发布 summary 的时序：一个 microtask 屏障保持后续事件顺序，close／switch 不发送迟到旧投影。
+- **审批 Proposal**：assistant proposal 阶段只调用 `ctx.tools.get(name, exactAgent).presentCall(parsedArgs)` 并有界缓存，审批显示 **Proposal · not run yet** 原生 diff；不执行工具、不调用 `presentResult`，带 result 或 malformed view 均回退原审批 UI。
+- **验收**：Backend＋三个 UI＋App 合并聚焦 **500/500**，strict TypeScript clean；真实临时 native composition inline＋fullscreen **2/2**，实际覆盖 read-only 沙箱升级审批、Proposed diff、允许一次后 owned 文件写入、live summary/diff、两页 history 与 `/history`。空大纲原生 cursor `-1` 的 App 复验也有独立回归。append 时序变异被新增回归抓住并恢复。日志 `.cache/native-final-parent.log`、`.cache/native-history-workspace-acceptance.log`、`.cache/native-workspace-barrier-mutation.log`。
+- **边界**：未挂 Web frontend、Schedule 或 SessionController，未新增 `/schedule`；Schedule 按用户决定暂缓。全部 native 验收使用 owned HOME/workspace 与 hermetic stream，无真实 Provider／profile／凭据／session 操作，未提交／tag／push／publish。
+
+## 未发布：渲染缓存、懒加载与测量性能
+
+- **最终完整门禁**：`pnpm check` **2513/2513**（206 测试文件，0 fail/cancel/skip/todo，536345ms，EXIT 0），`.cache/performance-full-check-final.log`。
+- **稳定块复用**：CachedBlock／ToolBlock／group 在无 live clock、宽度及 disclosure generation 不变时直接复用已绘 lines，不再每帧组装 viewKey。hover、cwd、Settings、child catalog、session、工具／Thinking disclosure 和 expanded child paint revision 都有显式失效；800 item 未变帧从 800 次 key build 降为 0，毫秒仅作诊断不作测试阈值。
+- **highlight.js 懒加载**：`theme` 导入不再加载 core／20 个 grammar；首次代码块同步返回 byte-identical plain fallback，并只发起一个动态 import，ready 后清 LRU 并通知。Transcript／ImageContentBody 与 DecisionDialog 两类直接 Markdown owner 都使自身 `(text,width)` 缓存失效并退订，failed 保持静默纯文本，无 stale plain cache 或 disposed repaint。
+- **流式 Markdown**：新增 `StreamingMarkdown`，强引用已封存 prefix，只重排 tail；非 append 重置、宽度切换双侧重绘、重复帧数组复用。段落／heading／闭合 fence／math 可 seal；list／quote／table／HTML／reference 等 barrier 清除既有 seal 并终态整文回退。后到 link reference（包括普通 barrier 之后）不会让旧链接文本滞留，fence 内同名文本仍是代码。18 项专项含 5000+ 次逐前缀 differential rendering；父级另跑 4 个定向文档逐字符全等。基准 40-section 流式消息中位 0.0132ms vs 0.3033ms，非门禁阈值。
+- **Dock 测量**：`CcEditor.measureRows()` 通过 seam 复用 vendored `layoutText`／`SelectList` 几何并 memoize，不调用 Editor.paint、不写 scroll／cursor／undo；`DockPromptEditor` 委托 super，App 直接测量 `Prompt` 而非 Container fallback。9 项矩阵覆盖 CJK／emoji／150 行／marker／completion／scroll，重复测量 0 次额外 layout。
+- **验收**：UI 全部 **1061/1061**；Input 全部 **351/351**；父级性能组合 **115/115**，build／strict TypeScript 通过。hover、highlight ready、dialog 退订、unsafe seal、late reference 和测量副作用均做过定向变异并恢复。证据 `.cache/performance-parent.log`、`.cache/render-cache-performance/RESULTS.md`。
+
+## 未发布：Input P2 显示列与跨上下文诊断
+
+- **最终完整门禁**：`pnpm check` **2462/2462**（202 测试文件，0 fail/cancel/skip/todo，512449ms，EXIT 0），`.cache/input-p2-full-check.log`。
+- **竖向移动**：vendored Pi Editor 不再把 UTF-16 偏移当终端显示列。source／target／sticky column 统一使用现有 `visibleWidth`，最终只在字素边界换回 UTF-16 cursor；CJK、emoji／ZWJ、variation selector、combining mark、混合软换行和短宽行保持目标视觉列。补丁及退出条件记录在 `vendor/pi-tui/SOURCE.md` deviation #10。
+- **快捷键诊断**：新增 `cross-context-shadow`，覆盖 fallback layer 死绑定、抢占默认键、chord-prefix 吞键和 modal interrupt priority（后续 Review 校正了原“超时后执行”的错误提示）。只报告相对声明 baseline 新增的问题；同上下文冲突、既定 local-over-global 优先级和 no-op 重保存不重复报告。App 将自带 `modeBindings` 同时传给 live／save-preview 的 `baselineBindings`，不会把产品预设误报为用户冲突。
+- **验收**：新增 `test/input-vertical-columns.test.ts` 5 项与 `test/input-keymap-shadow.test.ts` 6 项；竖向补丁变异使 4/5 测试变红，删除跨上下文检测使 6/6 变红，误报过滤器变异使 5/6 变红，恢复后全绿。Parent 独立 Input＋App＋Keyboard UI **369/369**，build／strict TypeScript 通过；`.cache/input-p2-parent.log`。未新增 `/hotkeys`、配置层级或第二编辑器状态。
+
 ## 未发布：源码打包与 Backend P2 修复（基于 v0.1.5）
 
 - **最终完整门禁**：`pnpm check` **2451/2451**（200 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，513316ms，EXIT 0），证据 `.cache/p2-full-check.log`。

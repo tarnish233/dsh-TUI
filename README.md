@@ -1,12 +1,12 @@
-# DSH TUI · v0.1.4
+# DSH TUI · v0.1.6
 
 ![DSH TUI app icon](assets/icon/dsh-tui.svg)
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.4**（`private: true`），收录原生 Skills 补全与 Enter 提交修复、连续单页 Settings、统一弹窗与队列／工具／图片查看优化，以及 Rex／Ghostty 终端协议适配；保留已验收的 Subagent 进度、分组、名字导航与原生 Stop/Reply。按用户确认，仅创建本地版本提交和 annotated `v0.1.4` tag，**未推送或发布**，不改全局安装。当前验收见 [验收记录](docs/ACCEPTANCE.md)；历史阶段记录只作对照。
+当前版本为 **v0.1.6**（`private: true`）。问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
 
-**该 tag 后的当前工作树**已完成 A1–A10 修复、当前 SDK 内适配层收敛，以及两批原生 UI 功能／Todo 固定区／共享配色和三状态区共存修复，并新增 `--demo tasks` 离线交互场景及固定区／混合活动组的展示层整体收敛，以及 Node 精确诊断／Thinking handoff／hover／标题四项现场修复及精确 Thinking 尾窗缓存优化；最新完整 `pnpm check` **2323/2323**（190 测试文件）。Jobs／Goal、显式 rename/fork、安全原生默认设置、能力摘要、文件输入／命令图片、continued questions 和有效目录已接入；DSH 业务所有权不变。原生专项 10 cases、新增双模式 PTY 通过。前次 1833/1861/1910 是独立历史验收。改动尚未提交或打新 tag，版本仍为 0.1.4；见 [两批完成记录](docs/NATIVE-UI-BATCHES.zh-CN.md)、[修复对照](docs/NATIVE-API-FIXES.zh-CN.md) 与 [收敛完成记录](docs/ADAPTER-CONVERGENCE-COMPLETE.zh-CN.md)。
+本版本同时收录 v0.1.5 之后的原生历史、Workspace 变更与审批 Proposal、渲染／高亮／测量缓存、显示列导航和全面 Review 修复。功能基线完整 `pnpm check` **2772/2772**（224 测试文件）；版本专项与完整边界见 [验收记录](docs/ACCEPTANCE.md)。按用户授权，仅创建本地版本提交和 annotated `v0.1.6` tag，**不推送远端、不发布包、不更换全局程序**。构建后退出旧 TUI，再运行 `dsh-tui` 即可加载新版本；`dsh-tui --version` 应为 `0.1.6`。
 
 Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
 
@@ -69,7 +69,9 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 
 相邻工具与纯原生子任务状态通知可进入 `Activities` 混合展示组，分别统计 tools／updates，保留原始身份、顺序与原文；真实子任务消息、用户输入／可见文本／todo／diff 等不被混入。两个分组设置都开启才启用，Ctrl+O／点击展开复用原有 disclosure。规则见 [展示层整体收敛](docs/PRESENTATION-COMPOSITION.zh-CN.md)。
 
-- CC 风格主输入、历史搜索、kill/yank、undo、原子大段粘贴、外部编辑器、Unix 挂起恢复；一套可热更新的键位设置。
+- CC/readline 编辑命令、kill/yank、undo、原子大段粘贴、外部编辑器、Unix 挂起恢复；一套可热更新的键位设置。主 Ctrl+C 按用户选择采用 Pi 清空／500ms 二次退出规则，不中断后台。
+- 输入邻近交互：问卷、审批、历史搜索、主命令短表单与快速选择共享编辑框上方的真实高度预算，保留唯一主 Editor；完整 native 计划／Proposal 可打开只读详情，返回保留原回答。
+- 原生 `/history` 大纲与有界只读事件窗口、live Workspace 原生 summary/diff、审批 `Proposal · not run yet`；不改 live transcript、不扫描工作区或执行预览工具。入口只按 mounted capability 开放。
 - `@` 文件／目录 mention 直接消费 DSH 原生 `fileReferences` provider：根输入候选跟随当前根 Agent 的 effective cwd 与工具命名空间，支持模糊路径、目录下钻和带空格引号；接受候选只填草稿，不读取或 stage 文件。子任务 Reply 不借用根目录候选。`@path` 是由模型按原生指引调用 `read` 的普通文本，和显式 `/attach` FileBlock 分开。
 - inline / fullscreen 两种 Pi renderer；工具卡、Markdown、原生 Diff、连续工具分组、Input/Output 预览与只读 Inspector；思考折叠摘要。
 - 真实模型流式上屏与结算、排队/steering、取消、权限预设、审批与问题；`/model` 模型选择器（搜索、provider 分组、effort 保留）。
@@ -99,13 +101,13 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | Ctrl+_ / Ctrl+Shift+- | 撤销 |
 | Ctrl+R | 历史搜索；Tab/Esc 放回编辑，Enter 发送，Ctrl+C 取消 |
 | Ctrl+S | 暂存 / 恢复完整草稿 |
-| Ctrl+C | 全局中断前台操作（包括审批/问题中）；空闲有草稿时先清空并保存，再按一次退出 |
-| Esc | 关闭局部面板；审批中拒绝该工具；问题中取消该问题。回合进行中或已有排队消息时，不发送当前草稿，把队列发出去。空闲且没有队列时，非空草稿双 Esc 清空 |
+| Ctrl+C | 主输入清空并保留可恢复草稿，后台继续；500ms 内再按退出。弹窗内只取消／拒绝当前交互 |
+| Esc | 先取消局部状态；审批拒绝／问题取消。child Reply 先返回根目标并保留草稿；根回合运行中原生中断，有队列时保留既有释放队列语义。空闲非空草稿双 Esc 清空 |
 | Ctrl+D | 有文本删字符，空输入重复确认退出 |
 | Ctrl+L | 重绘，保留草稿和会话 |
 | Ctrl+G / Ctrl+X Ctrl+E | 外部编辑器（VISUAL / EDITOR / nano） |
 | Ctrl+T | 显示／隐藏编辑器上方原生 Todo 清单（不追加对话摘要） |
-| Ctrl+O | 全局工具折叠 / 展开 |
+| Ctrl+O | 工具折叠／展开；问卷／审批有完整 native 内容时打开只读详情 |
 | Ctrl+X Ctrl+O | 工具 Inspector；`[` / `]` 或 Alt+Left/Right 浏览调用，Tab 切 Input/Output，c 复制 |
 | Alt+P | 模型选择 |
 | Shift+Tab | 循环 DSH 暴露的权限预设（执行原生 `/permission`，不切换 plan） |
@@ -119,7 +121,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 | Ctrl+X Ctrl+Q | 打开原生队列弹窗；按 message id 编辑、立即发送或取消一条排队消息 |
 | Ctrl+F（弹窗内） | 搜索当前 Settings / Keyboard / Help / Tools / Agents / Queue / Resume 内容；字段内仍是 readline 的字符右移 |
 
-回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel；`Ctrl+X Ctrl+Q` 打开同一个原生队列的搜索弹窗，不会建立第二份队列。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只中断当前回合，队列留在原地，不会自动接着发。
+回合进行中按 Enter 把消息排进 DSH inbox。排队的消息列在输入框上方，每一行可以 Send now、Edit 或 Cancel；`Ctrl+X Ctrl+Q` 打开同一个原生队列的搜索弹窗，不会建立第二份队列。Up 在空输入框仍把可收回的消息取回同一个草稿。Ctrl+C 只清空主草稿，不取消当前回合或队列，也不额外触发发送；显式配置的 `app.interrupt` 仍可调用原生中断。
 
 Subagent 进度紧贴编辑框上方，保留两行设计：蓝色 `● Agents` 标题、树形 agent 摘要和下一行原生当前活动。运行图标使用和 Editor Working 相同的 `· → ✻ → ✶ → ✳` 动态帧与 App 的同一个 100ms 时钟；没有每个 child 自己的计时器，根会话 ready／空闲时仍转，但不改根 busy、退出确认、计数或模型调度。进度只显示 `running`／`initializing` child；`idle`、完成、失败或停止项在原生状态更新后立即退场，没有活跃项就完全收起。标题与溢出数只统计已知活跃项，完整原生目录不删除；continuable child 再次运行会重新出现。明确回复目标若已 idle，只保留 Editor 的 `Replying to …` 提示，不用进度行冒充正在工作。`Settings → Agents` 可隐藏整个进度区，也可独立关闭 Agents 消息分组；两者都不停止或删除原生 child。
 
@@ -139,7 +141,7 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 
 - **Skills / `/技能名`**：`/` 补全合并 DSH 原生用户可调用技能，标注 `Skill`／`user-only`；Tab 只补入草稿，Enter 按原有提交规则发送。新空会话用 DSH 公开 `agentPresets.acquireScope` 读取 preset 目录，**启动即可以列出技能且不创建 Agent**；live 会话优先读取当前 preset 的 Skills registry。人类目录与模型工具可见性独立，不因 `skill` schema 未披露而隐藏。技能引用原文交给 DSH pre-step 加载与注入，同名原生命令优先，TUI 不展开正文。`/help` 始终保留只读 Skills 区，区分元数据服务不可用、不完整和真正为空；不可用／失败不会被缓存为永久空目录。根目录不假冒 child 回复范围。详见 [Skills](docs/SKILLS.md)；`dsh-tui --demo skills` 仅展示离线元数据 fixture。
 - **`/compact`**：摘要目标仍是最近一次实际路由时，原生插件接缝继承该请求的显式 reasoning effort；不同摘要模型不串用 effort，没有历史 effort 时保留 DSH 默认。消息、工具和输出预算不变。若压缩失败，界面在原生提示的下一行显示按 command/session 关联、脱敏且限长的 `Native cause`，不再只剩笼统错误。
-- **Subagents / `/agent`**：根会话 `/agent` 是打开现有 Agents 目录的 UI 导航，不注册第二套 DSH 业务命令、不创建或恢复 child。进度只显示原生 running／initializing 项，保持摘要＋活动两行；结算后隐藏，但主对话原生事实行和 Agents 历史仍保留。名字点击立即打开详情／加载界面，Esc 返回原 Editor；只有 `Agents`／`+N more` 文字打开完整树，其余进度文本可选字复制但不跳转。External 在历史中是没有本地 transcript 的叶子，不显示伪链接。`Ctrl+X Ctrl+A` 仍可打开树；R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips。Ctrl+C 在活动 child／回复目标上只中断该 child；child 回复目标中的 `/...` 仍是 child 文本，先 Esc 返回根会话才执行 `/agent` 等根命令。queue/steer、文本／图片、accepted receipt、失败草稿、子审批来源与父子 transcript 隔离均保留。token/timing 仍为 child session 累计值，没有假造 Pi turn/tool/context 计数；快捷键在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。`dsh-tui --demo subagent` 可看离线示例。
+- **Subagents / `/agent`**：根会话 `/agent` 是打开现有 Agents 目录的 UI 导航，不注册第二套 DSH 业务命令、不创建或恢复 child。进度只显示原生 running／initializing 项，保持摘要＋活动两行；结算后隐藏，但主对话原生事实行和 Agents 历史仍保留。名字点击立即打开详情／加载界面，Esc 返回原 Editor；只有 `Agents`／`+N more` 文字打开完整树，其余进度文本可选字复制但不跳转。External 在历史中是没有本地 transcript 的叶子，不显示伪链接。`Ctrl+X Ctrl+A` 仍可打开树；R 把同一个主 Editor 切到 continuable child 回复目标，S 停止 running/initializing child，两种操作也有可点击 chips。Ctrl+C 清空主草稿但不停止 child；停止使用现有 S 操作或显式配置的 `app.interrupt`；child 回复目标中的 `/...` 仍是 child 文本，先 Esc 返回根会话才执行 `/agent` 等根命令。queue/steer、文本／图片、accepted receipt、失败草稿、子审批来源与父子 transcript 隔离均保留。token/timing 仍为 child session 累计值，没有假造 Pi turn/tool/context 计数；快捷键在 `/settings` 修改，详见 [Subagents](docs/SUBAGENTS.md)。`dsh-tui --demo subagent` 可看离线示例。
 
 - **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；`Settings → Agents → Group agent messages` 独立控制这一展示，旧版本首次读取会沿用当时 `Group tool calls` 的值，迁移后与 Tools 完全独立，恢复默认也不回读 Tools。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
 
@@ -149,7 +151,7 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 - **`/preset`**：原生 Agent preset 名册；空白会话可原地切换，已开始的会话保留给下一次 `/new`，底栏用 `next preset` 区分。
 - **正常成功不刷对话区**：模型、effort、权限和 preset 的成功切换只更新底栏（自动标题显示在 Settings）；失败、保存异常和原生警告仍可见。`/preset status`、`/effort status`、裸 `/permission` 不回显状态列表，当前值看底栏。
 - **取消与排队**：中断调用原生 `Agent.cancel({kind:'user'}, {keepInbox:true})`；草稿与两个 inbox 队列保留，取消本身不主动续发。空输入 Up/Ctrl+P 取回可编辑的人类文本；后台任务唤醒仍归 DSH。已完成工具副作用不回滚。
-- **审批与问题**：问题中 Esc 以原生 `{cancelled:true}` 结算；Ctrl+C 中止整个回合；审批 Esc 返回原生 `rejected`，与回合 abort 的 `cancelled` 区分。
+- **审批与问题**：编辑框上方显示当前 native 决策；问题中 Ctrl+C／Esc 以原生 `{cancelled:true}` 结算，审批返回原生 `rejected`，不额外全局 abort。Ctrl+O 打开 supplied native detail／pure Proposal 的只读完整内容，返回保留原回答；显式 `app.interrupt` 的回合 abort 仍与局部取消区分。
 - **`/reload`**：空闲且无待决策时，先做本层 idle 检查，再调用 `hmr.runExclusive(() => hmr.reconcileProfile())`。当前 Agent、会话、transcript、草稿和缓存不重建；结果与 restart/pending 提示来自 DSH。忙碌、保留队列或待决策时拒绝。普通配置与插件启停由 DSH 原生重组；需要重启的情况以原生结果为准。直接重载前端插件会卸载/重建界面，不自动恢复最近会话。
 - **`/settings`**：可搜索、可滚动的**连续单页**，用 **General / Thinking / Tools & Diff / Agents / Images / DSH / Keyboard** 分组标题分隔，不再切换 tab 页面。Up/Down 跨组逐项移动；Tab/Shift+Tab（或 Right/Left）跳到下一／上一组，搜索不会被清空。原有 Tools／Diff、Thinking、screen、auto title 与 Keyboard shortcuts 都保留；新增 Agents 进度、Agents 独立分组、图片自动／文本预览、全屏选字复制、队列默认折叠、减少动态效果，以及 General 的终端状态／标题／通知。布尔直接切换，枚举和数字进入明确选择／编辑，每项可恢复默认；保存失败只回退该项并在当前弹窗显示。DSH 分类只提供当前 model／effort／preset／permission／Skills／plan 的状态与已有 picker／command 导航，默认 preset／permission 等 profile 写入仍须安全 native 接缝，未用本地设置冒充。设置写同一个 `settings.json`，不增加 profile/覆盖层级。
 - **`/resume`**：启动参数 `--resume <id>` / `-r <id>`，或 `-r` 不带 id 打开当前目录会话选择器（`Ctrl+A` 切当前目录/全部，模糊搜索，Esc 保留新会话）；不自动选择最近会话。重复恢复当前 id 按 DSH 原生语义保留已有 Agent/attachment，不取消流式、队列或待决策；切换其他 id 先准备成功再释放旧连接，失败仍可继续使用当前会话。
@@ -203,6 +205,7 @@ pnpm check          # build + typecheck + test
 - [图片投影、预览、附件输入与边界](docs/IMAGES.md)
 - [模型/provider 原生投影](docs/PROVIDERS.md) · [Skills 原生接入](docs/SKILLS.md)
 - [DSH 同进程集成](docs/BACKEND.md)
+- [输入邻近交互合同](docs/COMPOSER-INTERACTION-CONTRACT.md) · [原生历史与工作区](docs/NATIVE-HISTORY-WORKSPACE.md) · [审批 Proposal](docs/APPROVAL-PROPOSAL.md)
 - [Rex / Ghostty 终端支持](docs/TERMINALS.md) · [Grok Build / CC 深度对照](docs/TERMINAL-RESEARCH.zh-CN.md)
 - [主题与启动区](docs/THEME.md) · [鼠标抽象](docs/MOUSE.md)
 - [总体方案](docs/PROPOSAL.zh-CN.md) · [验收记录](docs/ACCEPTANCE.md)

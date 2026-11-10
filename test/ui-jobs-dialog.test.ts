@@ -98,6 +98,7 @@ function harness(options: {
   onRefresh?: () => void
   onInterrupt?: () => void
   rows?: number
+  keymap?: ReturnType<typeof createCcKeymap>
 } = {}): Harness {
   const tui = createFakeTui(options.rows ?? 26, 100)
   const events: string[] = []
@@ -108,7 +109,7 @@ function harness(options: {
     ...(options.loading === undefined ? {} : { loading: options.loading }),
     ...(options.maxOutputLines === undefined ? {} : { maxOutputLines: options.maxOutputLines }),
     ...(options.initialState === undefined ? {} : { initialState: options.initialState }),
-    keymap: createCcKeymap(),
+    keymap: options.keymap ?? createCcKeymap(),
     ...(options.onInterrupt === undefined ? {} : { onInterrupt: options.onInterrupt }),
     ...(options.wired === false ? {} : {
       onOpenOutput: (entry: InspectedJob) => {
@@ -253,7 +254,7 @@ test('selection is the opaque native id: refresh keeps it, removal retires it', 
   assert.equal(f.dialog.selectedId, 'bash-1a2b', 'a later roster selects a listed row, not the vanished one')
 })
 
-test('list keys follow the shared list actions and Ctrl+C is the configured interrupt', () => {
+test('list keys follow the shared list actions; default Ctrl+C closes locally and an explicit interrupt stays native', () => {
   const f = harness({ snapshot: snapshot(JOBS), onInterrupt: () => { f.events.push('interrupt') } })
   f.dialog.handleInput(END)
   assert.equal(f.dialog.selectedId, 'wf-9x')
@@ -262,11 +263,19 @@ test('list keys follow the shared list actions and Ctrl+C is the configured inte
   f.dialog.handleInput(UP)
   assert.equal(f.dialog.selectedId, 'wf-9x', 'list.previous wraps in native order')
   f.dialog.handleInput(CTRL_C)
-  assert.deepEqual(f.events, ['interrupt'], 'app.interrupt is forwarded, not turned into a local close')
-  assert.equal(f.dialog.isDone, false)
-  f.dialog.handleInput(ESC)
-  assert.deepEqual(f.events, ['interrupt', 'close'])
+  assert.deepEqual(f.events, ['close'], 'default app.clear is the local list.cancel here')
   assert.deepEqual(f.dialog.render(80), [], 'a closed modal paints nothing')
+
+  const explicit = harness({
+    snapshot: snapshot(JOBS),
+    keymap: createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+    onInterrupt: () => { explicit.events.push('interrupt') },
+  })
+  explicit.dialog.handleInput(CTRL_C)
+  assert.deepEqual(explicit.events, ['interrupt'], 'an explicit app.interrupt override is forwarded')
+  assert.equal(explicit.dialog.isDone, false)
+  explicit.dialog.handleInput(ESC)
+  assert.deepEqual(explicit.events, ['interrupt', 'close'])
 })
 
 test('a disposed or closed dialog ignores late native snapshots', () => {

@@ -48,6 +48,24 @@ Editor methods that matter to the app:
   cursor, undo, kill ring, history or pastes. A real switch cancels only a
   pending chord opened by this editor; another editor's chord on a shared
   keymap is left alone. See `docs/MODEL-INPUT-API.md`.
+- `measureRows(width: number): number` – **rows this editor paints at `width`,
+  exactly `render(width).length`**, computed without painting
+  (`MeasurableComponent`; the dock's measure path). It emits no line and
+  changes no state: `scrollOffset`, `lastWidth`,
+  `renderedVisibleLineCount`/`renderedAutocompleteHeight`, the cursor, undo,
+  kill ring, paste/attachment registries and the completion menu are untouched,
+  so measuring never moves the viewport and a render after a measurement is
+  byte-identical. It reuses the editor's own layout path
+  (`layoutText`/`wordWrapLine`, `visibleWidth`, `SelectList.render`) – there is
+  no second wrap or width implementation – and memoizes the answer under a
+  fingerprint of every input the height reads: `width`, `paddingX`, terminal
+  rows (the 30%-of-height visible cap, min 5), draft text, cursor line/column,
+  scroll offset, the paste/image/file marker id sets (markers are atomic for
+  wrapping) and completion state (open/closed, candidate count, selection,
+  `autocompleteMaxVisible`). Repeated measurements of unchanged state add no
+  layout; any of those inputs invalidates it. `focused` and theme/border text
+  are deliberately not inputs: they change cells, never the row count (a
+  decorator subclass such as the App's `PromptEditor` keeps the same height).
 - `printableInput(data): string | undefined` (module export) – decode a raw
   terminal chunk as printable text for text-field routing (plain/Shift Kitty
   CSI-u included; Ctrl/Alt keys, ESC sequences, C0 and DEL return undefined).
@@ -214,7 +232,8 @@ send gate must count file parts too (`part.type === 'image' || part.type === 'fi
 
 | action | default key(s) | notes |
 | --- | --- | --- |
-| `app.interrupt` | `ctrl+c` | global interrupt; completion/jump/pending/dialog UI cannot swallow it (paste bytes are not keys) |
+| `app.interrupt` | (unbound) | explicit native interrupt; no shipped default. A configured single key keeps priority before a pending chord and before the chain in the read-only/modal contexts. An explicit Ctrl+C binding collides with the `app.clear` default and is reported, never rewritten |
+| `app.clear` | `ctrl+c` | chosen installed Pi 1.5.1 main-input policy (**not a current-CC match**): clears the root draft without a native Agent/tool cancel; the App owns `captureDraft` + undoable `replaceDraftText` and the 500 ms second-press exit. Root editor/completion emit it once; local dialog/list/search/pickers resolve their cancel first; paste bytes are content and Kitty releases/repeats never dispatch a second clear |
 | `app.cancel` | `escape` | contextual fallback: editor closes completion and restores the history-browsing draft first, then forwards |
 | `app.exit` | `ctrl+d` | editor emits it only when the draft is empty; this guard is independent of binding priority |
 | `app.redraw` | `ctrl+l` | preserve draft |
@@ -228,6 +247,7 @@ send gate must count file parts too (`part.type === 'image' || part.type === 'fi
 | `tool.details.next-section` | `tab`, `right` | `toolDetails` only |
 | `tool.details.previous-section` | `shift+tab`, `left` | `toolDetails` only; cannot cycle permission presets while the modal owns the key |
 | `tool.details.copy` | `c` | `toolDetails` only; `c` stays plain text in the main editor |
+| `dialog.details` | `ctrl+o` | TUI extension; `dialog`/`modalList` contexts (and modal chains that fall back through `dialog`). Opens the full read-only native decision details from already supplied content; never answers, executes tools, reads paths or fabricates an applied label. Plain Ctrl+O stays `app.tools.expand` in the root prompt |
 | `app.todo` | `ctrl+t` | CC Ctrl+T is todo, not transpose. The App now uses it as the live dock visibility toggle for native todos above the editor; the binding id/default are unchanged. |
 | `app.thinking.toggle` | (unbound) | DSH/Pi concept; bind explicitly |
 | `app.model.select` | `alt+p` | Ctrl+P stays history |
@@ -240,7 +260,7 @@ send gate must count file parts too (`part.type === 'image' || part.type === 'fi
 | `image.details.toggle-preview` | `p` | TUI extension; `imageDetails` only. Renderer-only automatic/text-only display toggle (text-only starts no read/decode, changes no facts); `p` stays text in the prompt and modal fields |
 | `app.subagents.details` | `ctrl+x ctrl+a` | TUI extension; opens the native Agents overlay (`subagentList` / `subagentSession`). Plain Ctrl+A stays line start in the prompt |
 | `subagent.reply` | `r` | TUI extension; `subagentList`/`subagentSession` only. Sets the App-owned reply target; leave it with `app.cancel`. Plain `r` stays text in the prompt and every other context |
-| `subagent.interrupt` | `s` | TUI extension; `subagentList`/`subagentSession` only. Stops the focused child inside the overlay. Ctrl+C remains the global `app.interrupt` |
+| `subagent.interrupt` | `s` | TUI extension; `subagentList`/`subagentSession` only. Stops the focused child inside the overlay. Default Ctrl+C cancels the overlay locally (`list.cancel`); only an explicit `app.interrupt` override takes priority |
 | `app.suspend` | `ctrl+z` | parent must restore terminal state; see `docs/INPUT-LIFECYCLE.md` |
 | `app.message.sendNow` | (unbound) | app-state dependent |
 | `app.message.followUp` | (unbound) | app-state dependent |
@@ -265,14 +285,16 @@ reads, so those bytes also navigate tools inside `toolDetails`; in the editor
 they remain word motion. All six tool-details actions appear in the same
 grouped Settings shortcut list and use the same single `keybindings.json`
 override map; there is no modal-specific config.
-In `toolDetails` (as in the two picker contexts) the configured simple
-`app.interrupt` key wins even while a chord is pending. The App owns the
-interrupt handler/DSH cancellation; the input layer only emits `app.interrupt`.
+In `toolDetails` (as in the two picker contexts) default Ctrl+C resolves the
+local `list.cancel`; an **explicitly configured** simple `app.interrupt` key
+wins even while a chord is pending. The App owns the explicit interrupt
+handler/DSH cancellation; the input layer only emits `app.interrupt`.
 
 The image-details viewer uses the `imageDetails` context
 (`imageDetails → list → dialog → global`; **no `editor` fallback**), exactly like
-`toolDetails`: Esc closes the viewer (not `list.cancel`), the configured
-`app.interrupt` key always wins (even mid-chord), and `CcEditor` in this context
+`toolDetails`: Esc closes the viewer (not `list.cancel`), default Ctrl+C is
+the local cancel while an explicit `app.interrupt` override wins (even
+mid-chord), and `CcEditor` in this context
 discards printable input, editing bytes and bracketed paste instead of inserting
 them. `image.details.toggle-preview` (`p`) is a renderer-only automatic /
 text-only display toggle; text-only mode must not start a read/decode and
@@ -286,15 +308,15 @@ list) and `subagentSession` (one agent's session view):
 `app.subagents.details` (`ctrl+x ctrl+a`, TUI extension) opens it and is
 forwarded through the same `APP_FALLBACK_ACTIONS` path as the other overlay
 openers. The surface reuses `list.previous/next/pageUp/pageDown/first/last/
-select/cancel/select-digit`, `dialog.*` and global `app.interrupt`, and adds
+select/cancel/select-digit`, `dialog.*` and the global app layer, and adds
 exactly two overlay-local, app-implemented actions:
 
 - `subagent.reply` (default `r`): the App sets the focused child as the reply
   target. Leaving the target stays `app.cancel`; there is no second
   target/mode action on the root editor.
 - `subagent.interrupt` (default `s`): stops the focused child inside the
-  overlay. It does not rebind Ctrl+C; global `app.interrupt` keeps its priority
-  and the root Ctrl+C semantics.
+  overlay. It does not rebind Ctrl+C; default Ctrl+C resolves `list.cancel`
+  and only an explicit `app.interrupt` override takes priority.
 
 Both actions are ordinary rows in the one grouped Settings shortcut list and
 the one `keybindings.json` override map (remap, disable, or reset by deleting
@@ -308,10 +330,11 @@ editor; editor-implemented (root-only) commands and root-draft app actions
 fail closed, while `subagent.reply`/`subagent.interrupt` are emitted to
 `onAction` and the App performs the operation. The input layer only resolves or
 emits the action; it never calls the backend, and without an `onAction` handler
-the key has no effect. `app.cancel`, `list.cancel` and global `app.interrupt`
-keep their documented behavior. Global `app.exit` is **not** swallowed: Ctrl+D
+the key has no effect. `app.cancel`, `list.cancel` and an explicit
+`app.interrupt` keep their documented behavior. Global `app.exit` is **not** swallowed: Ctrl+D
 still reaches the App, which keeps its existing empty-input policy. Esc resolves
-to `list.cancel` and Ctrl+C keeps interrupt priority over a pending chord.
+to `list.cancel`; default Ctrl+C does the same and an explicit interrupt
+override keeps priority over a pending chord.
 
 Plain keys: the frontend can keep using Pi's `getKeybindings().matches` for
 non-chord app keys, but then the YAML/JSON override in `CcKeymap` is not in
@@ -492,6 +515,9 @@ const keymap = createCcKeymap({
     "app.todo": null,                       // explicitly disabled
     "app.thinking.toggle": "alt+t",         // opt-in binding
   },
+  // Bindings the host always composes (per-screen mode bindings). They are the
+  // baseline for cross-context diagnostics, not user overrides.
+  baselineBindings: { "historySearch.next": ["ctrl+r", "down", "ctrl+n"] },
   chordTimeoutMs: 3000,
 })
 
@@ -501,7 +527,15 @@ keymap.getPendingChordGeneration() // ownership token (null when idle)
 keymap.cancelChord()           // notifies onChordChange(null) when it was pending
 keymap.onChordChange((prefix) => {}) // subscribe; returns unsubscribe
 keymap.getDiagnostics()        // errors/warnings: unknown action, invalid key,
-                               // duplicate binding, byte ambiguity, chord shadow
+                               // duplicate binding, byte ambiguity, chord shadow,
+                               // cross-context shadow (see docs/INPUT.md).
+                               // shadow analysis is per full key sequence: kinds
+                               // single / same-sequence / chord-prefix /
+                               // chord-sequence / interrupt-priority; a chord
+                               // behind another chord or a single key behind a
+                               // chord prefix is unreachable (the prefix is
+                               // dropped on timeout/mismatch, never replayed)
+keymap.getConflicts()          // the conflict subset of getDiagnostics()
 keymap.getHelp(context?)       // metadata for Settings/diagnostic consumers
 ```
 
@@ -568,9 +602,10 @@ Host guidance (contract):
   and takes no new single-key global binding. `queue.send-now` needs a terminal
   that reports Ctrl+Enter (Kitty / modifyOtherKeys); plain Enter stays
   `list.select`.
-- The configured simple `app.interrupt` key keeps priority over local bindings
-  and pending chords in all five new contexts (as in the picker/details/Agents
-  contexts), so Ctrl+C is never swallowed by `list.cancel`.
+- Default Ctrl+C resolves the local `list.cancel`/`dialog.cancel` row in all
+  five new contexts (as in the picker/details/Agents contexts) and never
+  reaches the hidden root clear. An **explicitly configured** simple
+  `app.interrupt` key keeps priority over local bindings and pending chords.
 - All rows are ordinary `CC_ACTIONS` entries: remap/disable (`null`)/reset in
   the one grouped Keyboard list and `keybindings.json` map. Local rows never
   become global (e.g. `keybindings.disable` Ctrl+D is not a global disable and
@@ -586,9 +621,24 @@ Host guidance (contract):
   Empty-draft Delete is a no-op; disabling/remapping `app.exit` also disables
   Ctrl+D exit (`editor.isActionBoundToKey("app.exit", data)` is public for
   similar contextual checks).
-- Ctrl+C is a global keymap action, not a hardcoded branch. Esc closes local
-  completion/history state first and a consumed local Esc does not also emit
-  `app.cancel`.
+- Ctrl+C is a global keymap action (`app.clear` at the root), not a hardcoded
+  branch. Esc closes local completion/history state first and a consumed local
+  Esc does not also emit `app.cancel`. Ctrl+C while completion is open clears
+  the whole root draft once (Pi checks it before base autocomplete handling)
+  and the stale menu closes; it is not an `autocomplete.cancel`.
+- The input layer never measures the App's 500 ms clear/exit window, never
+  simulates shutdown, and never rewrites the draft. It suppresses Kitty key
+  releases entirely and suppresses repeated `app.clear` events so a held
+  Ctrl+C cannot become an accidental second exit press. Legacy terminals that
+  cannot report repeats keep the physical repeat indistinguishable; that limit
+  is documented in `docs/INPUT.md`.
+- `app.clear` fails closed outside the root prompt/completion contexts: a
+  disabled `historySearch.cancel`, a picker cancel, a modal search cancel or a
+  read-only surface never resurrects a hidden-root clear or invents a
+  replacement action.
+- `dialog.details` is registered in `dialog`/`modalList` and inherits through
+  the shared dialog fallback; it is remappable/disableable/reset like every
+  other row and never adds a second editor or durable store.
 - Character jump consumes only a real target character; control keys (including
   DEL/Backspace and escape sequences) cancel the jump and continue through the
   same `CcKeymap` (Ctrl+W stays whitespace kill, Backspace stays CC backward
@@ -603,11 +653,11 @@ Host guidance (contract):
   custom list components. Only picker contexts get this text-first routing.
 - In picker contexts, `toolDetails`, `imageDetails`, `subagentList`,
   `subagentSession`, `settingsList`, `keybindingsList`, `modalList`,
-  `queueList` and `modalSearch` the configured simple
-  `app.interrupt` key keeps priority over local bindings (e.g. `list.cancel`
-  Ctrl+C) **and over a pending chord**. The chord is cancelled and
-  `app.interrupt` is dispatched, so the modal/picker/overlay cannot swallow
-  Ctrl+C. Disabled provider actions never fall through to a generic
+  `queueList` and `modalSearch` default Ctrl+C resolves the local
+  cancel/restore/reject row, never the hidden root clear. An **explicitly
+  configured** simple `app.interrupt` key keeps priority over local bindings
+  **and over a pending chord**; the chord is cancelled and `app.interrupt` is
+  dispatched. Disabled provider actions never fall through to a generic
   `editor.complete` event in the picker (only `model.provider.*` events may
   change the provider group).
 
@@ -631,4 +681,7 @@ Terminal ownership, start/stop, raw-mode restore, exit hooks and the disposed
 
 See `docs/INPUT.md`. Highlights: CC yank-pop legality, PageUp/PageDown inside
 the editor, `Ctrl+Shift+R`, `app.message.*`, Mac Option-as-Meta in terminals
-that don't send CSI-u, and legacy `^H` ambiguity. No Node readline is used.
+that don't send CSI-u, and legacy `^H` ambiguity. The Ctrl+C clear/500 ms exit
+policy is chosen from installed Pi 1.5.1 and is **not a current-CC match**;
+`app.interrupt` has no shipped default. Legacy terminals cannot report Kitty
+releases/repeats. No Node readline is used.

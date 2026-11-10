@@ -56,6 +56,52 @@ async function* stream(ctx, options) {
     yield { type: 'finish', reason: { kind: 'tool-calls' } }
     return
   }
+  const workspaceFilesId = 'fixture-workspace-normal-file'
+  const hasWorkspaceFiles = messages.some(message => message.role === 'tool' && message.toolCallId === workspaceFilesId)
+  if (text.includes('fixture:workspace-files') && !hasWorkspaceFiles) {
+    // Both writes use the native pipeline in the owned workspace. './ ' is a
+    // legal whitespace filename; keeping its native position is essential for
+    // later per-file diff indices, even though its display label is blank.
+    const files = [
+      { id: 'fixture-workspace-whitespace-file', path: './ ', content: 'contents of the whitespace-named file\n' },
+      { id: workspaceFilesId, path: 'a.txt', content: 'contents of normal a.txt\n' },
+    ]
+    for (const [index, file] of files.entries()) {
+      const argumentsText = JSON.stringify({ file_path: file.path, content: file.content })
+      yield { type: 'block-start', index, blockType: 'tool-call' }
+      yield { type: 'tool-call-delta', index, id: file.id, name: 'write', argumentsDelta: argumentsText }
+      yield { type: 'block-end', index, block: { type: 'tool-call', id: file.id, name: 'write', arguments: argumentsText } }
+    }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    return
+  }
+  const writeId = 'fixture-native-write'
+  const hasWrite = messages.some(message => message.role === 'tool' && message.toolCallId === writeId)
+  if (text.includes('fixture:write') && !hasWrite) {
+    // One real native write/presentCall pipeline in the owned workspace.
+    const argumentsText = JSON.stringify({ file_path: 'native-write.txt', content: 'native new line\n' })
+    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    yield { type: 'tool-call-delta', index: 0, id: writeId, name: 'write', argumentsDelta: argumentsText }
+    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: writeId, name: 'write', arguments: argumentsText } }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    return
+  }
+  const escalatedWriteId = 'fixture-native-write-escalated'
+  const hasEscalatedWrite = messages.some(message => message.role === 'tool' && message.toolCallId === escalatedWriteId)
+  const writeDenied = messages.some(message => message.role === 'tool' && message.toolCallId === writeId
+    && (message.content ?? []).some(block => block.type === 'text' && block.text.includes('escalation available')))
+  if (text.includes('fixture:write') && writeDenied && !hasEscalatedWrite) {
+    const argumentsText = JSON.stringify({
+      file_path: 'native-write.txt', content: 'native new line\n',
+      sandbox_permissions: 'workspace-write',
+      justification: 'Allow this one fixture write inside the owned temporary workspace.',
+    })
+    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    yield { type: 'tool-call-delta', index: 0, id: escalatedWriteId, name: 'write', argumentsDelta: argumentsText }
+    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: escalatedWriteId, name: 'write', arguments: argumentsText } }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    return
+  }
   // This public pruning service is exercised inside the native open turn,
   // not from an idle human command (replacement tool/result has turn scope).
   if (text.includes('fixture:tool') && hasRead) {

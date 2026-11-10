@@ -73,8 +73,11 @@ test("global app actions are a fallback for local contexts; local bindings win",
   assert.equal(actionId(keymap.resolve("\x12", "editor")), "app.history.search")
   assert.equal(actionId(keymap.resolve("\x1bp", "editor")), "app.model.select")
   assert.equal(actionId(keymap.resolve("\x1b[Z", "editor")), "app.mode.cycle")
-  // Ctrl+C is only an app action, so the editor context falls through to global.
-  assert.equal(actionId(keymap.resolve("\x03", "editor")), "app.interrupt")
+  // Ctrl+C is a global app action: the editor context falls through to
+  // app.clear (Pi-style draft clear), while app.interrupt ships unbound.
+  assert.equal(actionId(keymap.resolve("\x03", "editor")), "app.clear")
+  assert.deepEqual(keymap.getBindings("app.interrupt"), [])
+  assert.deepEqual(keymap.getBindings("app.clear"), ["ctrl+c"])
 })
 
 test("context fallback chains: completion/search keep editor editing beneath them", () => {
@@ -214,9 +217,14 @@ test("chord prefix shadows a single-key binding in the same context", () => {
     },
   ]
   const keymap = createCcKeymap({ definitions })
-  assert.ok(keymap.getConflicts().some((d) => d.code === "chord-shadow" && d.action === "test.simple"))
-  // Chord prefix wins immediately; the single key is only reachable after the
-  // chord is cancelled, which the diagnostics warn about.
+  const shadow = keymap.getConflicts().find((d) => d.code === "chord-shadow" && d.action === "test.simple")
+  assert.ok(shadow)
+  // Chord prefix wins immediately. CcEditor drops the collected prefix on
+  // timeout/mismatch (no replay), so the single key is unreachable, not just
+  // delayed — the diagnostic must say that rather than promise a later fire.
+  assert.match(shadow.message, /unreachable/)
+  assert.match(shadow.message, /drops the collected prefix/)
+  assert.doesNotMatch(shadow.message, /only fires after/)
   assert.equal(keymap.resolve("\x18", "editor", 0).kind, "pending")
 })
 
@@ -262,6 +270,8 @@ test("CC_ACTIONS registry covers the required families with honest statuses", ()
     "editor.submit",
     "editor.complete",
     "app.interrupt",
+    "app.clear",
+    "dialog.details",
     "app.history.search",
     "app.stash",
     "app.editor.external",

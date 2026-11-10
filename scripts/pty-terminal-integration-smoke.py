@@ -35,7 +35,8 @@ class Session(helper.Session):
         self.support = support
         self.query_buffer = bytearray()
         self.query_count = 0
-        super().__init__(mode, 'terminal-' + family, settings={'formatVersion': 2, 'copyOnSelect': False})
+        super().__init__(mode, 'terminal-' + family, settings={'formatVersion': 2, 'copyOnSelect': False},
+                         bindings={'app.interrupt': 'ctrl+q'})
 
     def read(self, timeout=0.02):
         ready, _, _ = select.select([self.fd], [], [], timeout)
@@ -167,7 +168,7 @@ def run(mode, family):
                 else:
                     assert session.notices(before) == ['Waiting for approval']
                 cancelled = len(session.raw)
-                session.send(b'\x03')
+                session.send(b'\x11')  # explicit native interrupt; default Ctrl+C is local to the dialog
                 session.wait_for(b'ready', cancelled)
                 session.settle()
                 assert all(row['state'] not in ['done', 'error'] for row in session.reports(cancelled))
@@ -182,7 +183,7 @@ def run(mode, family):
                 else:
                     assert session.notices(before) == ['Waiting for your answer']
                 cancelled = len(session.raw)
-                session.send(b'\x03')
+                session.send(b'\x11')  # explicit native interruption, not local question cancellation
                 session.wait_for(b'ready', cancelled)
                 session.settle()
                 assert session.notices(cancelled) == []

@@ -355,14 +355,27 @@ test('fragmented bracketed paste is reassembled, keeps Tab/Ctrl+C bytes as text 
   assert.match(text(p.dialog), /provider 1\/1/)
 })
 
-test('Ctrl+C stays global through a pending chord and chord mismatch text becomes query', () => {
+test('default Ctrl+C cancels a pending chord and closes locally; an explicit interrupt keeps priority', () => {
   const models: Item[] = [{ id: 'p/one', provider: 'p', model: 'one', label: 'One' }]
   const p = makePicker({ models, currentProvider: 'p' })
   p.dialog.handleInput('\x18') // ctrl+x chord prefix
   assert.notEqual(p.dialog.keymap.getPendingChord(), null)
   p.dialog.handleInput(KEY.ctrlC)
-  assert.equal(p.interrupted, 1, 'Ctrl+C reaches app.interrupt through the pending chord')
+  assert.equal(p.cancelled, 1, 'default app.clear is the local list.cancel here')
+  assert.equal(p.interrupted, 0, 'default Ctrl+C never invokes app.interrupt')
   assert.equal(p.dialog.keymap.getPendingChord(), null)
+
+  const explicit = makePicker({
+    models,
+    currentProvider: 'p',
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
+    onInterrupt: () => {},
+  })
+  explicit.dialog.handleInput('\x18')
+  explicit.dialog.handleInput(KEY.ctrlC)
+  assert.equal(explicit.interrupted, 1, 'explicit interrupt override keeps priority through the chord')
+  assert.equal(explicit.cancelled, 0)
+  assert.equal(explicit.dialog.keymap.getPendingChord(), null)
 
   // A chord mismatch with a printable key re-dispatches it as query text.
   const q = makePicker({ models, currentProvider: 'p' })
@@ -392,14 +405,14 @@ test('browse Alt+B/F word movement activates search and uses the query editor', 
   assert.equal(fieldFocused(browse.dialog), true, 'Alt+B from browse activated the query')
 })
 
-test('Ctrl+C outside paste interrupts globally and Esc cancels locally, each once', () => {
+test('default Ctrl+C and Esc both cancel locally exactly once; only an explicit interrupt is native', () => {
   const models: Item[] = [{ id: 'p/one', provider: 'p', model: 'one', label: 'One' }]
-  const p = makePicker({ models, currentProvider: 'p' })
+  const p = makePicker({ models, currentProvider: 'p', onInterrupt: () => {} })
   p.dialog.handleInput(KEY.ctrlC)
-  assert.equal(p.interrupted, 1)
-  assert.equal(p.cancelled, 0)
+  assert.equal(p.cancelled, 1, 'default app.clear is the local list.cancel here')
+  assert.equal(p.interrupted, 0, 'default Ctrl+C must not invoke the native interrupt hook')
   p.dialog.handleInput(KEY.ctrlC)
-  assert.equal(p.interrupted, 2)
+  assert.equal(p.cancelled, 1, 'a closed picker stays closed (idempotent)')
 
   const c = makePicker({ models, currentProvider: 'p' })
   c.dialog.handleInput(KEY.escape)
@@ -407,18 +420,18 @@ test('Ctrl+C outside paste interrupts globally and Esc cancels locally, each onc
   c.dialog.handleInput(KEY.escape)
   assert.equal(c.cancelled, 1)
 
-  let cancelledWithoutInterrupt = 0
-  const noInterrupt = new ModelPickerDialog(fakeTui(), {
+  // Explicit user interrupt override: native, repeatable while the picker is open.
+  const explicit = makePicker({
     models,
     currentProvider: 'p',
-    keymap: keymap(),
-    onSelect: () => {},
-    onCancel: () => {
-      cancelledWithoutInterrupt += 1
-    },
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
+    onInterrupt: () => {},
   })
-  noInterrupt.handleInput(KEY.ctrlC)
-  assert.equal(cancelledWithoutInterrupt, 1, 'without onInterrupt Ctrl+C falls back to local cancel')
+  explicit.dialog.handleInput(KEY.ctrlC)
+  assert.equal(explicit.interrupted, 1)
+  assert.equal(explicit.cancelled, 0)
+  explicit.dialog.handleInput(KEY.ctrlC)
+  assert.equal(explicit.interrupted, 2)
 })
 
 test('remapped/disabled provider and list actions respect the shared keymap', () => {

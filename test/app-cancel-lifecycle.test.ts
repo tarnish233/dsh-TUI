@@ -405,7 +405,7 @@ test('Up/Ctrl+P recalls the retained queue while idle and never auto-drains it',
   } finally { await f.close() }
 })
 
-test('Ctrl+C is global while Settings owns focus and never converts a decision into a local answer', async () => {
+test('Pi Ctrl+C cancels Settings/approval locally; an explicit interrupt still takes the native global path', async () => {
   const f = await fixture()
   try {
     f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'running' })
@@ -413,18 +413,26 @@ test('Ctrl+C is global while Settings owns focus and never converts a decision i
     await paint(f.terminal)
     assert.match(f.terminal.screen(), /Settings/)
     f.terminal.type('\x03')
-    await until(() => f.backend.cancels === 1, 'global Ctrl+C cancels the native turn')
+    await paint(f.terminal)
+    assert.equal(f.backend.cancels, 0, 'default Ctrl+C closes Settings without interrupting DSH')
     assert.equal(f.backend.responses.length, 0)
-    f.terminal.type('\x1b')
-    await until(() => !f.terminal.screen().includes('Settings ·'), 'settings closes')
-    f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'idle' })
+    assert.equal(f.app.editor.focused, true)
+    assert.equal(f.app.isBusy, true)
 
     f.backend.emit({ type: 'decision', sessionId: f.backend.info.sessionId, request: f.backend.request('approval-ctrl-c', 'approval') })
     await until(() => f.app.pendingDecisionCount === 1, 'approval visible')
     f.terminal.type('\x03')
-    await until(() => f.backend.cancels === 2, 'approval Ctrl+C invokes backend.cancel')
-    assert.equal(f.backend.responses.length, 0, 'no pretend {cancelled:true} response')
+    await until(() => f.backend.responses.length === 1, 'approval Ctrl+C settles only the native rejection')
+    assert.deepEqual(f.backend.responses[0], { id: 'approval-ctrl-c', value: 'rejected' })
+    assert.equal(f.backend.cancels, 0)
     await until(() => f.app.pendingDecisionCount === 0, 'native decision closure removes the dialog')
+
+    f.app.keymap.setBindings({ 'app.interrupt': 'ctrl+q' })
+    f.backend.emit({ type: 'decision', sessionId: f.backend.info.sessionId, request: f.backend.request('approval-explicit-interrupt', 'approval') })
+    f.terminal.type('\x11')
+    await until(() => f.backend.cancels === 1, 'explicit interrupt still delegates native global cancellation')
+    assert.equal(f.backend.responses.length, 1, 'global interruption is not another local answer')
+    await until(() => f.app.pendingDecisionCount === 0, 'native cancellation closes the explicit-interrupt decision')
   } finally { await f.close() }
 })
 

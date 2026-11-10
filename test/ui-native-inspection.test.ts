@@ -76,6 +76,7 @@ function harness(options: {
   initialState?: { selectedKey?: string; scroll: number }
   onInterrupt?: () => void
   rows?: number
+  keymap?: ReturnType<typeof createCcKeymap>
 } = {}): Harness {
   const tui = createFakeTui(options.rows ?? 30, 100)
   const events: string[] = []
@@ -83,7 +84,7 @@ function harness(options: {
     ...(options.reads === undefined ? {} : { reads: options.reads }),
     ...(options.loading === undefined ? {} : { loading: options.loading }),
     ...(options.initialState === undefined ? {} : { initialState: options.initialState }),
-    keymap: createCcKeymap(),
+    keymap: options.keymap ?? createCcKeymap(),
     ...(options.onInterrupt === undefined ? {} : { onInterrupt: options.onInterrupt }),
     onClose: () => { events.push('close') },
   })
@@ -257,11 +258,21 @@ test('list navigation crosses sections, Enter and printables are inert, Esc clos
   assert.equal(f.dialog.isDone, false)
 
   f.dialog.handleInput(CTRL_C)
-  assert.deepEqual(f.events, ['interrupt'])
-  assert.equal(f.dialog.isDone, false)
-  f.dialog.handleInput(ESC)
-  assert.deepEqual(f.events, ['interrupt', 'close'])
-  assert.deepEqual(f.dialog.render(80), [])
+  assert.deepEqual(f.events, ['close'], 'default app.clear is the local list.cancel here')
+  assert.equal(f.dialog.isDone, true)
+  assert.deepEqual(f.dialog.render(80), [], 'a closed modal paints nothing')
+
+  // Only an explicit user override makes Ctrl+C native again.
+  const explicit = harness({
+    reads: FULL,
+    keymap: createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+    onInterrupt: () => { explicit.events.push('interrupt') },
+  })
+  explicit.dialog.handleInput(CTRL_C)
+  assert.deepEqual(explicit.events, ['interrupt'])
+  assert.equal(explicit.dialog.isDone, false)
+  explicit.dialog.handleInput(ESC)
+  assert.deepEqual(explicit.events, ['interrupt', 'close'])
 })
 
 test('a refresh keeps the selected native row key and retires a vanished key', () => {

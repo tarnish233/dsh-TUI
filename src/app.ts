@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import {
-  Container, getNativeClipboard, isViewportTUI,
+  Container, getNativeClipboard, isKeyRelease, isViewportTUI,
   matchesKey, ProcessTerminal, ScrollView, Spacer, Text, truncateToWidth, visibleWidth,
   type Component, type Focusable, type KeyId, type NativeClipboard, type Terminal, type TUI,
   type TuiInputListenerResult,
@@ -13,6 +13,7 @@ import {
 } from '#pi-tui'
 import type {
   Backend, BackendEvent, DecisionOption, DecisionRequest, DisplayContentPart, PromptContentPart, QueueEntry, SessionInfo, SkillCatalogSnapshot, StatsSnapshot, SubagentEntry, TranscriptCodec, UsageSnapshot,
+  HistoryTurnsResult, HistoryWindowResult, WorkspaceChangeDiffResult, WorkspaceFileDiff,
 } from './backend/types.ts'
 import { configDirectory, KeybindingsStore, PromptHistory, SettingsStore, type Settings } from './config.ts'
 import { HistorySearch } from './history-search.ts'
@@ -27,12 +28,15 @@ import type { TodosSnapshot } from './backend/types.ts'
 import { createGitStatsRefresher, readGitStats, type GitStats } from './state/git-stats.ts'
 import { TranscriptStore } from './state/transcript.ts'
 import { DecisionDialog, SelectDialog } from './ui/dialogs.ts'
+import { DecisionDetailsDialog, type DecisionDetailContent } from './ui/decision-details.ts'
 import { HelpPanel, type HelpCommand } from './ui/help.ts'
 import { KeybindingsDialog } from './ui/keybindings.ts'
 import { ModelPickerDialog, type ModelPickerItem } from './ui/model-picker.ts'
 import { SessionPickerDialog } from './ui/session-picker.ts'
 import { SettingsDialog, type SettingsViewState, type NativeSettingsEntry } from './ui/settings.ts'
 import { modalHeight, modalOverlayOptions, type ModalSize } from './ui/modal.ts'
+import { ComposerInteractionHost, isComposerInteraction } from './ui/composer-interaction.ts'
+import type { InteractionPlacement } from './ui/interaction.ts'
 import { QueueDialog } from './ui/queue-dialog.ts'
 import { HitboxRegistry } from './ui/mouse.ts'
 import { QueueList } from './ui/queue-list.ts'
@@ -40,6 +44,9 @@ import { ToolDetailsDialog } from './ui/tool-details.ts'
 import { ImageDetailsDialog } from './ui/image-details.ts'
 import { AgentsOverlay, type AgentsViewState } from './ui/agents-overlay.ts'
 import { ChildSessionView } from './ui/child-session-view.ts'
+import { WorkspaceChangesDialog } from './ui/workspace-changes-dialog.ts'
+import type { WorkspaceChangesDetailsRequest } from './ui/workspace-changes.ts'
+import { HistoryDialog, type HistoryWindowRequest } from './ui/history-dialog.ts'
 import { SubagentProgress } from './ui/subagent-progress.ts'
 import { TodoBoard } from './ui/todo-board.ts'
 import { GoalProgress } from './ui/goal-progress.ts'
@@ -102,6 +109,8 @@ function styledGitStatus(status: string): string {
   return out
 }
 const EXIT_ARM_MS = 1_000
+/** Observed installed Pi main-input policy: a second clear within 500ms exits. */
+const PI_CLEAR_WINDOW_MS = 500
 /**
  * How long a sent SIGTSTP may stay unhandled before the suspended UI is rolled
  * back. Comfortably longer than a job-control round trip: the signal itself is
@@ -116,6 +125,76 @@ const SHUTDOWN_CLOSE_MS = 8_000
 /** Shared 品牌蓝 (brand blue) for the prompt, working status and chrome. */
 const accent = t.accent
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+
+const nativeIndex = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+const nativeHistoryCursor = (value: unknown): value is number => value === -1 || nativeIndex(value)
+
+function historyTurnsResult(value: unknown): HistoryTurnsResult | undefined {
+  const row = object(value)
+  if (row === undefined || typeof row.sessionId !== 'string' || row.sessionId.length === 0 ||
+      typeof row.available !== 'boolean' || !Array.isArray(row.entries) ||
+      (row.attachmentId !== undefined && (typeof row.attachmentId !== 'string' || row.attachmentId.length === 0)) ||
+      (row.asOfSeq !== undefined && !nativeHistoryCursor(row.asOfSeq))) return undefined
+  const entries: HistoryTurnsResult['entries'][number][] = []
+  for (const value of row.entries) {
+    const entry = object(value)
+    if (entry === undefined || !nativeIndex(entry.turn) || !nativeIndex(entry.seq) ||
+        typeof entry.prompt !== 'string' || typeof entry.response !== 'string') return undefined
+    entries.push({ turn: entry.turn, seq: entry.seq, prompt: entry.prompt, response: entry.response })
+  }
+  return {
+    available: row.available, sessionId: row.sessionId, entries,
+    ...(typeof row.attachmentId === 'string' ? { attachmentId: row.attachmentId } : {}),
+    ...(nativeHistoryCursor(row.asOfSeq) ? { asOfSeq: row.asOfSeq } : {}),
+  }
+}
+
+function historyWindowResult(value: unknown): HistoryWindowResult | undefined {
+  const row = object(value)
+  if (row === undefined || typeof row.sessionId !== 'string' || row.sessionId.length === 0 ||
+      !nativeIndex(row.targetSeq) || !nativeIndex(row.startSeq) || !nativeIndex(row.endSeq) ||
+      !nativeIndex(row.inheritedEventCount) || typeof row.hasOlder !== 'boolean' || !Array.isArray(row.events) ||
+      (row.attachmentId !== undefined && (typeof row.attachmentId !== 'string' || row.attachmentId.length === 0))) return undefined
+  if (!row.events.every(value => {
+    const event = object(value)
+    return event !== undefined && typeof event.type === 'string' && nativeIndex(event.seq) && 'data' in event
+  })) return undefined
+  return row as unknown as HistoryWindowResult
+}
+
+/** Validate the untrusted native command result again at the UI boundary. */
+function workspaceChangeDiffResult(value: unknown): WorkspaceChangeDiffResult | undefined {
+  const row = object(value)
+  if (row === undefined || typeof row.sessionId !== 'string' || row.sessionId.length === 0 ||
+      !nativeIndex(row.seq) || !nativeIndex(row.index) ||
+      (row.attachmentId !== undefined && (typeof row.attachmentId !== 'string' || row.attachmentId.length === 0))) return undefined
+  let diff: WorkspaceFileDiff | undefined
+  if (row.diff !== undefined) {
+    const raw = object(row.diff)
+    if (raw === undefined || typeof raw.path !== 'string' || typeof raw.display !== 'string') return undefined
+    if (raw.kind === 'binary' || raw.kind === 'oversized') {
+      diff = { kind: raw.kind, path: raw.path, display: raw.display }
+    } else {
+      if (raw.kind !== 'text' || typeof raw.before !== 'boolean' || typeof raw.after !== 'boolean' ||
+          typeof raw.coarse !== 'boolean' || !Array.isArray(raw.hunks)) return undefined
+      const hunks: Array<{ oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }> = []
+      for (const value of raw.hunks) {
+        const hunk = object(value)
+        if (hunk === undefined || !nativeIndex(hunk.oldStart) || !nativeIndex(hunk.oldLines) ||
+            !nativeIndex(hunk.newStart) || !nativeIndex(hunk.newLines) || !Array.isArray(hunk.lines) ||
+            !hunk.lines.every(line => typeof line === 'string')) return undefined
+        hunks.push({ oldStart: hunk.oldStart, oldLines: hunk.oldLines, newStart: hunk.newStart, newLines: hunk.newLines, lines: [...hunk.lines] })
+      }
+      diff = { kind: 'text', path: raw.path, display: raw.display, before: raw.before, after: raw.after, coarse: raw.coarse, hunks }
+    }
+  }
+  return {
+    sessionId: row.sessionId,
+    ...(typeof row.attachmentId === 'string' ? { attachmentId: row.attachmentId } : {}),
+    seq: row.seq, index: row.index,
+    ...(diff === undefined ? {} : { diff }),
+  }
+}
 
 function admittedUserMessageId(event: { data: unknown }): string | undefined {
   const data = object(event.data)
@@ -181,6 +260,7 @@ const OPTIONAL_UI_COMMANDS = [
   { name: 'questions', description: 'View and answer native continued questions', capability: 'continued-questions' },
   { name: 'rename', description: 'Explicitly rename the current native session', capability: 'session-rename' },
   { name: 'fork', description: 'Fork the durable native conversation and switch', capability: 'session-fork' },
+  { name: 'history', description: 'Browse the native turn outline and paged history', capability: 'history-turns' },
   { name: 'attach', description: 'Attach one local file through native DSH storage', capability: 'file-input', inputHint: '[local-path]' },
 ] as const
 const UI_COMMAND_NAMES = new Set([...UI_COMMANDS.map(command => command.name), 'quit', 'config', 'clear'])
@@ -218,14 +298,22 @@ class Prompt implements Component, Focusable {
   editor: PromptEditor
   onKey?: (data: string) => boolean
   private _focused = false
+  private frozen = false
   constructor(tui: TUI, keymap: CcKeymap) { this.editor = new PromptEditor(tui, editorTheme, { paddingX: 2, keymap }) }
   setWorkingStatus(status: string): void { this.editor.setWorkingStatus(status) }
+  /** Compact paint only; the single Editor, cursor, undo and attachment state stay untouched. */
+  setFrozen(value: boolean): void { this.frozen = value }
   get focused(): boolean { return this._focused }
   set focused(value: boolean) { this._focused = value; this.editor.focused = value }
-  get capturesViewportInput(): boolean { return this.editor.capturesViewportInput }
-  render(width: number): string[] { return this.editor.render(width) }
+  get capturesViewportInput(): boolean { return this.frozen || this.editor.capturesViewportInput }
+  render(width: number): string[] {
+    if (!this.frozen) return this.editor.render(width)
+    const draft = oneLine(sanitize(this.editor.getText()), 1000)
+    return [truncateToWidth(accent('❯ ') + dim(draft ? draft + ' · draft preserved' : 'Input paused · resolve the interaction above'), Math.max(1, width))]
+  }
+  measureRows(width: number): number { return this.frozen ? 1 : this.editor.measureRows(width) }
   invalidate(): void { this.editor.invalidate() }
-  handleInput(data: string): void { if (!this.onKey?.(data)) this.editor.handleInput(data) }
+  handleInput(data: string): void { if (!this.frozen && !this.onKey?.(data)) this.editor.handleInput(data) }
 }
 
 export interface AppOptions {
@@ -294,8 +382,9 @@ interface SubagentReplyTarget {
 }
 
 interface DecisionDialogExtras {
-  /** Newer dialog surfaces expose a global-cancel hook separate from Esc. */
+  /** Explicit native interrupt is independent of default local Ctrl+C/Esc cancellation. */
   onInterrupt?: () => void
+  onDetails?: (content: DecisionDetailContent) => void
 }
 
 /** A native dequeue transfer receipt held only until explicit editing succeeds. Never an execution queue. */
@@ -337,6 +426,7 @@ export class App {
   private history: PromptHistory
   private readonly histories = new Map<string, PromptHistory>()
   private readonly viewOptions: TranscriptViewOptionsShape
+  private readonly workspaceChangesDetailsHandler = (request: WorkspaceChangesDetailsRequest): void => this.openWorkspaceChanges(request)
   private readonly transcript: TranscriptView
   private readonly subagentProgress: SubagentProgress
   private readonly todoBoard: TodoBoard
@@ -363,7 +453,14 @@ export class App {
   private readonly terminalIntegration: TerminalIntegration
   private off?: () => void
   private dialog?: Component
+  private dialogPlacement: InteractionPlacement = 'workspace'
   private dialogOverlay?: ReturnType<TUI['showOverlay']>
+  private readonly composerInteraction: ComposerInteractionHost
+  private decisionDetailsOverlay?: {
+    readonly parent: DecisionDialog
+    readonly dialog: DecisionDetailsDialog
+    readonly handle: ReturnType<TUI['showOverlay']>
+  }
   private settingsReturnState?: { view: SettingsViewState; context: UiContext }
   private appliedQueueCollapsed = false
   private imagePreviewIntent?: Settings['imagePreview']
@@ -411,6 +508,7 @@ export class App {
   private readonly activeCommands = new Map<string, string>()
   private nativeCommands: CommandCatalogEntry[] = []
   private catalogRequest?: { sessionId: string; attachmentId: string | undefined; dirty: boolean; promise: Promise<void> }
+  private historyOutlineRevision = 0
   private modelCatalogRequest?: { context: UiContext; dialog: ModelPickerDialog; surface: number; dirty: boolean; promise: Promise<void> }
   private presetPicker?: PresetPickerState
   private presetCatalogRequest?: { state: PresetPickerState; dirty: boolean; promise: Promise<void> }
@@ -510,7 +608,7 @@ export class App {
       'app.message.steer': ['ctrl+x ctrl+s'],
       'app.message.followUp': ['ctrl+x enter'],
     }
-    this.keymap = createCcKeymap({ bindings: this.modeBindings, chordTimeoutMs: 3000 })
+    this.keymap = createCcKeymap({ bindings: this.modeBindings, baselineBindings: this.modeBindings, chordTimeoutMs: 3000 })
     this.viewOptions = {
       ...toolPreferences(settings),
       groupSubagentMessages: settings.groupSubagentMessages,
@@ -535,6 +633,7 @@ export class App {
       terminal, cwd: options.cwd, env: options.terminalEnvironment ?? process.env,
     })
     this.prompt = new Prompt(this.tui, this.keymap)
+    this.composerInteraction = new ComposerInteractionHost({ maxHeight: width => this.composerHeight(width) })
     this.welcome = new WelcomeHeader({ demo: options.demo })
     this.transcript = new TranscriptView(this.store, this.viewOptions)
     const app = this
@@ -561,9 +660,10 @@ export class App {
       info: () => this.info, capture: () => this.context(),
       isCurrent: context => !this.closing && this.epoch === context.epoch && this.editor === context.editor &&
         this.info?.sessionId === context.sessionId && this.info?.attachmentId === context.attachmentId,
-      dialog: () => this.dialog, show: dialog => this.showDialog(dialog), dismiss: () => this.dismissDialog(),
+      dialog: () => this.dialog, show: (dialog, placement) => this.showDialog(dialog, false, placement), dismiss: () => this.dismissDialog(),
       render: () => this.render(), report: (message, error) => this.store.report(message, error ? 'error' : 'info'),
       interrupt: () => this.interrupt(), returnToSettings: () => this.returnToSettings(), settingsOpen: () => this.dialog instanceof SettingsDialog,
+      details: (parent, content) => this.openDecisionDetails(parent, content),
       goal: value => { this.goalProgress.status = value }, directory: value => { this.nativeDirectory = value },
       renamed: (sessionId, title) => {
         if (this.info?.sessionId !== sessionId) return
@@ -627,17 +727,23 @@ export class App {
   }
 
   /**
-   * Global routing for explicit Ctrl+C while a dialog, settings list or
-   * history search owns focus. It never clears or rewrites local state: the
-   * native cancel settles decisions and the backend reports the real outcome.
+   * Only an explicitly configured native interrupt may preempt a foreground
+   * surface. Default Pi-style Ctrl+C is app.clear and stays local to its owner.
    */
   private globalInput(data: string): TuiInputListenerResult {
-    if (this.closing || this.terminalPaused || this.dialog === undefined) return undefined
-    if (this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean }).isPasting === true || data.startsWith('\x1b[200~')) return undefined
+    if (this.closing || this.terminalPaused || this.dialog === undefined || isKeyRelease(data)) return undefined
+    if (this.foregroundPasting() || data.startsWith('\x1b[200~')) return undefined
     if (!this.bound(data, 'app.interrupt')) return undefined
     if (this.decisionId === undefined && !this.isBusy) return undefined
     void this.interrupt()
     return { consume: true }
+  }
+
+  /** Paste belongs to the visible input owner, including a retained-decision detail overlay. */
+  private foregroundPasting(): boolean {
+    const owner = this.decisionDetailsOverlay?.dialog ?? this.imageDetailsOverlay?.dialog ??
+      this.toolDetailsOverlay?.dialog ?? this.childSessionOverlay?.dialog ?? this.agentsOverlay?.dialog ?? this.dialog
+    return this.editor.isPasting() || (owner as (Component & { isPasting?: boolean }) | undefined)?.isPasting === true
   }
 
   /**
@@ -713,7 +819,14 @@ export class App {
       handleMouse: event => this.followHitboxes.handleMouse(event),
       invalidate: () => this.followHitboxes.clear(),
     })
-    for (const item of [this.queueList, this.statusDockStack, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
+    const queuePresentation: Component & { measureRows(width: number): number } = {
+      render: width => this.renderQueuePresentation(width),
+      measureRows: width => this.measureQueueRows(width),
+      handleMouse: event => this.composerInteraction.active ? undefined : this.queueList.handleMouse(event),
+      invalidate: () => this.queueList.invalidate(),
+    }
+    this.bottom.addChild(queuePresentation)
+    for (const item of [this.statusDockStack, this.composerInteraction, this.slot, this.hint, this.footer]) this.bottom.addChild(item)
     // Only TranscriptView sees pointer motion inside its own box. The parent
     // releases that hover at the surrounding boundaries without clearing any
     // press pin, drag, selection, disclosure or editor state.
@@ -751,7 +864,7 @@ export class App {
     this.store.onChange = () => { if (!this.handlingEvent) this.render() }
     this.off = this.options.backend.onEvent(event => this.onEvent(event))
     this.offInput = this.tui.addInputListener(data => {
-      const pasting = this.editor.isPasting() || (this.dialog as Component & { isPasting?: boolean } | undefined)?.isPasting === true
+      const pasting = this.foregroundPasting()
       // Real ProcessTerminal notifies before Pi consumes focus reports. Only
       // custom terminals without that public observer use this fallback.
       if (!this.tui.terminal.onFocusChange && !pasting && (data === '\x1b[O' || data === '\x1b[I')) {
@@ -814,6 +927,7 @@ export class App {
     const capabilities = this.info?.capabilities ?? []
     return OPTIONAL_UI_COMMANDS.filter(command =>
       (capabilities.includes(command.capability) || (command.name === 'inspect' && capabilities.includes('native-tools'))) &&
+      (command.name !== 'history' || capabilities.includes('history-window')) &&
       !this.nativeCommands.some(native => native.name === command.name))
   }
 
@@ -1279,7 +1393,7 @@ export class App {
   // ------------------------------------------------------------- subagents
 
   private syncOverlayMouse(): void {
-    this.viewOptions.mouseBlocked = !this.terminalPointerActive || this.dialogOverlay !== undefined || this.toolDetailsOverlay !== undefined ||
+    this.viewOptions.mouseBlocked = !this.terminalPointerActive || this.dialogOverlay !== undefined || this.decisionDetailsOverlay !== undefined || this.toolDetailsOverlay !== undefined ||
       this.imageDetailsOverlay !== undefined || this.agentsOverlay !== undefined ||
       this.childSessionOverlay !== undefined
   }
@@ -1637,7 +1751,9 @@ export class App {
         this.skillAutocompleteIntent = undefined
         this.rememberSkillAutocomplete(signal)
       }
-      this.exitArm = undefined
+      // Installed Pi keeps its short second-clear window even if ordinary
+      // editing intervenes. Explicit recovery/focus changes still retire it.
+      if (this.exitArm?.id !== 'app.clear') this.exitArm = undefined
       this.render()
     }
     this.editor.onSubmit = text => { const mode = this.nextSendMode ?? 'followup'; this.nextSendMode = undefined; void this.submit(text, mode) }
@@ -1665,9 +1781,20 @@ export class App {
     // open; there is no previous session to tear stale surfaces down from.
     const replacedSession = this.info !== undefined
     this.info = info; this.connected = true; this.fatal = false
+    const workspaceDiffAvailable = info.capabilities.includes('workspace-change-diff')
+    this.viewOptions.onWorkspaceChangesDetails = workspaceDiffAvailable ? this.workspaceChangesDetailsHandler : undefined
+    // A same-attachment capability loss must not leave an old modal advertising
+    // actions whose native service has disappeared. The summary card stays.
+    if (!changed && ((!workspaceDiffAvailable && this.dialog instanceof WorkspaceChangesDialog) ||
+        ((!info.capabilities.includes('history-turns') || !info.capabilities.includes('history-window')) && this.dialog instanceof HistoryDialog))) {
+      this.dismissDialog()
+    }
     if (info.title !== undefined) this.sessionTitles.set(info.sessionId, info.title)
     this.invalidateSkills()
     if (changed) {
+      // Pointer targets belong to the last painted attachment. Retire them now,
+      // before reset requests a deferred frame, including already pinned clicks.
+      this.transcript.retirePointerTargets()
       if (replacedSession) { this.settingsReturnState = undefined; this.settingsFeedback = undefined }
       this.skillsRequest = undefined
       this.skillAutocompleteIntent = undefined
@@ -2033,14 +2160,32 @@ export class App {
    * borrow down to one so each actually visible dock retains a compact row.
    * The one editor, queue, hints and footer always keep their measured height.
    */
+  private measureQueueRows(width: number): number {
+    return this.composerInteraction.active ? (this.queued > 0 ? 1 : 0) : measureRows(this.queueList, width)
+  }
+
+  private renderQueuePresentation(width: number): string[] {
+    if (!this.composerInteraction.active) return this.queueList.render(width)
+    return this.queued > 0 ? [truncateToWidth(dim(`${this.queued} queued message(s) · retained by DSH`), width)] : []
+  }
+
+  /** The interaction wins rows over expanded status/queue paint, never over native facts. */
+  private composerHeight(width: number): number {
+    const rows = Math.max(1, this.tui.terminal.rows)
+    const chrome = 1 + this.measureQueueRows(width) + measureRows(this.prompt, width) +
+      measureRows(this.hint, width) + measureRows(this.footer, width)
+    const transcript = rows >= 18 ? 4 : 1
+    const available = Math.max(1, rows - chrome - this.statusDockMinimumRows() - transcript)
+    return Math.max(1, Math.min(20, Math.floor(rows * 0.55), available))
+  }
+
   private statusDockPool(): number {
     const width = Math.max(1, this.tui.terminal.columns)
     const rows = this.tui.terminal.rows
-    // Measure, never paint: `docs/FRONTEND-CONTRACT.md` forbids re-rendering a
-    // dock member just to count its rows, and each member answers from its own
-    // state through {@link measureRows}.
-    const chrome = 1 + measureRows(this.queueList, width) + measureRows(this.slot, width) +
-      measureRows(this.hint, width) + measureRows(this.footer, width)
+    // Measure, never paint. Composer's budget excludes this pool, so there is
+    // no render-to-measure recursion when status and decision coexist.
+    const chrome = 1 + this.measureQueueRows(width) + measureRows(this.prompt, width) +
+      measureRows(this.hint, width) + measureRows(this.footer, width) + measureRows(this.composerInteraction, width)
     const preferred = Math.max(0, Math.min(15, Math.floor(rows / 2), rows - chrome - 4))
     const available = Math.max(0, rows - chrome - 1)
     return Math.min(available, Math.max(preferred, this.statusDockMinimumRows()))
@@ -2163,35 +2308,83 @@ export class App {
     this.tui.requestRender()
   }
 
-  private showDialog(dialog: Component, decision = false): void {
+  /** Pure native detail overlay; the pending decision instance and all its drafts stay retained. */
+  private openDecisionDetails(parent: DecisionDialog, content: DecisionDetailContent): void {
+    if (this.closing || this.terminalPaused || this.dialog !== parent) return
+    this.closeDecisionDetails(false)
+    this.exitArm = undefined
+    this.keymap.cancelChord(); this.chordHint = undefined
+    const dialog = new DecisionDetailsDialog(this.tui, {
+      content, keymap: this.keymap,
+      onClose: () => { if (this.decisionDetailsOverlay?.dialog === dialog) this.closeDecisionDetails() },
+      onInterrupt: () => { if (this.decisionDetailsOverlay?.dialog === dialog) void this.interrupt() },
+    })
+    const handle = this.tui.showOverlay(dialog, modalOverlayOptions('wide'))
+    this.decisionDetailsOverlay = { parent, dialog, handle }
+    this.syncOverlayMouse()
+    this.tui.setFocus(dialog)
+    this.render()
+  }
+
+  private closeDecisionDetails(restoreFocus = true): void {
+    const overlay = this.decisionDetailsOverlay
+    if (overlay === undefined) return
+    this.decisionDetailsOverlay = undefined
+    overlay.handle.hide()
+    disposeComponent(overlay.dialog)
+    this.syncOverlayMouse()
+    if (restoreFocus && !this.closing && !this.terminalPaused) this.tui.setFocus(this.dialog ?? this.prompt)
+    this.tui.requestRender()
+  }
+
+  private showDialog(dialog: Component, decision = false, placement: InteractionPlacement = 'workspace'): void {
     if (this.decisionId && !decision) {
       if (this.dialog !== dialog) disposeComponent(dialog)
       this.store.report('Resolve the pending DSH decision before opening another dialog.')
       return
     }
+    if (placement === 'composer' && !isComposerInteraction(dialog)) {
+      if (this.dialog !== dialog) disposeComponent(dialog)
+      throw new Error('Input-adjacent interactions must expose pure bounded layout measurement.')
+    }
     this.transcript.releaseHover()
+    this.closeDecisionDetails(false)
     this.closeImageDetails()
     this.closeToolDetails()
     this.closeSubagentSurfaces()
     this.surfaceGeneration += 1
+    this.exitArm = undefined
     this.dialogOverlay?.hide(); this.dialogOverlay = undefined
+    this.composerInteraction.setSurface(undefined)
     if (this.dialog && this.dialog !== dialog) disposeComponent(this.dialog)
     if (this.presetPicker?.dialog !== dialog) { this.presetPicker = undefined; this.presetCatalogRequest = undefined }
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialog = dialog
-    // The one composer stays mounted and untouched behind the modal. Only the
-    // active overlay owns input; no draft/undo/image state is copied or reset.
+    this.dialogPlacement = placement
+    // Keep the exact main Editor. A compact frozen paint leaves room for the
+    // decision, while workspace browsing retains the existing overlay path.
+    this.prompt.setFrozen(placement === 'composer')
+    this.queueList.invalidate()
     this.slot.clear(); this.slot.addChild(this.prompt)
-    const size = (dialog as Component & { modalSize?: ModalSize }).modalSize ?? 'standard'
-    this.dialogOverlay = this.tui.showOverlay(dialog, modalOverlayOptions(size))
+    if (placement === 'composer' && isComposerInteraction(dialog)) this.composerInteraction.setSurface(dialog)
+    else {
+      const size = (dialog as Component & { modalSize?: ModalSize }).modalSize ?? 'standard'
+      this.dialogOverlay = this.tui.showOverlay(dialog, modalOverlayOptions(size))
+    }
     this.syncOverlayMouse()
     this.tui.setFocus(dialog); this.render()
   }
   private hideDialog(): void {
+    this.closeDecisionDetails(false)
     this.surfaceGeneration += 1
+    this.exitArm = undefined
     this.keymap.cancelChord(); this.chordHint = undefined
     this.dialogOverlay?.hide(); this.dialogOverlay = undefined
+    this.composerInteraction.setSurface(undefined)
+    this.prompt.setFrozen(false)
+    this.queueList.invalidate()
     this.dialog = undefined; this.decisionId = undefined
+    this.dialogPlacement = 'workspace'
     this.presetPicker = undefined; this.presetCatalogRequest = undefined
     this.slot.clear(); this.slot.addChild(this.prompt)
     this.syncOverlayMouse()
@@ -2222,15 +2415,16 @@ export class App {
       title: `${request.origin.label ?? (request.origin.untracked === true ? 'Child session (untracked)' : request.origin.childSessionId)} › ${request.title}`,
     }
     this.decisionId = request.id
+    let dialog: DecisionDialog
     const extras: DecisionDialogExtras = {
       onInterrupt: () => { void this.interrupt() },
+      onDetails: content => this.openDecisionDetails(dialog, content),
     }
     const options = {
       request: displayRequest,
       onSubmit: (value: unknown) => { void this.answer(request.id, value) },
-      // Approval Esc uses DSH's native reject option; question Esc settles that
-      // one native request as cancelled. Ctrl+C still goes through the backend
-      // cancel path (a whole-turn abort) instead.
+      // Esc/default Ctrl+C settle this one native request as rejected/cancelled.
+      // Only an explicitly configured app.interrupt takes the whole-turn path.
       onCancel: () => {
         if (request.kind === 'question') { this.cancelQuestion(request.id); return }
         const rejection = this.rejectionValue(request)
@@ -2239,7 +2433,8 @@ export class App {
       keymap: this.keymap,
       ...extras,
     } as ConstructorParameters<typeof DecisionDialog>[1] & DecisionDialogExtras
-    this.showDialog(new DecisionDialog(this.tui, options), true)
+    dialog = new DecisionDialog(this.tui, options)
+    this.showDialog(dialog, true, 'composer')
   }
 
   private rejectionValue(request: DecisionRequest): { value: unknown } {
@@ -2310,7 +2505,11 @@ export class App {
     const up = this.bound(data, 'editor.move.line-up') || this.bound(data, 'editor.history.previous')
     const down = this.bound(data, 'editor.move.line-down') || this.bound(data, 'editor.history.next')
     if (this.editingQueueId) return false
-    if (up && (this.busy || this.queued > 0 || this.queuedAttachmentRecoveries.has(this.info?.sessionId ?? '')) && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
+    const recoveringClearedDraft = this.cleared !== undefined && this.queued === 0 &&
+      !this.queuedAttachmentRecoveries.has(this.info?.sessionId ?? '')
+    // Pi-style busy clears create a recoverable draft. When the native human
+    // inbox is empty, Up must not replace it with an empty dequeue/history read.
+    if (up && !recoveringClearedDraft && (this.busy || this.queued > 0 || this.queuedAttachmentRecoveries.has(this.info?.sessionId ?? '')) && !this.editor.getExpandedText() && this.info?.capabilities.includes('dequeue')) {
       if (!this.queueRecallPending) void this.recallQueue(data)
       return true
     }
@@ -2326,7 +2525,7 @@ export class App {
     if (down && this.restored && this.editor.getExpandedText() === this.restored.text) {
       const before = this.restored.before; this.restored = undefined; this.editor.restoreDraft(before); return true
     }
-    if (!this.bound(data, 'app.interrupt') && !this.bound(data, 'app.exit') && !this.bound(data, 'editor.delete.char-forward')) this.exitArm = undefined
+    if (this.exitArm?.id !== 'app.clear' && !this.bound(data, 'app.interrupt') && !this.bound(data, 'app.exit') && !this.bound(data, 'editor.delete.char-forward')) this.exitArm = undefined
     return false
   }
 
@@ -2419,35 +2618,30 @@ export class App {
 
   private dispatchAction(event: CcActionEvent): boolean {
     switch (event.id) {
+      case 'app.clear': {
+        // A field/surface must never forward clear to the hidden root draft.
+        if (this.dialog !== undefined || this.toolDetailsOverlay !== undefined || this.imageDetailsOverlay !== undefined ||
+            this.agentsOverlay !== undefined || this.childSessionOverlay !== undefined) break
+        // Retire only frontend input reads. Agent/tools/children and native
+        // queued messages keep running; this path never calls backend.cancel.
+        this.clipboardGeneration += 1; this.clipboardPending = false
+        this.fileAttachController?.abort(); this.fileAttachController = undefined
+        this.queueReadController?.abort()
+        if (!event.empty) {
+          this.cleared = this.editor.captureDraft()
+          this.editor.replaceDraftText('')
+        }
+        this.armExit(event.id, PI_CLEAR_WINDOW_MS)
+        break
+      }
       case 'app.interrupt': {
         const replyTarget = this.subagentReplyTarget
         if (replyTarget !== undefined) {
           const entry = this.store.subagentEntry(replyTarget.childId)
           if (this.canStopSubagent(entry)) void this.interruptSubagent(entry)
-          else if (!event.empty) {
-            this.cleared = this.editor.captureDraft()
-            this.editor.replaceDraftText('')
-            this.armExit(event.id)
-          } else this.armExit(event.id)
           break
         }
-        if (this.queueRecallPending) {
-          this.queueReadController?.abort()
-          if (!this.isBusy && event.empty) break
-        }
-        if (this.clipboardPending) {
-          this.clipboardGeneration += 1; this.clipboardPending = false
-          if (!this.isBusy && event.empty) break
-        }
-        if (this.isBusy) void this.interrupt()
-        else if (!event.empty) {
-          // CC: the first idle Ctrl+C clears the draft and arms the next press
-          // as exit. Typing or restoring the draft disarms it.
-          this.cleared = this.editor.captureDraft()
-          this.editor.replaceDraftText('')
-          this.armExit(event.id)
-        }
-        else this.armExit(event.id)
+        void this.interrupt()
         break
       }
       case 'app.cancel':
@@ -2529,13 +2723,13 @@ export class App {
     return true
   }
 
-  private armExit(id: string): void {
+  private armExit(id: string, windowMs = EXIT_ARM_MS): void {
     const now = Date.now()
-    if (this.exitArm?.id === id && now - this.exitArm.at < EXIT_ARM_MS) { void this.shutdown(0); return }
+    if (this.exitArm?.id === id && now - this.exitArm.at < windowMs) { void this.shutdown(0); return }
     this.exitArm = { id, at: now }
     this.render()
     if (this.exitTimer) clearTimeout(this.exitTimer)
-    this.exitTimer = setTimeout(() => { this.exitArm = undefined; this.render() }, EXIT_ARM_MS)
+    this.exitTimer = setTimeout(() => { this.exitArm = undefined; this.render() }, windowMs)
     this.exitTimer.unref()
   }
 
@@ -2547,7 +2741,7 @@ export class App {
       if (text !== undefined) this.editor.replaceDraftText(text)
       if (execute && text?.trim()) { this.editor.replaceDraftText(''); void this.submit(text) }
       this.render()
-    }))
+    }), false, 'composer')
   }
 
   async submit(text: string, mode: 'followup' | 'steer' | 'send-now' = 'followup', payload?: CcSubmitPayload): Promise<void> {
@@ -2816,6 +3010,7 @@ export class App {
       if (name === 'questions') { this.nativeUi.openQuestions(); return }
       if (name === 'rename') { if (argument) this.nativeUi.renameTo(argument); else this.nativeUi.openRename(); return }
       if (name === 'fork') { if (argument) this.store.report('Use /fork without arguments to confirm the current native durable boundary.', 'error'); else this.nativeUi.openFork(); return }
+      if (name === 'history') { if (argument) this.store.report('Use /history without arguments to browse the native outline.', 'error'); else this.openHistory(); return }
       if (name === 'attach') { await this.attachLocalFile(argument); return }
     }
     if (name === 'model') { if (argument) await this.runRemote('model', { id: argument }); else await this.pick('models'); return }
@@ -3178,6 +3373,7 @@ export class App {
   }
 
   private async pickPreset(existing?: Record<string, unknown>): Promise<void> {
+    const placement: InteractionPlacement = this.dialog instanceof SettingsDialog ? 'workspace' : 'composer'
     const context = this.context()
     let state: PresetPickerState | undefined
     const dialog = new SelectDialog(this.tui, {
@@ -3193,7 +3389,7 @@ export class App {
       onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
     })
-    this.showDialog(dialog)
+    this.showDialog(dialog, false, placement)
     if (this.dialog !== dialog) return
     state = { dialog, context, surface: this.surfaceGeneration }
     this.presetPicker = state
@@ -3248,6 +3444,7 @@ export class App {
   }
 
   private async pickPermission(): Promise<void> {
+    const placement: InteractionPlacement = this.dialog instanceof SettingsDialog ? 'workspace' : 'composer'
     const context = this.context()
     const dialog = new SelectDialog(this.tui, {
       title: 'Native permission preset', items: [], loading: true, keymap: this.keymap,
@@ -3258,7 +3455,7 @@ export class App {
       onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
     })
-    this.showDialog(dialog)
+    this.showDialog(dialog, false, placement)
     const surface = this.surfaceGeneration
     const result = object(await this.runRemote('permissions'))
     if (this.dialog !== dialog || !this.sameAttachment(context) || surface !== this.surfaceGeneration) return
@@ -3274,6 +3471,7 @@ export class App {
   }
 
   private confirmPermissionSelection(value: string, context: UiContext): void {
+    const placement = this.dialogPlacement
     const dialog = new SelectDialog(this.tui, {
       title: 'Confirm native permission change',
       items: [
@@ -3289,10 +3487,11 @@ export class App {
       onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
     })
-    this.showDialog(dialog)
+    this.showDialog(dialog, false, placement)
   }
 
   private async pickEffort(): Promise<void> {
+    const placement: InteractionPlacement = this.dialog instanceof SettingsDialog ? 'workspace' : 'composer'
     const context = this.context()
     const dialog = new SelectDialog(this.tui, {
       title: 'Choose reasoning effort', items: [], loading: true, keymap: this.keymap,
@@ -3304,7 +3503,7 @@ export class App {
       onCancel: () => { if (this.dialog !== dialog) return; this.dismissDialog(); this.returnToSettings() },
       onInterrupt: () => { void this.interrupt() },
     })
-    this.showDialog(dialog)
+    this.showDialog(dialog, false, placement)
     const surface = this.surfaceGeneration
     const data = object(await this.runRemote('efforts'))
     if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
@@ -3479,6 +3678,118 @@ export class App {
     this.showDialog(dialog)
   }
 
+  private openHistory(): void {
+    const info = this.info
+    if (info === undefined || !this.connected || this.closing || this.dialog !== undefined || this.decisionId !== undefined) return
+    if (!info.capabilities.includes('history-turns') || !info.capabilities.includes('history-window')) {
+      this.store.report('Native turn history is unavailable in this runtime.')
+      return
+    }
+    const dialog = new HistoryDialog(this.tui, {
+      session: info,
+      loading: true,
+      keymap: this.keymap,
+      codec: this.codec,
+      loadTurns: () => { void this.loadHistoryTurns(dialog) },
+      loadWindow: request => { void this.loadHistoryWindow(dialog, request) },
+      onClose: () => { if (this.dialog === dialog) this.dismissDialog() },
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else if (this.dialog === dialog) this.dismissDialog() },
+      onRenderRequest: () => this.render(),
+    })
+    this.showDialog(dialog)
+    void this.loadHistoryTurns(dialog)
+  }
+
+  private async loadHistoryTurns(dialog: HistoryDialog): Promise<void> {
+    if (this.dialog !== dialog || this.closing || !this.connected || !this.info?.capabilities.includes('history-turns')) return
+    const context = this.context()
+    const revision = ++this.historyOutlineRevision
+    dialog.setTurnsLoading(true)
+    try {
+      const outline = historyTurnsResult(await this.options.backend.command('history-turns'))
+      if (this.dialog !== dialog || revision !== this.historyOutlineRevision || !this.sameAttachment(context)) return
+      if (outline === undefined) dialog.setTurnsError('Native turn outline response was not usable.')
+      else dialog.setOutline(outline)
+    } catch (error) {
+      if (this.dialog === dialog && revision === this.historyOutlineRevision && this.sameAttachment(context)) {
+        dialog.setTurnsError(errorText(error))
+      }
+    }
+  }
+
+  private async loadHistoryWindow(dialog: HistoryDialog, request: HistoryWindowRequest): Promise<void> {
+    const info = this.info
+    if (this.dialog !== dialog || this.closing || !this.connected || info === undefined ||
+        request.sessionId !== info.sessionId || request.attachmentId !== info.attachmentId) return
+    if (!info.capabilities.includes('history-window')) {
+      dialog.failWindow(request.requestId, 'Native history window reads are unavailable in this runtime.')
+      return
+    }
+    try {
+      const result = historyWindowResult(await this.options.backend.command('history-window', {
+        sessionId: request.sessionId,
+        ...(request.attachmentId === undefined ? {} : { attachmentId: request.attachmentId }),
+        seq: request.targetSeq, before: request.before, after: request.after,
+      }))
+      if (result === undefined) dialog.failWindow(request.requestId, 'Native history window response was not usable.')
+      else dialog.setWindow(request.requestId, result)
+    } catch (error) {
+      dialog.failWindow(request.requestId, errorText(error))
+    }
+  }
+
+  private openWorkspaceChanges(request: WorkspaceChangesDetailsRequest): void {
+    const info = this.info
+    if (info === undefined || !this.connected || this.closing || this.dialog !== undefined || this.decisionId !== undefined ||
+        !info.capabilities.includes('workspace-change-diff') || request.sessionId !== info.sessionId || request.attachmentId !== info.attachmentId) return
+    // The callback can outlive its last paint. Only the current live card may
+    // open a read; never rebind an old card's seq/index to a new attachment or
+    // use its superseded summary as the dialog's file identity.
+    const item = this.store.items.find(item => item.kind === 'workspace-changes' && item.sessionId === request.sessionId &&
+      item.attachmentId === request.attachmentId && item.seq === request.seq && item.turn === request.turn)
+    if (item === undefined || item.kind !== 'workspace-changes') return
+    if (request.index !== undefined && (!nativeIndex(request.index) || item.files[request.index] === undefined ||
+        item.files[request.index]?.path !== request.files[request.index]?.path)) return
+    const context = this.context()
+    const dialog = new WorkspaceChangesDialog(this.tui, {
+      seq: item.seq,
+      summary: { turn: item.turn, files: item.files, total: item.total, added: item.added, deleted: item.deleted },
+      sessionId: item.sessionId,
+      ...(item.attachmentId === undefined ? {} : { attachmentId: item.attachmentId }),
+      isSessionCurrent: () => this.sameAttachment(context),
+      keymap: this.keymap,
+      loadDiff: (seq, index) => { void this.loadWorkspaceDiff(dialog, context, seq, index) },
+      onClose: () => { if (this.dialog === dialog) this.dismissDialog() },
+      onInterrupt: () => { if (this.isBusy) void this.interrupt(); else if (this.dialog === dialog) this.dismissDialog() },
+      onRenderRequest: () => this.render(),
+    })
+    this.showDialog(dialog)
+    if (request.index !== undefined) dialog.openDetail(request.index)
+  }
+
+  private async loadWorkspaceDiff(dialog: WorkspaceChangesDialog, context: UiContext, seq: number, index: number): Promise<void> {
+    if (this.dialog !== dialog || !this.sameAttachment(context)) return
+    if (!this.info?.capabilities.includes('workspace-change-diff')) {
+      dialog.setDiffError(seq, index, 'Native per-file diffs are unavailable in this runtime.')
+      return
+    }
+    try {
+      const result = workspaceChangeDiffResult(await this.options.backend.command('workspace-change-diff', {
+        sessionId: context.sessionId,
+        ...(context.attachmentId === undefined ? {} : { attachmentId: context.attachmentId }),
+        seq, index,
+      }))
+      if (this.dialog !== dialog || !this.sameAttachment(context)) return
+      if (result === undefined) {
+        dialog.setDiffError(seq, index, 'Native diff response was not usable.')
+        return
+      }
+      dialog.setDiff(result)
+    } catch (error) {
+      if (this.dialog === dialog && this.sameAttachment(context)) dialog.setDiffError(seq, index, errorText(error))
+    }
+  }
+
   private openQueue(): void {
     if (!this.connected || !this.info?.capabilities.includes('state')) {
       this.store.report('The native inbox view is unavailable in this runtime.')
@@ -3507,6 +3818,7 @@ export class App {
       const preview = (config: CcKeymapConfig) => createCcKeymap({
         definitions: this.keymap.definitions, chordTimeoutMs: this.keymap.getChordTimeoutMs(),
         bindings: { ...this.modeBindings, ...config },
+        baselineBindings: this.modeBindings,
       })
       const candidate = preview(next)
       const error = candidate.getDiagnostics().find(diagnostic => diagnostic.severity === 'error')
@@ -3624,7 +3936,7 @@ export class App {
           this.dismissDialog(); void this.attachLocalFile(values[0])
         },
       })
-      this.showDialog(dialog); return
+      this.showDialog(dialog, false, 'composer'); return
     }
     if (this.fileAttachController !== undefined) { this.store.report('Wait for the current local file input to finish.'); return }
     const stage = this.options.backend.stageFile
@@ -3892,6 +4204,7 @@ export class App {
       this.invalidateSkills(); this.skillsRequest = undefined
       this.queueReadController?.abort(); this.queueReadController = undefined
       this.queuedAttachmentRecoveries.clear()
+      this.closeDecisionDetails(false)
       this.closeImageDetails()
       this.closeToolDetails()
       this.closeSubagentSurfaces()

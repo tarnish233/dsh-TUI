@@ -75,7 +75,8 @@ const LABELS: Record<string, string> = {
   'editor.kill.word-forward': 'Delete next word (punctuation boundaries)',
   'editor.yank': 'Paste most recently deleted text',
   'editor.yank-pop': 'Cycle deleted text after pasting',
-  'app.interrupt': 'Interrupt / clear draft / confirm exit',
+  'app.clear': 'Clear editor / exit',
+  'app.interrupt': 'Interrupt',
   'app.todo': 'Todo panel (not implemented)',
   'app.thinking.toggle': 'Expand or collapse the latest thinking summary (hidden reasoning is revealed first)',
   'app.clipboard.pasteImage': 'Paste clipboard text (images not implemented)',
@@ -105,6 +106,25 @@ interface ResolvedModalAction {
 
 const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
+/**
+ * The binding-text field is a real embedded CC editor (`editor` context), where
+ * default Ctrl+C resolves the global `app.clear`. It consumes that key as its
+ * own local cancel ("abandon this edit"), but only under the same rule the list
+ * layers use: the *physical* key must still be an enabled single-key binding of
+ * a local cancel action, checked non-mutatingly (no resolution, no chord state).
+ * Disabling every cancel row, or remapping all of them away from Ctrl+C, leaves
+ * the key inert instead of inventing a cancel/back; the hidden root draft is
+ * never cleared and the native turn is never interrupted. Pasted bytes remain
+ * content (the caller guards paste state).
+ */
+function cancelFallback(keymap: CcKeymap, data: string): boolean {
+  if (keymap.isPendingChord()) return false
+  const simple = (binding: string): boolean =>
+    !binding.includes(' ') && matchesKey(data, binding as Parameters<typeof matchesKey>[1])
+  if (!keymap.getBindings('app.clear').some(simple)) return false
+  return [...CLOSE_ACTIONS].some(id => keymap.getBindings(id).some(simple))
+}
+
 const errorText = (error: unknown): string => sanitize(error instanceof Error ? error.message : String(error))
 
 export interface KeybindingsDialogOptions {
@@ -114,10 +134,10 @@ export interface KeybindingsDialogOptions {
   onChange: (actionId: string, bindings: string[] | null | undefined) => Promise<void>
   onBack: () => void
   /**
-   * Optional global interrupt hook. When provided, the configured
-   * `app.interrupt` key (Ctrl+C by default) calls it instead of leaving
-   * Settings; when omitted this pane keeps its local recovery behaviour
-   * (cancel the inline edit, otherwise go back).
+   * Optional explicit native interrupt hook. When provided, a configured
+   * `app.interrupt` binding (no shipped default) calls it instead of leaving
+   * Settings; when omitted this pane keeps its local recovery behaviour.
+   * Default Ctrl+C is `app.clear` and stays a local edit cancel here.
    */
   onInterrupt?: () => void
   /** Bounded modal height (defaults to the shared standard modal budget). */
@@ -418,6 +438,12 @@ export class KeybindingsDialog implements Component, Focusable {
       this.cancelEdit()
       return
     }
+    // Ctrl+C is `app.clear` in this embedded editor: abandon the edit locally
+    // instead of dropping the key on the hidden root draft.
+    if (!this.answer.editor.isPasting() && cancelFallback(this.options.keymap, raw)) {
+      this.cancelEdit()
+      return
+    }
     if (!this.answer.editor.isPasting()) {
       if (matchesKey(raw, 'enter')) {
         this.saveText(this.answer.raw)
@@ -442,7 +468,9 @@ export class KeybindingsDialog implements Component, Focusable {
   }
 
   private inputSearch(raw: string): void {
-    const action = this.resolve(raw)
+    // A fragmented bracketed paste owns the bytes while it arrives: a pasted
+    // Ctrl+C/Esc byte stays query content and never blurs or closes the surface.
+    const action = this.search.editor.isPasting() ? undefined : this.resolve(raw)
     if (action !== undefined) {
       switch (action.id) {
         case 'keybindings.edit':

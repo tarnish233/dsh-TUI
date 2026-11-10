@@ -576,7 +576,7 @@ test('no-match search is distinct from an empty category', () => {
   assert.equal(dialog.isDone, false)
 })
 
-test('remapped and disabled modal actions are respected; Ctrl+C keeps interrupt priority', () => {
+test('remapped and disabled modal actions are respected; default Ctrl+C is local, explicit interrupt is native', () => {
   const keymap = input.createCcKeymap({
     bindings: {
       'list.next': 'alt+j',
@@ -602,9 +602,19 @@ test('remapped and disabled modal actions are respected; Ctrl+C keeps interrupt 
   dialog.handleInput(CTRL_R)
   assert.equal(resets.length, 0, 'a disabled reset action is inert')
   dialog.handleInput(CTRL_C)
-  assert.deepEqual(events, ['interrupt'])
-  assert.equal(dialog.isDone, false)
+  assert.deepEqual(events, ['cancel'], 'default Ctrl+C is the local cancel, not a native interrupt')
+  assert.equal(dialog.isDone, true)
   assert.equal(patches.length, 0)
+
+  // Only an explicit user override makes Ctrl+C a native interrupt again; the
+  // surface stays open while the parent cancels the turn.
+  const explicit = harness({
+    keymap: input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+    withInterrupt: true,
+  })
+  explicit.dialog.handleInput(CTRL_C)
+  assert.deepEqual(explicit.events, ['interrupt'])
+  assert.equal(explicit.dialog.isDone, false)
 })
 
 test('digit selection uses the continuous roster index and stays inert when disabled', () => {

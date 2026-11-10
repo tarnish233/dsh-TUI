@@ -112,7 +112,10 @@ export interface SessionPickerOptions {
   keymap?: CcKeymap
   onSelect: (id: string) => void
   onCancel: () => void
-  /** Global interrupt (Ctrl+C by default); defaults to cancel like SelectDialog. */
+  /**
+   * Explicit native interrupt (a configured `app.interrupt`; no shipped
+   * default); defaults to cancel like SelectDialog. Default Ctrl+C is local.
+   */
   onInterrupt?: () => void
   /**
    * The ids of the rows currently visible in the row window, after the

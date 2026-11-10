@@ -97,7 +97,7 @@ test("browse contexts declare only their contracted local actions", () => {
   const local: Record<string, string[]> = {
     settingsList: ["modal.search", "settings.reset", "settings.previous-category", "settings.next-category"],
     keybindingsList: ["modal.search", "keybindings.edit", "keybindings.reset", "keybindings.disable"],
-    modalList: ["modal.search", "session.scope.toggle"],
+    modalList: ["modal.search", "session.scope.toggle", "dialog.details"],
     queueList: ["modal.search", "queue.edit", "queue.cancel-entry", "queue.send-now"],
     // A search field is not a list: no context-local rows, only the editor,
     // dialog and global fallback layers.
@@ -215,8 +215,11 @@ test("settingsList: group jumps, reset, select and no editor fallthrough", () =>
   assert.equal(actionId(keymap, "\x01", "settingsList"), undefined)
   assert.equal(actionId(keymap, "\x01", "editor"), "editor.move.line-start")
 
-  // Global app actions still fall through; Ctrl+R never means history here.
-  assert.equal(actionId(keymap, "\x0f", "settingsList"), "app.tools.expand")
+  // Ctrl+O is the dialog-local native-details row inside a modal list; the
+  // plain root prompt keeps app.tools.expand.
+  assert.equal(actionId(keymap, "\x0f", "settingsList"), "dialog.details")
+  assert.equal(actionId(keymap, "\x0f", "editor"), "app.tools.expand")
+  // Other global app actions still fall through; Ctrl+R never means history here.
   assert.equal(actionId(keymap, "\x12", "editor"), "app.history.search")
 
   // In the modal search field the same keys are text-field/global keys.
@@ -342,26 +345,41 @@ test("app.queue.open is a chord-aware global action that stays remappable", () =
 
 // --- interrupt priority -------------------------------------------------
 
-test("Ctrl+C keeps interrupt priority in every new modal context", () => {
+test("default Ctrl+C is local in every new modal context; an explicit interrupt keeps priority", () => {
   const keymap = mod.createCcKeymap({ platform: "posix" })
-  for (const context of NEW_CONTEXTS) {
-    assert.equal(actionId(keymap, "\x03", context), "app.interrupt", context)
+  assert.deepEqual(keymap.getBindings("app.interrupt"), [], "app.interrupt ships unbound")
+  // Default Ctrl+C reaches the local cancel/reject row, never a hidden root
+  // clear or a global native abort.
+  for (const context of BROWSE_CONTEXTS) {
+    assert.equal(actionId(keymap, "\x03", context), "list.cancel", context)
   }
-  // Read-only browse lists would otherwise see list.cancel (Ctrl+C); the
-  // configured interrupt key wins before the chain and before a pending chord.
+  assert.equal(actionId(keymap, "\x03", "modalSearch"), "dialog.cancel", "the modal field cancels its dialog")
+
+  // Read-only browse lists: a pending chord is dropped, then the local row
+  // receives the key (the editor re-dispatches the passthrough once).
   for (const context of BROWSE_CONTEXTS) {
     assert.equal(resolve(keymap, "\x18", context).kind, "pending", context)
-    assert.equal(actionId(keymap, "\x03", context), "app.interrupt", `${context} over a pending chord`)
+    const cancelled = keymap.resolve("\x03", context)
+    assert.equal(cancelled.kind, "cancelled-chord", `${context} drops the chord prefix`)
+    assert.equal(cancelled.kind === "cancelled-chord" ? cancelled.passthrough : "", "\x03")
     assert.equal(keymap.isPendingChord(), false, `${context} chord is cancelled`)
+    assert.equal(actionId(keymap, "\x03", context), "list.cancel")
   }
 
-  // The configured interrupt key is honoured, not a hardcoded byte.
+  // An explicit interrupt override is honoured, not a hardcoded byte, and it
+  // wins before the chain and before a pending chord in these contexts.
   const remapped = mod.createCcKeymap({ bindings: { "app.interrupt": "ctrl+g" }, platform: "posix" })
   for (const context of NEW_CONTEXTS) {
     assert.equal(actionId(remapped, "\x07", context), "app.interrupt", context)
   }
-  // Ctrl+C then resolves through the normal chain (list.cancel in browse lists).
+  for (const context of BROWSE_CONTEXTS) {
+    assert.equal(resolve(remapped, "\x18", context).kind, "pending", context)
+    assert.equal(actionId(remapped, "\x07", context), "app.interrupt", `${context} over a pending chord`)
+    assert.equal(remapped.isPendingChord(), false, `${context} chord is cancelled by the interrupt`)
+  }
+  // Old Ctrl+C then resolves through the normal chain (list.cancel in browse lists).
   assert.equal(actionId(remapped, "\x03", "settingsList"), "list.cancel")
+  assert.equal(actionId(remapped, "\x03", "modalSearch"), "dialog.cancel")
 
   // Esc keeps its local meaning: close the browse surface / cancel the field.
   assert.equal(actionId(keymap, "\x1b", "queueList"), "list.cancel")
@@ -444,10 +462,11 @@ test("modalSearch edits through the one editor; browse contexts fail closed", ()
   assert.equal(search.editor.getText(), textBefore)
   assert.deepEqual(actionIds(search.events), [])
 
-  // Esc in the field forwards app.cancel; Ctrl+C stays the global interrupt.
+  // Esc in the field forwards app.cancel; Ctrl+C cancels the containing dialog
+  // locally (dialog.cancel) instead of clearing the hidden root draft.
   press(search.editor, "\x1b")
   press(search.editor, "\x03")
-  assert.deepEqual(actionIds(search.events), ["app.cancel", "app.interrupt"])
+  assert.deepEqual(actionIds(search.events), ["app.cancel", "dialog.cancel"])
 
   // A read-only browse surface never types into a hidden draft: printable and
   // editing bytes are inert, list keys resolve to their named actions.

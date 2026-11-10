@@ -43,9 +43,12 @@
  * disabled bindings are respected and no literal arrow/Esc fallback is applied:
  * - `list.previous/next`, `list.page-up/down`, `list.first/last` scroll;
  * - `list.cancel`, `dialog.cancel`, `app.cancel` close;
- * - a configured single-key `app.interrupt` (Ctrl+C by default) is global turn
- *   cancellation: it cancels any pending chord, never closes, selects or
- *   submits by itself, and calls the parent's `onInterrupt`;
+ * - default Ctrl+C is the global `app.clear`: inside this panel it is the
+ *   local close (`list.cancel`, or `dialog.cancel` in the search field), never a
+ *   hidden root clear and never a native interrupt;
+ * - an explicitly configured single-key `app.interrupt` (no shipped default) is
+ *   native turn cancellation: it cancels any pending chord, never closes,
+ *   selects or submits by itself, and calls the parent's `onInterrupt`;
  * - `list.select`, `list.select-digit`, `dialog.confirm`, printable keys and
  *   every unbound sequence are inert while the list is focused. Enter/digits
  *   can never execute anything.
@@ -83,9 +86,10 @@ export interface HelpPanelOptions {
   /** Local close (Esc/list cancel). Called at most once. */
   onClose: () => void
   /**
-   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). The panel
-   * remains open: the parent runs its normal cancel path and closes the surface
-   * when appropriate. Without it, interrupt falls back to `onClose`.
+   * Explicit native interrupt (a configured `app.interrupt`; no shipped
+   * default). The panel remains open: the parent runs its normal cancel path
+   * and closes the surface when appropriate. Without it, interrupt falls back to
+   * `onClose`. Default Ctrl+C is the local close, never this callback.
    */
   onInterrupt?: () => void
   /**
@@ -459,7 +463,7 @@ export class HelpPanel implements Component, Focusable {
       }
       // Esc/Enter/Ctrl+C arrive through the editor's dialog/app fallbacks and
       // are handled in the editor.onAction hook (leave the search / stay inert /
-      // interrupt). Everything else is text.
+      // explicit interrupt). Everything else is text.
       const draft = this.search.editor.getText()
       const result = this.search.handleKey(raw)
       // Enter is inert in a read-only catalog. CcEditor clears its buffer on
@@ -542,8 +546,9 @@ export class HelpPanel implements Component, Focusable {
   }
 
   /**
-   * Global turn cancellation. The panel itself is not a decision: it never
-   * submits/answers. With no parent handler it falls back to a local close.
+   * Explicit native turn interruption (only a configured `app.interrupt`
+   * reaches here). The panel itself is not a decision: it never submits or
+   * answers. With no parent handler it falls back to a local close.
    */
   private interrupt(): void {
     if (this.done) return

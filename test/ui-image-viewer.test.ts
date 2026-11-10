@@ -192,11 +192,55 @@ test('height budget follows maxHeight, falls back compactly, and never slices AP
   })
 })
 
-test('loading closes on Esc, ignores unrelated global actions, and defers interrupt to the parent', async () => {
+test('default Ctrl+C closes locally without a native interrupt; disabled cancels stay inert', async () => {
+  const events: string[] = []
+  const local = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+    image: item(), keymap: keymap(), readImage: async () => PNG.value, maxHeight: 30,
+    onClose: () => { events.push('close') },
+    onInterrupt: () => { events.push('interrupt') },
+  })
+  await settle(local)
+  local.handleInput('\x03')
+  assert.deepEqual(events, ['close'], 'the default local Ctrl+C closes the read-only viewer')
+  assert.equal(local.isDisposed, false, 'close is parent-owned')
+
+  const disabledEvents: string[] = []
+  const disabled = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+    image: item(),
+    keymap: createCcKeymap({ bindings: { 'image.details.close': null, 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null } }),
+    readImage: async () => PNG.value, maxHeight: 30,
+    onClose: () => { disabledEvents.push('close') },
+    onInterrupt: () => { disabledEvents.push('interrupt') },
+  })
+  await settle(disabled)
+  disabled.handleInput('\x03')
+  assert.deepEqual(disabledEvents, [], 'global app.clear is never a phantom local close')
+  disabled.handleInput('\x1b')
+  assert.deepEqual(disabledEvents, [], 'a disabled local cancel has no invented Escape fallback')
+  disabled.dispose()
+
+  const remappedEvents: string[] = []
+  const remapped = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
+    image: item(),
+    keymap: createCcKeymap({ bindings: { 'image.details.close': 'x', 'list.cancel': 'x', 'dialog.cancel': 'x', 'app.cancel': 'ctrl+g' } }),
+    readImage: async () => PNG.value, maxHeight: 30,
+    onClose: () => { remappedEvents.push('close') },
+    onInterrupt: () => { remappedEvents.push('interrupt') },
+  })
+  await settle(remapped)
+  remapped.handleInput('\x03')
+  assert.deepEqual(remappedEvents, [], 'Ctrl+C is inert once the local cancels moved away')
+  remapped.handleInput('x')
+  assert.deepEqual(remappedEvents, ['close'])
+  remapped.dispose()
+})
+
+test('loading closes on Esc, ignores unrelated global actions, and defers an explicit interrupt to the parent', async () => {
   const pending = deferred<ImageAttachmentValue>()
   const events: string[] = []
   const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
-    image: item(), keymap: keymap(),
+    image: item(),
+    keymap: createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
     readImage: () => pending.promise,
     maxHeight: 30,
     onClose: () => { events.push('close') },
@@ -223,7 +267,9 @@ test('navigation honors the shared keymap and disables boundary moves', async ()
   const calls: string[] = []
   let index = 1
   const dialog = new ImageDetailsDialog(asTui(createFakeTui(40, 100)), {
-    image: item(), keymap: keymap(), readImage: async () => PNG.value, maxHeight: 30,
+    image: item(),
+    keymap: createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+    readImage: async () => PNG.value, maxHeight: 30,
     onClose: () => { calls.push('close') },
     onInterrupt: () => { calls.push('interrupt') },
     getImageNavigation: () => ({ index, total: 3 }),

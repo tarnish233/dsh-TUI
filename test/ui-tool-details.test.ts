@@ -636,16 +636,22 @@ test('disabled modal actions never fall through to permission or tool-expand glo
   assert.equal(events.filter(event => event === 'close').length, 0)
 })
 
-test('Ctrl+C is the global interrupt, Esc closes, and chords never leak', () => {
-  const interrupt = harness({ withInterrupt: true })
+test('default Ctrl+C closes locally; an explicit interrupt override still delegates', () => {
+  // Pi-style default: Ctrl+C is the local list.cancel, not a native interrupt.
+  const localDefault = harness({ withInterrupt: true })
+  localDefault.dialog.handleInput(CTRL_C)
+  assert.equal(localDefault.dialog.isDone, true, 'default Ctrl+C closes the read-only inspector')
+  assert.deepEqual(localDefault.events.filter(event => event === 'close'), ['close'])
+  assert.deepEqual(localDefault.events.filter(event => event === 'interrupt'), [], 'no native interrupt by default')
+
+  // Only an explicit app.interrupt override keeps the old native meaning.
+  const interrupt = harness({
+    withInterrupt: true,
+    keymap: input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+  })
   interrupt.dialog.handleInput(CTRL_C)
   assert.deepEqual(interrupt.events.filter(event => event === 'interrupt'), ['interrupt'])
-  assert.equal(interrupt.dialog.isDone, false, 'interrupt is not a local close')
-
-  const local = harness()
-  local.dialog.handleInput(CTRL_C)
-  assert.equal(local.dialog.isDone, true, 'without a handler the surface closes through onClose')
-  assert.deepEqual(local.events.filter(event => event === 'close'), ['close'])
+  assert.equal(interrupt.dialog.isDone, false, 'an explicit interrupt is not a local close')
 
   const esc = harness()
   esc.dialog.handleInput(ESC)
@@ -657,6 +663,65 @@ test('Ctrl+C is the global interrupt, Esc closes, and chords never leak', () => 
   editing.dialog.handleInput(CTRL_W)
   assert.equal(editing.dialog.section, 'input')
   assert.equal(editing.dialog.notice, '')
+})
+
+test('disabled/remapped local cancel is inert and never aliased from global app.clear', () => {
+  // All named local cancels disabled: Ctrl+C resolves the global app.clear in
+  // this read-only context, but that must never become a phantom local close.
+  const disabled = harness({
+    keymap: input.createCcKeymap({
+      bindings: { 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null },
+    }),
+  })
+  disabled.dialog.handleInput(CTRL_C)
+  assert.equal(disabled.dialog.isDone, false, 'disabled local cancel is not resurrected by app.clear')
+  assert.deepEqual(disabled.events, [])
+  assert.match(disabled.text(120), /find/, 'the find affordance stays')
+  assert.doesNotMatch(disabled.text(120), /Ctrl\+C close/i, 'no dead close hint for a disabled/aliased cancel')
+
+  // Local cancels remapped away from Ctrl+C: Ctrl+C must not close.
+  const remapped = harness({
+    keymap: input.createCcKeymap({ bindings: { 'list.cancel': 'q', 'dialog.cancel': 'q', 'app.cancel': 'ctrl+g' } }),
+  })
+  remapped.dialog.handleInput(CTRL_C)
+  assert.equal(remapped.dialog.isDone, false, 'remapped local cancel leaves Ctrl+C inert')
+  assert.deepEqual(remapped.events, [])
+  remapped.dialog.handleInput('q')
+  assert.equal(remapped.dialog.isDone, true)
+
+  // The same remap does not disable an explicit interrupt override.
+  const interrupt = harness({
+    withInterrupt: true,
+    keymap: input.createCcKeymap({
+      bindings: { 'list.cancel': 'q', 'dialog.cancel': 'q', 'app.cancel': 'ctrl+g', 'app.interrupt': 'ctrl+c' },
+    }),
+  })
+  interrupt.dialog.handleInput(CTRL_C)
+  assert.deepEqual(interrupt.events.filter(event => event === 'interrupt'), ['interrupt'])
+  assert.equal(interrupt.dialog.isDone, false)
+})
+
+test('find-field Ctrl+C follows the configured local cancel shortcut, not a global app.clear alias', () => {
+  const standard = harness()
+  standard.dialog.render(120)
+  standard.dialog.handleInput(CTRL_F)
+  assert.equal(standard.dialog.searchFocused, true)
+  standard.dialog.handleInput('o')
+  standard.dialog.handleInput(CTRL_C)
+  assert.equal(standard.dialog.searchFocused, false, 'default local Ctrl+C clears the find sublayer')
+  assert.equal(standard.dialog.isDone, false, 'the inspector itself stays open')
+  assert.equal(standard.dialog.searchQuery, '')
+
+  const remapped = harness({
+    keymap: input.createCcKeymap({ bindings: { 'list.cancel': 'q', 'dialog.cancel': 'q', 'app.cancel': 'ctrl+g' } }),
+  })
+  remapped.dialog.render(120)
+  remapped.dialog.handleInput(CTRL_F)
+  remapped.dialog.handleInput('o')
+  remapped.dialog.handleInput(CTRL_C)
+  assert.equal(remapped.dialog.searchFocused, true, 'remapped local cancel never resurrects a find cancel')
+  assert.equal(remapped.dialog.isDone, false)
+  assert.equal(remapped.dialog.searchQuery, 'o')
 })
 
 test('closing and copy follow remapped list/dialog bindings', async () => {

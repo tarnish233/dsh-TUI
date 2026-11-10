@@ -4,24 +4,39 @@
  * Three things live here:
  *
  * 1. `SelectDialog` — the generic search-free chooser (`/preset`, `/effort` and
- *    other small native rosters). It is a bounded `ModalFrame` surface sized
- *    `compact`, with clickable rows, a clickable action footer and the same
- *    key/mouse behaviour.
+ *    other small native rosters). It is a bounded `ModalFrame` surface, with
+ *    clickable rows, a clickable action footer and the same key/mouse
+ *    behaviour.
  * 2. `DecisionDialog` — native approvals and ordered questions. It keeps the
  *    opaque native option values, the ordered `{answers: (string|string[])[]}`
- *    result, per-question multi-select/custom/review state and the cancel vs
- *    interrupt split.
+ *    result, per-question multi-select/custom/review state, the local
+ *    cancel/reject path and the optional full native detail overlay request.
  * 3. Small shared modal helpers used by the other chooser/help components:
  *    keymap resolution for the unified `modalList` browse context, block
  *    windowing that also reports painted body row ranges (so mouse hits can
- *    never point at a clipped row), and the body/geometry composition helper.
+ *    never point at a clipped row), the body/geometry composition helper and
+ *    the shared proposal validation/rows also used by `decision-details.ts`.
  *
  * Contract boundaries (do not relax here):
  *
  * - Chrome, sizing, action chips and mouse geometry belong to `ModalFrame`.
  *   These components own only their body lines and their own list state.
- * - `app.interrupt` (Ctrl+C by default) stays global turn cancellation. It is
- *   never converted into a local answer, and never closes a decision by itself.
+ * - Placement is presentation only (`ComposerInteraction`, docs/
+ *   COMPOSER-INTERACTION-CONTRACT.md): the default stays the historical bounded
+ *   workspace overlay, a `composer` mount sits input-adjacent, uses the natural
+ *   content height capped by the parent's budget, and stops claiming viewport
+ *   keys so transcript paging keeps working. Selection keys stay local.
+ * - Default `Ctrl+C` is the local cancel/reject path of the focused surface
+ *   (`list.cancel`/`dialog.cancel`), never a hidden root clear and never a
+ *   native abort. An explicitly configured `app.interrupt` key is explicit
+ *   intent and keeps its priority through `onInterrupt`; it is never converted
+ *   into a local answer, and never closes a decision by itself.
+ * - The root `app.clear` binding is never re-aliased into a dismissal and never
+ *   reaches the hidden root draft from inside a decision. A custom-answer field
+ *   only maps the *actual configured* local cancel bindings onto the same local
+ *   dismiss path, and only when the editor layer does not claim that key; a
+ *   disabled/remapped cancel key therefore stays inert instead of gaining an
+ *   invented fallback.
  * - An approval's local cancel (Esc, `list.cancel`, the frame close affordance)
  *   submits the request's own rejected opaque option, so the native decision
  *   settles as `rejected`. Only when the request has no identifiable rejection
@@ -31,8 +46,16 @@
  *   request (or re-queues it) — the component never claims that a dismissed
  *   question stays hidden while pending.
  * - No guessed tool/diff correlation: a decision renders the native message and
- *   options only. Rich approval previews need a native seam this file does not
- *   invent.
+ *   options only, except for an approval that arrives with DSH's own
+ *   `toolPresentation.presentCall` diff intent. That preview is validated with
+ *   the shared tool-presentation reader, is rendered by the shared
+ *   `renderDiffBlock`, is always worded as a proposal that has not run, and is
+ *   dropped (with no error and no marker) when the record is missing or
+ *   malformed. `callId` alone is never evidence of a diff.
+ * - The full native detail (`question.detail` markdown or the validated pure
+ *   proposal) is never invented here: `onDetails` is only offered when the
+ *   native request already carries it, and the parent mounts the read-only
+ *   `DecisionDetailsDialog` over this retained decision instance.
  *
  * Layout/keys are adapted from agent_tui (MIT) src/ui/{dialogs,questionnaire,
  * select}.ts, rebuilt on public Pi TUI + this repo's input/theme components.
@@ -47,12 +70,17 @@ import {
   type TuiMouseEvent,
   type TuiMouseEventResult,
 } from '#pi-tui'
-import type { DecisionOption, DecisionRequest, Question } from '../backend/types.ts'
+import type { DecisionOption, DecisionRequest, JsonRecord, Question } from '../backend/types.ts'
 import { createCcKeymap, type CcKeymap } from '../input/index.ts'
+import type { DecisionDetailContent } from './decision-details.ts'
+import { subscribeHighlightRuntime } from './highlight.ts'
 import { InlineAnswer } from './inline-editor.ts'
+import type { ComposerInteraction, InteractionLayout } from './interaction.ts'
 import { ModalFrame, modalHeight, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { bold, cc, dim, markdownTheme, t } from './theme.ts'
-import { fit, truncateToWidth, visibleWidth, wrap } from './text.ts'
+import { fit, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
+import { renderDiffBlock, diffStats } from './tool-diff.ts'
+import { readToolPresentation, type MetaDiff } from './tool-io.ts'
 
 // ---------------------------------------------------------------------------
 // Keymap dispatch
@@ -65,6 +93,8 @@ export interface ResolvedModalAction {
 
 const isCancelAction = (id: string): boolean =>
   id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel'
+/** Every action that means "settle this surface locally, without answering". */
+const CANCEL_ACTIONS: readonly string[] = ['list.cancel', 'dialog.cancel', 'app.cancel']
 const isInterruptAction = (id: string): boolean => id === 'app.interrupt'
 const isSelectAction = (id: string): boolean => id === 'list.select' || id === 'dialog.confirm'
 
@@ -327,6 +357,111 @@ export function bodyHitAt(hits: readonly HitRange[], row: number): HitRange | un
   return hits.find(hit => row >= hit.startRow && row <= hit.endRow)
 }
 
+// ---------------------------------------------------------------------------
+// Composer / workspace presentation
+
+/** Historical bounded workspace overlay height; the default presentation. */
+function workspaceHeight(tui: Pick<TUI, 'terminal'>, size: ModalSize): number {
+  return modalHeight(tui, size)
+}
+
+/**
+ * Smallest natural composer plate: title, one body row, one footer row and the
+ * closed border. Never padded beyond the content, and clamped again by the
+ * parent's budget.
+ */
+const MIN_COMPOSER_ROWS = 6
+
+/** One frame plan shared by `measureRows` and `render` (never a second paint). */
+interface PlannedFrame {
+  readonly height: number
+  /** Body rows the frame actually gives the dialog at this height. */
+  readonly bodyHeight: number
+  readonly options: ModalFrameOptions
+  readonly lines: string[]
+  readonly hits: HitRange[]
+}
+
+/**
+ * Plan one frame at `width` from the same options the paint uses.
+ *
+ * `fixedHeight` keeps the historical workspace surface (it fills its bounded
+ * overlay exactly). Without it the height is the natural content height capped
+ * by `cap` — the parent's budget is a cap, never an excuse to pad a two-row
+ * picker into a tall panel. Chrome rows are allocated first by `ModalFrame`, so
+ * the action footer (including cancel/reject) survives at every height.
+ *
+ * Planning only measures and composes body rows: it paints nothing, syncs no
+ * hitboxes and changes no selection, focus or editor state. The body is built
+ * against the exact geometry the frame will use, so `measureRows` and `render`
+ * can never disagree about the row count.
+ */
+function planFrame(
+  frame: ModalFrame,
+  width: number,
+  options: (height: number) => ModalFrameOptions,
+  body: (bodyWidth: number, bodyHeight: number) => BodyPaint,
+  fixedHeight: number | undefined,
+  cap: number,
+  minimum = 1,
+): PlannedFrame {
+  const safeWidth = Math.max(1, Math.floor(width))
+  const budget = Math.max(1, Math.floor(cap))
+  // A framed plate stays readable for a tiny roster, but the floor is itself
+  // bounded by the parent's budget: a small viewport still wins.
+  const floor = Math.max(1, Math.min(budget, Math.floor(minimum)))
+  const at = (height: number): PlannedFrame => {
+    const built = options(height)
+    const geometry = frame.measure(safeWidth, built)
+    const paint = body(geometry.bodyWidth, geometry.bodyHeight)
+    const lines = paint.lines.slice(0, geometry.bodyHeight).map(line => fit(line, geometry.bodyWidth))
+    const hits = paint.hits.filter(hit => hit.endRow < lines.length)
+    return { height, bodyHeight: geometry.bodyHeight, options: built, lines, hits }
+  }
+  if (fixedHeight !== undefined) return at(Math.max(1, Math.floor(fixedHeight)))
+  // Chrome only shrinks as the height shrinks, so the fixed point is reached in
+  // one or two passes. The loop stays bounded so no degradation rule can spin.
+  let height = budget
+  for (let pass = 0; pass < 3; pass += 1) {
+    const plan = at(height)
+    const natural = Math.max(1, plan.height - plan.bodyHeight + plan.lines.length)
+    const next = Math.max(floor, Math.min(budget, natural))
+    if (next === height) return plan
+    height = next
+  }
+  return at(height)
+}
+
+/**
+ * True when `raw` is one of the enabled single-key bindings of `actionId`.
+ *
+ * Read-only test: it never opens, advances or cancels a pending chord, so a
+ * dialog can ask about one app action before forwarding the key to the single
+ * editor state. Chords are deliberately excluded (they belong to the editor or
+ * to the dialog's own resolution, not to this lookahead).
+ */
+export function boundToKey(keymap: CcKeymap, actionId: string, raw: string): boolean {
+  return keymap
+    .getBindings(actionId)
+    .some(binding => !binding.includes(' ') && matchesKey(raw, binding as KeyId))
+}
+
+/**
+ * True when the editor layer claims `raw` itself (a nearer binding wins), which
+ * keeps the single editor state authoritative inside an inline answer field.
+ * A pending chord always belongs to the editor until it completes or cancels.
+ */
+function editorClaimsKey(keymap: CcKeymap, raw: string): boolean {
+  if (keymap.isPendingChord()) return true
+  for (const action of keymap.getActions('editor')) {
+    for (const binding of keymap.getBindings(action.id)) {
+      const first = binding.split(' ')[0]
+      if (first !== undefined && matchesKey(raw, first as KeyId)) return true
+    }
+  }
+  return false
+}
+
 function choiceBlocks(
   items: readonly DecisionOption[],
   focus: number,
@@ -365,6 +500,118 @@ const errorLines = (text: string, width: number): string[] =>
   wrap(text, Math.max(4, width)).map(line => ` ${cc.error(fit(line, Math.max(4, width)))}`)
 
 // ---------------------------------------------------------------------------
+// Approval proposal preview
+
+/** Diff rows a bounded proposal preview may paint; never a full patch dump. */
+const PROPOSAL_PREVIEW_ROWS = 12
+/** Same column threshold the transcript's diff cards use by default. */
+const PROPOSAL_SPLIT_MIN_WIDTH = 120
+
+/**
+ * Validate the request's native proposed diff call view.
+ *
+ * DSH hands an approval the pure `presentCall` intent *before* the tool runs, so
+ * only the call half is read and only its diff card counts. A missing record, a
+ * different card, malformed `diffs`, or a record that carries only a `result`
+ * half is not a proposal: it yields `undefined`, and the dialog keeps its plain
+ * message + options with no error and no placeholder. `callId` is deliberately
+ * not consulted — an identity string is never evidence of a diff.
+ *
+ * Exported for the full detail overlay, which re-renders exactly this validated
+ * record (one validation rule, no second diff guess).
+ */
+export function decisionProposalRecord(raw: unknown): JsonRecord | undefined {
+  const record = asRecordLike(raw)
+  if (record === undefined) return undefined
+  // An approval is decided *before* execution, so a record that carries a
+  // result half is not the pure call intent this preview understands. Refuse it
+  // rather than risk presenting an executed result as a pending proposal.
+  if ('result' in record) return undefined
+  const call = readToolPresentation(record, false).call
+  if (call === undefined || call.card !== 'diff' || call.diffs.length === 0) return undefined
+  return record
+}
+
+/** Diffs of an already-validated pure proposal record (shared reader, no copy). */
+export function decisionProposalDiffs(record: JsonRecord): MetaDiff[] {
+  const call = readToolPresentation(record, false).call
+  return call === undefined ? [] : [...call.diffs]
+}
+
+/** Plain-object check for the untrusted presentation record. */
+function asRecordLike(raw: unknown): JsonRecord | undefined {
+  return typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as JsonRecord : undefined
+}
+
+/** One untrusted native path as a single printable row fragment. */
+function proposalPath(path: string): string {
+  return sanitize(path).replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Label + summary row of the proposal preview.
+ *
+ * The honesty wording comes first so a narrow body truncates the file list, not
+ * the fact that this is a proposal DSH has not run. No row of this preview may
+ * claim an applied change or an executed result.
+ */
+export function decisionProposalLabel(diffs: readonly MetaDiff[], width: number): string {
+  const paths = [...new Set(diffs.map(diff => proposalPath(diff.path)))].filter(path => path !== '')
+  const scope = paths.length === 0
+    ? 'file change'
+    : paths.length === 1
+      ? paths[0]!
+      : `${paths.length} files (${paths.slice(0, 3).join(', ')}${paths.length > 3 ? ` +${paths.length - 3} more` : ''})`
+  const stats = diffStats(diffs)
+  const counts = stats.oversized ? 'hunk too large to count precisely' : `+${stats.added} -${stats.removed} lines`
+  const label = 'Proposal'
+  return fit(` ${bold(t.accent(label))}${t.muted(` · not run yet · ${scope} · ${counts}`)}`, width)
+}
+
+/**
+ * Complete proposal rows: heading, diff rows and honest overflow markers.
+ *
+ * Diff math and width/wrap behaviour are `renderDiffBlock`'s; this function only
+ * adds the indent, the label and the truncation notice. `expanded` renders the
+ * whole patch (the full read-only detail overlay); otherwise the bounded
+ * `PROPOSAL_PREVIEW_ROWS` budget applies and the hidden count is reported.
+ *
+ * `indicatorMode: 'classic'` is deliberate: an approval has no card chrome and
+ * may be read on a terminal without diff colors, so `- old` / `+ new` must carry
+ * the change on its own instead of relying on the bands alone.
+ */
+export function decisionProposalRows(
+  diffs: readonly MetaDiff[],
+  width: number,
+  options: { readonly expanded: boolean },
+): { readonly lines: string[]; readonly hidden: number; readonly oversized: boolean } {
+  const indent = ' '
+  const contentWidth = Math.max(1, width - indent.length)
+  const rendered = renderDiffBlock(diffs, contentWidth, {
+    viewMode: 'auto',
+    indicatorMode: 'classic',
+    splitMinWidth: PROPOSAL_SPLIT_MIN_WIDTH,
+    wordWrap: true,
+    expanded: options.expanded,
+    collapsedLines: PROPOSAL_PREVIEW_ROWS,
+    layoutWidth: width,
+  })
+  const lines: string[] = [decisionProposalLabel(diffs, width)]
+  for (const row of rendered.lines) lines.push(fit(`${indent}${row}`, width))
+  if (rendered.oversized) lines.push(fit(`${indent}${dim(t.muted('(diff too large to display)'))}`, width))
+  if (rendered.hidden > 0) {
+    lines.push(fit(`${indent}${dim(t.muted(`… ${rendered.hidden} more ${rendered.hidden === 1 ? 'line' : 'lines'}`))}`, width))
+  }
+  return { lines, hidden: rendered.hidden, oversized: rendered.oversized }
+}
+
+/** Bounded preview composition: optional separator, label and preview rows. */
+function proposalLines(diffs: readonly MetaDiff[], width: number, gap: boolean): string[] {
+  const rows = decisionProposalRows(diffs, width, { expanded: false }).lines
+  return gap ? ['', ...rows] : rows
+}
+
+// ---------------------------------------------------------------------------
 // Generic chooser
 
 export interface SelectDialogOptions {
@@ -374,8 +621,9 @@ export interface SelectDialogOptions {
   onSelect: (value: unknown) => void
   onCancel: () => void
   /**
-   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). When omitted
-   * the interrupt key closes this surface through `onCancel`.
+   * Explicitly configured global turn cancellation (`app.interrupt`, no shipped
+   * default). When omitted an explicit interrupt key closes this surface through
+   * `onCancel`; the default `Ctrl+C` is the local cancel path either way.
    */
   onInterrupt?: () => void
   /** Shared keymap from the input subsystem. A default CC keymap is used when omitted. */
@@ -405,13 +653,14 @@ export interface SelectItemsOptions {
   preserveValue?: boolean
 }
 
-export class SelectDialog implements Component, Focusable {
-  readonly capturesViewportInput = true
+export class SelectDialog implements ComposerInteraction, Focusable {
   readonly modalSize: ModalSize = 'compact'
   readonly keymap: CcKeymap
   private readonly tui: TUI
   private readonly options: SelectDialogOptions
   private readonly frame = new ModalFrame()
+  /** Presentation only: unset keeps the historical bounded workspace overlay. */
+  private layout: InteractionLayout | undefined
   private items: DecisionOption[]
   private loadingState: boolean
   private errorState: string | undefined
@@ -443,6 +692,15 @@ export class SelectDialog implements Component, Focusable {
     this.focusedState = value
   }
 
+  /**
+   * A workspace surface owns the viewport (its list is the reading surface). A
+   * composer mount stops claiming it, so transcript paging stays available;
+   * the dialog's own selection keys are still resolved locally.
+   */
+  get capturesViewportInput(): boolean {
+    return this.layout?.placement !== 'composer'
+  }
+
   /** Parent hook for focus changes; safe to call repeatedly. */
   cancelChord(): void {
     this.keymap.cancelChord()
@@ -450,6 +708,28 @@ export class SelectDialog implements Component, Focusable {
 
   invalidate(): void {
     this.frame.invalidate()
+  }
+
+  /**
+   * Presentation-only placement (docs/COMPOSER-INTERACTION-CONTRACT.md).
+   *
+   * Idempotent: an unchanged layout touches nothing. It never reads data,
+   * answers, focuses, replaces an editor or requests a frame. Old mouse targets
+   * and presses belong to the previous geometry, so they are retired here — a
+   * press recorded before the reflow can never resolve against the new rows.
+   */
+  setInteractionLayout(layout: InteractionLayout): void {
+    const maxHeight = Number.isFinite(layout.maxHeight) ? Math.max(1, Math.floor(layout.maxHeight)) : 1
+    if (this.layout !== undefined && this.layout.placement === layout.placement && this.layout.maxHeight === maxHeight) return
+    this.layout = { placement: layout.placement, maxHeight }
+    this.press = undefined
+    this.hits = []
+    this.frame.invalidate()
+  }
+
+  /** Rows this dialog paints at `width`; equals `render(width).length`. */
+  measureRows(width: number): number {
+    return this.plan(width).height
   }
 
   // --- asynchronous roster updates (no auto-select, no auto-submit) ------
@@ -569,6 +849,9 @@ export class SelectDialog implements Component, Focusable {
       this.cancel()
       return
     }
+    // A composer mount leaves transcript paging to the parent; the chooser's
+    // own selection keys stay local.
+    if (this.layout?.placement === 'composer' && (action.id === 'list.page-up' || action.id === 'list.page-down')) return
     const count = this.items.length
     if (action.id === 'list.previous') this.move(-1)
     else if (action.id === 'list.next') this.move(1)
@@ -635,14 +918,14 @@ export class SelectDialog implements Component, Focusable {
     ]
   }
 
-  private modalOptions(): ModalFrameOptions {
+  private modalOptions(height: number): ModalFrameOptions {
     return {
       title: this.options.title,
       ownerKey: this.ownerKey(),
       ...((this.messageState ?? this.options.subtitle) === undefined ? {} : { subtitle: this.messageState ?? this.options.subtitle }),
       actions: this.actions(),
       onClose: () => this.cancel(),
-      maxHeight: modalHeight(this.tui, this.modalSize),
+      maxHeight: height,
       keymap: this.keymap,
     }
   }
@@ -658,11 +941,25 @@ export class SelectDialog implements Component, Focusable {
     return concatPaint([header, windowRowsWithHits(blocks, budget)])
   }
 
+  /** Same plan `measureRows` reports: one geometry, no render-to-measure recursion. */
+  private plan(width: number): PlannedFrame {
+    const cap = this.layout?.maxHeight ?? workspaceHeight(this.tui, this.modalSize)
+    return planFrame(
+      this.frame,
+      width,
+      height => this.modalOptions(height),
+      (bodyWidth, bodyHeight) => this.body(bodyWidth, bodyHeight),
+      this.layout === undefined ? workspaceHeight(this.tui, this.modalSize) : undefined,
+      cap,
+      MIN_COMPOSER_ROWS,
+    )
+  }
+
   render(width: number): string[] {
-    const options = this.modalOptions()
-    const painted = renderModalBody(this.frame, width, options, (bodyWidth, bodyHeight) => this.body(bodyWidth, bodyHeight))
-    this.hits = painted.paint.hits
-    return painted.lines
+    const safeWidth = Math.max(1, Math.floor(width))
+    const plan = this.plan(safeWidth)
+    this.hits = plan.hits
+    return this.frame.render(safeWidth, plan.lines, plan.options)
   }
 }
 
@@ -691,28 +988,51 @@ export interface DecisionDialogOptions {
    */
   onCancel: () => void
   /**
-   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). The dialog
-   * never converts this into `onCancel` or a cancelled answer; the parent runs
-   * `backend.cancel()` and the native decision closure closes the surface.
+   * Explicitly configured global turn cancellation (`app.interrupt`, no shipped
+   * default). The dialog never converts this into `onCancel` or a cancelled
+   * answer; the parent runs `backend.cancel()` and the native decision closure
+   * closes the surface. The default `Ctrl+C` is the local reject/cancel path.
    */
   onInterrupt?: () => void
   /** Shared keymap from the input subsystem. A default CC keymap is used when omitted. */
   keymap?: CcKeymap
+  /**
+   * Parent-owned full native detail request (`dialog.details`, Ctrl+O by
+   * default). It is only offered when this native request already carries
+   * `question.detail` or a usable pure `toolPresentation` proposal; the parent
+   * mounts the read-only `DecisionDetailsDialog` over this retained decision
+   * and keeps its selections, drafts and native option values.
+   */
+  onDetails?: (content: DecisionDetailContent) => void
 }
 
-export class DecisionDialog implements Component, Focusable {
-  readonly capturesViewportInput = true
+export class DecisionDialog implements ComposerInteraction, Focusable {
   readonly modalSize: ModalSize = 'standard'
   readonly keymap: CcKeymap
   private readonly tui: TUI
   private readonly request: DecisionRequest
   private readonly options: DecisionDialogOptions
   private readonly frame = new ModalFrame()
+  /** Presentation only: unset keeps the historical bounded workspace overlay. */
+  private layout: InteractionLayout | undefined
   private readonly questions: readonly Question[]
   private readonly states: QuestionState[]
   /** One markdown renderer for the current question's `detail` body. */
   private readonly detailMarkdown = new Markdown('', 0, 0, markdownTheme)
   private readonly approvalItems: readonly DecisionOption[]
+  /**
+   * Validated native proposed diff call view, read once from the immutable
+   * request. `undefined` means "no preview": the approval body stays exactly
+   * as it was before this seam existed. The original record is kept for the
+   * full read-only detail overlay — the same validated presentation, never a
+   * second projection of it.
+   */
+  private readonly proposalRecord: JsonRecord | undefined
+  private readonly proposedDiffs: readonly MetaDiff[] | undefined
+  /** Painted proposal rows keyed by width; dropped by `invalidate()`. */
+  private proposalCache: { readonly width: number; readonly lines: readonly string[] } | undefined
+  /** True when the native message already paints its own separator row. */
+  private readonly hasMessage: boolean
   private approvalIndex = 0
   private tab = 0
   private reviewFocus = 0
@@ -722,6 +1042,8 @@ export class DecisionDialog implements Component, Focusable {
   private done = false
   private dismissedState = false
   private disposedState = false
+  /** Disposes the lazy grammar repaint edge (see the constructor). */
+  private unsubscribeHighlight: (() => void) | undefined
 
   constructor(tui: TUI, options: DecisionDialogOptions) {
     this.tui = tui
@@ -730,6 +1052,9 @@ export class DecisionDialog implements Component, Focusable {
     this.keymap = options.keymap ?? createCcKeymap()
     this.questions = this.request.kind === 'question' ? (this.request.questions ?? []) : []
     this.approvalItems = this.request.kind === 'approval' ? (this.request.options ?? []) : []
+    this.proposalRecord = this.request.kind === 'approval' ? decisionProposalRecord(this.request.toolPresentation) : undefined
+    this.proposedDiffs = this.proposalRecord === undefined ? undefined : decisionProposalDiffs(this.proposalRecord)
+    this.hasMessage = (this.request.message?.trim() ?? '') !== ''
     this.states = this.questions.map(() => ({
       focus: 0,
       selected: undefined,
@@ -738,6 +1063,17 @@ export class DecisionDialog implements Component, Focusable {
       checked: new Set<number>(),
       answer: new InlineAnswer(tui, this.keymap),
     }))
+    // `detailMarkdown` caches its own `(text, width)` lines, independently of the
+    // transcript's block cache, and this dialog is not a Transcript child: the
+    // view's ready edge cannot reach it. So the dialog subscribes itself, drops
+    // only that renderer's lines and asks for one repaint. A failed load changes
+    // nothing (the plain rows stay correct), and a disposed dialog neither
+    // invalidates nor paints.
+    this.unsubscribeHighlight = subscribeHighlightRuntime(event => {
+      if (event.state !== 'ready' || this.disposedState) return
+      this.detailMarkdown.invalidate()
+      this.tui.requestRender()
+    })
   }
 
   get focused(): boolean {
@@ -783,6 +1119,8 @@ export class DecisionDialog implements Component, Focusable {
   dispose(): void {
     if (this.disposedState) return
     this.disposedState = true
+    this.unsubscribeHighlight?.()
+    this.unsubscribeHighlight = undefined
     // The keymap is shared by every surface: only the surface that currently
     // owns input may cancel a pending chord.
     if (this.focusedState) this.keymap.cancelChord()
@@ -795,10 +1133,43 @@ export class DecisionDialog implements Component, Focusable {
   }
 
   invalidate(): void {
-    // The theme may have changed: the detail body styles markdown too.
+    // The theme may have changed: the detail body styles markdown too, and the
+    // proposal rows carry themed diff bands.
     this.frame.invalidate()
     this.detailMarkdown.invalidate()
+    this.proposalCache = undefined
     for (const state of this.states) state.answer.invalidate()
+  }
+
+  /**
+   * A workspace surface owns the viewport (its options are the reading
+   * surface). A composer mount stops claiming it, so transcript paging stays
+   * available; the dialog's own selection keys are still resolved locally.
+   */
+  get capturesViewportInput(): boolean {
+    return this.layout?.placement !== 'composer'
+  }
+
+  /**
+   * Presentation-only placement (docs/COMPOSER-INTERACTION-CONTRACT.md).
+   *
+   * Idempotent: an unchanged layout touches nothing. It never reads native
+   * data, answers, focuses, replaces an editor or requests a frame. Old mouse
+   * targets and presses belong to the previous geometry, so they are retired
+   * here — a press recorded before the reflow can never answer a different row.
+   */
+  setInteractionLayout(layout: InteractionLayout): void {
+    const maxHeight = Number.isFinite(layout.maxHeight) ? Math.max(1, Math.floor(layout.maxHeight)) : 1
+    if (this.layout !== undefined && this.layout.placement === layout.placement && this.layout.maxHeight === maxHeight) return
+    this.layout = { placement: layout.placement, maxHeight }
+    this.press = undefined
+    this.hits = []
+    this.frame.invalidate()
+  }
+
+  /** Rows this dialog paints at `width`; equals `render(width).length`. */
+  measureRows(width: number): number {
+    return this.plan(width).height
   }
 
   // -------------------------------------------------------------------------
@@ -1002,7 +1373,85 @@ export class DecisionDialog implements Component, Focusable {
   }
 
   // -------------------------------------------------------------------------
+  // Full native detail (read-only, parent-mounted)
+
+  /**
+   * The native detail this request already carries, if any.
+   *
+   * - approval: the validated pure `presentCall` diff record (never a result,
+   *   never a guessed call);
+   * - question: that question's own `detail` markdown (the plan review body).
+   *
+   * `undefined` means there is nothing honest to open, so no detail action is
+   * offered and `onDetails` is never called.
+   */
+  private detailContent(): DecisionDetailContent | undefined {
+    if (this.isApproval) {
+      const record = this.proposalRecord
+      return record === undefined ? undefined : { kind: 'proposal', title: 'Proposed change', presentation: record }
+    }
+    if (this.onReview) return undefined
+    const question = this.questions[this.tab]
+    if (question === undefined) return undefined
+    const detail = questionDetail(question)
+    if (detail === undefined) return undefined
+    const header = question.header?.trim() ?? ''
+    return { kind: 'markdown', title: header === '' ? this.dialogTitle() : header, text: detail }
+  }
+
+  private detailsAvailable(): boolean {
+    return this.options.onDetails !== undefined && this.detailContent() !== undefined
+  }
+
+  /**
+   * Ask the parent to mount the full read-only detail over this retained
+   * decision. No answer, focus, selection, draft or native value changes here.
+   */
+  private openDetails(): void {
+    if (this.done || this.disposedState) return
+    const onDetails = this.options.onDetails
+    const content = this.detailContent()
+    if (onDetails === undefined || content === undefined) return
+    onDetails(content)
+  }
+
+  // -------------------------------------------------------------------------
   // Input
+
+  /** Modal action plus this dialog's own `dialog.details` (input-owned key). */
+  private resolveAction(raw: string): ResolvedModalAction | undefined {
+    return modalAction(this.keymap, raw, ['dialog.details'])
+  }
+
+  /** A composer mount leaves transcript paging to the parent. */
+  private pagingKey(actionId: string): boolean {
+    return this.layout?.placement === 'composer' && (actionId === 'list.page-up' || actionId === 'list.page-down')
+  }
+
+  /**
+   * A configured local cancel key inside the custom-answer field.
+   *
+   * The editor layer carries no Ctrl+C cancel binding any more, and the root
+   * `app.clear` binding is deliberately not re-aliased here: a dialog must never
+   * clear the hidden root draft from inside a decision, and a phantom dismissal
+   * for a key the user actually moved is worse than an inert key. So the dialog
+   * maps the *actual configured* local cancel bindings (`list.cancel`,
+   * `dialog.cancel`, `app.cancel`) onto the same dismiss path the rest of the
+   * surface uses, and only when the editor layer does not claim that key itself
+   * (a remapped cancel that collides with an edit key keeps the edit) and no
+   * explicit `app.interrupt` intent owns it.
+   */
+  private answerCancelKey(raw: string): boolean {
+    if (this.keymap.isPendingChord()) return false
+    if (boundToKey(this.keymap, 'app.interrupt', raw)) return false
+    if (!CANCEL_ACTIONS.some(id => boundToKey(this.keymap, id, raw))) return false
+    return !editorClaimsKey(this.keymap, raw)
+  }
+
+  /** True when the key is the configured `dialog.details` binding (read-only lookahead). */
+  private detailsKey(raw: string): boolean {
+    return this.detailsAvailable() && boundToKey(this.keymap, 'dialog.details', raw)
+  }
 
   handleInput(raw: string): void {
     if (this.done || this.disposedState) return
@@ -1012,11 +1461,27 @@ export class DecisionDialog implements Component, Focusable {
       this.editorKey(raw)
       return
     }
-    const action = modalAction(this.keymap, raw)
+    // While the answer field owns input the dialog only looks ahead for the two
+    // app-level keys it must keep local; every editing key stays with the one
+    // CcEditor state (dialog actions are never double-resolved).
+    if (this.editing() && this.answerCancelKey(raw)) {
+      this.dismissQuestion()
+      return
+    }
+    if (this.editing() && this.detailsKey(raw)) {
+      this.openDetails()
+      return
+    }
+    const action = this.resolveAction(raw)
     if (action !== undefined && isInterruptAction(action.id)) {
       this.interrupt()
       return
     }
+    if (action !== undefined && action.id === 'dialog.details') {
+      this.openDetails()
+      return
+    }
+    if (action !== undefined && this.pagingKey(action.id)) return
     if (this.isApproval) {
       this.approvalKey(raw, action)
       return
@@ -1279,7 +1744,18 @@ export class DecisionDialog implements Component, Focusable {
     return header === '' ? this.request.title : header
   }
 
+  /**
+   * The native-detail chip is only painted when this request actually carries
+   * readable native content, and it only asks the parent to mount the read-only
+   * overlay: it never answers, executes or fabricates an applied change.
+   */
+  private detailsAction(): ModalAction | undefined {
+    if (!this.detailsAvailable()) return undefined
+    return { id: 'details', label: 'Details', action: 'dialog.details', onActivate: () => this.openDetails() }
+  }
+
   private actions(): ModalAction[] {
+    const details = this.detailsAction()
     if (this.isApproval) {
       const count = this.approvalItems.length
       return [
@@ -1294,6 +1770,7 @@ export class DecisionDialog implements Component, Focusable {
           disabled: count === 0,
         },
         { id: 'reject', label: 'Reject', action: 'list.cancel', onActivate: () => this.rejectApproval() },
+        ...(details === undefined ? [] : [details]),
       ]
     }
     if (this.onReview) {
@@ -1310,16 +1787,17 @@ export class DecisionDialog implements Component, Focusable {
         onActivate: () => this.selectFocused(),
       },
       { id: 'cancel', label: 'Cancel', action: 'list.cancel', onActivate: () => this.dismissQuestion() },
+      ...(details === undefined ? [] : [details]),
     ]
   }
 
-  private modalOptions(): ModalFrameOptions {
+  private modalOptions(height: number): ModalFrameOptions {
     return {
       title: this.dialogTitle(),
       ownerKey: this.ownerKey(),
       actions: this.actions(),
       onClose: () => this.closeRoute(),
-      maxHeight: modalHeight(this.tui, this.modalSize),
+      maxHeight: height,
       keymap: this.keymap,
     }
   }
@@ -1345,12 +1823,63 @@ export class DecisionDialog implements Component, Focusable {
     }
     const blocks = choiceBlocks(this.approvalItems, this.approvalIndex, this.approvalIndex, bodyWidth, true, false, new Set())
     const hint = this.hintLine()
-    const budget = Math.max(1, bodyHeight - message.lines.length - (hint === '' ? 0 : 2))
+    const hintRows = hint === '' ? 0 : 2
+    const optionRows = blocks.reduce((sum, block) => sum + block.lines.length, 0)
+    const optionMinimum = Math.min(2, Math.max(1, optionRows))
+    // Degradation order (docs/APPROVAL-PROPOSAL.md): the native message, then
+    // the options' floor, then the hint group, and only the remainder becomes the
+    // bounded proposal preview. The hint is therefore dropped *before* the
+    // options lose their two-row floor: a permission decision may never become
+    // less visible because a prose hint or a proposal preview wanted the rows.
+    // A missing or malformed native presentation paints nothing here (no error,
+    // no marker).
+    const afterMessage = bodyHeight - message.lines.length
+    const proposalRoom = afterMessage - optionMinimum - hintRows
+    const proposal = this.proposalPaint(bodyWidth, proposalRoom)
+    const hintCost = afterMessage - optionMinimum - proposal.lines.length >= hintRows ? hintRows : 0
+    const budget = Math.max(1, afterMessage - proposal.lines.length - hintCost)
     return concatPaint([
       message,
+      proposal,
       windowRowsWithHits(blocks, budget),
-      ...(hint === '' ? [] : [textPaint(['']), textPaint([' ' + hint])]),
+      ...(hintCost === 0 ? [] : [textPaint(['']), textPaint([' ' + hint])]),
     ])
+  }
+
+  /**
+   * Bounded native proposal preview. `room` is the exact number of body rows the
+   * approval can spare; nothing is painted when the preview does not exist or
+   * there is no row left for it. A clipped preview keeps the label first and
+   * ends with an honest `… N more` marker instead of a silent cut.
+   */
+  private proposalPaint(width: number, room: number): BodyPaint {
+    if (this.proposedDiffs === undefined || room <= 0) return textPaint([])
+    const full = this.proposalLines(width)
+    if (full.length === 0) return textPaint([])
+    // The message paint already ends with its own separator row, so this preview
+    // only contributes one when the request has no message at all. The heading
+    // sits after that optional gap and is the first row that must survive.
+    const head = this.hasMessage ? 0 : 1
+    if (room <= head) return textPaint([])
+    if (room === head + 1) return textPaint([full[head]!])
+    if (full.length <= room) return textPaint(full)
+    const kept = room - 1
+    const hidden = full.length - kept
+    return textPaint([
+      ...full.slice(0, kept),
+      fit(` ${dim(t.muted(`… ${hidden} more proposal ${hidden === 1 ? 'line' : 'lines'}`))}`, Math.max(1, width)),
+    ])
+  }
+
+  /** Cached rendered-with-theme proposal rows (rebuild happens on invalidate). */
+  private proposalLines(width: number): readonly string[] {
+    const diffs = this.proposedDiffs
+    if (diffs === undefined) return []
+    const safeWidth = Math.max(1, Math.floor(width))
+    if (this.proposalCache?.width !== safeWidth) {
+      this.proposalCache = { width: safeWidth, lines: proposalLines(diffs, safeWidth, !this.hasMessage) }
+    }
+    return this.proposalCache.lines
   }
 
   /** Narrow hint line: real registry actions come from the frame footer. */
@@ -1574,12 +2103,26 @@ export class DecisionDialog implements Component, Focusable {
     return { blocks }
   }
 
+  /** Same plan `measureRows` reports: one geometry, no render-to-measure recursion. */
+  private plan(width: number): PlannedFrame {
+    const cap = this.layout?.maxHeight ?? workspaceHeight(this.tui, this.modalSize)
+    return planFrame(
+      this.frame,
+      width,
+      height => this.modalOptions(height),
+      (bodyWidth, bodyHeight) =>
+        this.isApproval ? this.renderApproval(bodyWidth, bodyHeight) : this.renderQuestions(bodyWidth, bodyHeight),
+      this.layout === undefined ? workspaceHeight(this.tui, this.modalSize) : undefined,
+      cap,
+      MIN_COMPOSER_ROWS,
+    )
+  }
+
   render(width: number): string[] {
-    const options = this.modalOptions()
-    const painted = renderModalBody(this.frame, width, options, (bodyWidth, bodyHeight) =>
-      this.isApproval ? this.renderApproval(bodyWidth, bodyHeight) : this.renderQuestions(bodyWidth, bodyHeight))
-    this.hits = painted.paint.hits
-    return painted.lines
+    const safeWidth = Math.max(1, Math.floor(width))
+    const plan = this.plan(safeWidth)
+    this.hits = plan.hits
+    return this.frame.render(safeWidth, plan.lines, plan.options)
   }
 }
 

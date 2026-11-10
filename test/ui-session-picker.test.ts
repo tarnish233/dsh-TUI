@@ -580,24 +580,43 @@ test('the selection stays on the same session across re-filters', () => {
   assert.match(selectedLine(p.picker), /Beta session/, 'and it survives the query being cleared')
 })
 
-test('interrupt routing follows the shared keymap and the onInterrupt hook', () => {
+test('default Ctrl+C is the local cancel; only an explicit interrupt override is native', () => {
   const items: Item[] = [{ id: 'a', title: 'A session', cwd: DIRECTORY, createdAt: Date.now() }]
   const hooked = makePicker({ items, onInterrupt: true })
   hooked.picker.handleInput(KEY.ctrlC)
-  assert.equal(hooked.interrupted, 1)
-  assert.equal(hooked.cancelled, 0, 'global interrupt never becomes a local cancel')
+  assert.equal(hooked.interrupted, 0, 'default Ctrl+C must not reach the native interrupt hook')
+  assert.equal(hooked.cancelled, 1, 'default app.clear is the local list.cancel here')
   assert.deepEqual(hooked.selected, [])
+  hooked.picker.handleInput(KEY.ctrlC)
+  assert.equal(hooked.cancelled, 1, 'a closed picker cancels once (idempotent)')
 
   const fallback = makePicker({ items })
   fallback.picker.handleInput(KEY.ctrlC)
-  assert.equal(fallback.cancelled, 1, 'without a hook Ctrl+C cancels like SelectDialog')
+  assert.equal(fallback.cancelled, 1, 'without a hook Ctrl+C still cancels locally')
 
-  // A remapped interrupt key is respected: Ctrl+C then falls through to
-  // list.cancel instead of the interrupt hook.
+  // Explicit override: the configured interrupt key is native, while default
+  // Ctrl+C keeps its local cancel meaning.
+  const explicit = makePicker({ items, keymap: keymap({ 'app.interrupt': 'alt+x' }), onInterrupt: true })
+  explicit.picker.handleInput('\x1bx')
+  assert.equal(explicit.interrupted, 1)
+  assert.equal(explicit.cancelled, 0)
+
   const remapped = makePicker({ items, keymap: keymap({ 'app.interrupt': 'alt+x' }), onInterrupt: true })
   remapped.picker.handleInput(KEY.ctrlC)
   assert.equal(remapped.interrupted, 0)
   assert.equal(remapped.cancelled, 1)
+
+  // Every local cancel row remapped away from Ctrl+C: the default app.clear key
+  // must not become a phantom close.
+  const away = makePicker({
+    items,
+    keymap: keymap({ 'list.cancel': 'ctrl+q', 'dialog.cancel': 'ctrl+w', 'app.cancel': 'ctrl+e' }),
+    onInterrupt: true,
+  })
+  away.picker.handleInput(KEY.ctrlC)
+  assert.equal(away.cancelled, 0, 'no invented close fallback after a remap')
+  assert.equal(away.interrupted, 0)
+  assert.deepEqual(away.selected, [])
 })
 
 test('empty states are scope-aware and query-aware', () => {
@@ -733,7 +752,10 @@ test('phase-1 loading renders immediately and stays dismissable', () => {
   other.picker.handleInput('abc')
   assert.deepEqual(other.selected, [], 'there is nothing to select yet')
   other.picker.handleInput(KEY.ctrlC)
-  assert.equal(other.cancelled, 1, 'interrupt routing works during loading')
+  assert.equal(other.cancelled, 0, 'Ctrl+C cancels the focused search layer first')
+  assert.doesNotMatch(text(other.picker), /Search abc/, 'the query layer was restored')
+  other.picker.handleInput(KEY.ctrlC)
+  assert.equal(other.cancelled, 1, 'the next Ctrl+C is the local cancel during loading')
 
   // Loading that ends with zero sessions falls back to the per-scope hints.
   const ended = makePicker({ loading: true })

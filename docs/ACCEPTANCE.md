@@ -1,4 +1,69 @@
-# v0.1.4 原生 DSH 边界与交互语义验收
+# 原生 DSH 边界与交互语义验收
+
+## v0.1.6：本地版本标记
+
+用户明确选择 `v0.1.6`，授权将已验收项目改动纳入本地版本提交，再创建 annotated tag；不 push、不发布 registry、不更换全局程序，`private:true` 保持。只提交源码、正式测试、manifest、bundle 和文档；缓存、构建产物、运行状态与凭据不入库。
+
+- **已验收基线**：下节功能源码完整 `pnpm check` **2772/2772**（224 文件）已通过。版本标记前，全部 **541** 个 tracked/untracked 输入与 `.cache/composer-post-docs-tree.sha256` 完全一致，证据 `.cache/release-v0.1.6-pre-tree.sha256`；不是只检查已有 tracked 文件。
+- **版本调整范围**：仅 `package.json`、`src/version.ts` 的 `0.1.6` 与 README／CHANGELOG／本验收记录／交互合同的版本及历史状态说明；没有再次修改业务、输入或 renderer 逻辑，也没有重跑或冒称新的完整 2772 项门禁。
+- **本地加载**：既有 `/opt/homebrew/bin/dsh-tui` 软链仍指向本项目 `bin/dsh-tui.mjs`，只重新构建本项目 `lib/` 和 vendored dist，不替换软链。退出旧 TUI 后重启即可加载新版本。
+- **版本专项**：`pnpm build`、`pnpm typecheck` 通过；12 个正式测试文件 **106/106**（0 fail/cancel/skip/todo，16550ms），覆盖 CLI／welcome identity、真实 source-only pack、native Pi clear／command／ask、App／composer／input／只读详情／搜索／局部取消。源码 `VERSION`、`lib/version.js`、manifest 和既有软链 CLI 一致为 **0.1.6**，`private:true`。证据 `.cache/release-v0.1.6/verification.log`；版本专项期间全部 541 输入指纹一致，`.cache/release-v0.1.6/{frozen-tree,post-check-tree}.sha256`。只使用临时 HOME/workspace、fixture，不启动真实用户 profile 或模型。
+- **依赖核验边界**：临时 HOME 下运行 pnpm 12 触发公开 npm registry 的锁文件供应链核验和本项目依赖准备；不是全程离线安装验收，lockfile 内容未变。没有使用真实 npm 凭据、真实模型 Provider 或替换全局安装。后续文档补记仅更新本文件与 CHANGELOG 的验收数字，源码／测试／脚本再次核对不变。
+
+> 下方保留各实施阶段的当时状态；其中“未提交／无 tag”等约束是版本标记前的记录，不表示本地 v0.1.6 缺少已验收改动。
+
+## 打 tag 前功能验收：输入邻近交互与 Pi Ctrl+C
+
+用户确认按用途分层，并选择安装版 Pi 1.5.1 主输入的 Ctrl+C 逻辑，不再将滚动 CC 文档当作行为基准。合同见 `COMPOSER-INTERACTION-CONTRACT.md`。四个 `cloudagent/glm-5.3` 在明确文件所有权下实现，Parent 负责共享 host／App／原生与 PTY 验收。
+
+- **布局**：native ask／approval／continued answer、prompt-history search、短选择／输入在编辑框上方；完整 Settings／Model／Resume／Help／History／Workspace／Queue／Jobs／Inspection／Tool／Image／Agents／Child 保持独立。Settings 子操作继承父工作页。一个真实 Editor 保留，临时 compact/frozen 只改绘制；纯几何测量不 paint，不挤出 native choice/cancel 或只剩无形 hitbox。
+- **详情**：native `question.detail` 和 pure `presentCall` Proposal 以只读全内容打开，保留同一 pending decision；back、native close、同 session 新 attachment 与 stale callback 均有独立 App 回归。没有新增执行、文件读取、Applied 标签或第二 durable transcript。
+- **输入**：主 Ctrl+C 一次清空/保存，无 `backend.cancel`，busy root／command／child destination 同样成立；500ms 二次退出，普通键入不重置该 Pi 窗口；Up／focus／lifecycle 显式恢复退休窗口。Esc 与显式未默认绑定的 `app.interrupt` 调用原生取消，Ctrl+D 和其余 CC/readline 不改。局部 Ctrl+C 只结算本请求／局部层，完全禁用或重映射离开旧键时没有 phantom fallback；paste/release/repeat 保持安全。
+- **正式分域**：Input 379/379；decision/chooser/details 83/83；独立面板 283/283；history/tool/image/agents 172/172。Parent 修正 strict-only 类型遗漏及无效 hint 假断言，独立 App／host／native 回归另有完整证据；不以 Agent 的意图报告代替最终验收。
+- **真正原生 composition**：19/19（`.cache/composer-native-focused.log`），含 native streaming 清草稿后继续真实增量、等待中的 native command 未被清空取消、Esc 才原生 abort、默认审批／问卷 Ctrl+C 本地 rejected／ASK_CANCELLED、显式 interrupt 的 ASK_ABORTED、默认 scope 的 approval→allow→write→workspace→history 及真实子 Agent Stop。new `acceptance-native-pi-clear` 不调用真实 Provider。
+- **PTY**：独立 Ctrl+C／Esc／SIGINT／busy clear／窗口退出／恢复 10/10，`.cache/composer-pty-cancel.log`；通用 CLI keyboard Settings/resize 2/2，`.cache/composer-pty-smoke.log`。正式 PTY 分组的 42 项首次通过；旧终端提醒假设的 2 项改用显式 interrupt 后 2/2 重验，`.cache/composer-terminal-pty-final.log`。最终全门禁会再次覆盖合并结果。
+- **变异**：22/22 实际断言 red 且立即恢复/hash；Parent 8 项 `.cache/composer-parent-mutations.json`，四 owner 14 项报告记录 `.cache/composer-resolution.md`。一个巨型 TUI 对象 diff 的超时尝试不计证明；改布尔 identity 断言后真正 red。一个 source-only native 变异未影响 prebuilt lib 也不计，随后真实 source App/dequeue-capability 回归 red。
+- **最终完整门禁**：新增正式回归 **94** 项；冻结全部代码／测试／文档后 `pnpm check` **2772/2772**，224 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，553357ms，EXIT 0；`.cache/composer-full-check-final.log`。`.cache/composer-frozen-tree.sha256` 与 `.cache/composer-post-check-tree.sha256` 完全一致（541 个 tracked/untracked 输入），门禁期间无文件修改。之后只补文档验收数字，产品源码、脚本和正式测试 checksum 再次核对不变。
+- **完整门禁首轮**：2771/2772，唯一失败是原有 `ui-view` layout 测试只固定 renderer clock、却未固定 store duration clock，1ms 真实时间差使 Thinking 标题出现差异。修复仅在该测试给 store 同样的 deterministic now，未改生产 renderer/state，原字节全等断言保留；完整文件与定向 20/20 重复通过。首轮 frozen fingerprint 前后相同，证据 `.cache/composer-full-check-first.log`；随后完整冻结复跑已全绿。不以旧 2678/2678 代替当前实现。
+- **安全**：全部 Owned temp HOME/workspace，真实原生服务＋hermetic stream，无真实模型／Provider／真实用户凭据、profile/session 写入。服务器仅读安装 metadata，并在 empty env + user/net namespace 临时 HOME 执行版本查询；CC 交互探针按用户选择停用。无 commit/tag/push/publish/global replacement，Schedule 仍暂缓。
+
+## 前次工作树批次：全面 Review 修复闭环
+
+本批对应 `.cache/review-report.md` 的 8 项 P2、3 项 P3。所有产品修复均有正式聚焦回归；四域 Agent 的变异与 Parent 的 9 个定向变异都已恢复并核验源文件 hash，未将“测试绿”当作缺陷不存在的证明。
+
+- **R1/R2/R3**：Workspace item/request 带 exact session/attachment；App 与 View 双重验证来源和当前 turn/seq，原生 read 传 captured scope，切换同步退休 pointer targets。Parent 加测 stable turn 卡片重绘后旧 press 不可变成新 snapshot 的点击；空白文件名不被跳过，native index 原样保留，diff path 全 union 交叉验证。同 turn latest higher seq 原地替换，lower late seq 与 same-seq identical 均 no-op；真实 zero-files 不伪造。
+- **R4/R9**：独立只读历史禁止读取或修改共享 disclosure map，`createView` 也强制该合同；首帧、分页、invalidate、关闭与 dispose 后主 Thinking／Tool／group 保持展开。Activity/Subagent header hover 在 fast path 前失效，正常无变化帧计数保持 0；readonly header 无 dead action。
+- **R5/R6/R11**：unrounded display goal 跨宽 glyph/短行/softwrap/page 保留；实际 layout width stamp 在 resize／不同宽度恢复时防止旧 goal 覆盖新 source-column 计算。完整 chord 的跨 fallback layer 冲突与较短 chord 抢占被诊断，sibling suffix 与 no-op restatement 不误报；实际 Settings save gate 拒绝冲突且不改文件/draft。prefix timeout 仍丢弃收集的键，文案不再误称稍后执行。
+- **R7/R8/R10**：原生更小 readWindowMax 仅依据当前公开 failure 的 exact code/message 做一次严格 narrowing，原 5 秒 deadline/signal 内完成，服务／方法替换失效缓存；不读取 private config，不 widening，不 generic-error retry。成功读取静默，max=0 时 known cut 的 no-progress 页面明确 Partial。只广告完整 mounted capabilities，同 attachment capability loss 关闭旧 modal。校正 native call-before-approval 文档并用真实 pending-file-absent 断言验证，不把 admission 说成 execution。
+- **Parent 真正 native composition**：`test/acceptance-native-review-fixes.test.ts` 使用默认 bundle（没有额外启用 host tool-fs），inline/fullscreen 的 readWindowMax 0/1/20 验证 bounded range、完整逐 seq 去重或 honest partial、live store/draft 不变；另经真实 native writes 创建 `./ ` 和 `a.txt`，通过 production transcript pointer → App → scoped adapter → native diff 及 dialog 键盘路径读取原生 index 0/1，不用直接 fake service 代替。原 Proposal 验收双模式同样改用默认 bundle，确认 durable call 先到、批准前文件仍不存在、允许一次后才写入。
+- **专项最终证据**：新增正式回归 **61** 项。Parent 独立全部 Backend／Input／UI＋App native **1966/1966**，`.cache/review-fix-final-focused.log`；实际 native **9/9**（窗口 0/1/20 双模式 6、原 Proposal 2、空白文件 native diff 1），Help **2/2**、source-only pack **1/1**，合计 **12/12**，`.cache/review-fix-final-native-pack.log`。build＋strict TypeScript EXIT 0。四域＋Parent **24/24** 定向变异均变红、立即恢复并验证 hash；Parent 9 项详情在 `.cache/review-fix-parent-mutations.json`，其余在 `.cache/review-fix-{input,backend,native-ui,groups}-*.log`。最终 source/untracked whitespace clean、无 mutation marker。
+- **最终完整门禁**：冻结代码／测试／文档后 `pnpm check` **2678/2678**，216 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，541365ms，EXIT 0；`.cache/review-fix-full-check-final.log`。`.cache/review-fix-frozen-tree.sha256` 与 `.cache/review-fix-post-check-tree.sha256` 完全一致，运行期间无文件修改；之后只补本验收数字。旧 2617/2617 仅属于前一批，不代替本批 gate。
+- **边界**：所有 native／CLI／PTY 用 owned 临时 home/workspace 和 fixture stream；没有真实模型／Provider／用户凭据／profile/session 操作、全局替换、commit/tag/push/publish。没有 Web frontend、Schedule、SessionController 或 `/schedule`，Schedule 继续暂缓。
+
+## 前次工作树批次：DSH 原生历史、工作区变更与审批 Proposal
+
+- **最终完整 `pnpm check` 2617/2617**，214 测试文件，build＋strict TypeScript，0 fail/cancel/skip/todo，532824ms，EXIT 0；`.cache/native-capabilities-full-check-final.log`。首轮 **2615/2617** 仅两项 Help 首屏 `/permission` 可见性假设失败（`/history` 新增一行）；改用既有 Ctrl+F 只读搜索后双模式 **2/2**，最终完整复跑全绿。
+
+- **合并聚焦 500/500**，strict TypeScript EXIT 0：全部 Backend、History／Workspace／Approval UI 与 App fake-backend 集成，`.cache/native-final-parent.log`；另有真实 native composition inline＋fullscreen **2/2**，`.cache/native-history-workspace-acceptance.log`。空历史合法 `asOfSeq:-1` 由 App 保留并显示真实空大纲，不再误判 malformed 或发起事件窗口读取。
+- **前次真实 composition**：当时临时 HOME/workspace 挂载官方 `session-turn-outline` 与 `workspace-changes`，并在测试 patch 中额外启用原生 `tool-fs`（本次 Review 回归已移除该额外 patch，使用实际默认 preset scope）。hermetic stream 首先收到 read-only sandbox denial，再按原生协议携带 `sandbox_permissions + justification` 重试同一写入；审批对话框显示真实 `presentCall` 的 **Proposal / not run yet**，Enter 允许一次后才创建 owned `native-write.txt`。随后验证原生 workspace summary、text diff、history older/newer 两页只共享锚点 seq，以及 `/history` 大纲。零真实 Provider／profile／credentials／用户 session。
+- **真实验收抓到的 adapter 缺陷**：官方 recorder 在 `session.append('workspace/changes')` 的同步通知之后才 `records.set()`，原 adapter 立即查询导致卡片永远缺 summary。现在仅保持该 append 窗口到一个 microtask，再按原生顺序释放 summary、后续 `turn/end`／idle；close 使旧屏障失效，新 session `ready` 不被阻塞。新增 3 项时序／close／switch 回归；临时禁用屏障后官方时序测试按预期失败，恢复后 **17/17**，`.cache/native-workspace-barrier.log`、`.cache/native-workspace-barrier-mutation.log`。
+- **边界**：历史详情是独立只读 transcript，不改 live store；workspace 不读文件／跑 git／解析路径， resumed 记录不伪造空变更；approval 不执行工具、不调用 `presentResult`、不把 Proposal 标成 Applied。Schedule 按用户决定暂缓，没有 Web frontend、Schedule、SessionController 或 `/schedule`。
+
+## 当前工作树：渲染缓存、懒加载与测量性能
+
+- **最终完整 `pnpm check` 2513/2513**，206 测试文件，0 fail/cancel/skip/todo，536345ms，EXIT 0；`.cache/performance-full-check-final.log`。前两次长跑遇到位置不固定的原生／PTY 子进程超时，相关场景分层独立复验通过后，最终完整运行全绿。
+- **缓存与失效**：稳定 block/group 在 width、clock、disclosure generation 和 child paint revision 不变时不再构造 key；800-item 未变帧 key build **800→0**。hover／Settings／catalog／session／expansion 都有回归，expanded group 不会被局部子块变化遮蔽。
+- **Lazy highlight**：导入 theme 时 highlight.js 不在 require cache；并发调用只 import 一次，fallback 不进入 LRU。Transcript／ImageContentBody 和 DecisionDialog 都处理 ready 缓存失效与 dispose 退订，failed 永久纯文本且不抛渲染错误。
+- **Streaming Markdown**：18 项测试、5000+ 次全前缀 differential rendering；所有不确定 container／reference barrier 清除旧 seal 并整文回退。父级独立复现并修复了后到 `[ref]:` 使已封存文本应变成链接的问题，另验证 barrier 后定义、多段落和 fence 内定义共 4 个文档逐字符全等。
+- **Editor 测量**：`measureRows === render.length` 且测量不改 viewport；空／宽字符／ZWJ／150 行／wrap／paste／image／file／scroll／autocomplete 矩阵 9 项，memo 删除、scroll／lastWidth／visible rows 写入及漏 text fingerprint 的变异均被抓取。
+- **当前证据**：UI **1061/1061**、Input **351/351**、Parent 性能组合 **115/115**，build／strict TypeScript EXIT 0；`.cache/performance-parent.log`。完整门禁结果见后续汇总；无真实 Provider／profile、全局安装或 commit。
+
+## 当前工作树：Input P2 显示列与跨上下文诊断
+
+- **最终完整 `pnpm check` 2462/2462**，202 测试文件，0 fail/cancel/skip/todo，512449ms，EXIT 0；`.cache/input-p2-full-check.log`。
+- **显示列移动**：Editor 的上下视觉行、短行 sticky column 和行尾记录全部改用与 renderer 相同的 `visibleWidth`；目标显示列向下取整到完整 grapheme，不再切断 ZWJ／组合字符。新增 5 项 CJK／emoji／VS16／combining／软换行／历史边界回归；临时还原 vendor 补丁时 4 项按预期失败，恢复后 5/5。
+- **跨上下文冲突**：在原 same-context／byte／chord 诊断之外补 `cross-context-shadow`，用当前与 host baseline 的有效编译结果区分新增死绑定、默认键被抢占和有意优先级。覆盖 single、chord-prefix、interrupt-priority、默认配置与 `modeBindings` 零误报；App live 和 save preview 都声明同一 baseline。删除检测时 6/6 新测试失败，删除 baseline 过滤时 5/6 失败，恢复后全绿。
+- **Parent 复验**：Input 全部＋`app.test.ts`＋`ui-keybindings.test.ts` **369/369**，build／strict TypeScript EXIT 0，`.cache/input-p2-parent.log`。`src/app.ts` 仅增加 baseline 声明及两种 screen 的零误报断言；无新 `/hotkeys`、设置层级、真实 profile／Provider 或全局 Pi 修改。
 
 ## 当前工作树：源码打包与 Backend P2 修复
 

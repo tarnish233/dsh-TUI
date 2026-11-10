@@ -229,12 +229,14 @@ test("toolDetails resolves real bytes for tool/section switching, copy, list scr
   assert.equal(resolveId(keymap, "\x1b[F", "toolDetails"), "list.last")
   assert.equal(resolveId(keymap, "1", "toolDetails"), "list.select-digit")
 
-  // Esc closes via list.cancel; Ctrl+C is the priority global interrupt.
+  // Esc closes via list.cancel; default Ctrl+C is the same local cancel row.
   assert.equal(resolveId(keymap, "\x1b", "toolDetails"), "list.cancel")
-  assert.equal(resolveId(keymap, "\x03", "toolDetails"), "app.interrupt")
+  assert.equal(resolveId(keymap, "\x03", "toolDetails"), "list.cancel")
 
-  // The CC Ctrl+O expand meaning is still a global fallback in the modal.
-  assert.equal(resolveId(keymap, "\x0f", "toolDetails"), "app.tools.expand")
+  // Ctrl+O is the dialog-local native-details row inside the modal chain; the
+  // plain root prompt keeps app.tools.expand.
+  assert.equal(resolveId(keymap, "\x0f", "toolDetails"), "dialog.details")
+  assert.equal(resolveId(keymap, "\x0f", "editor"), "app.tools.expand")
 })
 
 test("read-only toolDetails never falls through to editor operations", () => {
@@ -444,49 +446,53 @@ test("remapped details chord is dispatched by the editor; the old chord is not",
 
 // --- interrupt priority -------------------------------------------------
 
-test("configured app.interrupt beats a pending chord and list.cancel in toolDetails", () => {
+test("default Ctrl+C is local; an explicit app.interrupt keeps priority in toolDetails", () => {
   const keymap = mod.createCcKeymap()
+  assert.deepEqual(keymap.getBindings("app.interrupt"), [])
   const changes: Array<readonly string[] | null> = []
   keymap.onChordChange((prefix) => changes.push(prefix))
 
   assert.equal(keymap.resolve("\x18", "toolDetails", 1_000).kind, "pending")
   assert.deepEqual(keymap.getPendingChord(), ["ctrl+x"])
-  const interrupted = keymap.resolve("\x03", "toolDetails", 1_010)
-  assert.equal(interrupted.kind, "action")
-  assert.equal(actionId(interrupted), "app.interrupt", "Ctrl+C is never swallowed by the pending chord")
+  const cancelled = keymap.resolve("\x03", "toolDetails", 1_010)
+  assert.equal(cancelled.kind, "cancelled-chord")
+  assert.equal(cancelled.kind === "cancelled-chord" ? cancelled.passthrough : "", "\x03")
   assert.equal(keymap.isPendingChord(), false)
   assert.deepEqual(changes, [["ctrl+x"], null], "the hint is cleared exactly once")
+  assert.equal(resolveId(keymap, "\x03", "toolDetails"), "list.cancel")
 
-  // A remapped interrupt key keeps the same priority.
-  const remapped = mod.createCcKeymap({ bindings: { "app.interrupt": "ctrl+q" } })
+  // An explicitly remapped interrupt key keeps the same priority.
+  const remapped = mod.createCcKeymap({ bindings: { "app.interrupt": "alt+q" } })
   assert.equal(remapped.resolve("\x18", "toolDetails", 1_000).kind, "pending")
-  assert.equal(resolveId(remapped, "\x11", "toolDetails", 1_010), "app.interrupt")
+  assert.equal(resolveId(remapped, "\x1bq", "toolDetails", 1_010), "app.interrupt")
   assert.equal(remapped.isPendingChord(), false)
   // The old Ctrl+C now reaches the local list.cancel in toolDetails.
   assert.equal(resolveId(remapped, "\x03", "toolDetails"), "list.cancel")
 
-  // Disabling app.interrupt exposes list.cancel instead of a phantom interrupt.
+  // Disabling the explicit interrupt never invents a phantom priority; the
+  // local cancel row receives Ctrl+C (the chord is handled first).
   const disabled = mod.createCcKeymap({ bindings: { "app.interrupt": null } })
   assert.equal(resolveId(disabled, "\x03", "toolDetails"), "list.cancel")
   assert.equal(disabled.resolve("\x18", "toolDetails", 2_000).kind, "pending")
-  const cancelled = disabled.resolve("\x03", "toolDetails", 2_010)
-  assert.equal(cancelled.kind, "cancelled-chord")
+  const cancelledByLocal = disabled.resolve("\x03", "toolDetails", 2_010)
+  assert.equal(cancelledByLocal.kind, "cancelled-chord")
   assert.equal(
-    resolveId(disabled, cancelled.kind === "cancelled-chord" ? cancelled.passthrough : "", "toolDetails"),
+    resolveId(disabled, cancelledByLocal.kind === "cancelled-chord" ? cancelledByLocal.passthrough : "", "toolDetails"),
     "list.cancel",
   )
 
-  // Existing picker priority is preserved (and now also survives a chord).
+  // The picker keeps its default local cancel and the same explicit override.
   const picker = mod.createCcKeymap()
   assert.equal(picker.resolve("\x18", "modelPickerSearch", 3_000).kind, "pending")
-  assert.equal(resolveId(picker, "\x03", "modelPickerSearch", 3_010), "app.interrupt")
+  assert.equal(picker.resolve("\x03", "modelPickerSearch", 3_010).kind, "cancelled-chord")
   assert.equal(picker.isPendingChord(), false)
+  assert.equal(resolveId(picker, "\x03", "modelPickerSearch"), "list.cancel")
 
   // Existing `list` semantics are deliberately unchanged.
   assert.equal(resolveId(mod.createCcKeymap(), "\x03", "list"), "list.cancel")
 })
 
-test("CcEditor in toolDetails dispatches a pending-chord Ctrl+C without touching the draft", () => {
+test("CcEditor in toolDetails cancels locally on Ctrl+C without touching the draft", () => {
   const { editor, events } = makeEditor({ context: "toolDetails" })
   editor.setText("readonly content")
   const before = editor.captureDraft()
@@ -495,10 +501,16 @@ test("CcEditor in toolDetails dispatches a pending-chord Ctrl+C without touching
   assert.equal(editor.getKeymap().isPendingChord(), true)
   press(editor, "\x03")
 
-  assert.deepEqual(actionIds(events), ["app.interrupt"])
+  assert.deepEqual(actionIds(events), ["list.cancel"])
   assert.equal(editor.getKeymap().isPendingChord(), false)
   assert.deepEqual(editor.captureDraft(), before)
   assert.equal(editor.getText(), "readonly content")
+
+  // Only an explicit interrupt override is forwarded to the App.
+  events.length = 0
+  const explicit = makeEditor({ context: "toolDetails", bindings: { "app.interrupt": "alt+q" } })
+  press(explicit.editor, "\x1bq")
+  assert.deepEqual(actionIds(explicit.events), ["app.interrupt"])
 })
 
 // --- back to the editor -------------------------------------------------

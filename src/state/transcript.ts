@@ -41,6 +41,8 @@ import type {
   TodoItem,
   TodosSnapshot,
   TranscriptCodec,
+  WorkspaceChangeFile,
+  WorkspaceChangesSummary,
 } from '../backend/types.ts'
 import {
   composeSubagentRows,
@@ -61,6 +63,7 @@ export type TranscriptItem =
   | TodosTranscriptItem
   | SubagentTranscriptItem
   | SubagentMessageTranscriptItem
+  | WorkspaceChangesTranscriptItem
 
 export interface UserTranscriptItem {
   readonly kind: 'user'
@@ -224,6 +227,44 @@ export interface TodosTranscriptItem {
   readonly kind: 'todos'
   readonly id: string
   readonly todos: readonly TodoItem[]
+  readonly version: number
+}
+
+/**
+ * One compact, turn-level changed-files card.
+ *
+ * DSH attaches `WorkspaceChangesSummary` to a **live** session event only. A
+ * resumed/snapshot replay carries no native summary, so this item is never
+ * fabricated for history: the card exists exactly where the backend attached
+ * native facts.
+ *
+ * Identity follows the native recorder: **one card per native turn**, keyed by
+ * the turn, while `seq` is the latest announcing event position of that turn
+ * (DSH's own contract: the latest record for one turn replaces earlier ones).
+ * The id is therefore stable across a replaced summary, and `seq` is the
+ * position the parent asks the native diff service for. `sessionId` /
+ * `attachmentId` capture the store identity at apply time so a click can prove
+ * which conversation the card belongs to.
+ *
+ * `files` keeps the native array order and length exactly: its element index is
+ * the native index the diff service expects. A summary that cannot be projected
+ * row for row yields no card at all instead of a re-indexed subset.
+ */
+export interface WorkspaceChangesTranscriptItem {
+  readonly kind: 'workspace-changes'
+  readonly id: string
+  /** Exact native session identity captured when the live summary was applied. */
+  readonly sessionId: string
+  /** Exact process attachment identity when the store knew one at apply time. */
+  readonly attachmentId?: string
+  /** Announcing durable event position; the latest record of this turn. */
+  readonly seq: number
+  readonly turn: number
+  readonly files: readonly WorkspaceChangeFile[]
+  /** Native total file count; may exceed `files.length` when the read was bounded. */
+  readonly total: number
+  readonly added: number
+  readonly deleted: number
   readonly version: number
 }
 
@@ -672,6 +713,10 @@ export class TranscriptStore {
       case 'session_event':
         if (!this.isCurrent(event.sessionId)) return
         this.projectSessionEvent(event.event)
+        // Live-only native attachment: `reset()` replays the durable snapshot
+        // through `projectSessionEvent` directly, so resumed history can never
+        // grow a changed-files card without a native live summary.
+        this.applyWorkspaceChanges(event.event)
         this.notify()
         return
       case 'closed':
@@ -1464,6 +1509,64 @@ export class TranscriptStore {
   }
 
   /**
+   * Attach one compact changed-files card for a live event that carries a
+   * native `workspaceChanges` summary.
+   *
+   * Nothing is derived from tool results, prose or git: absence of the native
+   * field means no card at all. The summary is validated field by field; a
+   * malformed record (including one unusable file row) is ignored instead of
+   * being described optimistically, because dropping a row would shift every
+   * later native index.
+   *
+   * Native semantics are DSH's own: **the latest record of one turn replaces
+   * earlier ones** (the official recorder can write the same turn twice). The
+   * card id is therefore the turn, not the announcing seq. A higher announcing
+   * position replaces the summary in place and becomes the position used for
+   * the native diff; a late lower position for the same turn (or the previous
+   * turn's record) can never restore a superseded summary. The same position
+   * with identical facts is a no-op, while different facts at the same position
+   * still update and bump the version once.
+   */
+  private applyWorkspaceChanges(event: SessionEvent): void {
+    if (event.workspaceChanges === undefined) return
+    const seq = asIndex(event.seq)
+    if (seq === undefined || seq < 0) return
+    // The store only reaches this path for the current session (see `handle`),
+    // so the captured identity is the one the native summary was observed in.
+    const info = this.infoValue
+    if (info === undefined) return
+    const summary = asWorkspaceChangesSummary(event.workspaceChanges)
+    if (summary === undefined) return
+    const id = workspaceChangesItemId(summary.turn)
+    const index = this.list.findIndex(item => item.kind === 'workspace-changes' && item.id === id)
+    const current = index >= 0 ? this.list[index] : undefined
+    if (current !== undefined && current.kind === 'workspace-changes') {
+      // A lower late announcing position is a superseded native record: it must
+      // not resurrect an older summary or an older diff position.
+      if (seq < current.seq) return
+      // An identical record at the same position changes nothing at all (no
+      // version bump, no repaint, cached block stays valid).
+      if (seq === current.seq && sameWorkspaceChanges(current, summary)) return
+    }
+    const item: WorkspaceChangesTranscriptItem = {
+      kind: 'workspace-changes',
+      id,
+      sessionId: info.sessionId,
+      ...(info.attachmentId === undefined ? {} : { attachmentId: info.attachmentId }),
+      seq,
+      turn: summary.turn,
+      files: summary.files,
+      total: summary.total,
+      added: summary.added,
+      deleted: summary.deleted,
+      version: ++this.versionCounter,
+    }
+    // New turn: append. Same turn: replace in place so the card keeps its row.
+    if (current === undefined || current.kind !== 'workspace-changes') this.list.push(item)
+    else this.list[index] = item
+  }
+
+  /**
    * DSH's native `todos` projection is the whole live checklist of a turn, so
    * it is one item: append it once, replace it in place afterwards, and drop it
    * when the fold reports null. The statuses are DSH's; nothing is inferred.
@@ -1489,6 +1592,78 @@ export class TranscriptStore {
   private notify(): void {
     this.onChange()
   }
+}
+
+/**
+ * Stable per-turn card id. The announcing seq is a fact about the latest record,
+ * not the identity of the turn's card, so a replaced summary keeps its row.
+ */
+export const workspaceChangesItemId = (turn: number): string => `workspace-changes:turn:${turn}`
+
+/**
+ * Validate one native workspace summary without inventing or repairing facts.
+ *
+ * The summary-level fields are required. Every file row is validated too, and
+ * one unusable row rejects the whole summary: the native array index is the
+ * index the diff service expects, so a "skipped" row would silently read the
+ * next file's bytes. A whitespace-only `path`/`display` is a legal native value
+ * (`write './ '` creates a single space file); only a non-string or an empty
+ * `path` is unusable. `total` stays the native count so a bounded native read
+ * can still be stated honestly.
+ */
+function asWorkspaceChangesSummary(value: unknown): WorkspaceChangesSummary | undefined {
+  if (!isRecord(value)) return undefined
+  const turn = asIndex(value.turn)
+  const total = asIndex(value.total)
+  const added = asIndex(value.added)
+  const deleted = asIndex(value.deleted)
+  if (turn === undefined || turn < 0 || total === undefined || total < 0) return undefined
+  if (added === undefined || added < 0 || deleted === undefined || deleted < 0) return undefined
+  if (!Array.isArray(value.files)) return undefined
+  const files: WorkspaceChangeFile[] = []
+  for (const entry of value.files) {
+    const file = asWorkspaceChangeFile(entry)
+    if (file === undefined) return undefined
+    files.push(file)
+  }
+  return { turn, files, total, added, deleted }
+}
+
+function asWorkspaceChangeFile(value: unknown): WorkspaceChangeFile | undefined {
+  if (!isRecord(value)) return undefined
+  const path = asString(value.path)
+  const display = asString(value.display)
+  const added = asIndex(value.added)
+  const deleted = asIndex(value.deleted)
+  // A path is the native identity, so it must exist; whitespace is not emptiness.
+  if (path === undefined || path === '' || display === undefined) return undefined
+  if (added === undefined || added < 0 || deleted === undefined || deleted < 0) return undefined
+  return {
+    path,
+    display,
+    added,
+    deleted,
+    ...(value.binary === true ? { binary: true } : {}),
+    ...(value.oversized === true ? { oversized: true } : {}),
+  }
+}
+
+function sameWorkspaceChanges(
+  item: WorkspaceChangesTranscriptItem,
+  summary: WorkspaceChangesSummary,
+): boolean {
+  if (item.turn !== summary.turn || item.total !== summary.total) return false
+  if (item.added !== summary.added || item.deleted !== summary.deleted) return false
+  if (item.files.length !== summary.files.length) return false
+  for (const [index, file] of summary.files.entries()) {
+    const current = item.files[index]
+    if (current === undefined) return false
+    if (current.path !== file.path || current.display !== file.display) return false
+    if (current.added !== file.added || current.deleted !== file.deleted) return false
+    if ((current.binary === true) !== (file.binary === true)) return false
+    if ((current.oversized === true) !== (file.oversized === true)) return false
+  }
+  return true
 }
 
 /**

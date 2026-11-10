@@ -47,6 +47,16 @@ export interface CcEditorSnapshot {
   lastAction: string | null
   preferredVisualCol: number | null
   snappedFromCursorCol: number | null
+  /**
+   * Display column the last vertical move asked for, when the caret had to be
+   * clamped (mid-wide-grapheme rounding or atomic marker snap). Opaque data,
+   * like `preferredVisualCol`: it only keeps sticky-column movement honest.
+   *
+   * `width` is the layout width the goal was measured in; a restore at a
+   * different width drops the goal instead of replaying a column from the old
+   * wrapping.
+   */
+  verticalGoal: { cursorLine: number; cursorCol: number; visualCol: number; width: number } | null
   scrollOffset: number
   jumpMode: "forward" | "backward" | null
   isInPaste: boolean
@@ -149,6 +159,18 @@ declare module "#pi-tui" {
     ): boolean
     ccSetCursor(line: number, col: number): void
     ccTransposeChars(): boolean
+    /**
+     * Cheap fingerprint of every input `ccRenderRows(width)` reads (width,
+     * padding, terminal rows, draft text and cursor, marker ids, scroll offset,
+     * completion-menu state). Used to invalidate a memoized row count.
+     */
+    ccRenderSignature(width: number): string
+    /**
+     * Row count of the next `render(width)` without painting: same layout,
+     * wrapping and width math, but no emitted lines and no scroll/cursor/
+     * render-state mutation.
+     */
+    ccRenderRows(width: number): number
     ccHasAutocompleteProvider(): boolean
     ccTriggerCompletion(): void
     /** Re-request candidates for the current draft without accepting or submitting. */
@@ -191,6 +213,8 @@ const SEAM_METHODS = [
   "ccAutocompleteStep",
   "ccAutocompleteAccept",
   "ccRefreshAutocomplete",
+  "ccRenderSignature",
+  "ccRenderRows",
 ] as const
 
 /** True when the loaded Pi TUI editor exposes the CC seam. */

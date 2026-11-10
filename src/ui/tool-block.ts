@@ -19,10 +19,11 @@ import type { ItemBlock, TranscriptViewOptions } from './blocks.ts'
 import { toolImageOccurrences } from './image-data.ts'
 import { imageMarkerLine } from './image-marker.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
+import { countCacheKeyBuild } from './render-counters.ts'
 import { fit, sanitize, visibleWidth, wrap } from './text.ts'
 import { bold, dim, t } from './theme.ts'
 import { renderDiffBlock, diffStats } from './tool-diff.ts'
-import { isToolExpanded, requestToolExpansion, toolExpansionKey } from './tool-expansion.ts'
+import { requestToolExpansion, toolDisclosureExpanded, toolExpansionKey, toolExpansionRevision } from './tool-expansion.ts'
 import {
   formatToolDuration,
   getToolSummary,
@@ -48,6 +49,8 @@ interface ToolCache {
   readonly width: number
   readonly key: string
   readonly lines: string[]
+  /** Disclosure generations this frame was composed from. */
+  readonly expansions: { readonly tools: number }
 }
 
 interface CappedBody {
@@ -93,6 +96,8 @@ export class ToolBlock implements ItemBlock {
   private cwd = ''
   private group: ToolGroupContext | undefined
   private hovered: string | undefined
+  /** See `ItemBlock.paintRevision`: a group reuses its frame while this holds. */
+  paintRevision = 0
   private cache: ToolCache | undefined
   private pendingBoxes: MouseHitbox[] = []
   private lastBoxes: MouseHitbox[] = []
@@ -170,14 +175,21 @@ export class ToolBlock implements ItemBlock {
     return projection.outputText
   }
 
+  /** Read-only projection: no module-level disclosure is read or written. */
+  private get readonly(): boolean {
+    return this.flags.readonlyDisclosure === true
+  }
+
   get expanded(): boolean {
     if (this.group !== undefined) return this.group.isExpanded()
-    return isToolExpanded(toolExpansionKey(this.item.callId), this.flags.expandTools)
+    return toolDisclosureExpanded(this.flags, toolExpansionKey(this.item.callId))
   }
 
   /** True when this card carries a local override over the global expand flag. */
   private get overridden(): boolean {
-    return isToolExpanded(toolExpansionKey(this.item.callId), this.flags.expandTools) !== this.flags.expandTools
+    if (this.readonly) return false
+    return toolDisclosureExpanded(this.flags, toolExpansionKey(this.item.callId))
+      !== (this.flags.expandTools === true)
   }
 
   private get fullscreen(): boolean {
@@ -202,6 +214,8 @@ export class ToolBlock implements ItemBlock {
   }
 
   private toggleExpansion(): void {
+    // A read-only projection advertises no disclosure and accepts none.
+    if (this.readonly) return
     if (this.group !== undefined) {
       // A child never opens its own disclosure inside a group; a click on the
       // expanded body/title collapses the group through its context.
@@ -221,6 +235,9 @@ export class ToolBlock implements ItemBlock {
     const next = entering ? id : this.hovered === id ? undefined : this.hovered
     if (next === this.hovered) return
     this.hovered = next
+    // Hover is a cache-key input but not a content version: the fast path must be
+    // dropped explicitly or the hint would keep painting the previous state.
+    this.invalidate()
     this.requestRender()
   }
 
@@ -236,7 +253,7 @@ export class ToolBlock implements ItemBlock {
   }
 
   private resultBox(row: number): MouseHitbox | undefined {
-    if (!this.canExpand()) return undefined
+    if (this.readonly || !this.canExpand()) return undefined
     const id = `${toolExpansionKey(this.item.callId)}:result`
     return {
       id,
@@ -293,7 +310,7 @@ export class ToolBlock implements ItemBlock {
   }
 
   private bodyBox(startRow: number, endRow: number): MouseHitbox | undefined {
-    if (endRow < startRow) return undefined
+    if (this.readonly || endRow < startRow) return undefined
     return {
       id: `${toolExpansionKey(this.item.callId)}:body`,
       startRow,
@@ -304,6 +321,7 @@ export class ToolBlock implements ItemBlock {
   }
 
   private hintText(kind: 'expand' | 'collapse' | 'details'): string {
+    if (kind !== 'details' && this.readonly) return ''
     if (kind === 'details') {
       if (this.fullscreen) return 'click to show details'
       const key = this.flags.hints?.toolsDetails?.trim() ?? ''
@@ -533,7 +551,9 @@ export class ToolBlock implements ItemBlock {
     const key = toolExpansionKey(this.item.callId)
     const titleRow = 0
     lines.push(this.summaryLine())
-    boxes.push(this.titleBox(titleRow))
+    // A read-only card owns no expansion hitbox: a hint and a hitbox that
+    // cannot change anything would be a dead affordance.
+    if (!this.readonly) boxes.push(this.titleBox(titleRow))
 
     let elbowUsed = false
     const bodyRow = (content: string): string => {
@@ -616,14 +636,38 @@ export class ToolBlock implements ItemBlock {
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, Math.floor(width))
+    const expansions = { tools: toolExpansionRevision() }
+    // Fast path: a card whose live duration is not running has no key input that
+    // can change between paints without `invalidate()` (content, preferences,
+    // cwd, hover) or a disclosure flip (the generation below), so the exact
+    // cached lines array — and the hitboxes it declared — are still correct.
+    const cache = this.cache
+    if (!this.clocked() && cache !== undefined && cache.width === safeWidth && cache.expansions.tools === expansions.tools) {
+      return cache.lines
+    }
+    countCacheKeyBuild()
     const key = this.viewKey()
     if (this.cache !== undefined && this.cache.width === safeWidth && this.cache.key === key) {
       return this.cache.lines
     }
     const lines = this.build(safeWidth).map(line => fit(line, safeWidth))
-    this.cache = { width: safeWidth, key, lines }
+    this.cache = { width: safeWidth, key, lines, expansions }
     this.syncMouse()
     return lines
+  }
+
+  /**
+   * Is the rendered `· 1.2s` still advancing?
+   *
+   * Only an unsettled card with a start time measures a moving duration: a
+   * settled card renders a recorded constant, so it must return to the fast
+   * path. Mirrors the group's `liveStamp()` predicate so nested and standalone
+   * cards agree.
+   */
+  private clocked(): boolean {
+    if (!isTerminalTool(this.item, this.projection().presentation)) return false
+    if (this.item.status === 'done' || this.item.status === 'error') return false
+    return this.item.startedAt !== undefined
   }
 
   /** Cache key includes every setting, context, hover and real live duration. */
@@ -662,6 +706,7 @@ export class ToolBlock implements ItemBlock {
   }
 
   invalidate(): void {
+    this.paintRevision += 1
     this.cache = undefined
     // Deliberately does not touch the registry: an ordinary repaint must keep
     // the press pin so a click whose rows moved between frames still lands.

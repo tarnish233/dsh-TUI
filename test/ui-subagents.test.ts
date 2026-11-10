@@ -2267,14 +2267,15 @@ test('overlay Reply/Stop chips are clickable and a vanished chip cannot fire', (
   assert.deepEqual(replies, ['live'], 'no hidden chip fired')
 })
 
-test('overlay Ctrl+C stops the active child first, then falls back to interrupt/close', () => {
+test('explicit app.interrupt still stops the active child first, then falls back to interrupt/close', () => {
   const tui = createFakeTui(30, 100)
   const stops: string[] = []
   const interrupts: string[] = []
   const closed: string[] = []
+  const interruptKeymap = input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } })
   const overlay = new AgentsOverlay(asTui(tui), {
     entries: interventionEntries(),
-    keymap: keymap(),
+    keymap: interruptKeymap,
     onClose: () => closed.push('close'),
     onStop: value => stops.push(value.id),
     onInterrupt: () => interrupts.push('interrupt'),
@@ -2300,6 +2301,49 @@ test('overlay Ctrl+C stops the active child first, then falls back to interrupt/
   })
   plainOverlay.handleInput(CTRL_C)
   assert.deepEqual(closed, ['close', 'closed-plain'])
+})
+
+test('default Ctrl+C closes the overlay locally without stopping the active child', () => {
+  const stops: string[] = []
+  const interrupts: string[] = []
+  const closed: string[] = []
+  const overlay = new AgentsOverlay(asTui(createFakeTui(30, 100)), {
+    entries: interventionEntries(),
+    keymap: keymap(),
+    onClose: () => closed.push('close'),
+    onStop: value => stops.push(value.id),
+    onInterrupt: () => interrupts.push('interrupt'),
+  })
+  overlay.focused = true
+  selectRow(overlay, 'live')
+  overlay.handleInput(CTRL_C)
+  assert.deepEqual(closed, ['close'], 'the Pi-style default Ctrl+C is a local close')
+  assert.deepEqual(stops, [], 'default Ctrl+C never requests a native child stop')
+  assert.deepEqual(interrupts, [], 'default Ctrl+C never reaches the native interrupt')
+
+  // Disabled local cancels are inert: global app.clear is not a phantom close.
+  const disabledClosed: string[] = []
+  const disabled = new AgentsOverlay(asTui(createFakeTui(30, 100)), {
+    entries: interventionEntries(),
+    keymap: input.createCcKeymap({ bindings: { 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null } }),
+    onClose: () => disabledClosed.push('close'),
+  })
+  disabled.focused = true
+  disabled.handleInput(CTRL_C)
+  assert.deepEqual(disabledClosed, [])
+
+  // Remapped local cancels leave Ctrl+C inert; the new key still works.
+  const remappedClosed: string[] = []
+  const remapped = new AgentsOverlay(asTui(createFakeTui(30, 100)), {
+    entries: interventionEntries(),
+    keymap: input.createCcKeymap({ bindings: { 'list.cancel': 'q', 'dialog.cancel': 'q', 'app.cancel': 'ctrl+g' } }),
+    onClose: () => remappedClosed.push('close'),
+  })
+  remapped.focused = true
+  remapped.handleInput(CTRL_C)
+  assert.deepEqual(remappedClosed, [], 'no phantom close from global app.clear')
+  remapped.handleInput('q')
+  assert.deepEqual(remappedClosed, ['close'])
 })
 
 test("narrow overlays keep every action chip's paint and hitbox in sync", () => {
@@ -2415,8 +2459,9 @@ test('child view reply asks the parent to return to its main Editor and creates 
   assert.equal(harness.child.isDone, false)
 })
 
-test('child view stops only an active local child; Esc closes without stopping', () => {
-  const harness = childHarness({ onStop: () => {}, onReply: () => {}, onInterrupt: () => {} })
+test('child view stops an active child only for an explicit interrupt override; Esc never stops', () => {
+  const interruptKeymap = input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } })
+  const harness = childHarness({ onStop: () => {}, onReply: () => {}, onInterrupt: () => {}, keymap: interruptKeymap })
   const stopKey = actionKeys('subagent.interrupt')
   harness.child.handleInput(stopKey.raw)
   assert.deepEqual(harness.stops, ['child-1'], 'a running local child can be stopped')
@@ -2434,6 +2479,7 @@ test('child view stops only an active local child; Esc closes without stopping',
     onStop: () => {},
     onReply: () => {},
     onInterrupt: () => interrupts.push('interrupt'),
+    keymap: interruptKeymap,
   })
   const text = plain(settled.child.render(100)).join('\n')
   assert.ok(!text.includes('stop'))
@@ -2457,6 +2503,24 @@ test('child view stops only an active local child; Esc closes without stopping',
   external.child.handleInput(stopKey.raw)
   assert.deepEqual(external.replies, [])
   assert.deepEqual(external.stops, [])
+})
+
+test('default Ctrl+C closes the child view locally without stopping the child', () => {
+  const harness = childHarness({ onStop: () => {}, onReply: () => {}, onInterrupt: () => {} })
+  harness.child.handleInput(CTRL_C)
+  assert.deepEqual(harness.closed, ['close'], 'the Pi-style default Ctrl+C closes the read-only child view')
+  assert.deepEqual(harness.stops, [], 'default Ctrl+C never stops the child')
+  assert.deepEqual(harness.replies, [])
+
+  // Disabled local cancels are inert; the global app.clear default is not
+  // aliased into a phantom local close.
+  const disabledClosed: string[] = []
+  const disabled = childHarness({
+    keymap: input.createCcKeymap({ bindings: { 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null } }),
+    onClose: () => disabledClosed.push('close'),
+  })
+  disabled.child.handleInput(CTRL_C)
+  assert.deepEqual(disabledClosed, [])
 })
 
 test('child view without callbacks is inert; the footer still says read-only', () => {

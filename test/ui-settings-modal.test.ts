@@ -345,14 +345,27 @@ test('a zero-row test host renders an unbounded roster and close still works', (
   assert.deepEqual(events, ['cancel'])
 })
 
-test('Ctrl+C keeps interrupt priority while search has a pending chord', () => {
-  const { dialog, events } = harness({ withInterrupt: true })
-  dialog.handleInput(CTRL_F)
-  dialog.handleInput('\x1b[200~a')
-  dialog.handleInput('\x1b[201~')
-  dialog.handleInput(CTRL_C)
-  assert.deepEqual(events, ['interrupt'])
-  assert.equal(dialog.isDone, false)
+test('default Ctrl+C restores the focused search layer locally; only an explicit interrupt is native', () => {
+  const local = harness({ withInterrupt: true })
+  local.dialog.handleInput(CTRL_F)
+  local.dialog.handleInput('\x1b[200~a')
+  local.dialog.handleInput('\x1b[201~')
+  assert.equal(local.dialog.searchFocusedState, true)
+  local.dialog.handleInput(CTRL_C)
+  assert.deepEqual(local.events, [], 'default app.clear never reaches the native interrupt hook')
+  assert.equal(local.dialog.searchFocusedState, false, 'the search layer is cancelled locally')
+  assert.equal(local.dialog.isDone, false, 'the Settings surface stays open')
+  assert.equal(local.dialog.query, 'a', 'the query draft survives the local layer cancel until re-focused')
+
+  const explicit = harness({
+    keymap: input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }),
+    withInterrupt: true,
+  })
+  explicit.dialog.handleInput(CTRL_F)
+  explicit.dialog.handleInput(CTRL_C)
+  assert.deepEqual(explicit.events, ['interrupt'])
+  assert.equal(explicit.dialog.isDone, false)
+  assert.equal(explicit.dialog.searchFocusedState, true, 'an explicit interrupt leaves the field open')
 })
 
 test('a pasted Ctrl+C byte stays in the search field instead of interrupting the turn', () => {

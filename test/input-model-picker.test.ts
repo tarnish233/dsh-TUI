@@ -100,8 +100,9 @@ test("browse-mode keymap defaults: provider keys, shared list keys and editor fa
   assert.equal(actionId(keymap.resolve("1", "modelPickerList")), "list.select-digit")
   assert.equal(actionId(keymap.resolve("\r", "modelPickerList")), "list.select")
   assert.equal(actionId(keymap.resolve("\x1b", "modelPickerList")), "list.cancel")
-  // Ctrl+C is the global interrupt, not list.cancel, in the picker contexts.
-  assert.equal(actionId(keymap.resolve("\x03", "modelPickerList")), "app.interrupt")
+  // Default Ctrl+C is the local list.cancel in the picker context; the global
+  // app.clear fallback is never reached by default.
+  assert.equal(actionId(keymap.resolve("\x03", "modelPickerList")), "list.cancel")
   // Editing fallback underneath the list layer.
   assert.equal(actionId(keymap.resolve("\x17", "modelPickerList")), "editor.kill.whitespace-backward")
   assert.equal(actionId(keymap.resolve("\x01", "modelPickerList")), "editor.move.line-start")
@@ -124,8 +125,8 @@ test("search-mode defaults: provider keys, Enter/Esc, text editing and no list s
   assert.equal(actionId(keymap.resolve("\r", "modelPickerSearch")), "list.select")
   assert.equal(actionId(keymap.resolve("\n", "modelPickerSearch")), "list.select")
   assert.equal(actionId(keymap.resolve("\x1b", "modelPickerSearch")), "list.cancel")
-  // Ctrl+C keeps the global interrupt (list.cancel also binds it).
-  assert.equal(actionId(keymap.resolve("\x03", "modelPickerSearch")), "app.interrupt")
+  // Ctrl+C cancels the picker locally through its list.cancel row.
+  assert.equal(actionId(keymap.resolve("\x03", "modelPickerSearch")), "list.cancel")
   // Standard readline edits are available.
   assert.equal(actionId(keymap.resolve("\x02", "modelPickerSearch")), "editor.move.char-left")
   assert.equal(actionId(keymap.resolve("\x06", "modelPickerSearch")), "editor.move.char-right")
@@ -436,28 +437,28 @@ test("Enter/Esc in search mode are list actions, never submit or clear the query
   assert.deepEqual(actionIds(browse.events), ["list.select"])
 })
 
-test("Ctrl+C stays global in both picker contexts (chord and paste semantics)", () => {
+test("default Ctrl+C cancels both picker contexts locally (chord and paste semantics)", () => {
   const search = makeEditor()
   search.editor.setContext("modelPickerSearch")
   typeText(search.editor, "que")
   press(search.editor, "\x03")
-  assert.deepEqual(actionIds(search.events), ["app.interrupt"])
-  assert.equal(search.editor.getText(), "que", "interrupt does not clear the query before the app decides")
+  assert.deepEqual(actionIds(search.events), ["list.cancel"])
+  assert.equal(search.editor.getText(), "que", "the local cancel does not clear the query")
 
   const browse = makeEditor()
   browse.editor.setContext("modelPickerList")
   press(browse.editor, "\x03")
-  assert.deepEqual(actionIds(browse.events), ["app.interrupt"])
+  assert.deepEqual(actionIds(browse.events), ["list.cancel"])
 
-  // Pending chord: the keymap cancels the chord and re-dispatches Ctrl+C.
+  // Pending chord: the keymap drops the prefix and re-dispatches Ctrl+C once.
   const chord = makeEditor()
   chord.editor.setContext("modelPickerSearch")
   press(chord.editor, "\x18")
   press(chord.editor, "\x03")
   assert.equal(chord.editor.getKeymap().isPendingChord(), false)
-  assert.deepEqual(actionIds(chord.events), ["app.interrupt"])
+  assert.deepEqual(actionIds(chord.events), ["list.cancel"])
 
-  // Pasted Ctrl+C bytes are text/paste content, never an interrupt key.
+  // Pasted Ctrl+C bytes are text/paste content, never a cancel key.
   const pasted = makeEditor()
   pasted.editor.setContext("modelPickerSearch")
   pasted.editor.handleInput("\x1b[200~a\x03b\x1b[201~")
@@ -465,18 +466,19 @@ test("Ctrl+C stays global in both picker contexts (chord and paste semantics)", 
   assert.deepEqual(pasted.events, [])
   assert.equal(pasted.editor.getText().includes("a"), true)
 
-  // Config wins: disabling app.interrupt exposes list.cancel for Ctrl+C.
-  const disabled = makeEditor({ bindings: { "app.interrupt": null } })
-  disabled.editor.setContext("modelPickerSearch")
-  press(disabled.editor, "\x03")
-  assert.deepEqual(actionIds(disabled.events), ["list.cancel"])
-
-  // Remapping app.interrupt moves the global key; list.cancel keeps Ctrl+C.
+  // An explicit interrupt override keeps its priority in the picker contexts.
   const remapped = makeEditor({ bindings: { "app.interrupt": "ctrl+q" } })
   remapped.editor.setContext("modelPickerSearch")
   press(remapped.editor, "\x11")
   press(remapped.editor, "\x03")
   assert.deepEqual(actionIds(remapped.events), ["app.interrupt", "list.cancel"])
+
+  // Disabling the local cancel row never invents a new fallback and never
+  // clears hidden root state from the picker (app.clear is root-only).
+  const disabled = makeEditor({ bindings: { "list.cancel": null } })
+  disabled.editor.setContext("modelPickerSearch")
+  press(disabled.editor, "\x03")
+  assert.deepEqual(actionIds(disabled.events), [])
 })
 
 test("standard readline edits still work inside the picker search field", () => {
@@ -551,7 +553,7 @@ test("old contexts do not inherit picker routing", () => {
   // list still owns Ctrl+C and printable selection; editor stays text.
   assert.equal(actionId(keymap.resolve("\x03", "list")), "list.cancel")
   assert.equal(actionId(keymap.resolve("\x03", "dialog")), "dialog.cancel")
-  assert.equal(actionId(keymap.resolve("\x03", "editor")), "app.interrupt")
+  assert.equal(actionId(keymap.resolve("\x03", "editor")), "app.clear")
   assert.equal(actionId(keymap.resolve("j", "list")), "list.next")
   assert.equal(keymap.resolve("j", "editor").kind, "none")
   assert.equal(actionId(keymap.resolve("\t", "editor")), "editor.complete")

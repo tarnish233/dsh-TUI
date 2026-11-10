@@ -15,6 +15,8 @@
 import {
   decodeKittyPrintable,
   Editor,
+  isKeyRelease,
+  isKeyRepeat,
   matchesKey,
   type EditorOptions,
   type EditorTheme,
@@ -130,6 +132,7 @@ export interface CcExternalEditorRequest {
 /** Actions that exist in the registry but are implemented by the app. */
 const APP_FALLBACK_ACTIONS = new Set([
   "app.interrupt",
+  "app.clear",
   "app.cancel",
   "app.exit",
   "app.redraw",
@@ -162,6 +165,7 @@ const APP_FALLBACK_ACTIONS = new Set([
   "list.select-digit",
   "dialog.confirm",
   "dialog.cancel",
+  "dialog.details",
   "tool.details.next-section",
   "tool.details.previous-section",
   "tool.details.previous-tool",
@@ -180,15 +184,19 @@ const APP_FALLBACK_ACTIONS = new Set([
  * closed there instead of acting on hidden root state.
  *
  * Deliberately excluded: app.cancel/list.cancel/dialog.* keep their documented
- * local close behavior, app.interrupt keeps global priority, app.exit remains
- * global (the App still applies its empty-input exit policy), and app-level
- * surfaces (redraw, help, todo, model picker, detail overlays, suspend) remain
- * available as global fallbacks. The Agents surface actions
- * `subagent.reply`/`subagent.interrupt` also remain available to the overlay:
- * they are app-implemented, the input layer only emits the action, and the App
- * owns the reply target and the native child interrupt.
+ * local close behavior, an explicitly configured app.interrupt keeps its
+ * read-only/modal priority, app.exit remains global (the App still applies its
+ * empty-input exit policy), and app-level surfaces (redraw, help, todo, model
+ * picker, detail overlays, suspend) remain available as global fallbacks. The
+ * Agents surface actions `subagent.reply`/`subagent.interrupt` also remain
+ * available to the overlay: they are app-implemented, the input layer only
+ * emits the action, and the App owns the reply target and the native child
+ * interrupt.
  */
 const ROOT_EDITOR_APP_ACTIONS = new Set([
+  // Pi-style Ctrl+C clears the *root* draft. A read-only surface must never
+  // clear hidden root state, so the action fails closed there like stash/paste.
+  "app.clear",
   "app.stash",
   "app.history.search",
   "app.editor.external",
@@ -196,6 +204,20 @@ const ROOT_EDITOR_APP_ACTIONS = new Set([
   "app.message.sendNow",
   "app.message.steer",
   "app.message.followUp",
+])
+
+/**
+ * Contexts backed by the one root prompt draft. `app.clear` is only meaningful
+ * there; a picker, modal search field, history-search overlay or read-only
+ * surface must not clear hidden root state when its own local cancel row is
+ * disabled/remapped away. Installed Pi 1.5.1 CustomEditor handles Ctrl+C before
+ * base autocomplete handling, so `autocomplete` is a root-clear context: the
+ * whole draft clears and the stale menu closes naturally.
+ * (Read-only surfaces are additionally covered by ROOT_EDITOR_APP_ACTIONS.)
+ */
+const ROOT_CLEAR_CONTEXTS: ReadonlySet<CcContext> = new Set<CcContext>([
+  "editor",
+  "autocomplete",
 ])
 
 /** Same normalization Pi applies in `setText` (used for a true no-op check). */
@@ -453,6 +475,12 @@ export class CcEditor extends Editor {
   private ownedChordGeneration: number | null = null
   /** Payload captured immediately before the active submit clears the draft. */
   private pendingSubmit: CcSubmitPayload | undefined
+  /**
+   * Memoized `measureRows` answer: the row count together with the exact state
+   * fingerprint (`ccRenderSignature`) it was computed from. One entry only —
+   * the dock measures the current frame, and a stale width is not worth keeping.
+   */
+  private rowMeasure: { readonly signature: string; readonly rows: number } | undefined
 
   constructor(tui: TUI, theme: EditorTheme, options: CcEditorOptions = {}) {
     super(tui, theme, options)
@@ -1180,6 +1208,12 @@ export class CcEditor extends Editor {
 
   override handleInput(data: string): void {
     if (this.disposed) return
+    // Kitty CSI-u / xterm modifyOtherKeys releases are not presses. Pi's main
+    // screen filters them before a component by default, but CcEditor may be
+    // driven directly (hosts/tests); a release must never complete a chord or
+    // emit a second action (e.g. the second Ctrl+C that would arm exit).
+    // Fragmented bracketed paste is exempt: pasted bytes are content.
+    if (!this.pasteFilter.isPasting && isKeyRelease(data)) return
     const tokens = this.pasteFilter.push(data)
     // A paste boundary invalidates any half-typed chord: pasted bytes and the
     // next keys after the paste must never complete the old chord.
@@ -1271,6 +1305,13 @@ export class CcEditor extends Editor {
       case "action":
         this.clearChordTimer()
         this.ownedChordGeneration = null
+        // A held/repeated Ctrl+C is still one physical press for exit policy:
+        // Kitty flag 2 repeats of app.clear are consumed instead of arming a
+        // second exit. Other repeats keep their normal action (navigation,
+        // deletion) because holding those keys is expected terminal behaviour.
+        // Legacy terminals cannot distinguish a repeat from a new press; that
+        // limit is documented in docs/INPUT.md.
+        if (resolution.action.id === "app.clear" && isKeyRepeat(data)) return
         this.runAction(resolution.action, data, context)
         // A completion menu goes stale as soon as a non-completion action edits
         // or moves the draft; close it rather than showing a wrong prefix.
@@ -1347,9 +1388,13 @@ export class CcEditor extends Editor {
     // draft, so these fail closed even if a custom registry, a completion
     // overlay or a fallback layer makes them resolvable there: the key is
     // consumed instead of mutating the hidden root editor. App actions
-    // (app.cancel, list.cancel, app.interrupt, subagent.reply/interrupt, ...)
-    // still flow below.
+    // (app.cancel, list.cancel, an explicitly configured app.interrupt,
+    // subagent.reply/interrupt, ...) still flow below.
     if (this.isReadOnlySurface() && action.implementor === "editor") return
+    // Hidden-root boundary for the Pi-style clear action: only the root prompt
+    // (or its completion/history overlay) owns the draft, so a picker/modal
+    // search field never clears hidden state when its local cancel is disabled.
+    if (action.id === "app.clear" && !ROOT_CLEAR_CONTEXTS.has(this.actionContext)) return
     // Same boundary for app actions that would act on the hidden root draft
     // (stash, paste, external editor, submit/steer/follow-up, history search,
     // exit). They remain resolvable in the keymap for diagnostics/Settings,
@@ -1586,6 +1631,45 @@ export class CcEditor extends Editor {
     }
     this.submitNow(() => this.ccSubmit())
     void data
+  }
+
+  // --- measurement (no paint) --------------------------------------------
+
+  /**
+   * Rows this editor paints at `width`: exactly `render(width).length`.
+   *
+   * The status dock needs the editor's height *before* it lays the transcript
+   * out, and `docs/FRONTEND-CONTRACT.md` forbids re-rendering a member to count
+   * its rows. Measuring therefore asks the vendored Editor for its row geometry
+   * (`ccRenderRows`) instead of painting:
+   *
+   * - **side-effect free**: no line is emitted, and `scrollOffset`, `lastWidth`,
+   *   `renderedVisibleLineCount`/`renderedAutocompleteHeight`, the cursor, the
+   *   undo stack and the completion menu are untouched. The scroll adjustment
+   *   that `render` applies to itself is computed on a local copy, so a
+   *   measurement never changes the frame that follows it (and repeated
+   *   measurements are identical);
+   * - **one layout implementation**: the seam reuses `layoutText` (word-aware
+   *   `wordWrapLine` + marker-aware grapheme segmentation), the same padding
+   *   math and the same `SelectList.render` the paint uses, so the row count
+   *   cannot drift from a second wrap algorithm;
+   * - **memoized**: the answer is cached under a fingerprint of every input the
+   *   row count reads — width, `paddingX`, terminal rows (the visible-line
+   *   cap), draft text, cursor line/column, scroll offset, the paste/image/file
+   *   marker id sets (they change segmentation), and completion state (open /
+   *   closed, candidate count, selection, visible cap). A repeat measurement of
+   *   unchanged state costs a fingerprint compare and performs no layout.
+   *
+   * `width` is passed through unmodified, exactly like `render(width)`, so the
+   * two agree for every width the parent may pass.
+   */
+  measureRows(width: number): number {
+    const signature = this.ccRenderSignature(width)
+    const cached = this.rowMeasure
+    if (cached !== undefined && cached.signature === signature) return cached.rows
+    const rows = this.ccRenderRows(width)
+    this.rowMeasure = { signature, rows }
+    return rows
   }
 
   // --- chord timer -------------------------------------------------------

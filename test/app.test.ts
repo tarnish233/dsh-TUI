@@ -305,6 +305,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
   test('Settings shortcut editor saves, disables and resets one binding without losing the draft (' + screen + ')', async () => {
     const f = await fixture(screen)
     try {
+      assert.deepEqual(f.app.keymap.getConflicts().filter(diagnostic => diagnostic.code === 'cross-context-shadow'), [], 'shipped mode bindings are the declared baseline, not user conflicts')
       const events: BackendEvent[] = []
       f.backend.onEvent(event => events.push(event))
       f.terminal.type('draft preserved ')

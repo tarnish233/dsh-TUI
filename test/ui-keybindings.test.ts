@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { stripTerminalSequences, visibleWidth } from '#pi-tui'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
+import type { CcKeymap } from '../src/input/index.ts'
 
 const input = await loadInputModule()
 const { KeybindingsDialog, parseShortcutText } = await import('../src/ui/keybindings.ts')
@@ -221,40 +222,57 @@ test('a failed save leaves the binding text editable and does not change effecti
   assert.equal(f.dialog.isEditing, false, 'the configured cancel shortcut also cancels an edit')
 })
 
-test('global interrupt stays separate from the inline editor cancel', async () => {
-  const keymap = input.createCcKeymap()
-  const events: string[] = []
-  const make = (onInterrupt?: () => void) => new KeybindingsDialog(asTui(createFakeTui(0, 80)), {
-    keymap,
-    path: '/temporary/config/keybindings.json',
-    onChange: async () => {},
-    onBack: () => { events.push('back') },
-    ...(onInterrupt === undefined ? {} : { onInterrupt: () => { events.push('interrupt') } }),
+test('default Ctrl+C cancels only the edit locally; an explicit interrupt override stays native', async () => {
+  const make = (options: { keymap?: CcKeymap; hooked?: boolean } = {}) => {
+    const events: string[] = []
+    const dialog = new KeybindingsDialog(asTui(createFakeTui(0, 80)), {
+      keymap: options.keymap ?? input.createCcKeymap(),
+      path: '/temporary/config/keybindings.json',
+      onChange: async () => {},
+      onBack: () => { events.push('back') },
+      ...(options.hooked === true ? { onInterrupt: () => { events.push('interrupt') } } : {}),
+    })
+    dialog.focused = true
+    return { dialog, events }
+  }
+
+  // Default Ctrl+C is app.clear. In the binding text field it abandons only this
+  // edit (the same local layer Esc cancels), never the pane and never the turn.
+  const local = make({ hooked: true })
+  local.dialog.handleInput('\r')
+  assert.equal(local.dialog.isEditing, true)
+  local.dialog.handleInput('\x03')
+  assert.deepEqual(local.events, [], 'default Ctrl+C never reaches the native interrupt hook')
+  assert.equal(local.dialog.isEditing, false, 'default Ctrl+C cancels the focused edit layer')
+  local.dialog.handleInput('\x03')
+  assert.deepEqual(local.events, ['back'], 'back in the browse list closes the pane locally')
+
+  // Only an explicit user override makes Ctrl+C a native interrupt; the edit
+  // stays open and is never silently cancelled by it.
+  const explicit = make({ keymap: input.createCcKeymap({ bindings: { 'app.interrupt': 'ctrl+c' } }), hooked: true })
+  explicit.dialog.handleInput('\r')
+  assert.equal(explicit.dialog.isEditing, true)
+  explicit.dialog.handleInput('\x03')
+  assert.deepEqual(explicit.events, ['interrupt'])
+  assert.equal(explicit.dialog.isEditing, true, 'explicit interrupt leaves the binding editor open')
+  explicit.dialog.handleInput(ESC)
+  assert.equal(explicit.dialog.isEditing, false)
+
+  // With every local cancel row remapped away from Ctrl+C, the default
+  // app.clear key must not become a phantom cancel/back.
+  const remapped = make({
+    keymap: input.createCcKeymap({
+      bindings: { 'list.cancel': 'ctrl+q', 'dialog.cancel': 'ctrl+w', 'app.cancel': 'ctrl+e' },
+    }),
+    hooked: true,
   })
-
-  // With the hook, the configured interrupt key is global: it does not save or
-  // close the pane, and it does not silently cancel the edit either.
-  const hooked = make(() => { events.push('interrupt') })
-  hooked.focused = true
-  hooked.handleInput('\r')
-  assert.equal(hooked.isEditing, true)
-  hooked.handleInput('\x03')
-  assert.deepEqual(events, ['interrupt'])
-  assert.equal(hooked.isEditing, true, 'global interrupt leaves the binding editor open')
-  hooked.handleInput(ESC)
-  assert.equal(hooked.isEditing, false)
-
-  // Without the hook, Ctrl+C keeps this pane's recovery behaviour.
-  events.length = 0
-  const plain = make()
-  plain.focused = true
-  plain.handleInput('\r')
-  assert.equal(plain.isEditing, true)
-  plain.handleInput('\x03')
-  assert.deepEqual(events, [])
-  assert.equal(plain.isEditing, false, 'the configured cancel shortcut still cancels an edit')
-  plain.handleInput('\x03')
-  assert.deepEqual(events, ['back'])
+  remapped.dialog.handleInput('\r')
+  assert.equal(remapped.dialog.isEditing, true)
+  const before = remapped.dialog.bindingText
+  remapped.dialog.handleInput('\x03')
+  assert.deepEqual(remapped.events, [])
+  assert.equal(remapped.dialog.isEditing, true, 'no invented fallback after a remap')
+  assert.equal(remapped.dialog.bindingText, before, 'the dropped app.clear never edits the field')
 })
 
 test('fragmented paste is reported so the parent interrupt listener can defer', () => {

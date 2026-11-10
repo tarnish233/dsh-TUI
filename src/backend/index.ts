@@ -19,6 +19,9 @@ export type {
   DecisionOrigin,
   DecisionRequest,
   DisplayContentPart,
+  HistoryTurnEntry,
+  HistoryTurnsResult,
+  HistoryWindowResult,
   ImageAttachmentRef,
   ImageAttachmentValue,
   ImageMediaType,
@@ -32,4 +35,8 @@ export type {
   SubagentSnapshot,
   SubagentStatus,
   SubagentTiming,
+  WorkspaceChangeDiffResult,
+  WorkspaceChangeFile,
+  WorkspaceChangesSummary,
+  WorkspaceFileDiff,
 } from './types.ts'

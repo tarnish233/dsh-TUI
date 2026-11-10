@@ -37,7 +37,7 @@ rewrite its accepted code. See [confirmed fixes](NATIVE-API-FIXES.zh-CN.md).
 
 Public services used (all through `ctx.get(name)` with capability validation):
 `agents`, `commands`, `skills`, `workingDirectory`, `llm`, `attachments`,
-`fileReferences`, `sessionQuery`, `sessionProjections`, `agentDefaultModel`,
+`fileReferences`, `sessionQuery`, `sessionProjections`, `workspaceChanges`, `agentDefaultModel`,
 `permissionPresets`, `agentPresets`, `sessions`, `hmr`, `tools`, `loader`,
 `sessionTitle`, `jobs`, `goals`, `settings` and `userQuestions`. Native pure helpers include
 `createUserMessage`, `buildForkSeed`, public `readPluginInventory` and
@@ -304,7 +304,10 @@ adapter's created/resumed handle is ever disposed.
   because it could hide lifecycle facts the transcript needs.
 - `toolPresentation` is ephemeral: `ctx.tools.get(name, agent)` plus only the
   definition's pure `presentCall`/`presentResult`; no tool is re-executed and
-  nothing is written back to DSH's log.
+  nothing is written back to DSH's log. An assistant-message tool-call block is
+  a call *proposal*: its `presentCall(args)` result is cached by `callId` for
+  the approval decision and the assistant event itself carries no event-level
+  `toolPresentation`.
 - Snapshots keep the newest suffix within 8000 events and 4 MiB UTF-8; omissions
   are reported as `truncated`/`totalEvents`, durable text is never rewritten.
 
@@ -318,6 +321,29 @@ behavior. Human answers are normalized to native outcomes
 cancel settles the exact native request as `ASK_CANCELLED`; a signal/turn abort
 settles it as `ASK_ABORTED`, so Esc and Ctrl+C stay distinguishable. Every path
 emits `decision_closed` once before settling.
+
+An approval request preserves its native `callId` and, when available, a
+validated `toolPresentation` `{call}` view. The view is the pure
+`presentCall(args)` result the mounted tool definition produced for the
+assistant message that *proposed* the call, cached by `callId` in the existing
+bounded `ToolPresenter` call map (the same `MAX_CACHED_TOOL_CALLS` budget used
+by the durable `tool/call`/`tool/result` path). Timing is the opposite of "the
+approval creates the call": the native scheduler appends the durable
+`tool/call` first (`dsh-tools` `BatchSettlement.start`) and only then runs
+`pipeline.prepare`, whose pre-execute gate raises this approval. A durable call
+therefore exists before the human answers, but nothing has been executed, and
+the approval decision can still reach this adapter before it has mapped that
+event — so the proposal cache, not the durable event, is the reliable preview
+source. The adapter never executes a tool, calls `presentResult`, reads a file
+or infers a diff to fill that preview: it parses the proposal's actual JSON
+arguments, calls only `ctx.tools.get(name, exactAgent).presentCall(args)`,
+JSON-safes and structurally validates the tagged `generic`/`terminal`/`diff`
+view, and reuses the cached value. A missing `callId`, a missing/evicted
+proposal, an unparsable argument string, a throwing lookup/presenter or a
+malformed view leaves a normal approval (with `callId` when the native request
+carried one) and no fabricated preview; presenter diagnostics are never
+forwarded. One assistant message may propose several calls and caches each.
+The existing durable `tool/call`/`tool/result` presentation path is unchanged.
 
 Question answers keep the native `{id, selected, custom?}` meaning: `selected`
 holds chosen option labels only, and `custom` holds free-form text. A question
@@ -360,7 +386,8 @@ failed wake is not reversible; it only keeps the inbox.
 `native-jobs`, `native-job-output`, `native-goal`, `native-working-directory`,
 `native-inventory`, `native-tools`, `native-questions`,
 `native-question-answer`, `native-defaults`, `native-default-update`,
-`session-fork`) never materialize a pending session. That list is the
+`session-fork`, `history-turns`, `history-window`, `workspace-change-diff`)
+never materialize a pending session. That list is the
 `sessionless` rows of the one declaration table
 (`COMMAND_DECLARATIONS` in `src/backend/context.ts`), which also owns the
 accepted-name set and the staging rule; it is not maintained in parallel here.
@@ -370,6 +397,104 @@ answers `{removed:false}` (a pending attachment has no native inbox, exactly
 like `dequeue` answering `[]`), and `efforts` reads the pending route.
 `queue-replace`/`queue-send-now` are not session-less: they rewrite or wake a
 queue row that only a live Agent owns.
+
+`history-turns`, `history-window` and `workspace-change-diff` are read-only and
+each is advertised only when its own native method is mounted:
+`history-turns` needs `sessionProjections.snapshot`, `history-window` needs
+`sessionQuery.readEvent`, `workspace-changes` needs `workspaceChanges.summary`
+and `workspace-change-diff` needs `workspaceChanges.diff`. They are separate
+capabilities because the event summary and the per-file comparison come from
+two different native methods; a composition that mounts only one advertises
+only that one.
+
+### Native history read faces
+
+`command('history-turns', {sessionId?, attachmentId?})` reads the whole-log
+turn outline through exactly one public carrier cut,
+`ctx.sessionProjections.snapshot(session, ['turnOutline'])`. It never calls the
+deprecated `sessionProjections.stateOf` registry read, never folds events and
+never creates an Agent. The response is `{available, sessionId, attachmentId,
+asOfSeq?, entries}` where each entry is `{turn, seq, prompt, response}` with a
+native safe-integer `turn`/`seq` (strictly increasing), string previews and no
+native extra fields. A missing projection/unit, an unreadable cut or any
+malformed/non-increasing row answers `available:false` with `entries: []` — an
+unavailable outline is never presented as an authoritative empty one. A native
+empty outline (no started turn yet) is `available:true` with no entries. A
+supplied `sessionId`/`attachmentId` must be the current attachment, otherwise
+the command rejects `STALE_SESSION`; a pending attachment answers
+`available:false` without materializing its Agent (`history-turns` never
+creates one).
+
+`command('history-window', {sessionId?, attachmentId?, seq, before?, after?})`
+reads one full native event plus a bounded raw-log context window through
+`ctx.sessionQuery.readEvent({sessionId, seq, before, after}, signal)`. `seq`
+must be a native event seq; `before`/`after` must be integers in `0..50`
+(omitted means `0`, exactly the native default) and are validated before any
+native call — 50 is this adapter's per-side safety cap, never a claim about the
+mounted runtime. The read is bounded by the existing 5 s `durableRead` carrier,
+so `close()` and attachment retirement abort it and a late window is never
+published for a replaced attachment. A runtime mounted with a smaller native
+`readWindowMax` (a legal profile setting, e.g. 20) still works: that bound is
+configuration, not a readable service fact — `@deepseek-ai/dsh-session-query`
+exports only the `Config` input and keeps the resolved value private — so the
+adapter reads nothing off the service and instead adapts to one proven
+rejection. Exactly `SESSION_QUERY_INVALID_WINDOW` plus the exact bounded message
+`<before|after> must be an integer between 0 and N` proves `N`; both sides are
+clamped to `N` in **one** retry inside the same `durableRead` signal/deadline
+(never a recursive or second-carrier loop) and the proven bound is cached per
+mounted service object + `readEvent` identity, so later pages are narrowed
+before dispatch and a replaced service or hot-patched method starts over. A
+narrower caller request is never widened to that bound; a generic, malformed,
+paraphrased, non-narrowing or above-cap failure, or a close/switch that already
+happened, fails closed with the original rejection and no second native call.
+The native response is validated against the bounds that were **actually
+dispatched**: non-negative `inheritedEventCount`, native `startSeq`/`endSeq`,
+`startSeq <= endSeq`, the target inside the window, `startSeq >= seq - before`
+and `endSeq <= seq + after` (a wider slice is malformed, so a negotiated
+narrowing is really honoured), an `events` array whose count equals
+`endSeq - startSeq + 1`, and contiguous native seqs from `startSeq`
+onward. Any mismatch rejects `RUNTIME_REQUEST_FAILED` instead of returning an
+empty corpus. Each event is mapped through the same `sessionEventWire` path as
+live/snapshot facts, so `surfaceOp`, `sourceEventSeqs`, `time` and the
+ephemeral `toolPresentation` survive. `hasOlder` is `true` only when
+`startSeq > 0` proves earlier raw events exist; the DTO has no `hasNewer`
+claim because one window never proves later events exist. A pending attachment
+rejects `NOT_CONNECTED` without creating an Agent.
+
+### Live workspace changes
+
+When the mounted `@deepseek-ai/dsh-workspace-changes` recorder appends a live
+`workspace/changes` event, the adapter waits one microtask before calling
+`ctx.workspaceChanges.summary(exactLiveSessionId, exactNativeEventSeq)`: the
+official recorder publishes its in-memory record immediately *after* the
+synchronous `session/event` append notification. That short barrier preserves
+the order of subsequent native events, close drops it, and a session switch
+cannot trap the new `ready`. The
+lookup uses the raw native event seq (never the wire's `0` missing-seq
+fallback) and only the exact live session object. A native summary is copied
+field by field into `SessionEvent.workspaceChanges`
+(`turn/files/total/added/deleted`, each file
+`path/display/added/deleted/binary?/oversized?`): `cwd` and the git
+`snapshot` ids never cross the DTO, `binary`/`oversized` are forwarded only as
+literal `true`, and every count is a non-negative safe integer. A missing,
+`turn`-less or malformed summary, or a throwing lookup, leaves the event
+without the field — it is never flattened into `files: []` and never breaks
+transcript delivery. The summary is attached only to live events: a durable
+snapshot of a resumed conversation has no per-turn summaries (the recorder
+keeps them for the live Session only), so replay never fabricates a card.
+
+`command('workspace-change-diff', {sessionId?, attachmentId?, seq, index})`
+validates the exact live session/attachment, a native event `seq` and a
+non-negative safe integer file `index`, then calls
+`ctx.workspaceChanges.diff(sessionId, seq, index, signal)` under the existing
+8 s `nativeUiRead` owned signal/identity guard (`close()` and a switch abort
+it). The native comparison is validated as the `text`/`binary`/`oversized`
+union (text hunks keep `oldStart/oldLines/newStart/newLines/lines`, `before`,
+`after`, `coarse`; unknown kinds and malformed fields reject
+`RUNTIME_REQUEST_FAILED`). Native `undefined` means the Host holds no
+comparison, so the DTO omits `diff` instead of inventing an empty one. The
+adapter never reads a file, resolves a path, runs git, watches the tree or
+infers a diff; `src/backend/native-workspace.ts` is pure whitelist validation.
 
 `model`/`preset`/`effort` stage on a pending session; they apply through
 DSH's own owners when live:

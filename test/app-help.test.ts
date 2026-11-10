@@ -128,7 +128,7 @@ test('parent Help acceptance: F1 opens Help, inert Enter does not select, idle C
   } finally { await f.close() }
 })
 
-test('parent Help acceptance: busy Ctrl+C remains global native cancellation without editing or answering', async () => {
+test('parent Help acceptance: busy default Ctrl+C is local, explicit interrupt remains native', async () => {
   const f = await fixture()
   try {
     f.terminal.type('busy draft')
@@ -136,8 +136,17 @@ test('parent Help acceptance: busy Ctrl+C remains global native cancellation wit
     f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'running' })
     await f.app.submit('/help'); await paint(f.terminal)
     f.terminal.type('\x03')
-    await until(() => f.backend.cancels === 1 && !f.app.isBusy, 'Ctrl+C cancels the foreground through DSH')
+    await paint(f.terminal)
+    assert.equal(f.backend.cancels, 0)
+    assert.equal(f.app.isBusy, true)
     assert.deepEqual(f.backend.responses, [])
+    assert.deepEqual(f.app.editor.captureDraft(), before)
+    assert.equal(f.app.editor.focused, true)
+
+    f.app.keymap.setBindings({ 'app.interrupt': 'ctrl+q' })
+    await f.app.submit('/help'); await paint(f.terminal)
+    f.terminal.type('\x11')
+    await until(() => f.backend.cancels === 1 && !f.app.isBusy, 'explicit interrupt cancels the foreground through DSH')
     assert.deepEqual(f.app.editor.captureDraft(), before)
     f.terminal.type('\x1b'); await paint(f.terminal)
     assert.equal(f.app.editor.focused, true)

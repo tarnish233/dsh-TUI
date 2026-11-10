@@ -76,7 +76,7 @@ def run(mode):
             # Exercise the actual Settings UI, not a direct config write or
             # component-only fixture. All files stay in this temporary home.
             if typed and keyboard_stage == 0 and elapsed > 0.65:
-                os.write(fd, b'\x03')  # Cancel the initial demo turn.
+                os.write(fd, b'\x1b')  # Esc cancels; Pi-style Ctrl+C only clears/arms exit.
                 keyboard_stage = 1
             elif keyboard_stage == 1 and elapsed > 0.8:
                 os.write(fd, b'\x03')  # Clear the keyboard draft.
@@ -123,7 +123,7 @@ def run(mode):
                 resize(100, 35)
                 resized_large = True
             if elapsed > 3.2 and keyboard_stage == 9 and exits < 6 and elapsed - last_exit > 0.2:
-                # Cancel a running turn, clear a draft, then confirm exit.
+                # Pi-style first clear arms the 500ms window; the second exits even if busy.
                 os.write(fd, b'\x03')
                 exits += 1
                 last_exit = elapsed

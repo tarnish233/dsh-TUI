@@ -36,7 +36,10 @@
  * The disclosure state is the shared ephemeral map (`tool-expansion.ts`) under
  * `group:<anchor item id>`, so Ctrl+O and single-expand treat a group exactly
  * like a tool group. Nothing is persisted, no timer is armed and no child
- * catalog/session is fetched here.
+ * catalog/session is fetched here. A read-only projection
+ * (`flags.readonlyDisclosure`) neither reads nor writes that map: it stays
+ * collapsed (`toggle()` is a no-op) so isolating a historical view can never
+ * clear or steal the live transcript's overrides.
  */
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { SubagentEntry } from '../backend/types.ts'
@@ -46,7 +49,7 @@ import type { ActivityFrameNode } from './activity-group.ts'
 import type { ItemBlock, TranscriptViewOptions } from './blocks.ts'
 import { dispatchToChild, HoverOwnership, hoverControlAt, hoverRowSlot, type MouseHitbox } from './mouse.ts'
 import { SubagentLinkHitboxes } from './subagent-link.ts'
-import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey } from './tool-expansion.ts'
+import { isToolExpanded, requestToolExpansion, toolGroupExpansionKey, toolExpansionRevision } from './tool-expansion.ts'
 import {
   subagentActivity,
   subagentGlyph,
@@ -60,6 +63,7 @@ import {
   subagentTone,
   type SubagentLinkSpan,
 } from './subagent-format.ts'
+import { countCacheKeyBuild } from './render-counters.ts'
 import { fit, oneLine, truncateToWidth, visibleWidth } from './text.ts'
 import { bold, dim, t } from './theme.ts'
 
@@ -226,7 +230,18 @@ export class SubagentGroupBlock implements Component {
   private collapsedRows: CollapsedRow[] = []
   private frameBoxes: MouseHitbox[] = []
   private disposed = false
-  private cache: { key: string; lines: string[]; paints: readonly (readonly string[])[] } | undefined
+  private cache: {
+    width: number
+    key: string
+    lines: string[]
+    paints: readonly (readonly string[])[]
+    /** Disclosure generation this frame was composed from. */
+    expansions: number
+    /** Child paint generations this frame was composed from (expanded only). */
+    readonly memberPaints: readonly number[]
+    /** Read-only projection the frame was composed for (never reads the map). */
+    readonlyDisclosure: boolean
+  } | undefined
 
   constructor(anchor: SubagentRecordItem, flags: TranscriptViewOptions) {
     this.itemId = anchor.id
@@ -234,8 +249,23 @@ export class SubagentGroupBlock implements Component {
     this.flags = flags
   }
 
-  /** Disclosure state, shared with the whole transcript (Ctrl+O and single-expand). */
+  /**
+   * A read-only projection (`flags.readonlyDisclosure`, R4) never reads or
+   * writes the shared disclosure map — the same contract `ToolBlock` honours for
+   * a single card, applied to this host.
+   */
+  private get frozen(): boolean {
+    return this.flags.readonlyDisclosure === true
+  }
+
+  /**
+   * Disclosure state, shared with the whole transcript (Ctrl+O and single-expand).
+   *
+   * A read-only projection defaults to collapsed and never consults the shared
+   * map, so a live transcript's override under the same key cannot expand it.
+   */
   get expanded(): boolean {
+    if (this.frozen) return false
     return isToolExpanded(this.key, this.flags.expandTools)
   }
 
@@ -293,7 +323,11 @@ export class SubagentGroupBlock implements Component {
     if (!unchanged) this.cache = undefined
   }
 
-  /** Flip the whole group through the shared disclosure helper (viewport anchor first). */
+  /**
+   * Flip the whole group through the shared disclosure helper (viewport anchor
+   * first). A no-op in a read-only projection: disclosure there is never routed,
+   * so no request may reach the shared map.
+   */
   toggle(): void {
     requestToolExpansion(this.flags, this.key, !this.expanded)
   }
@@ -342,6 +376,7 @@ export class SubagentGroupBlock implements Component {
       this.flags.screen ?? 'inline',
       this.flags.hints?.expand ?? '',
       typeof this.flags.onSubagentDetails === 'function' ? 'links' : 'inert',
+      this.frozen ? 'readonly' : 'live',
       this.links.hoveredId ?? '',
     ].join('|')
   }
@@ -349,11 +384,21 @@ export class SubagentGroupBlock implements Component {
   render(width: number): string[] {
     if (this.disposed) return []
     const safeWidth = Math.max(1, Math.floor(width))
+    // Fast path: durable subagent rows carry no clock, so every key input reaches
+    // this cache through `invalidate()`/`setMembers`, a new width, the shared
+    // disclosure generation (this group's own header is a disclosure too) or a
+    // child's own paint generation.
+    if (this.cache !== undefined && this.cache.width === safeWidth
+      && this.cache.expansions === toolExpansionRevision() && this.cache.readonlyDisclosure === this.frozen
+      && this.membersUnchanged()) {
+      return this.cache.lines
+    }
     const expanded = this.expanded
     // Members are always rendered first in expanded mode: their own caches make
     // it cheap, and the returned line arrays are the identity that tells this
     // group whether anything it composed has actually changed.
     const paints = expanded ? this.members.map(member => member.block.render(this.childWidth(safeWidth))) : []
+    countCacheKeyBuild()
     const key = this.frameKey(safeWidth, expanded)
     if (this.cache !== undefined && this.cache.key === key && sameLines(this.cache.paints, paints)) {
       this.syncMouse(expanded)
@@ -361,13 +406,38 @@ export class SubagentGroupBlock implements Component {
     }
     const lines = expanded ? this.buildExpanded(safeWidth, paints) : this.buildCollapsed(safeWidth)
     const fitted = lines.map(line => fit(line, safeWidth))
-    this.cache = { key, lines: fitted, paints }
+    this.cache = {
+      width: safeWidth,
+      key,
+      lines: fitted,
+      paints,
+      expansions: toolExpansionRevision(),
+      memberPaints: this.memberPaints(expanded),
+      readonlyDisclosure: this.frozen,
+    }
     this.syncMouse(expanded)
     return fitted
   }
 
   private childWidth(width: number): number {
     return Math.max(1, width - PREFIX_WIDTH)
+  }
+
+  /** Paint generation of every member block (empty while collapsed). */
+  private memberPaints(expanded: boolean): readonly number[] {
+    return expanded ? this.members.map(member => member.block.paintRevision ?? 0) : []
+  }
+
+  /** Do the members still paint the frame this cache was composed from? */
+  private membersUnchanged(): boolean {
+    const cached = this.cache
+    if (cached === undefined) return false
+    const current = this.members
+    if (cached.memberPaints.length !== (this.expanded ? current.length : 0)) return false
+    for (let index = 0; index < cached.memberPaints.length; index += 1) {
+      if ((current[index]?.block.paintRevision ?? 0) !== cached.memberPaints[index]) return false
+    }
+    return true
   }
 
   private buildCollapsed(width: number): string[] {
@@ -412,6 +482,8 @@ export class SubagentGroupBlock implements Component {
   // --- header ----------------------------------------------------------------
 
   private hintText(expanded: boolean): string {
+    // A read-only group can never toggle, so it advertises no affordance.
+    if (this.frozen) return ''
     const screen = this.flags.screen ?? 'inline'
     const key = this.flags.hints?.expand?.trim() ?? ''
     if (screen === 'fullscreen') return expanded ? 'click to collapse' : 'click to show more'
@@ -526,6 +598,23 @@ export class SubagentGroupBlock implements Component {
   }
 
   /**
+   * Header hover is a paint input of this group, so it must drop the frame.
+   *
+   * The hint is restyled in accent and `links.hoveredId` is part of the frame
+   * key, but the fast path answers *before* that key is composed — a mere
+   * `onRenderRequest` would therefore keep serving the neutral frame (and a
+   * frame rebuilt mid-hover would keep the accent after the pointer left).
+   * `SubagentLinkHitboxes` only reports real transitions, so a stationary
+   * pointer still reuses the composed frame, and the link gestures keep their
+   * press pin because no cache drop touches `links`.
+   */
+  private setHeaderHover(): void {
+    if (this.disposed) return
+    this.cache = undefined
+    this.flags.onRenderRequest?.()
+  }
+
+  /**
    * Re-declare this frame's links.
    *
    * Only two kinds exist: the header disclosure control (it can never open a
@@ -539,14 +628,18 @@ export class SubagentGroupBlock implements Component {
     const height = this.cache?.lines.length ?? 0
     const boxes: MouseHitbox[] = []
     if (height > 0) {
-      boxes.push({
-        id: this.headerBoxIdValue(),
-        startRow: 0,
-        endRow: 0,
-        claimPress: true,
-        onClick: () => { this.toggle() },
-        onHover: () => { this.flags.onRenderRequest?.() },
-      })
+      // A read-only group cannot toggle, so its header is not a control: no
+      // press pin, no hover target and no advertised shortcut.
+      if (!this.frozen) {
+        boxes.push({
+          id: this.headerBoxIdValue(),
+          startRow: 0,
+          endRow: 0,
+          claimPress: true,
+          onClick: () => { this.toggle() },
+          onHover: () => { this.setHeaderHover() },
+        })
+      }
       if (!expanded) {
         // Only a visible child name is a navigation link; every other cell of a
         // collapsed row is plain text with native selection/copy.
@@ -564,7 +657,9 @@ export class SubagentGroupBlock implements Component {
               endCol: row.link.endCol,
               claimPress: true,
               onClick: () => handler(row.sessionId),
-              onHover: () => { this.flags.onRenderRequest?.() },
+              // The link name is restyled on hover and `links.hoveredId` is part of
+              // the frame key, so the fast path must be dropped explicitly.
+              onHover: () => { this.cache = undefined; this.flags.onRenderRequest?.() },
             })
           }
         }
@@ -600,7 +695,7 @@ export class SubagentGroupBlock implements Component {
       // their own gesture helper.
       const next = span !== undefined
         ? { component: span.block, slot: hoverRowSlot(span.startRow) }
-        : hoverControlAt(event, this, HEADER_ROW, HEADER_SLOT)
+        : this.frozen ? undefined : hoverControlAt(event, this, HEADER_ROW, HEADER_SLOT)
       this.hover.moveTo(next, span === undefined ? event : { ...event, y: event.y - span.startRow })
     }
     if (span !== undefined) {

@@ -109,9 +109,12 @@ export interface JobsDialogOptions {
    * the callback keeps the key inert and advertises no refresh action.
    */
   onRefresh?: () => void
-  /** Esc / configured cancel. The parent hides and disposes this instance. */
+  /** Esc / Ctrl+C / configured local cancel. The parent hides and disposes this instance. */
   onClose: () => void
-  /** Global turn cancellation (`app.interrupt`); defaults to closing. */
+  /**
+   * Explicit native interrupt (a configured `app.interrupt`, no shipped
+   * default); defaults to closing. Default Ctrl+C is the local cancel.
+   */
   onInterrupt?: () => void
   /** Optional repaint hook for hosts that own rendering. */
   onRenderRequest?: () => void
@@ -226,7 +229,6 @@ interface OutputMeta {
 }
 
 const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
-
 export class JobsDialog implements Component, Focusable {
   readonly capturesViewportInput = true
   readonly modalSize: ModalSize = 'standard'

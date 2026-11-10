@@ -29,6 +29,13 @@
  * deliberately inert inside this modal; the parent action
  * `app.subagents.details` opened it, it cannot re-enter itself.
  *
+ * Pi-style Ctrl+C: the default Ctrl+C locally resolves `list.cancel` in this
+ * read-only context, so it closes the overlay without a native interrupt and
+ * without reaching a hidden root clear. A disabled/remapped local cancel is
+ * inert here (no global `app.clear` alias, no invented close fallback). Only an
+ * explicit `app.interrupt` override keeps its old native meaning (stop the
+ * selected child first, then the parent's interrupt).
+ *
  * Intervention is requested, never performed: `subagent.reply` / the Reply
  * action chip call `onReply` and `subagent.interrupt` / the Stop chip call
  * `onStop` only when that callback exists *and* the selected native row is
@@ -120,7 +127,7 @@ export interface AgentsOverlayOptions {
    * callback exists and the row is local and `running`/`initializing`.
    */
   onStop?: (entry: SubagentEntry) => void
-  /** Global interrupt (`app.interrupt`); defaults to closing the overlay. */
+  /** Global interrupt override (`app.interrupt`); defaults to closing the overlay. */
   onInterrupt?: () => void
   /**
    * Reserved for truly global app actions. Only `app.exit` is forwarded here,
@@ -525,8 +532,9 @@ export class AgentsOverlay implements Component, Focusable {
         this.toggleFilter()
         return
       case 'app.interrupt':
-        // Ctrl+C is the interrupt escape hatch, so it stops a stoppable child
-        // instead of dropping the whole surface; Esc still closes (above).
+        // An explicit native interrupt override stops a stoppable child instead
+        // of dropping the whole surface. With the Pi-style default Ctrl+C this
+        // action is unbound, so Ctrl+C stays a local list/dialog cancel.
         if (this.stopSelected()) return
         if (this.options.onInterrupt !== undefined) this.options.onInterrupt()
         else this.close()

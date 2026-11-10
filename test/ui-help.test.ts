@@ -282,7 +282,7 @@ test('Enter, digits, printable keys and unrelated globals are inert', () => {
 // ---------------------------------------------------------------------------
 // Close and interrupt
 
-test('Esc closes exactly once and Ctrl+C is global cancellation, not a choice', () => {
+test('Esc closes exactly once and default Ctrl+C is the local close, not a native interrupt', () => {
   const closeOnce = makePanel({ commands: catalog() })
   closeOnce.panel.handleInput('\x1b')
   assert.equal(closeOnce.calls.close, 1)
@@ -291,10 +291,20 @@ test('Esc closes exactly once and Ctrl+C is global cancellation, not a choice', 
   closeOnce.panel.handleInput('\r')
   assert.equal(closeOnce.calls.close, 1)
 
-  const interrupted = makePanel({ commands: catalog() })
+  // Default Ctrl+C is the global `app.clear`; inside the focused panel it is the
+  // local close (`list.cancel`), never a native interrupt or a hidden draft clear.
+  const cleared = makePanel({ commands: catalog() })
+  cleared.panel.handleInput('\x03')
+  assert.equal(cleared.calls.close, 1, 'default Ctrl+C closes the focused local surface')
+  assert.equal(cleared.calls.interrupt, 0, 'default Ctrl+C must not invoke the native interrupt')
+  cleared.panel.handleInput('\x03')
+  assert.equal(cleared.calls.close, 1, 'one close, idempotent on the closed panel')
+
+  // An explicit user interrupt override keeps its priority.
+  const interrupted = makePanel({ commands: catalog(), keymap: keymap({ 'app.interrupt': 'ctrl+c' }) })
   interrupted.panel.handleInput('\x03')
   assert.equal(interrupted.calls.interrupt, 1)
-  assert.equal(interrupted.calls.close, 0, 'global interrupt must not be converted into a local close/answer')
+  assert.equal(interrupted.calls.close, 0, 'an explicit interrupt must not be converted into a local close/answer')
   // Still open and usable while the parent cancels the turn.
   assert.match(render(interrupted.panel, 80).text, /Commands/)
   interrupted.panel.handleInput('\r')
@@ -303,9 +313,9 @@ test('Esc closes exactly once and Ctrl+C is global cancellation, not a choice', 
   interrupted.panel.handleInput('\x1b')
   assert.equal(interrupted.calls.close, 1)
 
-  const fallback = makePanel({ commands: catalog(), onInterrupt: null })
-  fallback.panel.handleInput('\x03')
-  assert.equal(fallback.calls.close, 1, 'without a parent handler, interrupt is only a local dismissal')
+  const fallback = makePanel({ commands: catalog(), keymap: keymap({ 'app.interrupt': 'ctrl+x' }), onInterrupt: null })
+  fallback.panel.handleInput('\x18')
+  assert.equal(fallback.calls.close, 1, 'without a parent handler, explicit interrupt is only a local dismissal')
 })
 
 test('disabled or remapped close/interrupt bindings are respected', () => {
@@ -375,15 +385,24 @@ test('remapped and disabled list navigation never falls back to defaults', () =>
 // ---------------------------------------------------------------------------
 // Focus and chord ownership
 
-test('a pending chord can still be interrupted by global Ctrl+C', () => {
-  const { panel, calls } = makePanel({ commands: catalog(), keymap: keymap() })
-  panel.focused = true
-  panel.handleInput('\x18') // Ctrl+X chord prefix
-  assert.equal(panel.keymap.isPendingChord(), true)
-  panel.handleInput('\x03') // Ctrl+C stays global through the chord
-  assert.equal(panel.keymap.isPendingChord(), false)
-  assert.equal(calls.interrupt, 1)
-  assert.equal(calls.close, 0)
+test('default Ctrl+C cancels a pending chord and then closes locally; an explicit interrupt keeps priority', () => {
+  const local = makePanel({ commands: catalog(), keymap: keymap() })
+  local.panel.focused = true
+  local.panel.handleInput('\x18') // Ctrl+X chord prefix
+  assert.equal(local.panel.keymap.isPendingChord(), true)
+  local.panel.handleInput('\x03') // default app.clear: chord cancelled, local close
+  assert.equal(local.panel.keymap.isPendingChord(), false)
+  assert.equal(local.calls.close, 1)
+  assert.equal(local.calls.interrupt, 0)
+
+  const explicit = makePanel({ commands: catalog(), keymap: keymap({ 'app.interrupt': 'ctrl+c' }) })
+  explicit.panel.focused = true
+  explicit.panel.handleInput('\x18')
+  assert.equal(explicit.panel.keymap.isPendingChord(), true)
+  explicit.panel.handleInput('\x03') // explicit override keeps priority through the chord
+  assert.equal(explicit.panel.keymap.isPendingChord(), false)
+  assert.equal(explicit.calls.interrupt, 1)
+  assert.equal(explicit.calls.close, 0)
 })
 
 test('a cancelled chord re-dispatches its fresh key and mismatch keys stay inert', () => {
@@ -542,13 +561,11 @@ test('setCatalog replaces only metadata and preserves the live search query, foc
   assert.match(listed, /\/deploy <env>/)
   assert.doesNotMatch(listed, /\/cmd0\d/, 'the old catalog is gone')
 
-  // The original keymap and callbacks still own the surface.
+  // The original keymap and callbacks still own the surface: default Ctrl+C is
+  // the local close, the native interrupt hook stays untouched.
   panel.handleInput('\x03')
-  assert.equal(calls.interrupt, 1)
-  assert.equal(calls.close, 0)
-  panel.handleInput('\x1b')
+  assert.equal(calls.interrupt, 0)
   assert.equal(calls.close, 1)
-  assert.equal(calls.interrupt, 1)
 })
 
 test('setCatalog keeps the scroll position and clamps it only in the next render', () => {

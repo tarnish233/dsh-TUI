@@ -26,7 +26,7 @@ assert NODE, 'node is required'
 class Session:
     # /help now opens a modal. A whitespace prompt also suppresses the CLI's
     # automatic --demo tools example, and App ignores it without starting a turn.
-    def __init__(self, mode, scenario, prompt=' ', settings=None):
+    def __init__(self, mode, scenario, prompt=' ', settings=None, bindings=None):
         self.mode = mode
         self.scenario = scenario
         self.config = tempfile.mkdtemp(prefix='dsh-cancel-pty-')
@@ -35,6 +35,8 @@ class Session:
             # scenario-specific preferences isolated to the temp config dir.
             (Path(self.config) / 'settings.json').write_text(
                 json.dumps(settings), encoding='utf8')
+        if bindings is not None:
+            (Path(self.config) / 'keybindings.json').write_text(json.dumps(bindings), encoding='utf8')
         self.raw = bytearray()
         self.status = None
         self.started = time.monotonic()
@@ -146,6 +148,27 @@ def idle_clear_exit(mode):
         session.close()
 
 
+def busy_clear_exit(mode):
+    session = Session(mode, 'busy-clear-exit')
+    try:
+        session.wait_for(b'ready')
+        offset = len(session.raw)
+        session.send(b'PTY live response while editing\r')
+        session.wait_for(b'Working', offset)
+        session.send(b'PTY busy draft to clear')
+        session.wait_for(b'PTY busy draft to clear', offset)
+        offset = len(session.raw)
+        session.send(b'\x03')
+        session.wait_for(b'again to exit', offset)
+        assert not session.poll_exit(), (mode, 'first busy Ctrl+C exited instead of clearing')
+        session.send(b'\x03')
+        result = session.finish(restore_offset=offset)
+        result['firstClearWhileBusy'] = True
+        return result
+    finally:
+        session.close()
+
+
 def external_sigint(mode):
     session = Session(mode, 'external-sigint', 'approval')
     try:
@@ -181,8 +204,8 @@ def question_escape_cancels_natively(mode):
         session.close()
 
 
-def busy_settings_interrupt(mode):
-    session = Session(mode, 'busy-settings-interrupt')
+def busy_settings_local_cancel_then_escape(mode):
+    session = Session(mode, 'busy-settings-local-cancel-then-escape')
     try:
         session.wait_for(b'ready')
         offset = len(session.raw)
@@ -194,18 +217,13 @@ def busy_settings_interrupt(mode):
         session.wait_for(b'Default screen', offset)
         offset = len(session.raw)
         session.send(b'\x03')
-        # A continuous Settings page can cover the ready footer. Close only
-        # the local overlay before inspecting idle state; Ctrl+C still owns
-        # native turn interruption while Settings has focus.
+        # Default Ctrl+C closes only Settings. Wait for the root prompt before
+        # sending Esc, which is now the explicit native turn interruption.
+        # read(timeout) is not a delay; the real focused caret is the boundary.
+        session.wait_for(b'\x1b[7m \x1b[27m', offset)
         escape_offset = len(session.raw)
         session.send(b'\x1b')
-        # read(timeout) may return immediately on any available output; it is
-        # not a delay. Wait for prompt focus so a lone legacy Esc has resolved
-        # before sending Ctrl+C (otherwise the bytes can become Alt+Ctrl+C).
-        # Pi draws its focused empty editor with an inverse-space caret; it
-        # intentionally keeps the hardware cursor hidden during rendering.
-        session.wait_for(b'\x1b[7m \x1b[27m', escape_offset)
-        session.wait_for(b'ready', offset)
+        session.wait_for(b'ready', escape_offset)
         assert '完成。Demo'.encode('utf8') not in session.raw[offset:], 'interruption must not silently finish the ordinary demo turn'
         arm_offset = len(session.raw)
         session.send(b'\x03')
@@ -219,7 +237,7 @@ def busy_settings_interrupt(mode):
 if __name__ == '__main__':
     results = []
     for mode in ('inline', 'fullscreen'):
-        for scenario in (idle_clear_exit, external_sigint,
-                         question_escape_cancels_natively, busy_settings_interrupt):
+        for scenario in (idle_clear_exit, busy_clear_exit, external_sigint,
+                         question_escape_cancels_natively, busy_settings_local_cancel_then_escape):
             results.append(scenario(mode))
     print(json.dumps({'ptyCancellationAcceptance': results}, indent=2))

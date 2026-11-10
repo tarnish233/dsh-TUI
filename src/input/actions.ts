@@ -141,6 +141,12 @@ const keybindingsListContext = ["keybindingsList"] as const
 const modalListContext = ["modalList"] as const
 const queueListContext = ["queueList"] as const
 /**
+ * Native decision dialogs and generic modal lists. Registered in both named
+ * contexts; every modal browse chain also reaches the `dialog` layer, so the
+ * one Ctrl+O row is available wherever a decision surface can be focused.
+ */
+const decisionDialogContexts = ["dialog", "modalList"] as const
+/**
  * Browse surfaces that offer `modal.search` (Ctrl+F). `imageDetails` is
  * intentionally absent: the image viewer has no search field.
  */
@@ -554,18 +560,32 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     implementor: "editor",
     status: "cc-match",
     description: "Close the completion list",
+    note: "Esc closes only the completion menu. Ctrl+C is not a completion cancel in the chosen Pi main-input policy: it clears the entire root draft (app.clear) even while the menu is open, and the stale menu closes as a consequence.",
   },
 
   // --- CC app overrides -------------------------------------------------
+  // Ordering matters for one physical byte: an explicit `app.interrupt`
+  // override on Ctrl+C keeps precedence over the shipped `app.clear` default
+  // (the collision is reported as a conflict, never silently rewritten).
   {
     id: "app.interrupt",
     family: "app",
     contexts: appContext,
+    defaultBindings: [],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Interrupt the active native operation (no shipped default; bind explicitly)",
+    note: "The old Ctrl+C default moved to app.clear. An explicit single-key override keeps priority before a pending chord and before the chain in the read-only/modal contexts; an explicit Ctrl+C interrupt collides with the app.clear default and is reported, never rewritten.",
+  },
+  {
+    id: "app.clear",
+    family: "app",
+    contexts: appContext,
     defaultBindings: ["ctrl+c"],
     implementor: "app",
-    status: "cc-match",
-    description: "Interrupt the active operation globally (completion, jump, chord and dialog UI do not block it)",
-    note: "Esc handles local layers first; Ctrl+C always reaches the app. Busy drafts are preserved by the app.",
+    status: "pi-extension",
+    description: "Clear the root draft without aborting the active work; a repeated press within 500 ms arms the safe exit",
+    note: "Chosen from the observed installed Pi 1.5.1 main-input policy, not a current-CC match (CC Ctrl+C cancels/interrupts). The App clears/saves the one draft and owns the 500 ms exit arm; the input layer only emits the action. Local dialog/list/search cancellation wins first; completion does not intercept Ctrl+C, so the root draft clears and the stale menu closes. Paste bytes are never keys, and Kitty key releases/repeats never dispatch a second clear.",
   },
   {
     id: "app.cancel",
@@ -1172,6 +1192,17 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     implementor: "app",
     status: "cc-app-override",
     description: "Cancel and settle the focused dialog/approval request",
+    note: "Default Ctrl+C cancels/rejects locally and never reaches the hidden root app.clear; a configured single-key app.interrupt keeps priority in the read-only/modal contexts.",
+  },
+  {
+    id: "dialog.details",
+    family: "dialog",
+    contexts: decisionDialogContexts,
+    defaultBindings: ["ctrl+o"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Open the full read-only native decision details of the focused dialog",
+    note: "Dialog/modal-list contexts only. It reads the already supplied native question/tool detail or pure proposal content; it never answers, executes tools, reads paths or fabricates an applied label. Plain Ctrl+O stays app.tools.expand in the root prompt.",
   },
 
   // --- history search ---------------------------------------------------

@@ -34,7 +34,13 @@ const SRC_DIR = join(ROOT, 'src')
 const BRAND_FILE = join(SRC_DIR, 'ui', 'brand.ts')
 const LOGO_FILE = join(SRC_DIR, 'ui', 'logo.ts')
 /** The single place a literal brand-value hex is allowed: content syntax. */
-const CONTENT_HEX_FILE = join(SRC_DIR, 'ui', 'highlight.ts')
+/**
+ * The content syntax palette. It moved out of `highlight.ts` when the grammar
+ * tables became lazily loaded, so the hex allowlist follows the palette module.
+ * `highlight.ts` (the lazy facade) and `highlight-runtime.ts` (the grammar
+ * table) must not spell any color.
+ */
+const CONTENT_HEX_FILE = join(SRC_DIR, 'ui', 'highlight-palette.ts')
 /** Retired chrome blues (names for history only): DeepSeek pixel blue, the old
  * cc-dark accent blue, the pre-cc-dark product brand blue. They must never
  * reappear anywhere under src/. */
@@ -257,7 +263,7 @@ test('no retired brand hex survives anywhere under src', () => {
       assert.ok(!source.includes(retired), `${name} still contains the retired blue ${retired}`)
     }
     // The current brand VALUE as a literal is only legal in the content syntax
-    // palette (src/ui/highlight.ts) — there it is a coincidence, not a
+    // palette (src/ui/highlight-palette.ts) — there it is a coincidence, not a
     // derivation. The truth point itself is excluded (it spells the brand).
     if (file === BRAND_FILE) continue
     if (file === CONTENT_HEX_FILE) continue
@@ -273,7 +279,9 @@ test('no retired brand hex survives anywhere under src', () => {
 })
 
 test('no leftover orange, purple or turquoise UI accent in src/ui', () => {
-  const files = readdirSync(join(SRC_DIR, 'ui')).filter(file => file.endsWith('.ts') && file !== 'theme.ts' && file !== 'highlight.ts')
+  // `theme.ts` owns the palette and the content syntax palette is its own module.
+  const files = readdirSync(join(SRC_DIR, 'ui')).filter(file =>
+    file.endsWith('.ts') && file !== 'theme.ts' && file !== 'highlight-palette.ts')
   assert.ok(files.length > 0)
   for (const file of files) {
     const source = readFileSync(join(SRC_DIR, 'ui', file), 'utf8')

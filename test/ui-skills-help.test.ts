@@ -315,10 +315,10 @@ test('many skills stay inside the row budget and scroll with the shared list key
   assert.ok(narrow.render(20).length <= 12)
 })
 
-test('the Skills section keeps the existing close/interrupt behavior unchanged', () => {
+test('the Skills section keeps the local close; only an explicit interrupt override is native', () => {
   let closes = 0
   let interrupts = 0
-  const panel = new HelpPanel(fakeTui(30, 80), {
+  const local = new HelpPanel(fakeTui(30, 80), {
     commands: commands(),
     customCommands: customCommands(),
     skills: skillCatalog(),
@@ -326,13 +326,26 @@ test('the Skills section keeps the existing close/interrupt behavior unchanged',
     onClose: () => { closes += 1 },
     onInterrupt: () => { interrupts += 1 },
   })
-  panel.handleInput('\x03')
+  local.handleInput('\x03')
+  assert.equal(interrupts, 0, 'default Ctrl+C is the local close, not a native interrupt')
+  assert.equal(closes, 1)
+  local.handleInput('\x1b')
+  assert.equal(closes, 1, 'close stays idempotent')
+
+  closes = 0
+  const explicit = new HelpPanel(fakeTui(30, 80), {
+    commands: commands(),
+    customCommands: customCommands(),
+    skills: skillCatalog(),
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
+    onClose: () => { closes += 1 },
+    onInterrupt: () => { interrupts += 1 },
+  })
+  explicit.handleInput('\x03')
   assert.equal(interrupts, 1)
   assert.equal(closes, 0)
-  panel.handleInput('\x1b')
+  explicit.handleInput('\x1b')
   assert.equal(closes, 1)
-  panel.handleInput('\x1b')
-  assert.equal(closes, 1, 'close stays idempotent')
 })
 // ---------------------------------------------------------------------------
 // Shared frame geometry + search over the read-only Skills catalog

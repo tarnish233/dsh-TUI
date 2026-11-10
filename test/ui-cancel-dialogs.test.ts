@@ -106,7 +106,9 @@ test('a request without any rejection option falls back to the parent local canc
   assert.equal(cancelled, 1)
 })
 
-test('Ctrl+C on an approval calls onInterrupt only and the dialog stays usable', () => {
+test('default Ctrl+C on an approval rejects with the native rejected option, never an interrupt', () => {
+  // The shipped keymap has no `app.interrupt` default any more: Ctrl+C is the
+  // surface-local list/dialog cancel. No backend turn cancellation is implied.
   const submitted: unknown[] = []
   let cancelled = 0
   let interrupts = 0
@@ -118,26 +120,52 @@ test('Ctrl+C on an approval calls onInterrupt only and the dialog stays usable',
   })
   dialog.focused = true
   dialog.handleInput('\x03')
-  assert.equal(interrupts, 1)
-  assert.deepEqual(submitted, [], 'global interrupt never answers the request')
-  assert.equal(cancelled, 0, 'global interrupt never responds with a cancelled decision')
-  // The turn cancellation settles the native request; the surface stays usable
-  // in the meantime and can still answer explicitly.
-  dialog.handleInput('\r')
-  assert.deepEqual(submitted, ['allowed-once'])
-  assert.equal(cancelled, 0)
+  assert.deepEqual(submitted, ['rejected'], 'the request\'s own rejected opaque value settles it')
+  assert.equal(cancelled, 0, 'a rejection is not a turn cancellation')
+  assert.equal(interrupts, 0, 'no implicit global interrupt')
+
+  // An explicit interrupt override is the user's stated intent and still wins.
+  const explicit: unknown[] = []
+  let explicitInterrupts = 0
+  const withOverride = new DecisionDialog(fakeTui(), {
+    request: nativeApproval(),
+    onSubmit: value => { explicit.push(value) },
+    onCancel: () => { explicit.push('cancelled') },
+    onInterrupt: () => { explicitInterrupts += 1 },
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
+  })
+  withOverride.focused = true
+  withOverride.handleInput('\x03')
+  assert.equal(explicitInterrupts, 1)
+  assert.deepEqual(explicit, [], 'a global interrupt never answers the request')
+  // The request stays pending and the surface stays usable.
+  withOverride.handleInput('\r')
+  assert.deepEqual(explicit, ['allowed-once'])
 })
 
-test('Ctrl+C without an interrupt hook never invents a cancelled answer', () => {
+test('default Ctrl+C is inert when every local cancel binding is disabled', () => {
+  // No invented fallback: the root `app.clear` binding is not aliased into a
+  // local dismissal, and the hidden root draft is never cleared either.
   const submitted: unknown[] = []
   let cancelled = 0
-  const dialog = new DecisionDialog(fakeTui(), { request: nativeApproval(), onSubmit: value => { submitted.push(value) }, onCancel: () => { cancelled += 1 } })
+  const disabled = keymap({ 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null })
+  const dialog = new DecisionDialog(fakeTui(), {
+    request: nativeApproval(),
+    onSubmit: value => { submitted.push(value) },
+    onCancel: () => { cancelled += 1 },
+    keymap: disabled,
+  })
+  dialog.focused = true
   dialog.handleInput('\x03')
+  dialog.handleInput('\x1b')
   assert.deepEqual(submitted, [])
   assert.equal(cancelled, 0)
+  // The decision still settles through its own explicit action.
+  dialog.handleInput('\r')
+  assert.deepEqual(submitted, ['allowed-once'])
 })
 
-test('a remapped app.interrupt is honoured and Ctrl+C then falls back to local dismissal', () => {
+test('a remapped app.interrupt is honoured and Ctrl+C then stays the local cancel', () => {
   let interrupts = 0
   let cancelled = 0
   const submitted: unknown[] = []
@@ -151,32 +179,35 @@ test('a remapped app.interrupt is honoured and Ctrl+C then falls back to local d
   })
   dialog.handleInput('\x11') // ctrl+q = the configured interrupt
   assert.equal(interrupts, 1)
-  dialog.handleInput('\x03') // ctrl+c is no longer app.interrupt: list.cancel rejects
+  dialog.handleInput('\x03') // ctrl+c is not app.interrupt: list.cancel rejects
   assert.deepEqual(submitted, ['rejected'])
   assert.equal(cancelled, 0)
 })
 
-test('SelectDialog routes Ctrl+C to onInterrupt, or closes locally when no hook exists', () => {
+test('SelectDialog dismisses locally on Ctrl+C; only an explicit interrupt override interrupts', () => {
   const events: string[] = []
-  const withHook = new SelectDialog(fakeTui(), {
+  const plain = new SelectDialog(fakeTui(), {
     title: 'Pick',
     items: [{ label: 'One', value: 'one' }],
     onSelect: () => { events.push('select') },
     onCancel: () => { events.push('cancel') },
     onInterrupt: () => { events.push('interrupt') },
   })
-  withHook.handleInput('\x03')
-  assert.deepEqual(events, ['interrupt'])
-  withHook.handleInput('\x1b')
-  assert.deepEqual(events, ['interrupt', 'cancel'])
-  const withoutHook = new SelectDialog(fakeTui(), {
+  plain.handleInput('\x03')
+  assert.deepEqual(events, ['cancel'], 'default Ctrl+C closes the chooser, it is not a turn abort')
+
+  const explicit = new SelectDialog(fakeTui(), {
     title: 'Pick',
     items: [{ label: 'One', value: 'one' }],
     onSelect: () => { events.push('select') },
-    onCancel: () => { events.push('dismissed') },
+    onCancel: () => { events.push('cancel2') },
+    onInterrupt: () => { events.push('interrupt') },
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
   })
-  withoutHook.handleInput('\x03')
-  assert.deepEqual(events, ['interrupt', 'cancel', 'dismissed'])
+  explicit.handleInput('\x03')
+  assert.deepEqual(events, ['cancel', 'interrupt'])
+  explicit.handleInput('\x1b')
+  assert.deepEqual(events, ['cancel', 'interrupt', 'cancel2'], 'Esc keeps closing locally afterwards')
 })
 
 // ---------------------------------------------------------------------------
@@ -234,7 +265,7 @@ test('a dismissed question keeps checks and selection when reopened', () => {
   assert.deepEqual(result, { answers: [['Blue'], 'Expanded'] })
 })
 
-test('Ctrl+C while typing a custom answer interrupts without losing the draft', () => {
+test('Ctrl+C while typing a custom answer dismisses locally and keeps the draft', () => {
   const events: string[] = []
   const dialog = new DecisionDialog(fakeTui(), {
     request: twoQuestions(),
@@ -246,12 +277,47 @@ test('Ctrl+C while typing a custom answer interrupts without losing the draft', 
   dialog.handleInput('3') // custom row of question 1
   for (const char of 'teal') dialog.handleInput(char)
   dialog.handleInput('\x03')
-  assert.deepEqual(events, ['interrupt'])
-  assert.match(text(dialog), /teal/, 'the busy-editor draft survives the interrupt')
+  assert.deepEqual(events, ['cancel'], 'the configured local cancel key dismisses, it does not abort the turn')
+  assert.match(text(dialog), /teal/, 'the busy-editor draft survives the dismissal')
+  assert.equal(dialog.dismissed, true)
+  dialog.focused = false
+  dialog.focused = true
   dialog.handleInput('\r') // confirm the preserved draft, advance
   dialog.handleInput('2') // second question: Expanded
   dialog.handleInput('\r')
-  assert.deepEqual(events, ['interrupt', 'submit'])
+  assert.deepEqual(events, ['cancel', 'submit'])
+
+  // An explicit interrupt override is dispatched by the editor, not shadowed.
+  const explicit: string[] = []
+  const overridden = new DecisionDialog(fakeTui(), {
+    request: twoQuestions(),
+    onSubmit: () => {},
+    onCancel: () => { explicit.push('cancel') },
+    onInterrupt: () => { explicit.push('interrupt') },
+    keymap: keymap({ 'app.interrupt': 'ctrl+c' }),
+  })
+  overridden.focused = true
+  overridden.handleInput('3')
+  for (const char of 'teal') overridden.handleInput(char)
+  overridden.handleInput('\x03')
+  assert.deepEqual(explicit, ['interrupt'])
+  assert.match(text(overridden), /teal/, 'the draft survives the interrupt too')
+
+  // Disabled local cancels gain no invented dismissal in the answer field.
+  const inert: string[] = []
+  const disabled = new DecisionDialog(fakeTui(), {
+    request: twoQuestions(),
+    onSubmit: () => {},
+    onCancel: () => { inert.push('cancel') },
+    onInterrupt: () => { inert.push('interrupt') },
+    keymap: keymap({ 'list.cancel': null, 'dialog.cancel': null, 'app.cancel': null }),
+  })
+  disabled.focused = true
+  disabled.handleInput('3')
+  disabled.handleInput('x')
+  disabled.handleInput('\x03')
+  assert.deepEqual(inert, [], 'a disabled cancel key is inert, not aliased to app.clear')
+  assert.match(text(disabled), /x/, 'the draft is untouched')
 })
 
 // ---------------------------------------------------------------------------

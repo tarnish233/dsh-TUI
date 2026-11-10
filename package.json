@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "A native DeepSeek Harness terminal application plugin, using a vendored Pi TUI.",
   "type": "module",
@@ -68,8 +68,10 @@
     "@deepseek-ai/dsh-file-reference-local": "0.2.2-rc.1",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
     "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-turn-outline": "0.2.2-rc.1",
     "@deepseek-ai/dsh-web-app": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-working-directory": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-working-directory": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-workspace-changes": "0.2.2-rc.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": { "optional": true },
@@ -80,8 +82,10 @@
     "@deepseek-ai/dsh-file-reference-local": { "optional": true },
     "@deepseek-ai/dsh-llm": { "optional": true },
     "@deepseek-ai/dsh-session": { "optional": true },
+    "@deepseek-ai/dsh-session-turn-outline": { "optional": true },
     "@deepseek-ai/dsh-web-app": { "optional": true },
-    "@deepseek-ai/dsh-working-directory": { "optional": true }
+    "@deepseek-ai/dsh-working-directory": { "optional": true },
+    "@deepseek-ai/dsh-workspace-changes": { "optional": true }
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "3.19.0",

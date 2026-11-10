@@ -384,7 +384,7 @@ test('parent tools: readonly details ignore disabled section fallbacks and idle 
   } finally { await f.close() }
 })
 
-test('parent tools: busy Ctrl+C closes the inspector and reaches backend cancellation exactly once', async () => {
+test('parent tools: busy default Ctrl+C closes only the inspector and preserves root work/draft', async () => {
   const f = await fixture()
   try {
     addCall(f.backend, 'cancel', { settled: false })
@@ -394,7 +394,8 @@ test('parent tools: busy Ctrl+C closes the inspector and reaches backend cancell
     f.terminal.type('\x18'); f.terminal.type('\x0f'); await paint(f.terminal)
     assert.match(f.terminal.screen(), /┌─ Tools/)
     f.terminal.type('\x03'); await paint(f.terminal)
-    assert.equal(f.backend.cancelCount, 1)
+    assert.equal(f.backend.cancelCount, 0)
+    assert.equal(f.app.isBusy, true)
     assert.doesNotMatch(f.terminal.screen(), /┌─ Tools/)
     assert.equal(f.app.editor, editor)
     assert.deepEqual(editor.captureDraft(), draft)

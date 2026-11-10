@@ -23,7 +23,9 @@
  */
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { CcKeymap } from '../input/index.ts'
+import type { SubagentEntry } from '../backend/types.ts'
 import type { TranscriptStore } from '../state/transcript.ts'
+import { workspaceChangesItemId } from '../state/transcript.ts'
 import type { ToolTranscriptItem, TranscriptItem } from '../state/transcript.ts'
 import {
   type ItemBlock,
@@ -32,6 +34,7 @@ import {
   type TranscriptViewHints,
   type TranscriptViewOptions,
 } from './blocks.ts'
+import { subscribeHighlightRuntime } from './highlight.ts'
 import { dispatchToChild, HoverOwnership, hoverRowSlot, type HoverSlot } from './mouse.ts'
 import {
   planTranscriptNodes,
@@ -62,6 +65,7 @@ import {
 } from './tool-expansion.ts'
 import { toolPreferences, type ToolViewOptions } from './tool-view.ts'
 import type { ImageDetailsRequest } from './image-view.ts'
+import type { WorkspaceChangesDetailsRequest } from './workspace-changes.ts'
 import {
   clearThinkingExpansion,
   isThinkingExpanded,
@@ -128,6 +132,23 @@ export interface TranscriptViewOptionsShape extends ToolViewOptions {
   onSubagentDetails?: (sessionId: string) => void
   /** Real `app.subagents.details` key label for wide row hints. */
   subagentDetailsHint?: string
+  /**
+   * Open the parent-owned native workspace diff surface for one live card.
+   * `request.index` is the exact native file row that was activated; the parent
+   * owns the `workspace-change-diff` read and the dialog identity guards.
+   */
+  onWorkspaceChangesDetails?: (request: WorkspaceChangesDetailsRequest) => void
+  /** Optional click hint for a wide changed-files card (a real affordance only). */
+  workspaceChangesDetailsHint?: string
+  /**
+   * Read-only disclosure projection (the historical detail surface).
+   *
+   * When true no block and no view path reads, writes, clears, retains or
+   * transfers the module-level tool/group/reasoning expansion maps: disclosure
+   * always paints collapsed and every toggle is inert. The flag is a display
+   * contract only — it is not a DSH mode, input state or persisted setting.
+   */
+  readonlyDisclosure?: boolean
   /**
    * Fold consecutive durable subagent records into one display group.
    *
@@ -286,10 +307,25 @@ export class TranscriptView implements Component {
   /** Number of node projections built so far (diagnostics/tests). */
   private planBuilds = 0
   private sessionId: string | undefined
+  /** The catalog last handed to the blocks (element identity is the token). */
+  private subagentEntries: readonly SubagentEntry[] | undefined
+  /**
+   * Fingerprint of the paint-affecting view options of the last frame.
+   *
+   * The blocks cache their lines behind a fast path, so a preference that
+   * changes without an explicit `invalidate()` would keep painting the old
+   * frame. The view is the only writer of `flags`, so comparing the options it
+   * derives them from is the safety net: a changed colour/preview/disclosure
+   * preference repaints the frame exactly once, and a repaint of unchanged
+   * options never invalidates anything.
+   */
+  private optionsSignature: string | undefined
   /** Width of the last painted frame (`0` before the first render). */
   private lastWidth = 0
   private liveTimer: ReturnType<typeof setInterval> | undefined
   private liveTimerMs = 0
+  /** Disposes the lazy highlight-runtime repaint edge (see the constructor). */
+  private unsubscribeHighlight: (() => void) | undefined
   /** Set by {@link dispose}: the view is inert and never renders again. */
   private disposed = false
 
@@ -298,9 +334,26 @@ export class TranscriptView implements Component {
     this.options = options
     this.flags = { showThinking: options.showThinking, expandTools: options.expandTools, hints: options.hints }
     this.syncFlags()
+    // The grammar tables load behind the renderer. A `Markdown` instance caches
+    // its own rendered lines, so block invalidation alone cannot show the real
+    // syntax colors: this one edge drops the bodies' line caches and asks for a
+    // single repaint. It is disposed with the view, so a dead transcript never
+    // repaints and never keeps the module's listener set alive.
+    this.unsubscribeHighlight = subscribeHighlightRuntime(event => {
+      if (event.state !== 'ready' || this.disposed) return
+      this.invalidate()
+      this.options.onRenderRequest?.()
+    })
   }
 
   private syncFlags(): void {
+    // A preference change is a cache-key input of every block. Detecting it here
+    // (instead of trusting every parent call site to remember `invalidate()`)
+    // keeps the fast path honest: one compare per frame, one invalidation per
+    // real change.
+    const signature = this.paintSignature()
+    if (this.optionsSignature !== undefined && this.optionsSignature !== signature) this.invalidate()
+    this.optionsSignature = signature
     this.flags.showThinking = this.options.showThinking
     this.flags.expandTools = this.options.expandTools
     this.flags.hints = this.options.hints
@@ -313,10 +366,37 @@ export class TranscriptView implements Component {
     this.flags.imageDetailsHint = this.options.imageDetailsHint
     this.flags.onSubagentDetails = this.options.onSubagentDetails
     this.flags.subagentDetailsHint = this.options.subagentDetailsHint
+    // The card callback is wrapped with the view's own current-item/session
+    // guard: a cached or press-pinned block can fire between `store.reset()`
+    // and the next paint, and it must never hand the parent a stale identity.
+    const workspaceDetails = this.options.onWorkspaceChangesDetails
+    this.flags.onWorkspaceChangesDetails = workspaceDetails === undefined
+      ? undefined
+      : request => {
+          if (!this.isWorkspaceRequestCurrent(request)) return
+          workspaceDetails(request)
+        }
+    this.flags.workspaceChangesDetailsHint = this.options.workspaceChangesDetailsHint
+    // A read-only view owns no disclosure mutation path at all; leaving the
+    // request hook unset also keeps `requestToolExpansion` from routing back
+    // into this view.
+    this.flags.readonlyDisclosure = this.options.readonlyDisclosure === true
     // Presentation only: a durable settlement/trigger row shows the real child
     // label (and only then a name link) from the catalog the store already
     // holds. Nothing is fetched and no child Session is read or resumed.
-    this.flags.subagentEntries = this.store.subagentEntries
+    //
+    // The catalog is a cache-key input of those rows (the label and whether it is
+    // openable) but it is not part of any item version, so a changed catalog
+    // invalidates every block: the fast path must never keep a stale label or a
+    // dead link. `SubagentProjection.entries` hands out a fresh array every read
+    // while keeping the *entry objects* of unchanged children, so element
+    // identity — not array identity — is the change token.
+    const entries = this.store.subagentEntries
+    if (!sameCatalog(this.subagentEntries, entries)) {
+      if (this.subagentEntries !== undefined) this.invalidate()
+      this.subagentEntries = [...entries]
+    }
+    this.flags.subagentEntries = entries
     Object.assign(this.flags, toolPreferences(this.options))
     // Independent from `groupTools`: absent means the standalone default `true`,
     // and an explicit `false` (the migrated setting) restores one row per
@@ -331,7 +411,52 @@ export class TranscriptView implements Component {
     // The view owns the disclosure request: it is the only place that can
     // freeze the viewport *before* the state flips and ask for the repaint
     // afterwards. Key-driven and click-driven tool expansion share this path.
-    this.flags.onToolExpansionRequest = (key: string, expanded: boolean) => { this.applyToolExpansionRequest(key, expanded) }
+    this.flags.onToolExpansionRequest = this.flags.readonlyDisclosure === true
+      ? undefined
+      : (key: string, expanded: boolean) => { this.applyToolExpansionRequest(key, expanded) }
+  }
+
+  /**
+   * Read-only disclosure for this view (public, for `HistoryDialog` and hosts
+   * that build their own detail view through `createView`).
+   *
+   * It writes the same mutable option the parent can set, re-derives the flags
+   * and repaints once. It never reads or restores shared state: there is no
+   * backup/restore step that could overwrite a live disclosure change made in
+   * the meantime.
+   */
+  setReadonlyDisclosure(readonly: boolean): void {
+    if ((this.options.readonlyDisclosure === true) === readonly) return
+    this.options.readonlyDisclosure = readonly
+    this.syncFlags()
+    this.invalidate()
+    this.options.onRenderRequest?.()
+  }
+
+  /** True while this view paints a read-only disclosure projection. */
+  get readonlyDisclosure(): boolean {
+    return this.flags.readonlyDisclosure === true
+  }
+
+  /**
+   * Is one workspace-details request still the current live fact?
+   *
+   * Deliberately dynamic: it compares the request's captured session identity
+   * and announcing position with the store **right now**, so a gesture that was
+   * pinned before `store.reset()` (or before the same turn's summary was
+   * replaced) is dropped even though no paint has happened yet.
+   */
+  private isWorkspaceRequestCurrent(request: WorkspaceChangesDetailsRequest): boolean {
+    const info = this.store.info
+    if (info === undefined) return false
+    if (request.sessionId !== info.sessionId) return false
+    if ((request.attachmentId ?? undefined) !== (info.attachmentId ?? undefined)) return false
+    const id = workspaceChangesItemId(request.turn)
+    for (const item of this.store.items) {
+      if (item.kind !== 'workspace-changes' || item.id !== id) continue
+      return item.seq === request.seq && item.sessionId === request.sessionId
+    }
+    return false
   }
 
   /**
@@ -348,6 +473,7 @@ export class TranscriptView implements Component {
    * clicked row stays under the pointer while the frame changes.
    */
   private applyToolExpansionRequest(key: string, expanded: boolean): void {
+    if (this.readonlyDisclosure) return
     if (!key.startsWith('tool:') && !key.startsWith('group:')) return
     this.options.onViewportAnchor?.(expanded)
     if (expanded) {
@@ -360,6 +486,10 @@ export class TranscriptView implements Component {
       }
     }
     setToolExpanded(key, expanded)
+    // Single-expand changes the *other* root cards' keys too (they close), and
+    // the module-level disclosure is not part of any version: every cached block
+    // drops its lines so the fast path cannot repaint a stale frame.
+    this.invalidate()
     this.options.onToolExpansionRequest?.(key, expanded)
     this.options.onRenderRequest?.()
   }
@@ -432,6 +562,44 @@ export class TranscriptView implements Component {
     return frame
   }
 
+  /** Everything the blocks read from the view options, as one comparable string. */
+  private paintSignature(): string {
+    const options = this.options
+    const tools = toolPreferences(options)
+    return [
+      options.showThinking,
+      tools.expandTools,
+      tools.groupTools,
+      tools.expandedInputMaxLines,
+      tools.expandedOutputMaxLines,
+      tools.toolLabelClip,
+      tools.diffViewMode,
+      tools.diffIndicatorMode,
+      tools.diffSplitMinWidth,
+      tools.editDiffCollapsedLines,
+      tools.writeDiffCollapsedLines,
+      tools.diffWordWrap,
+      options.thinkingPreviewLines ?? 3,
+      options.screen ?? 'inline',
+      options.hints?.expand ?? '',
+      options.hints?.toolsDetails ?? '',
+      options.hints?.thinking ?? '',
+      options.imageDetailsHint ?? '',
+      options.subagentDetailsHint ?? '',
+      options.workspaceChangesDetailsHint ?? '',
+      typeof options.now === 'function' ? 'now' : '',
+      typeof options.onToolDetails === 'function' ? 'details' : '',
+      typeof options.onImageDetails === 'function' ? 'images' : '',
+      typeof options.onSubagentDetails === 'function' ? 'subagents' : '',
+      typeof options.onWorkspaceChangesDetails === 'function' ? 'workspace' : '',
+      // Projection-only display preferences (see `TranscriptFlags`).
+      options.groupSubagentMessages ?? true,
+      options.suppressLiveTodos === true,
+      options.mouseBlocked === true,
+      options.readonlyDisclosure === true,
+    ].join('|')
+  }
+
   private planOptions(): PlanOptions {
     return {
       groupTools: this.flags.groupTools ?? true,
@@ -464,6 +632,9 @@ export class TranscriptView implements Component {
    * a toggle that leaves half the transcript in its old state.
    */
   toggleToolsExpanded(): void {
+    // A read-only projection cannot expand disclosure, so it has nothing to flip
+    // (and must not clear the live view's overrides either).
+    if (this.readonlyDisclosure) return
     this.options.expandTools = !this.options.expandTools
     clearToolExpansion()
     this.syncFlags()
@@ -482,6 +653,9 @@ export class TranscriptView implements Component {
   get expandedDisclosureCount(): number {
     this.syncFlags()
     let count = 0
+    // A read-only projection is always collapsed: it neither counts shared
+    // overrides nor lets a viewport anchor observe a spurious disclosure.
+    if (this.readonlyDisclosure) return 0
     for (const node of this.frameNodes()) {
       if (node.kind === 'group') {
         if (isToolExpanded(toolGroupExpansionKey(node.anchor.callId), this.flags.expandTools)) count += 1
@@ -544,6 +718,21 @@ export class TranscriptView implements Component {
     this.hover.release()
   }
 
+  /**
+   * Synchronously retire every pointer target (parent seam).
+   *
+   * The parent calls this when it replaces the root/attachment identity, before
+   * any repaint: cached item blocks keep their last hitboxes and a press pin can
+   * survive a row that is about to disappear. This drops hover ownership, the
+   * painted row spans and each block's hitboxes/pins. It touches no content, no
+   * store item, no editor and no focus state, and it requests no repaint.
+   */
+  retirePointerTargets(): void {
+    this.hover.release()
+    for (const entry of this.cache.values()) entry.block.clearMouse?.()
+    this.spans = []
+  }
+
   /** Diagnostics/tests: whether the live reasoning timer is armed. */
   get liveTimerRunning(): boolean {
     return this.liveTimer !== undefined
@@ -574,6 +763,8 @@ export class TranscriptView implements Component {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.unsubscribeHighlight?.()
+    this.unsubscribeHighlight = undefined
     this.stopLiveTimer()
     // Release the pointer hover before the blocks forget their hitboxes: a card
     // that vanished while still blue would otherwise never repaint neutral.
@@ -605,8 +796,13 @@ export class TranscriptView implements Component {
       this.groupedKeys = new Set()
       this.spans = []
       this.plan = undefined
-      clearThinkingExpansion()
-      clearToolExpansion()
+      // Historical/read-only views share no disclosure state with the live
+      // transcript: a session change in this projection must not clear (or
+      // retain) the module-level maps the live view still paints from.
+      if (!this.readonlyDisclosure) {
+        clearThinkingExpansion()
+        clearToolExpansion()
+      }
     }
     const safeWidth = Math.max(1, Math.floor(width))
     // A modal owns the pointer: the transcript behind it must not keep a hint
@@ -687,7 +883,8 @@ export class TranscriptView implements Component {
     // A removed call must not leave a stale disclosure behind; keys of items
     // that still exist (grouped or not) are kept so ungrouping restores them,
     // while a group key is only retained for as long as a group row exists.
-    retainToolExpansion(new Set(disclosureKeys))
+    // A read-only projection must never prune the live view's keys.
+    if (!this.readonlyDisclosure) retainToolExpansion(new Set(disclosureKeys))
     this.spans = spans
     // A repaint that re-based (or dropped) the hovered block moved its hitbox
     // away from a pointer that did not move: the hint must go back to neutral.
@@ -865,6 +1062,7 @@ export class TranscriptView implements Component {
    * parent decides what to say/do instead of the view inventing a fallback.
    */
   toggleLatestThinking(): boolean {
+    if (this.readonlyDisclosure) return false
     for (let index = this.store.items.length - 1; index >= 0; index -= 1) {
       const item = this.store.items[index]
       if (item === undefined) continue
@@ -993,6 +1191,24 @@ function samePlanOptions(previous: PlanOptions, next: PlanOptions): boolean {
     && previous.groupSubagentMessages === next.groupSubagentMessages
     && previous.showThinking === next.showThinking
     && previous.suppressLiveTodos === next.suppressLiveTodos
+}
+
+/**
+ * Is the child catalog the same as the one the blocks were painted with?
+ *
+ * Only element identity is compared: the projection reuses each unchanged
+ * child's entry object, so an upsert that changes a label or an openability
+ * replaces exactly that object. Nothing here reads a clock or a revision.
+ */
+function sameCatalog(
+  previous: readonly SubagentEntry[] | undefined,
+  next: readonly SubagentEntry[],
+): boolean {
+  if (previous === undefined || previous.length !== next.length) return false
+  for (const [index, entry] of next.entries()) {
+    if (previous[index] !== entry) return false
+  }
+  return true
 }
 
 /**

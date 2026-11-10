@@ -77,6 +77,15 @@ ccCaptureSnapshot() {
         lastAction: this.lastAction,
         preferredVisualCol: this.preferredVisualCol,
         snappedFromCursorCol: this.snappedFromCursorCol,
+        verticalGoal:
+            this.verticalGoal && typeof this.verticalGoal === "object"
+                ? {
+                      cursorLine: this.verticalGoal.cursorLine,
+                      cursorCol: this.verticalGoal.cursorCol,
+                      visualCol: this.verticalGoal.visualCol,
+                      width: this.verticalGoal.width,
+                  }
+                : null,
         scrollOffset: this.scrollOffset,
         jumpMode: this.jumpMode,
         isInPaste: this.isInPaste,
@@ -158,6 +167,24 @@ ccRestoreSnapshot(snapshot, options = {}) {
     this.snappedFromCursorCol = Number.isFinite(snapshot.snappedFromCursorCol)
         ? snapshot.snappedFromCursorCol
         : null;
+    const goal = snapshot.verticalGoal;
+    // `width` is the layout width the goal was measured in, so a restore at a
+    // different width cannot replay a column computed for the old wrapping. A
+    // snapshot without a usable width (older draft) simply drops the goal.
+    this.verticalGoal =
+        goal &&
+        Number.isFinite(goal.cursorLine) &&
+        Number.isFinite(goal.cursorCol) &&
+        Number.isFinite(goal.visualCol) &&
+        Number.isFinite(goal.width) &&
+        goal.width >= 1
+            ? {
+                  cursorLine: Math.max(0, Math.floor(goal.cursorLine)),
+                  cursorCol: Math.max(0, Math.floor(goal.cursorCol)),
+                  visualCol: Math.max(0, Math.floor(goal.visualCol)),
+                  width: Math.max(1, Math.floor(goal.width)),
+              }
+            : null;
     this.scrollOffset = Math.max(0, Math.floor(snapshot.scrollOffset ?? 0));
     this.jumpMode =
         snapshot.jumpMode === "forward" || snapshot.jumpMode === "backward" ? snapshot.jumpMode : null;
@@ -269,6 +296,102 @@ ccMoveWord(direction, mode = "word") {
 
 ccPageScroll(direction) {
     this.pageScroll(direction < 0 ? -1 : 1);
+}
+
+// --- measurement (no paint) ---------------------------------------------
+
+/**
+ * Cheap fingerprint of every input `ccRenderRows(width)` reads.
+ *
+ * `render(width).length` is decided by: the width math (`width`, `paddingX`),
+ * the terminal height (visible-line cap), the draft text and cursor, the marker
+ * registries (paste/image/file ids change grapheme segmentation), the scroll
+ * offset and the open completion menu (state, candidate count, selection,
+ * visible cap). This string holds exactly those facts and nothing else, so a
+ * memoized row count keyed on it can never survive a change that could alter
+ * the height. Deliberately absent: `focused` (a zero-width cursor marker and a
+ * highlighted cell — row count is unchanged), theme/border text (one border row
+ * each) and paste payloads (`layoutText` sees the marker text, not the body).
+ */
+ccRenderSignature(width) {
+    const lines = this.state.lines;
+    const ids = (map) => [...map.keys()].sort((a, b) => a - b).join(",");
+    const list = this.autocompleteList;
+    // The row count of `SelectList.render` depends only on the candidate count,
+    // the selection and the visible cap (one line per visible row plus the
+    // scroll indicator), never on item text.
+    const menu =
+        this.autocompleteState !== null && list !== undefined
+            ? `${typeof list.getItemCount === "function" ? list.getItemCount() : "?"}:${
+                  typeof list.getSelectedIndex === "function" ? list.getSelectedIndex() : "?"
+              }`
+            : "-";
+    return [
+        width,
+        this.paddingX,
+        this.tui.terminal.rows,
+        lines.length,
+        this.state.cursorLine,
+        this.state.cursorCol,
+        this.scrollOffset,
+        this.autocompleteState ?? "-",
+        this.autocompleteMaxVisible,
+        menu,
+        ids(this.pastes),
+        ids(this.imageAttachments),
+        ids(this.fileAttachments),
+        // Single-line edits mutate `lines[cursorLine]` in place, so the array
+        // identity is not enough: the text itself is part of the fingerprint.
+        // Lines never contain "\n", so this join is injective per line count.
+        lines.join("\n"),
+    ].join("\u0000");
+}
+
+/**
+ * Row count of the next `render(width)` — computed, never painted.
+ *
+ * `render` builds the same layout and then pushes one top border, the visible
+ * layout lines and one bottom border (plus the completion menu rows). It also
+ * clamps/adjusts `scrollOffset`, records `lastWidth`/`renderedVisibleLineCount`/
+ * `renderedAutocompleteHeight` and emits cursor cells; none of that is painted
+ * here, so measuring cannot move the viewport or change a later frame.
+ *
+ * Wrapping, width and grapheme logic are reused verbatim (`layoutText`,
+ * `paddingX` math, `SelectList.render`), never re-implemented. The private
+ * fields read here are the ones `render` itself reads; this is the same
+ * app-specific seam that already drives CC submission and snapshots.
+ */
+ccRenderRows(width) {
+    // Same width math as `render` (horizontal padding, reserved cursor column).
+    const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+    const paddingX = Math.min(this.paddingX, maxPadding);
+    const contentWidth = Math.max(1, width - paddingX * 2);
+    const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+    const layoutLines = this.layoutText(layoutWidth);
+    // Same visible-line cap as `render` (30% of the terminal height, min 5).
+    const terminalRows = this.tui.terminal.rows;
+    const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+    let cursorLineIndex = layoutLines.findIndex((line) => line.hasCursor);
+    if (cursorLineIndex === -1) cursorLineIndex = 0;
+    // The same scroll adjustment `render` applies, computed on a local copy so
+    // the measurement never becomes the next frame's starting offset.
+    let offset = this.scrollOffset;
+    if (cursorLineIndex < offset) {
+        offset = cursorLineIndex;
+    } else if (cursorLineIndex >= offset + maxVisibleLines) {
+        offset = cursorLineIndex - maxVisibleLines + 1;
+    }
+    const maxScrollOffset = Math.max(0, layoutLines.length - maxVisibleLines);
+    offset = Math.max(0, Math.min(offset, maxScrollOffset));
+    // Exactly the slice `render` paints (its `slice` semantics included).
+    const visibleLines = layoutLines.slice(offset, offset + maxVisibleLines).length;
+    // One top border, the visible layout lines, one bottom border.
+    let rows = 2 + visibleLines;
+    // An open completion menu paints its own rows below the frame.
+    if (this.autocompleteState && this.autocompleteList) {
+        rows += this.autocompleteList.render(contentWidth).length;
+    }
+    return rows;
 }
 
 /** Word/punctuation/CJK aware boundaries (Alt+B/F, Option+Delete). */

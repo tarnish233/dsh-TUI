@@ -1,5 +1,7 @@
 # Popup/settings implementation contract (2026-11-07)
 
+> **Historical pass contract.** The current placement and Ctrl+C policy is [COMPOSER-INTERACTION-CONTRACT.md](COMPOSER-INTERACTION-CONTRACT.md): transient decisions/short input use the composer region, browsing/configuration stays an independent overlay, and default Ctrl+C uses Pi clear/exit plus local surface cancellation. The blanket-overlay and default-global-interrupt statements below describe the prior pass, not the current UI.
+
 > **Status: implemented in the current working tree; unreleased.** Final parent
 > verification: `pnpm check` 1646/1646 (121 files), latest Settings CLI/PTY 2/2
 > and native Settings 2/2; earlier popup offline CLI/PTY 23/23,

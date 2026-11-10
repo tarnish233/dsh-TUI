@@ -90,7 +90,7 @@ for (const screen of ['inline', 'fullscreen'] as const) {
     }, {}, { screen })
   })
 
-  test(`parent native acceptance (${screen}): approval Ctrl+C aborts the whole turn and preserves draft`, { timeout: TIMEOUT }, async () => {
+  test(`parent native acceptance (${screen}): Pi approval Ctrl+C rejects locally and preserves draft`, { timeout: TIMEOUT }, async () => {
     await runNativeScene(async (scene: NativeScene) => {
       const { app, events, terminal, object, until, facts } = scene
       const idle = async (offset = 0) => {
@@ -105,7 +105,8 @@ for (const screen of ['inline', 'fullscreen'] as const) {
       const offset = events.length
       terminal.type('\x03')
       await idle(offset)
-      scene.assert.ok(facts(events.slice(offset)).some(event => event.type === 'turn/end' && object(object(event.data).reason).kind === 'aborted'))
+      scene.assert.equal(facts(events.slice(offset)).some(event => event.type === 'turn/end' && object(object(event.data).reason).kind === 'aborted'), false, 'focused approval Ctrl+C does not abort the native turn')
+      scene.assert.match(JSON.stringify(facts(events.slice(offset))), /approval-rejected/)
       scene.assert.equal(app.pendingDecisionCount, 0)
       scene.assert.equal(app.editor.getExpandedText(), before.expandedText)
       scene.assert.deepEqual(app.editor.captureDraft().pastes, before.pastes)
@@ -146,7 +147,7 @@ test('parent native acceptance: question Esc cancels only that ask (ASK_CANCELLE
   })
 })
 
-test('parent native acceptance: question Ctrl+C still aborts the whole turn (ASK_ABORTED)', { timeout: TIMEOUT }, async () => {
+test('parent native acceptance: Pi question Ctrl+C cancels only that ask (ASK_CANCELLED)', { timeout: TIMEOUT }, async () => {
   await runNativeScene(async (scene: NativeScene) => {
     const { app, events, terminal, object, until, facts } = scene
     const idle = async (offset = 0) => {
@@ -159,8 +160,9 @@ test('parent native acceptance: question Ctrl+C still aborts the whole turn (ASK
     terminal.type('\x03')
     await idle(offset)
     scene.assert.equal(app.pendingDecisionCount, 0)
-    scene.assert.ok(facts(events.slice(offset)).some(event => event.type === 'turn/end' && object(object(event.data).reason).kind === 'aborted'), 'Ctrl+C keeps the whole-turn abort path')
-    scene.assert.match(JSON.stringify(facts(events.slice(offset))), /ASK_ABORTED/)
+    scene.assert.equal(facts(events.slice(offset)).some(event => event.type === 'turn/end' && object(object(event.data).reason).kind === 'aborted'), false, 'focused question Ctrl+C is local to the native request')
+    scene.assert.match(JSON.stringify(facts(events.slice(offset))), /ASK_CANCELLED/)
+    scene.assert.match(JSON.stringify(facts(events.slice(offset))), /question-complete/)
     scene.assert.equal(events.some(event => event.type === 'closed'), false)
   })
 })

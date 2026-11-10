@@ -53,7 +53,10 @@ export interface QueueDialogOptions {
   onSendNow?: (entry: QueueEntry) => void | Promise<void>
   /** Local dismissal (Esc / list.cancel). */
   onClose: () => void
-  /** Global turn cancellation (`app.interrupt`); defaults to closing. */
+  /**
+   * Explicit native interrupt (a configured `app.interrupt`; no shipped
+   * default); defaults to closing. Default Ctrl+C is the local cancel.
+   */
   onInterrupt?: () => void
   /** Optional repaint hook for hosts that own rendering. */
   onRenderRequest?: () => void
@@ -348,7 +351,9 @@ export class QueueDialog implements Component, Focusable {
 
   handleInput(raw: string): void {
     if (this.done || this.disposed) return
-    if (isInterruptKey(this.keymap, raw)) {
+    // A fragmented bracketed paste owns the bytes: a pasted Ctrl+C stays
+    // content and can never interrupt the turn or close this surface.
+    if (!this.isPasting && isInterruptKey(this.keymap, raw)) {
       this.interrupt()
       return
     }
@@ -384,7 +389,9 @@ export class QueueDialog implements Component, Focusable {
   }
 
   private inputSearch(raw: string): void {
-    const action = this.resolve(raw)
+    // A fragmented bracketed paste owns the bytes while it arrives: a pasted
+    // Ctrl+C/Esc byte stays query content and never blurs or closes the surface.
+    const action = this.search.editor.isPasting() ? undefined : this.resolve(raw)
     if (action !== undefined) {
       switch (action.id) {
         case 'list.select':

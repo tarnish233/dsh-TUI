@@ -1396,17 +1396,29 @@ test('the group keeps its composed frame until a member or a preference changes'
   ]
   for (const [name, mutate] of mutations) {
     const fresh = groupFlags({ expandTools: true, screen: 'fullscreen', groupTools: true, toolLabelClip: 0 })
-    const entry = new ToolGroupBlock(first, fresh)
-    entry.setMembers([
+    const membersFor = (): ToolGroupMember[] => [
       { item: first, block: stubBlock(first, ['a'], { contexts: [], events: [], renders: 0 }) },
       { item: second, block: stubBlock(second, ['b'], { contexts: [], events: [], renders: 0 }) },
-    ])
+    ]
+    const entry = new ToolGroupBlock(first, fresh)
+    entry.setMembers(membersFor())
     entry.render(60)
     const before = entry.frameCacheKey
+    // The preference must be part of the composed key: a group built with the
+    // changed preference composes a different key for the identical member list,
+    // so a frame can never be reused across a Settings change.
     mutate(fresh)
+    const changed = new ToolGroupBlock(first, fresh)
+    changed.setMembers(membersFor())
+    changed.render(60)
+    assert.notEqual(changed.frameCacheKey, before, `${name} must invalidate the composed frame`)
+    // The live instance repaints through the owner's invalidation (the view
+    // detects the option change), it never keeps the cached frame.
+    entry.invalidate()
     entry.render(60)
-    assert.notEqual(entry.frameCacheKey, before, `${name} must invalidate the composed frame`)
+    assert.equal(entry.frameCacheKey, changed.frameCacheKey, `${name}: the repaint uses the new preference`)
     entry.dispose()
+    changed.dispose()
   }
 
   // A cwd change and header hover are part of the key too.

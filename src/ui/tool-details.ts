@@ -50,7 +50,7 @@
  *   list.select                                  select a call in the call list
  *   tool.details.previous-tool / next-tool       parent-owned earlier/later call
  *   list.cancel / dialog.cancel / app.cancel     clear find, else close
- *   app.interrupt                                parent's turn interrupt (else close)
+ *   app.interrupt                                explicit native interrupt override (else close)
  *
  * The find field is a real field (one `InlineAnswer`/`CcEditor`, shared keymap):
  * typing, word vs whitespace deletion, kill/yank, undo and paste use the CC
@@ -69,6 +69,7 @@
 import {
   CURSOR_MARKER,
   ScrollView,
+  matchesKey,
   type Component,
   type Focusable,
   type TUI,
@@ -103,8 +104,10 @@ export interface ToolDetailsDialogOptions {
   /** Local dismissal (Esc / list.cancel). Parent hides and disposes. */
   onClose: () => void
   /**
-   * Global turn cancellation (`app.interrupt`, Ctrl+C by default). When
-   * omitted the interrupt key closes this surface through `onClose`.
+   * Explicit global interrupt override (`app.interrupt`). Since the Pi-style
+   * default moved to `app.clear`, this only receives a user-configured native
+   * interrupt binding. When omitted the interrupt key closes this surface
+   * through `onClose`.
    */
   onInterrupt?: () => void
   /**
@@ -489,6 +492,16 @@ export class ToolDetailsDialog implements Component, Focusable {
   }
 
   private forwardToSearch(raw: string): void {
+    // The find field is a genuine editor-context field, so its own CcEditor
+    // resolves global `app.clear` for Ctrl+C. Honor the local sublayer cancel
+    // only when this exact key is an *enabled configured* local cancel shortcut
+    // (`list.cancel` / `dialog.cancel` / `app.cancel`); a remapped/disabled
+    // local cancel must not be resurrected by the global app.clear default.
+    // An explicit native interrupt override keeps its priority.
+    if (this.localCancelKey(raw) && !this.search.isBound(raw, 'app.interrupt')) {
+      this.clearSearch()
+      return
+    }
     const result = this.search.handleKey(raw)
     switch (result) {
       case 'confirm':
@@ -1547,6 +1560,16 @@ export class ToolDetailsDialog implements Component, Focusable {
   private bindingLabel(actionId: string): string | undefined {
     const binding = this.keymap.getBindings(actionId)[0]
     return binding === undefined ? undefined : formatBinding(binding.split(' '))
+  }
+
+  private localCancelKey(raw: string): boolean {
+    const interrupt = new Set(this.keymap.getBindings('app.interrupt'))
+    return ['list.cancel', 'dialog.cancel', 'app.cancel'].some(id =>
+      this.keymap.getBindings(id).some(spec =>
+        !spec.includes(' ') &&
+        !interrupt.has(spec) &&
+        matchesKey(raw, spec as Parameters<typeof matchesKey>[1])),
+    )
   }
 
   private closeKey(): string | undefined {

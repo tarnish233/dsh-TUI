@@ -1,125 +1,88 @@
 /**
- * Bounded code highlighting for Pi TUI Markdown code blocks.
+ * Bounded code highlighting for Pi TUI Markdown code blocks, loaded lazily.
  *
  * Adapted from agent_tui (MIT) src/ui/highlight.ts and its cc-dark palette.
  * Unlike the streaming renderer, this module refuses to highlight large or
  * very long code blocks and reuses a small LRU by code+language, so a token
  * update cannot re-run highlight.js on already-stable code.
  *
- * The core is the one CommonJS file in this module graph (`es/core.js` is a thin
- * wrapper over `lib/core.js`). Loading it through Node's CommonJS loader keeps a
- * single cached public instance when the native host has already required
- * highlight.js, instead of making the ESM loader translate that CJS file again.
- * Language definitions stay ESM: those files have no CJS counterpart in this path.
+ * Lazy contract
+ * -------------
+ * `theme.ts` (and therefore every UI surface) imports this facade, and this
+ * facade imports **no** highlight.js code: startup only pays for the palette in
+ * `highlight-palette.ts`. The grammars live in `highlight-runtime.ts` and are
+ * reached through exactly one dynamic import:
+ *
+ * - `idle`: nothing is loaded. `highlightCode` returns `plainHighlightLines`
+ *   (byte-identical to the unstyled rows the eager implementation produced for
+ *   an unknown language) and starts the single load.
+ * - `loading`: concurrent calls return the same fallback and never start a
+ *   second import.
+ * - `ready`: real syntax colors. The fallback rows were never cached, so no
+ *   stale unstyled line can survive; the generation counter and the subscriber
+ *   notification are how the Markdown owners drop their *own* line caches (a
+ *   `Markdown` instance caches rendered lines by `text`+`width` independently
+ *   of any block cache).
+ * - `failed`: the load failed once. Highlighting stays on the fallback
+ *   permanently, nothing throws, and no retry storm starts. A host that wants
+ *   to retry calls {@link ensureHighlightRuntime} again after a reset.
+ *
+ * `whenHighlightRuntimeReady` is the awaitable shape of the same load; it is
+ * used by tests and by a parent that wants to warm the grammars while an
+ * overlay is open. No debug UI reads these functions.
  */
-import { createRequire } from 'node:module'
-import type { HLJSApi } from 'highlight.js'
-import bash from 'highlight.js/lib/languages/bash'
-import c from 'highlight.js/lib/languages/c'
-import cpp from 'highlight.js/lib/languages/cpp'
-import css from 'highlight.js/lib/languages/css'
-import diff from 'highlight.js/lib/languages/diff'
-import go from 'highlight.js/lib/languages/go'
-import ini from 'highlight.js/lib/languages/ini'
-import java from 'highlight.js/lib/languages/java'
-import javascript from 'highlight.js/lib/languages/javascript'
-import json from 'highlight.js/lib/languages/json'
-import kotlin from 'highlight.js/lib/languages/kotlin'
-import markdown from 'highlight.js/lib/languages/markdown'
-import python from 'highlight.js/lib/languages/python'
-import rust from 'highlight.js/lib/languages/rust'
-import shell from 'highlight.js/lib/languages/shell'
-import sql from 'highlight.js/lib/languages/sql'
-import swift from 'highlight.js/lib/languages/swift'
-import typescript from 'highlight.js/lib/languages/typescript'
-import xml from 'highlight.js/lib/languages/xml'
-import yaml from 'highlight.js/lib/languages/yaml'
-import { foregroundAnsi, getTerminalColorMode, parseColor } from '#pi-tui'
+import { plainHighlightLines } from './highlight-palette.ts'
+import type { HighlightRuntime } from './highlight-runtime.ts'
 
-const requireFromHere = createRequire(import.meta.url)
-/** Public package, CommonJS build: `module.exports` is the highlight.js instance. */
-const hljs = requireFromHere('highlight.js/lib/core') as HLJSApi
+export type { HighlightRuntime } from './highlight-runtime.ts'
 
-const languages: Record<string, unknown> = {
-  bash, c, cpp, css, diff, go, ini, java, javascript, json, kotlin, markdown, python, rust, shell, sql, swift, typescript, xml, yaml,
-}
-for (const [name, definition] of Object.entries(languages)) hljs.registerLanguage(name, definition as never)
+/** `idle` before the first code block, then one of the three settled states. */
+export type HighlightRuntimeState = 'idle' | 'loading' | 'ready' | 'failed'
 
-const aliases: Record<string, string> = {
-  js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript', ts: 'typescript', tsx: 'typescript', mts: 'typescript',
-  sh: 'bash', zsh: 'bash', console: 'shell', py: 'python', rs: 'rust', golang: 'go', yml: 'yaml', toml: 'ini', html: 'xml',
-  htm: 'xml', svg: 'xml', md: 'markdown', kt: 'kotlin', 'c++': 'cpp', h: 'c', hpp: 'cpp', jsonc: 'json', json5: 'json', patch: 'diff',
+/** What a subscriber learns when the load settles. */
+export interface HighlightRuntimeEvent {
+  readonly state: 'ready' | 'failed'
+  /** Increments once per successful load; use it to stamp derived caches. */
+  readonly generation: number
 }
 
-const mode = getTerminalColorMode()
-const color = (hex: string): string => foregroundAnsi(parseColor(hex), mode)
-/**
- * Content syntax palette: independent of the interface chrome brand color.
- * `#79c0ff` (numbers, literals, properties, selectors) merely happens to equal
- * the brand blue's current value — it is NOT derived from src/ui/brand.ts.
- * Do not "tidy" these into the theme tokens: code color is content, the brand
- * hue is chrome, and a future brand change must not recolor syntax.
- */
-const scopeColors: Record<string, string> = {
-  keyword: color('#ff7b72'), 'selector-tag': color('#ff7b72'), 'template-tag': color('#ff7b72'), doctag: color('#ff7b72'),
-  built_in: color('#ffa657'), type: color('#ffa657'), 'title.class': color('#ffa657'), 'title.class.inherited': color('#ffa657'),
-  title: color('#d2a8ff'), 'title.function': color('#d2a8ff'), section: color('#79c0ff'),
-  string: color('#a5d6ff'), regexp: color('#a5d6ff'), 'meta string': color('#a5d6ff'),
-  number: color('#79c0ff'), literal: color('#79c0ff'), symbol: color('#79c0ff'), attr: color('#79c0ff'), attribute: color('#79c0ff'),
-  property: color('#79c0ff'), variable: color('#ffa657'), 'template-variable': color('#ffa657'), meta: color('#79c0ff'),
-  comment: color('#8b949e'), quote: color('#8b949e'), addition: color('#56d364'), deletion: color('#ffa198'),
-  name: color('#7ee787'), 'selector-id': color('#79c0ff'), 'selector-class': color('#79c0ff'), bullet: color('#f2cc60'),
-}
-const DEFAULT = color('#d6dde3')
+/** One load attempt. The default imports the grammar module. */
+export type HighlightRuntimeLoader = () => Promise<HighlightRuntime>
 
 const MAX_HIGHLIGHT_CHARS = 6000
 const MAX_HIGHLIGHT_LINES = 200
 const MAX_CACHE_ENTRIES = 64
+/** Highlighted rows by `lang\0code`. Never populated from the fallback path. */
 const cache = new Map<string, string[]>()
 
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'").replace(/&#39;/g, "'").replace(/&amp;/g, '&')
-}
+const defaultLoader: HighlightRuntimeLoader = () => import('./highlight-runtime.ts').then(module => module.highlightRuntime)
+let loader: HighlightRuntimeLoader = defaultLoader
 
-function scopeColor(classes: string): string | undefined {
-  const parts = classes.split(/\s+/).map(part => part.replace(/^hljs-/, '').replace(/_+$/, ''))
-  const joined = parts.join('.')
-  return scopeColors[joined] ?? scopeColors[parts[0] ?? ''] ?? undefined
-}
-
-function toAnsiLines(html: string): string[] {
-  const lines: string[] = ['']
-  const stack: string[] = []
-  const current = (): string => stack.at(-1) ?? DEFAULT
-  const pattern = /<span class="([^"]+)">|<\/span>|([^<]+)/g
-  for (const match of html.matchAll(pattern)) {
-    if (match[1] !== undefined) {
-      stack.push(scopeColor(match[1]) ?? current())
-    } else if (match[0] === '</span>') {
-      stack.pop()
-    } else if (match[2] !== undefined) {
-      const pieces = decodeEntities(match[2]).split('\n')
-      pieces.forEach((piece, index) => {
-        if (index > 0) lines.push('')
-        if (piece !== '') lines[lines.length - 1] += `${current()}${piece}\x1b[39m`
-      })
-    }
-  }
-  return lines
-}
-
-function plain(code: string): string[] {
-  return code.split('\n').map(line => (line === '' ? '' : `${DEFAULT}${line}\x1b[39m`))
-}
+let state: HighlightRuntimeState = 'idle'
+let runtime: HighlightRuntime | undefined
+let generation = 0
+let importCount = 0
+let inflight: Promise<void> | undefined
+/** Identifies the current attempt, so a reset can never be overwritten. */
+let epoch = 0
+const listeners = new Set<(event: HighlightRuntimeEvent) => void>()
 
 /**
- * Highlight one code block, or return plain styled lines when it is too large.
- * The returned array length matches the input line count.
+ * Highlight one code block, or return plain styled rows while the grammars are
+ * not loaded / the block is too large.
+ *
+ * The returned array length matches the input line count. Cache hits return the
+ * identical array, so a repaint never re-runs a grammar.
  */
 export function highlightCode(code: string, lang?: string): string[] {
-  if (code.length > MAX_HIGHLIGHT_CHARS || code.split('\n').length > MAX_HIGHLIGHT_LINES) return plain(code)
+  if (code.length > MAX_HIGHLIGHT_CHARS || code.split('\n').length > MAX_HIGHLIGHT_LINES) return plainHighlightLines(code)
+  const loaded = runtime
+  if (loaded === undefined) {
+    // The fallback is deliberately not cached: a cached unstyled row would
+    // outlive the load and repaint as "highlighted" forever.
+    void ensureHighlightRuntime()
+    return plainHighlightLines(code)
+  }
   const key = `${lang ?? ''}\u0000${code}`
   const hit = cache.get(key)
   if (hit !== undefined) {
@@ -128,15 +91,7 @@ export function highlightCode(code: string, lang?: string): string[] {
     cache.set(key, hit)
     return hit
   }
-  const name = lang === undefined ? undefined : (aliases[lang.toLowerCase()] ?? lang.toLowerCase())
-  let lines = plain(code)
-  if (name !== undefined && hljs.getLanguage(name) !== undefined) {
-    try {
-      lines = toAnsiLines(hljs.highlight(code, { language: name, ignoreIllegals: true }).value)
-    } catch {
-      lines = plain(code)
-    }
-  }
+  const lines = loaded.highlight(code, lang)
   cache.set(key, lines)
   while (cache.size > MAX_CACHE_ENTRIES) {
     const oldest = cache.keys().next().value
@@ -146,6 +101,112 @@ export function highlightCode(code: string, lang?: string): string[] {
   return lines
 }
 
+/**
+ * Start the one load (or join the running one) and resolve when it settles.
+ *
+ * Never rejects: a failed load is reported through the state and the
+ * subscribers, because a renderer frame must not throw over a missing grammar.
+ */
+export function ensureHighlightRuntime(): Promise<void> {
+  if (state === 'ready' || state === 'failed') return Promise.resolve()
+  const running = inflight
+  if (running !== undefined) return running
+  state = 'loading'
+  importCount += 1
+  // The loader is invoked synchronously (the dynamic `import()` is asynchronous
+  // by itself), so the attempt is observable in the same turn and a loader that
+  // throws synchronously still becomes a rejection instead of escaping a frame.
+  let attempt: Promise<HighlightRuntime>
+  try {
+    attempt = Promise.resolve(loader())
+  } catch {
+    attempt = Promise.reject(new Error('the highlight runtime loader failed'))
+  }
+  const attemptEpoch = epoch
+  const pending = attempt
+    .then(
+      loaded => {
+        // An attempt that was superseded (only the test seam can do that) must
+        // not revive a reset module.
+        if (epoch !== attemptEpoch) return
+        runtime = loaded
+        state = 'ready'
+        generation += 1
+        inflight = undefined
+        notify('ready')
+      },
+      () => {
+        if (epoch !== attemptEpoch) return
+        runtime = undefined
+        state = 'failed'
+        inflight = undefined
+        notify('failed')
+      },
+    )
+  inflight = pending
+  return pending
+}
+
+/** Awaitable form of {@link ensureHighlightRuntime} (prefetch + wait). */
+export function whenHighlightRuntimeReady(): Promise<void> {
+  return ensureHighlightRuntime()
+}
+
+/** Current load state; `ready` is the only state that paints syntax colors. */
+export function highlightRuntimeState(): HighlightRuntimeState {
+  return state
+}
+
+/** True once the grammar module is loaded and usable. */
+export function isHighlightRuntimeReady(): boolean {
+  return runtime !== undefined
+}
+
+/** Successful loads so far (0 or 1 in practice; diagnostics/tests). */
+export function highlightGeneration(): number {
+  return generation
+}
+
+/** Loader invocations so far. Exactly one per settled attempt (tests). */
+export function highlightRuntimeImportCount(): number {
+  return importCount
+}
+
+/**
+ * Listen for the settled load.
+ *
+ * The listener runs once, after the state is final, with the generation that
+ * produced it. A throwing listener cannot break the loader or the other
+ * listeners. The returned function disposes the subscription; owners must call
+ * it from `dispose()` so a dead view never repaints another one's frame.
+ */
+export function subscribeHighlightRuntime(listener: (event: HighlightRuntimeEvent) => void): () => void {
+  listeners.add(listener)
+  return () => { listeners.delete(listener) }
+}
+
+/**
+ * Live subscriber count (tests/diagnostics only).
+ *
+ * A view or dialog must release its subscription on dispose; asserting the count
+ * proves the disposal itself instead of relying on the `disposed` guard inside
+ * the listener.
+ */
+export function highlightRuntimeSubscriberCount(): number {
+  return listeners.size
+}
+
+function notify(state: HighlightRuntimeEvent['state']): void {
+  const event: HighlightRuntimeEvent = { state, generation }
+  for (const listener of [...listeners]) {
+    try {
+      listener(event)
+    } catch {
+      // A subscriber is display-only; a broken one must not fail the load.
+    }
+  }
+}
+
 /** Test/diagnostic hook; not used by the renderer. */
 export function highlightCacheSize(): number {
   return cache.size
@@ -153,5 +214,32 @@ export function highlightCacheSize(): number {
 
 /** Test/diagnostic hook; not used by the renderer. */
 export function clearHighlightCache(): void {
+  cache.clear()
+}
+
+/**
+ * Test seam: replace the loader (or pass `undefined` for the real one).
+ *
+ * Narrow on purpose — the production path has exactly one loader and no UI
+ * switch for it.
+ */
+export function setHighlightRuntimeLoaderForTests(next?: HighlightRuntimeLoader): void {
+  loader = next ?? defaultLoader
+}
+
+/**
+ * Test seam: back to the pre-import state (`idle`, no runtime, no listeners, no
+ * cache, the real loader). Test files run in their own process, so this only
+ * exists to exercise the state machine's transitions in one file.
+ */
+export function resetHighlightRuntimeForTests(): void {
+  epoch += 1
+  state = 'idle'
+  runtime = undefined
+  generation = 0
+  importCount = 0
+  inflight = undefined
+  loader = defaultLoader
+  listeners.clear()
   cache.clear()
 }

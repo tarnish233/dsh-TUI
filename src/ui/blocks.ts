@@ -36,15 +36,25 @@ import type {
   UserTranscriptItem,
 } from '../state/transcript.ts'
 import type { SubagentMessageTranscriptItem, SubagentTranscriptItem } from '../state/subagents.ts'
+import { WorkspaceChangesBlock, type WorkspaceChangesDetailsRequest } from './workspace-changes.ts'
 import { ImageContentBody, type ContentRenderOptions } from './image-content.ts'
 import { imageMarkerLine } from './image-marker.ts'
 import { toolImageOccurrences } from './image-data.ts'
 import type { ImageDetailsRequest } from './image-view.ts'
 import { HitboxRegistry, hoverExitEvent, type MouseHitbox } from './mouse.ts'
 import { SubagentLinkHitboxes } from './subagent-link.ts'
+import { countCacheKeyBuild } from './render-counters.ts'
+import { toolExpansionRevision } from './tool-expansion.ts'
 import { bold, cc, dim, italic, markdownTheme, t } from './theme.ts'
 import { fit, oneLine, plural, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
-import { adoptThinkingExpansion, ThinkingBlock, type ThinkingRun, type ThinkingScreen } from './thinking-block.ts'
+import {
+  adoptThinkingExpansion,
+  isThinkingRunLive,
+  ThinkingBlock,
+  thinkingExpansionRevision,
+  type ThinkingRun,
+  type ThinkingScreen,
+} from './thinking-block.ts'
 import type { ToolGroupContext, ToolViewOptions } from './tool-view.ts'
 import { ToolBlock } from './tool-block.ts'
 import {
@@ -113,6 +123,24 @@ export interface TranscriptViewOptions extends ToolViewOptions {
    * catalog is already in memory, and no child Session is read for painting.
    */
   subagentEntries?: readonly SubagentEntry[]
+  /**
+   * Open the parent-owned per-file native diff surface for one live
+   * workspace-changes card. Without it the card still paints every native fact
+   * but owns no hitbox and advertises no dead click. The parent answers with the
+   * `workspace-change-diff` result; this UI never reads a file or runs git.
+   */
+  onWorkspaceChangesDetails?: (request: WorkspaceChangesDetailsRequest) => void
+  /** Optional display hint for a wide changed-files card (a real binding only). */
+  workspaceChangesDetailsHint?: string
+  /**
+   * Read-only disclosure projection (the historical detail surface).
+   *
+   * When true every block bypasses the module-level reasoning/tool/group
+   * expansion maps: nothing is read, written, cleared or transferred, every
+   * disclosure paints collapsed and every toggle/hint is inert. The live
+   * transcript's shared state is never affected by this view.
+   */
+  readonlyDisclosure?: boolean
 }
 
 /** Cache key for the display-only hint labels. */
@@ -188,6 +216,14 @@ export interface ItemBlock extends Component {
   readonly itemId: string
   readonly kind: TranscriptItem['kind']
   readonly version: number
+  /**
+   * Monotone generation of this block's painted frame.
+   *
+   * A group reuses its composed frame while its members' generations are
+   * unchanged, so a child hover/expansion/update cannot be masked by the
+   * group's own fast path.
+   */
+  readonly paintRevision?: number
   update(item: TranscriptItem): void
   /** Cancel frame-local pointer state when this item leaves the view. */
   clearMouse?(): void
@@ -205,6 +241,7 @@ export function createItemBlock(item: TranscriptItem, options: TranscriptViewOpt
     case 'todos': return new TodosBlock(item, options)
     case 'subagent': return new SubagentBlock(item, options)
     case 'subagent-message': return new SubagentMessageBlock(item, options)
+    case 'workspace-changes': return new WorkspaceChangesBlock(item, options)
   }
 }
 
@@ -307,12 +344,25 @@ function thinkingSectionLines(
 }
 
 /** Options handed to a per-item {@link ThinkingBlock}. */
-function thinkingBlockOptions(item: TranscriptItem, flags: TranscriptViewOptions): ConstructorParameters<typeof ThinkingBlock>[0] {
+function thinkingBlockOptions(
+  item: TranscriptItem,
+  flags: TranscriptViewOptions,
+  /** Owner hook: reasoning hover/expansion changes the owner's cache key too. */
+  onLocalRepaint: () => void = () => {},
+): ConstructorParameters<typeof ThinkingBlock>[0] {
   return {
     itemId: item.id,
-    ...(flags.onRenderRequest === undefined ? {} : { onRenderRequest: flags.onRenderRequest }),
+    // The reasoning block asks for a repaint on hover and on disclosure; both
+    // change the owner's cache key without a new item version, so the owner's
+    // cached lines must be dropped before the parent's frame is requested.
+    onRenderRequest: () => {
+      onLocalRepaint()
+      flags.onRenderRequest?.()
+    },
     ...(flags.now === undefined ? {} : { now: flags.now }),
     ...(flags.onViewportAnchor === undefined ? {} : { onViewportAnchor: flags.onViewportAnchor }),
+    // Read-only detail projections never read or mutate the shared map.
+    ...(flags.readonlyDisclosure === true ? { readonly: true } : {}),
   }
 }
 
@@ -330,8 +380,16 @@ abstract class CachedBlock implements ItemBlock {
   readonly itemId: string
   readonly kind: TranscriptItem['kind']
   version = 0
+  /** See {@link ItemBlock.paintRevision}; bumped by every invalidation. */
+  paintRevision = 0
   protected readonly flags: TranscriptViewOptions
-  private cache: { width: number; key: string; lines: string[] } | undefined
+  private cache: {
+    width: number
+    key: string
+    lines: string[]
+    /** Disclosure generations this frame was composed from. */
+    expansions: { readonly tools: number; readonly thinking: number }
+  } | undefined
 
   constructor(id: string, kind: TranscriptItem['kind'], version: number, flags: TranscriptViewOptions) {
     this.itemId = id
@@ -353,21 +411,69 @@ abstract class CachedBlock implements ItemBlock {
     return ''
   }
 
+  /**
+   * Can a key input change between two paints without an `invalidate()`?
+   *
+   * Only a clock does that: a live duration or an in-progress reasoning run is
+   * rendered text, and the parent's paid render is what advances it. Everything
+   * else — content, preferences, cwd, hover, disclosure — reaches the cache
+   * through {@link update}, {@link invalidate} or a new width. Blocks that answer
+   * `true` always compose a key; every other block reuses its exact cached lines
+   * array when the width matches (see {@link render}).
+   */
+  protected clocked(): boolean {
+    return false
+  }
+
   /** Re-declare this frame's mouse hitboxes after `render`. */
   protected syncMouse(): void {}
 
+  /**
+   * Drop the composed lines of this block and of every renderer it owns.
+   *
+   * A `Markdown` instance memoizes its own `(text, width)` lines, so a block
+   * whose output depends on a theme-level renderer (the lazy highlight grammar)
+   * must forward the invalidation instead of only forgetting its own array.
+   */
   invalidate(): void {
+    this.paintRevision += 1
     this.cache = undefined
+    this.invalidateOwned()
+  }
+
+  /** Registered renderers of this block (Markdown bodies) drop their caches. */
+  protected invalidateOwned(): void {}
+
+  /**
+   * Can this block answer "nothing changed" from its own cache?
+   *
+   * `width` and the two module-level disclosure generations are the only key
+   * inputs that can move without a content version or an `invalidate()`: hover,
+   * cwd, preferences, the child catalog and item content all invalidate, and a
+   * clocked block never takes this path at all.
+   */
+  private reusable(safeWidth: number, tools: number, thinking: number): boolean {
+    const cache = this.cache
+    return this.clocked() === false
+      && cache !== undefined
+      && cache.width === safeWidth
+      && cache.expansions.tools === tools
+      && cache.expansions.thinking === thinking
   }
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, Math.floor(width))
+    const expansions = { tools: toolExpansionRevision(), thinking: thinkingExpansionRevision() }
+    // Fast path: no key input can have changed since this paint, so the exact
+    // lines array (and therefore every hitbox row and row span) is still valid.
+    if (this.reusable(safeWidth, expansions.tools, expansions.thinking)) return this.cache!.lines
+    countCacheKeyBuild()
     const key = `${this.version}|${this.viewKey()}`
     if (this.cache !== undefined && this.cache.width === safeWidth && this.cache.key === key) {
       return this.cache.lines
     }
     const lines = this.build(safeWidth).map(line => fit(line, safeWidth))
-    this.cache = { width: safeWidth, key, lines }
+    this.cache = { width: safeWidth, key, lines, expansions }
     this.syncMouse()
     return lines
   }
@@ -404,6 +510,10 @@ class UserBlock extends CachedBlock {
     else this.registry.sync(this.pendingBoxes)
   }
 
+  protected invalidateOwned(): void {
+    this.body.invalidate()
+  }
+
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     return this.registry.handleMouse(event)
   }
@@ -418,6 +528,9 @@ class UserBlock extends CachedBlock {
     const next = entering ? key : this.hovered === key ? undefined : this.hovered
     if (next === this.hovered) return
     this.hovered = next
+    // Hover is a cache-key input but not a content version: the fast path must be
+    // dropped explicitly or the hint would keep painting from the previous paint.
+    this.invalidate()
     this.flags.onRenderRequest?.()
   }
 
@@ -455,10 +568,11 @@ class AssistantBlock extends CachedBlock {
 
   constructor(item: AssistantTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
-    this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags))
+    this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags, () => { this.invalidate() }))
     // The durable item keeps its native id; only disclosure/render identity is
-    // inherited from the live attempt it replaced.
-    adoptThinkingExpansion(item.thinkingKey, item.id)
+    // inherited from the live attempt it replaced. A read-only projection never
+    // transfers (that is a mutation of the live view's shared state).
+    if (flags.readonlyDisclosure !== true) adoptThinkingExpansion(item.thinkingKey, item.id)
     this.assign(item)
   }
 
@@ -474,6 +588,18 @@ class AssistantBlock extends CachedBlock {
 
   protected viewKey(): string {
     return `${this.flags.showThinking ? 'think' : 'plain'}|${hintsKey(this.flags.hints)}|${this.flags.thinkingPreviewLines ?? 3}|${this.flags.screen ?? 'inline'}|${thinkingKey(this.thinkingBlock, this.runs, this.flags)}|${imageKey(this.flags, this.hovered)}`
+  }
+
+  /**
+   * A live reasoning run prints its own elapsed time, which no version bump
+   * announces: those paints keep composing a key so the clock keeps advancing.
+   */
+  protected clocked(): boolean {
+    return this.runs.some(isThinkingRunLive)
+  }
+
+  protected invalidateOwned(): void {
+    this.body.invalidate()
   }
 
   protected syncMouse(): void {
@@ -513,6 +639,9 @@ class AssistantBlock extends CachedBlock {
     const next = entering ? key : this.hovered === key ? undefined : this.hovered
     if (next === this.hovered) return
     this.hovered = next
+    // Hover is a cache-key input but not a content version: the fast path must be
+    // dropped explicitly or the marker hint would keep painting the old state.
+    this.invalidate()
     this.flags.onRenderRequest?.()
   }
 
@@ -555,8 +684,8 @@ class AttemptBlock extends CachedBlock {
 
   constructor(item: AttemptTranscriptItem, flags: TranscriptViewOptions) {
     super(item.id, item.kind, item.version, flags)
-    this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags))
-    adoptThinkingExpansion(item.thinkingKey, item.id)
+    this.thinkingBlock = new ThinkingBlock(thinkingBlockOptions(item, flags, () => { this.invalidate() }))
+    if (flags.readonlyDisclosure !== true) adoptThinkingExpansion(item.thinkingKey, item.id)
     this.assign(item)
   }
 
@@ -574,6 +703,16 @@ class AttemptBlock extends CachedBlock {
 
   protected viewKey(): string {
     return `${this.flags.expandTools ? 'expand' : 'fold'}|${this.flags.showThinking ? 'think' : 'plain'}|${hintsKey(this.flags.hints)}|${this.flags.thinkingPreviewLines ?? 3}|${this.flags.screen ?? 'inline'}|${thinkingKey(this.thinkingBlock, this.runs, this.flags)}|${imageKey(this.flags, this.hovered)}`
+  }
+
+  /** A live reasoning run keeps printing its own elapsed text (see AssistantBlock). */
+  protected clocked(): boolean {
+    return this.runs.some(isThinkingRunLive)
+  }
+
+  protected invalidateOwned(): void {
+    this.body.invalidate()
+    this.plainBody.invalidate()
   }
 
   protected syncMouse(): void {
@@ -613,6 +752,7 @@ class AttemptBlock extends CachedBlock {
     const next = entering ? key : this.hovered === key ? undefined : this.hovered
     if (next === this.hovered) return
     this.hovered = next
+    this.invalidate()
     this.flags.onRenderRequest?.()
   }
 
@@ -829,7 +969,9 @@ class SubagentBlock extends CachedBlock {
       endCol: link.endCol,
       claimPress: true,
       onClick: () => handler(sessionId),
-      onHover: () => { this.flags.onRenderRequest?.() },
+      // The link name changes color on hover: a cache-key input, so the fast
+      // path must be dropped before the parent repaints.
+      onHover: () => { this.invalidate(); this.flags.onRenderRequest?.() },
     }])
   }
 
@@ -949,7 +1091,9 @@ class SubagentMessageBlock extends CachedBlock {
       endCol: link.endCol,
       claimPress: true,
       onClick: () => handler(sessionId),
-      onHover: () => { this.flags.onRenderRequest?.() },
+      // The link name changes color on hover: a cache-key input, so the fast
+      // path must be dropped before the parent repaints.
+      onHover: () => { this.invalidate(); this.flags.onRenderRequest?.() },
     }])
   }
 

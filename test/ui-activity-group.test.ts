@@ -18,12 +18,15 @@ import {
   type ActivityMemberItem,
 } from '../src/ui/activity-group.ts'
 import { createItemBlock, type TranscriptViewOptions } from '../src/ui/blocks.ts'
+import { cacheKeyBuilds, resetCacheKeyBuilds } from '../src/ui/render-counters.ts'
 import { planSubagentGroupNodes } from '../src/ui/subagent-group.ts'
+import { t } from '../src/ui/theme.ts'
 import {
   clearToolExpansion,
   isToolExpanded,
   setToolExpanded,
   toolExpansionKey,
+  toolExpansionRevision,
   toolGroupExpansionKey,
 } from '../src/ui/tool-expansion.ts'
 import { planTranscriptNodes } from '../src/ui/tool-group.ts'
@@ -794,4 +797,184 @@ test('a hidden live todo still breaks the run, and the mixed group adds no timer
   assert.ok(!lines.some(line => line.includes('Activities:')), lines.join('\n'))
   assert.ok(lines.some(line => line.includes('Subtask status updated')), lines.join('\n'))
   assert.equal(hidden.liveTimerRunning, false, 'no display timer is armed by the group')
+})
+// ---------------------------------------------------------------------------
+// R9: the group header hover is a paint input of the fast path
+
+/**
+ * A standalone mixed group over the real cached member blocks, plus the count of
+ * repaints it asked its host for. `readOnly` marks the projection with the R4
+ * marker (`readonlyDisclosure`), which the shared options type declares via the
+ * native history owner and this module reads structurally.
+ */
+function standaloneActivity(options: {
+  readOnly?: boolean
+  flags?: Partial<ViewOptionsShape>
+} = {}): { readonly group: ActivityGroupBlock; readonly members: readonly ActivityGroupMember[]; readonly requested: () => number } {
+  let requests = 0
+  const flags = viewOptions({ onRenderRequest: () => { requests += 1 }, ...options.flags }) as TranscriptViewOptions
+  const projection = options.readOnly === true ? readonlyProjection(flags) : flags
+  const records: ActivityMemberItem[] = [
+    toolItem('call-1', 'list_agents', 'done', { resultText: 'child-1 running\nchild-2 idle\nchild-3 completed' }),
+    noticeItem(4),
+  ]
+  const members: ActivityGroupMember[] = records.map(item => ({ item, block: createItemBlock(item, projection) }))
+  const group = new ActivityGroupBlock(records[0]!, projection)
+  group.setMembers(members)
+  return { group, members, requested: () => requests }
+}
+
+/** Mark one projection read-only (R4 marker added to `TranscriptViewOptions`). */
+function readonlyProjection(flags: TranscriptViewOptions): TranscriptViewOptions {
+  return { ...flags, readonlyDisclosure: true }
+}
+
+const HINT = ' · ctrl+o to expand'
+
+test('R9: hovering the group header paints the accent hint instead of a stale frame', () => {
+  reset()
+  const { group, requested } = standaloneActivity()
+  const width = 100
+  resetCacheKeyBuilds()
+  const rest = group.render(width)
+  assert.equal(cacheKeyBuilds(), 1, 'the first paint composes exactly one key')
+  assert.ok(rest[0]!.includes(t.muted(HINT)), 'the resting hint is neutral')
+
+  // Stable, hover-free repaint: still the fast path, no key, no repaint request.
+  assert.equal(group.render(width), rest, 'a hover-free repeat reuses the exact frame')
+  assert.equal(cacheKeyBuilds(), 1, 'a hover-free repeat composes no key')
+  assert.equal(requested(), 0, 'a hover-free repeat asks for no repaint')
+
+  // Enter: one real transition, one composed key, one requested paint.
+  assert.equal(group.handleMouse(mouse('move', 2, 0)), undefined, 'motion is never claimed')
+  assert.equal(requested(), 1, 'entering asks for exactly one repaint')
+  const hovered = group.render(width)
+  assert.equal(cacheKeyBuilds(), 2, 'the enter transition composes exactly one new key')
+  assert.ok(hovered[0]!.includes(t.accent(HINT)), 'the hint is painted in the hover accent')
+  assert.notEqual(hovered[0], rest[0], 'the header really changes')
+  assert.equal(plain(hovered)[0], plain(rest)[0], 'only the styling changes, never the text')
+  assert.deepEqual(hovered.slice(1), rest.slice(1), 'no member row is repainted by header hover')
+
+  // The fast-path answer must be the forced-rebuild answer, byte for byte.
+  group.invalidate()
+  assert.equal(group.render(width)[0], hovered[0], 'the fast-path header equals a forced rebuild')
+
+  // A stationary pointer is not a transition: the frame is reused again.
+  const settled = group.render(width)
+  const builds = cacheKeyBuilds()
+  assert.equal(group.handleMouse(mouse('move', 3, 0)), undefined)
+  assert.equal(group.render(width), settled, 'staying on the header reuses the frame')
+  assert.equal(cacheKeyBuilds(), builds, 'staying on the header composes no key')
+  assert.equal(requested(), 1, 'staying on the header is not a transition')
+
+  // Leave for a member row: the neutral frame comes back, byte for byte.
+  group.handleMouse(mouse('move', 2, 2))
+  assert.equal(requested(), 2, 'leaving asks for exactly one repaint')
+  const left = group.render(width)
+  assert.deepEqual(left, rest, 'the accent does not stick after the pointer leaves')
+  assert.equal(cacheKeyBuilds(), builds + 1, 'the exit transition composes exactly one key')
+  group.dispose()
+})
+
+test('R9: a frame rebuilt while the header is hovered is dropped again on leave', () => {
+  reset()
+  const { group, members } = standaloneActivity()
+  const width = 100
+  const rest = group.render(width)
+  group.handleMouse(mouse('move', 2, 0))
+  assert.ok(group.render(width)[0]!.includes(t.accent(HINT)), 'the hover is painted')
+
+  // A live member update is the realistic "other invalidation": it composes a
+  // fresh frame *while* the pointer is still on the header.
+  group.setMembers(members.map(member => ({ ...member, item: { ...member.item, version: member.item.version + 1 } })))
+  const rebuilt = group.render(width)
+  assert.ok(rebuilt[0]!.includes(t.accent(HINT)), 'the rebuilt frame still paints the hover')
+
+  // Leaving must invalidate that newer frame too, not only the first one.
+  group.handleMouse(mouse('move', 2, 3))
+  const left = group.render(width)
+  assert.ok(!left[0]!.includes(t.accent(HINT)), 'the accent is gone after leaving')
+  assert.equal(plain(left)[0], plain(rest)[0], 'the neutral header is painted, not a stuck accent')
+
+  // A member repaint (its own cache drops its key) must not resurrect it either.
+  group.handleMouse(mouse('move', 2, 0))
+  group.render(width)
+  group.handleMouse(mouse('move', 2, 3))
+  for (const member of members) member.block.invalidate()
+  assert.deepEqual(group.render(width), left, 'a member repaint after leave paints the neutral header')
+  group.dispose()
+})
+
+test('R9: a header press stays pinned across the hover invalidation', () => {
+  reset()
+  const { group } = standaloneActivity()
+  const width = 100
+  group.render(width)
+  assert.equal(group.handleMouse(mouse('press', 2, 0))?.handled, true, 'the header claims the press')
+  // The pointer moves away (dropping the hover frame) and comes back before the
+  // release: the pinned press must still reach the region that was pressed.
+  group.handleMouse(mouse('move', 2, 1))
+  group.render(width)
+  group.handleMouse(mouse('move', 2, 0))
+  group.render(width)
+  assert.equal(group.handleMouse(mouse('click', 2, 0))?.handled, true, 'the synthesized click lands')
+  assert.equal(group.expanded, true, 'the pinned press still toggled its own header')
+  assert.ok(text(group.render(width)).includes(SETTLEMENT_DETAIL), 'the real member paint is shown')
+  reset()
+  group.dispose()
+})
+
+test('R4: a read-only mixed group never reads or writes the live disclosure map', () => {
+  reset()
+  const key = toolGroupExpansionKey('tool:call-1')
+  setToolExpanded(key, true)
+  const live = standaloneActivity()
+  assert.equal(live.group.expanded, true, 'the live transcript is expanded')
+
+  // Same anchor, same store facts: the read-only projection is still collapsed
+  // and reads nothing from the live override.
+  const readOnly = standaloneActivity({ readOnly: true })
+  assert.equal(readOnly.group.expanded, false, 'the read-only group defaults to collapsed')
+  assert.equal(isToolExpanded(key), true, 'reading the read-only frame left the live override alone')
+
+  // No request may reach the shared map, and no revision may move.
+  const revision = toolExpansionRevision()
+  readOnly.group.toggle()
+  assert.equal(toolExpansionRevision(), revision, 'toggle() is a no-op in a read-only projection')
+  assert.equal(isToolExpanded(key), true, 'the live override survived the read-only toggle')
+
+  const width = 100
+  const lines = readOnly.group.render(width)
+  assert.equal(readOnly.group.expanded, false, 'still collapsed after painting')
+  assert.equal(lines.length, 1 + readOnly.members.length, 'only the collapsed frame is painted')
+  assert.ok(!plain(lines)[0]!.includes('ctrl+o to expand'), 'no shortcut is advertised that cannot run')
+  assert.ok(!readOnly.group.hitboxes.some(box => box.id.endsWith('#header')), 'the header is not a control')
+  assert.equal(readOnly.group.handleMouse(mouse('move', 2, 0)), undefined)
+  assert.equal(readOnly.group.hoverSlot, undefined, 'the read-only header owns no hover target')
+  assert.equal(readOnly.group.handleMouse(mouse('press', 2, 0)), undefined, 'the read-only header claims no press')
+  assert.equal(readOnly.group.handleMouse(mouse('click', 2, 0)), undefined)
+  assert.equal(toolExpansionRevision(), revision, 'no click path mutated the shared map')
+  assert.equal(isToolExpanded(key), true, 'the live override is still exactly as it was')
+
+  // The live projection is unaffected by anything the read-only view painted.
+  assert.equal(new ActivityGroupBlock(live.group.memberItems[0]!, viewOptions() as TranscriptViewOptions).expanded, true)
+  assert.ok(text(live.group.render(width)).includes(SETTLEMENT_DETAIL), 'the live group is still open')
+  live.group.dispose()
+  readOnly.group.dispose()
+
+  // Defaults are unchanged: a plain group with no override stays collapsed.
+  reset()
+  const defaultGroup = standaloneActivity()
+  assert.equal(defaultGroup.group.expanded, false, 'the default disclosure is still collapsed')
+
+  // ...and a read-only toggle over an *empty* map must not create an override
+  // either (the shared helper would otherwise write one).
+  const emptyRevision = toolExpansionRevision()
+  const emptyReadOnly = standaloneActivity({ readOnly: true })
+  emptyReadOnly.group.render(width)
+  emptyReadOnly.group.toggle()
+  assert.equal(isToolExpanded(key, false), false, 'no override was created')
+  assert.equal(toolExpansionRevision(), emptyRevision, 'the shared generation did not move')
+  emptyReadOnly.group.dispose()
+  defaultGroup.group.dispose()
 })

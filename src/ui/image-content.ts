@@ -12,12 +12,12 @@
  * re-lexed when another part changes. Image bytes are never touched here, and a
  * file block is never treated as an image or fetched.
  */
-import { Markdown } from '#pi-tui'
 import type { DisplayContentPart, FileAttachmentRef, ImageAttachmentRef } from '../backend/types.ts'
 import type { TranscriptItem } from '../state/transcript.ts'
 import { itemContentParts, legacyImagePlaceholders, imageOccurrenceKey } from './image-data.ts'
 import { fileMarkerLine } from './file-marker.ts'
 import { imageMarkerLine, type ImageMarkerSpec } from './image-marker.ts'
+import { StreamingMarkdown } from './markdown-stream.ts'
 import { markdownTheme } from './theme.ts'
 import { wrap } from './text.ts'
 
@@ -126,8 +126,15 @@ function buildRuns(item: TranscriptItem): Run[] {
 
 export class ImageContentBody {
   private readonly mode: TextMode
-  private readonly markdowns: Markdown[] = []
-  private readonly markdownText: string[] = []
+  /**
+   * One streaming renderer per text-run slot (markdown mode only).
+   *
+   * A `Markdown` instance re-lexes the whole source after every `setText`, so a
+   * streaming body would pay the full message on every frame. `StreamingMarkdown`
+   * keeps a sealed prefix (its rows held strongly) and re-renders only the tail;
+   * the rows it returns are byte-identical to a whole-text render.
+   */
+  private readonly streams: StreamingMarkdown[] = []
   private runs: Run[] = []
   private itemId = ''
   private signature = ''
@@ -148,6 +155,24 @@ export class ImageContentBody {
   /** True when the item has at least one image/file occurrence (or placeholder). */
   get hasAttachments(): boolean {
     return this.runs.some(run => run.kind !== 'text')
+  }
+
+  /**
+   * Drop every derived row of this body: the tail renderer's lines **and** the
+   * sealed prefix rows plus their renderer.
+   *
+   * A `Markdown` instance memoizes its rendered lines by `(text, width)`, which
+   * is a *different* cache from the owning block's, and the sealed prefix rows
+   * are held strongly so a repaint never re-lexes them. Both must go when a
+   * theme-level renderer changes behind the body's back — above all the lazily
+   * loaded highlight grammar, whose `ready` edge would otherwise leave plain
+   * (pre-grammar) rows in a sealed prefix forever.
+   *
+   * The authored text is kept; only derived state is released, so the next paint
+   * is one whole render and re-seals as the message continues.
+   */
+  invalidate(): void {
+    for (const stream of this.streams) stream.invalidate()
   }
 
   render(width: number, options: ContentRenderOptions): ContentBodyResult {
@@ -205,16 +230,19 @@ export class ImageContentBody {
   }
 
   private renderText(text: string, width: number, slot: number): string[] {
+    // Plain human-turn bodies keep their `wrap()` path: no Markdown, no lexing,
+    // no streaming state.
     if (this.mode === 'plain') return wrap(text, width)
-    let markdown = this.markdowns[slot]
-    if (markdown === undefined) {
-      markdown = new Markdown('', 0, 0, markdownTheme)
-      this.markdowns[slot] = markdown
+    let stream = this.streams[slot]
+    if (stream === undefined) {
+      stream = new StreamingMarkdown(markdownTheme)
+      this.streams[slot] = stream
     }
-    if (this.markdownText[slot] !== text) {
-      markdown.setText(text)
-      this.markdownText[slot] = text
-    }
-    return markdown.render(width)
+    return stream.render(text, width)
+  }
+
+  /** Diagnostics/tests: the streaming renderer of one text slot. */
+  streamAt(slot: number): StreamingMarkdown | undefined {
+    return this.streams[slot]
   }
 }

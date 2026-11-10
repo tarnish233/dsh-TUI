@@ -335,11 +335,17 @@ test('the render cache key includes settings, hover and live duration', () => {
   assert.notDeepEqual(second, first, 'live shell duration advances the frame')
 
   const settle = tool({ name: 'bash', arguments: '{"command":"x"}', resultText: lines(20, 'ok'), durationMs: 5 })
-  const configured = new ToolBlock(settle, flags({ expandTools: true, expandedOutputMaxLines: 1 }))
-  const narrow = plain(configured)
-  ;(configured as unknown as { flags: TranscriptViewOptions }).flags.expandedOutputMaxLines = 10
-  const wide = plain(configured)
+  const narrowBlock = new ToolBlock(settle, flags({ expandTools: true, expandedOutputMaxLines: 1 }))
+  const narrow = plain(narrowBlock)
+  const wideBlock = new ToolBlock(settle, flags({ expandTools: true, expandedOutputMaxLines: 10 }))
+  const wide = plain(wideBlock)
   assert.notDeepEqual(wide, narrow, 'expandedOutputMaxLines participates in the cache key')
+  // The same instance repaints when the preference changes: the owner detects the
+  // option change and invalidates (see `TranscriptView`), and the repaint matches
+  // a card built with the new preference instead of serving the old frame.
+  ;(narrowBlock as unknown as { flags: TranscriptViewOptions }).flags.expandedOutputMaxLines = 10
+  narrowBlock.invalidate()
+  assert.deepEqual(plain(narrowBlock), wide, 'a preference change repaints the live card')
 
   const hovered = new ToolBlock(settle, flags({ hints: { expand: 'ctrl+o' } }))
   const before = hovered.render(80)
