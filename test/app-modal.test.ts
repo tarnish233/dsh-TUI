@@ -165,8 +165,12 @@ for (const screen of ['inline', 'fullscreen'] as const) {
     try {
       const permission = f.app.session?.permissions?.currentValue
       await f.app.submit('/settings'); await category(f.terminal, 5)
-      // DSH rows are now part of the one continuous list, not local tab indexes.
-      for (let index = 0; index < 3; index++) f.terminal.type('\x1b[B')
+      // Native preferences may add rows; navigate by the stable permission ID,
+      // not a guessed offset from the DSH section's first row.
+      const dialog = focusedSettings(f.app), target = 'native:native.permission'
+      assert.ok(dialog.rows().some(row => row.id === target), 'the native permission entry is present')
+      for (let index = 0; index < dialog.rows().length && dialog.activeRowId !== target; index++) f.terminal.type('\x1b[B')
+      assert.equal(dialog.activeRowId, target)
       f.terminal.type('\r'); await paint(f.terminal)
       assert.equal(header(f.terminal, 'Native permission preset'), true)
       f.terminal.type('\r'); await paint(f.terminal)
@@ -179,6 +183,32 @@ for (const screen of ['inline', 'fullscreen'] as const) {
     } finally { await f.close() }
   })
 }
+
+test('a decision replacing a Settings child never resurrects Settings later', async () => {
+  const f = await fixture('fullscreen')
+  try {
+    await f.app.submit('/settings'); await paint(f.terminal)
+    await category(f.terminal, 5)
+    const dialog = focusedSettings(f.app), target = 'native:native.permission'
+    for (let index = 0; index < dialog.rows().length && dialog.activeRowId !== target; index++) f.terminal.type('\x1b[B')
+    assert.equal(dialog.activeRowId, target)
+    f.terminal.type('\r'); await paint(f.terminal)
+    assert.equal(header(f.terminal, 'Native permission preset'), true)
+
+    // A native decision takes over the Settings child while its return state
+    // exists; clearing the draft or opening Help later must not restore Settings.
+    const sending = f.app.submit('approval')
+    await until(() => header(f.terminal, 'Demo approval'), 'the demo decision replaces the Settings child')
+    f.terminal.type('\r'); await paint(f.terminal)
+    await sending
+    await until(() => !header(f.terminal, 'Demo approval'), 'the decision settles')
+
+    await f.app.submit('/help'); await paint(f.terminal)
+    assert.equal(header(f.terminal, 'Help'), true)
+    f.terminal.type('\x1b'); await paint(f.terminal)
+    assert.equal(header(f.terminal, 'Settings'), false, 'a stale Settings return state must not reopen it')
+  } finally { await f.close() }
+})
 
 test('actual fullscreen close chip dismisses Settings without rewriting the root draft', async () => {
   const f = await fixture('fullscreen')

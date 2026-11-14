@@ -454,7 +454,9 @@ ccKillToLineEnd() {
 }
 
 ccKillWord(direction, mode = "word") {
-    this.exitHistoryBrowsing();
+    // A no-op kill (nothing left of the cursor, col 0 of the first line) must
+    // not leave history browsing: the recalled entry and the pre-browsing
+    // draft stay reachable (Esc restores it). Only a real deletion is an edit.
     const currentLine = this.state.lines[this.state.cursorLine] || "";
     const wasKill = this.lastAction === "kill";
     const backward = direction < 0;
@@ -513,10 +515,12 @@ ccKillWord(direction, mode = "word") {
             currentLine.slice(0, this.state.cursorCol) + currentLine.slice(target);
         changed = true;
     }
-    if (changed && this.onChange) {
+    if (!changed) return false;
+    this.exitHistoryBrowsing();
+    if (this.onChange) {
         this.onChange(this.getText());
     }
-    return changed;
+    return true;
 }
 
 // --- yank / undo --------------------------------------------------------
@@ -559,10 +563,6 @@ ccHistoryNext() {
 
 ccIsBrowsingHistory() {
     return this.historyIndex > -1;
-}
-
-ccExitHistoryBrowsing() {
-    this.exitHistoryBrowsing();
 }
 
 ccGetHistory() {
@@ -612,10 +612,6 @@ ccSubmit() {
 
 ccShouldSubmitOnBackslashEnter(data) {
     return this.shouldSubmitOnBackslashEnter(data, getKeybindings());
-}
-
-ccDropUndoSnapshot() {
-    this.undoStack.pop();
 }
 
 /**
@@ -826,9 +822,69 @@ function copySeamMethods(target, source) {
   }
 }
 
+/**
+ * Keep history browsing across a no-op deletion.
+ *
+ * Pi's vendored deletion helpers call `exitHistoryBrowsing()` before checking
+ * whether there is anything to delete. A no-op Backspace/Delete/Ctrl+U/Ctrl+K
+ * must not discard the recalled entry or the pre-browsing draft; only a real
+ * edit ends browsing. These wrappers are the smallest seam because the vendored
+ * source remains untouched.
+ */
+function preserveHistoryOnNoop(name, isNoop) {
+  const original = Editor.prototype[name]
+  Object.defineProperty(Editor.prototype, name, {
+    configurable: true,
+    writable: true,
+    value: function (...args) {
+      if (this.ccIsBrowsingHistory && this.ccIsBrowsingHistory() && isNoop(this)) return
+      return Reflect.apply(original, this, args)
+    },
+  })
+}
+
+/**
+ * Deletion methods whose no-op must not end history browsing.
+ *
+ * `handleBackspace`/`handleForwardDelete` are the keys, `deleteToStartOfLine`
+ * is Ctrl+U and `deleteToEndOfLine` is Ctrl+K.
+ */
+const HISTORY_NOOP_WRAPPERS = [
+  ["handleBackspace", editor => editor.state.cursorLine === 0 && editor.state.cursorCol === 0],
+  ["deleteToStartOfLine", editor => editor.state.cursorLine === 0 && editor.state.cursorCol === 0],
+  [
+    "handleForwardDelete",
+    editor => {
+      const line = editor.state.lines[editor.state.cursorLine] || ""
+      return editor.state.cursorLine === editor.state.lines.length - 1 && editor.state.cursorCol >= line.length
+    },
+  ],
+  [
+    "deleteToEndOfLine",
+    editor => {
+      const line = editor.state.lines[editor.state.cursorLine] || ""
+      return editor.state.cursorLine === editor.state.lines.length - 1 && editor.state.cursorCol >= line.length
+    },
+  ],
+]
+
 export function installPiTuiSeam() {
   if (installed) return
-  installed = true
   copySeamMethods(Editor.prototype, EditorSeam)
   copySeamMethods(SelectList.prototype, SelectListSeam)
+  // Install-time assertion, not a log line: silently skipping a wrapper would
+  // quietly lose a documented rule (history browsing would end on a no-op
+  // Ctrl+K/Backspace/Delete), so a vendored refresh that renames one of these
+  // methods fails loudly here instead.
+  const missing = HISTORY_NOOP_WRAPPERS.map(([name]) => name).filter(
+    (name) => typeof Editor.prototype[name] !== "function",
+  )
+  if (missing.length > 0) {
+    throw new Error(
+      `pi-tui seam: Editor no longer exposes ${missing.join(", ")}; ` +
+        "the history-preserving no-op wrapper cannot be installed (see src/input/pi-tui-seam.js).",
+    )
+  }
+  installed = true
+  for (const [name, isNoop] of HISTORY_NOOP_WRAPPERS) preserveHistoryOnNoop(name, isNoop)
 }

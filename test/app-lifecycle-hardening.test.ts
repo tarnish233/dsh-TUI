@@ -13,17 +13,21 @@
  * 3. A second exit request escalates instead of joining a bounded native drain
  *    for seconds, and a suspend whose SIGTSTP is ignored rolls back instead of
  *    leaving the UI paused forever.
+ * 4. The pre-ready buffer replays only frames whose fact the ready snapshot
+ *    cannot carry, keeps a decision when the bound is hit, and reports the
+ *    overflow once instead of per frame.
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import { App } from '../src/app.ts'
-import type { Backend, BackendEvent, JsonRecord, SessionInfo } from '../src/backend/types.ts'
+import type { Backend, BackendEvent, DecisionRequest, JsonRecord, SessionInfo } from '../src/backend/types.ts'
 import { DEMO_TRANSCRIPT_CODEC } from '../src/demo.ts'
+import type { TranscriptItem } from '../src/state/transcript.ts'
 import { delay, until, VirtualTerminal } from './helpers/terminal.ts'
 
 /** Minimal native-shaped backend: only the event plane this suite drives. */
@@ -33,6 +37,8 @@ class LifecycleBackend implements Backend {
   readonly info: SessionInfo
   /** Resolved by `releaseClose`; lets a test hold `close()` open. */
   closeGate?: Promise<void>
+  /** Runs immediately before the ready frame, while App.info is still absent. */
+  beforeReady?: () => void
   private releaseClose?: () => void
   closed = 0
 
@@ -52,7 +58,7 @@ class LifecycleBackend implements Backend {
 
   onEvent(listener: (event: BackendEvent) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   emit(event: BackendEvent) { for (const listener of this.listeners) listener(event) }
-  async connect() { this.emit({ type: 'ready', info: this.info }); return this.info }
+  async connect() { this.beforeReady?.(); this.emit({ type: 'ready', info: this.info }); return this.info }
   async send() {}
   async respond() { throw new Error('the lifecycle fixture never answers decisions') }
   async cancel() {}
@@ -185,4 +191,140 @@ test('a suspend whose SIGTSTP is ignored rolls the UI back instead of pausing fo
     process.kill = realKill
     await close()
   }
+})
+
+test('a decision emitted before the first ready is buffered, not dropped', async () => {
+  const { app, backend, terminal, close } = await fixture({})
+  try {
+    const request: DecisionRequest = {
+      id: 'pre-ready-decision',
+      kind: 'approval',
+      title: 'Early approval',
+      options: [
+        { label: 'Allow once', value: 'allowed-once' },
+        { label: 'Reject', value: 'rejected' },
+      ],
+    }
+    backend.beforeReady = () => backend.emit({
+      type: 'decision',
+      sessionId: backend.info.sessionId,
+      request,
+    })
+    await app.start()
+    await paint(terminal)
+    assert.match(terminal.screen(), /Early approval/, 'the pre-ready native decision reaches the UI')
+  } finally { await close() }
+})
+
+test('connected keybinding reloads do not duplicate an unchanged diagnostic', async () => {
+  const { app, terminal, directory, close } = await fixture({})
+  try {
+    await writeFile(join(directory, 'keybindings.json'), JSON.stringify({ 'list.next': 'not-a-key' }))
+    await app.start()
+    await paint(terminal)
+    const internals = app as unknown as { reloadKeys(): boolean }
+    internals.reloadKeys()
+    internals.reloadKeys()
+    await paint(terminal)
+    assert.equal(terminal.screen().match(/Keybinding:/g)?.length ?? 0, 1,
+      'an unchanged keybinding document is not re-reported on every reload')
+  } finally { await close() }
+})
+
+test('startup keybinding diagnostics are replayed once, not duplicated', async () => {
+  const { app, terminal, directory, close } = await fixture({})
+  try {
+    await writeFile(join(directory, 'keybindings.json'), JSON.stringify({ 'list.next': 'not-a-key' }))
+    await app.start()
+    await paint(terminal)
+    const occurrences = terminal.screen().match(/Keybinding:/g)?.length ?? 0
+    assert.equal(occurrences, 1, 'one invalid binding produces one visible diagnostic')
+  } finally { await close() }
+})
+
+test('a malformed keybinding document is reported once across repeated reloads', async () => {
+  const { app, terminal, directory, close } = await fixture({})
+  try {
+    const file = join(directory, 'keybindings.json')
+    const internals = app as unknown as { reloadKeys(): boolean }
+    await writeFile(file, '{ INVALID JSON')
+    await app.start()
+    await paint(terminal)
+    assert.equal(terminal.screen().match(/Keybindings not applied/g)?.length ?? 0, 1, 'the broken document is reported once at startup')
+    // Every watcher tick over the same broken bytes parses the same error; the
+    // error text is part of the dedupe signature, so nothing is re-reported.
+    internals.reloadKeys()
+    internals.reloadKeys()
+    await paint(terminal)
+    assert.equal(terminal.screen().match(/Keybindings not applied/g)?.length ?? 0, 1, 'repeated reloads of one broken file stay quiet')
+    // A repaired document applies, and a later break is a new state that is
+    // worth reporting again.
+    await writeFile(file, JSON.stringify({ 'app.model.select': 'ctrl+x ctrl+m' }))
+    internals.reloadKeys()
+    assert.deepEqual(app.keymap.getBindings('app.model.select'), ['ctrl+x ctrl+m'])
+    await writeFile(file, 'not json at all')
+    internals.reloadKeys()
+    await paint(terminal)
+    assert.equal(terminal.screen().match(/Keybindings not applied/g)?.length ?? 0, 2, 'a newly broken file is reported again')
+  } finally { await close() }
+})
+
+test('pre-ready projections cannot overwrite the ready snapshot', async () => {
+  const { app, backend, terminal, close } = await fixture({})
+  try {
+    backend.info.permissions = { currentValue: 'workspace-write' }
+    backend.beforeReady = () => {
+      const sessionId = backend.info.sessionId
+      // Last-writer-wins facts the ready payload already answers newer.
+      backend.emit({ type: 'permissions', sessionId, value: { currentValue: 'stale-permission' } })
+      backend.emit({ type: 'model_route', sessionId, provider: 'stale-provider', model: 'stale-model' })
+      backend.emit({ type: 'title', sessionId, value: 'stale title' })
+      // Snapshot-only projections: the newest frame is the fact to keep.
+      backend.emit({ type: 'todos', sessionId, value: [{ content: 'stale todo', status: 'pending' }] })
+      backend.emit({ type: 'todos', sessionId, value: [{ content: 'newest todo', status: 'in_progress' }] })
+      backend.emit({ type: 'plan', sessionId, value: { active: true } })
+      backend.emit({ type: 'models_changed', sessionId })
+    }
+    await app.start()
+    await paint(terminal)
+    assert.equal(app.session?.permissions?.currentValue, 'workspace-write', 'the ready permission wins over a buffered one')
+    assert.equal(app.session?.model, 'fixture-model', 'the ready route wins over a buffered route')
+    assert.equal(app.session?.provider, 'fixture-provider')
+    assert.notEqual(app.session?.title, 'stale title', 'the ready title is not replaced by a buffered copy')
+    assert.doesNotMatch(terminal.screen(), /stale permission|stale-model|stale-provider|stale todo|stale title/)
+    assert.match(terminal.screen(), /newest todo/, 'the newest snapshot-only projection still replays')
+    assert.match(terminal.screen(), /Plan mode is active\./, 'a resumed plan state is still announced')
+  } finally { await close() }
+})
+
+test('a pre-ready decision survives a full buffer and the overflow is reported once', async () => {
+  const { app, backend, terminal, close } = await fixture({})
+  try {
+    const request: DecisionRequest = {
+      id: 'priority-decision',
+      kind: 'approval',
+      title: 'Buffered approval',
+      options: [
+        { label: 'Allow once', value: 'allowed-once' },
+        { label: 'Reject', value: 'rejected' },
+      ],
+    }
+    backend.beforeReady = () => {
+      const sessionId = backend.info.sessionId
+      for (let index = 0; index < 512; index++) backend.emit({ type: 'status', sessionId, status: 'idle' })
+      // A decision outranks the oldest buffered non-decision frame.
+      backend.emit({ type: 'decision', sessionId, request })
+      // The buffer is full again; these non-decision frames are dropped.
+      backend.emit({ type: 'status', sessionId, status: 'running' })
+      backend.emit({ type: 'status', sessionId, status: 'idle' })
+    }
+    await app.start()
+    await paint(terminal)
+    assert.match(terminal.screen(), /Buffered approval/, 'the decision is never the frame the bound discards')
+    const drops = app.store.items.filter((item): item is Extract<TranscriptItem, { kind: 'notice' }> =>
+      item.kind === 'notice' && item.text.startsWith('Dropped '))
+    assert.equal(drops.length, 1, 'one overflow summary per start, not one notice per dropped frame')
+    assert.match(drops[0]!.text, /^Dropped 2 startup events/)
+    assert.equal(app.isBusy, false, 'a dropped status frame never becomes the live busy state')
+  } finally { await close() }
 })

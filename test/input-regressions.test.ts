@@ -11,6 +11,10 @@
  *  I4 hand-typed marker text is never silently upgraded by a later insert
  *  I5 a held fragmented-paste prefix has a deadline and cannot eat the next key
  *  I6 `text` and `content` describe the same, once-trimmed draft
+ *  I7 a no-op kill is not an edit and keeps history browsing (and its draft);
+ *     the seam install asserts the wrappers it needs still exist
+ *  I8 a held paste prefix released at the deadline is delivered as ordinary keys
+ *     and its synthetic Escape is consumed by the input layer (never app.cancel)
  *
  * All tests are offline: no model, provider, credential, tty or network.
  */
@@ -298,8 +302,11 @@ test("I5: a held fragmented-paste prefix is released as keys so the next keystro
   assert.equal(editor.isPasting(), true, "held bytes are visible to the host's paste protection")
   await sleep(40)
   assert.equal(editor.isPasting(), false, "the deadline released the held prefix")
+  // Released as ordinary keys: the ESC is Escape, `[` is plain input, so no
+  // held byte is swallowed and the next keystroke is independent of the hold.
+  assert.equal(editor.getText(), "a[", "the held printable byte is delivered as input")
   editor.handleInput("b")
-  assert.equal(editor.getText(), "ab", "the keystroke after an expired hold types normally")
+  assert.equal(editor.getText(), "a[b", "the keystroke after an expired hold types normally")
 })
 
 test("I5: a real fragmented paste start still reassembles inside the deadline", async () => {
@@ -356,4 +363,215 @@ test("I6: a trimmed attachment draft keeps text and content in agreement", () =>
   assert.deepEqual(payload.content, [
     { type: "image", mediaType: "image/png", data: upload(1).data, name: "shot-1.png" },
   ])
+})
+
+// --- I7: a no-op kill keeps history browsing ---------------------------
+
+test("I7: a no-op Ctrl+W at column 0 keeps history browsing so Esc restores the draft", () => {
+  const { editor } = makeEditor()
+  const actions: string[] = []
+  editor.onAction = (event) => {
+    actions.push(event.id)
+  }
+  editor.addToHistory("recalled entry")
+  editor.setText("my draft")
+  renderAt(editor, 80)
+
+  press(editor, "\x10") // Up enters browsing with the cursor at the entry's end
+  assert.equal(editor.getText(), "recalled entry")
+  assert.equal(editor.ccIsBrowsingHistory(), true)
+
+  press(editor, "\x01") // Ctrl+A: column 0 of the first line, nothing to kill
+  assert.deepEqual(editor.getCursor(), { line: 0, col: 0 })
+  press(editor, "\x17") // Ctrl+W deletes nothing
+
+  assert.equal(editor.getText(), "recalled entry")
+  assert.equal(editor.ccIsBrowsingHistory(), true, "a kill with nothing to delete is not an edit")
+  assert.deepEqual(editor.ccGetKillRing(), [], "a no-op kill pushes nothing onto the kill ring")
+
+  press(editor, "\x1b") // Esc: the history layer restores the pre-browsing draft
+  assert.equal(editor.getText(), "my draft")
+  assert.equal(editor.ccIsBrowsingHistory(), false)
+  assert.deepEqual(actions, [], "Esc was consumed by history restore, not app.cancel")
+})
+
+test("I7: no-op Ctrl+U, Backspace and Delete keep history browsing", () => {
+  for (const [label, prepare, key] of [
+    ["Ctrl+U", (editor: TestEditor) => press(editor, "\x01"), "\x15"],
+    ["Backspace", (editor: TestEditor) => press(editor, "\x01"), "\x7f"],
+    ["Delete", (_editor: TestEditor) => {}, "\x1b[3~"],
+  ] as const) {
+    const { editor } = makeEditor()
+    editor.addToHistory("recalled entry")
+    editor.setText("my draft")
+    renderAt(editor, 80)
+    press(editor, "\x10")
+    assert.equal(editor.ccIsBrowsingHistory(), true, label)
+    prepare(editor)
+    press(editor, key)
+    assert.equal(editor.getText(), "recalled entry", `${label} is a no-op`)
+    assert.equal(editor.ccIsBrowsingHistory(), true, `${label} must not end browsing`)
+    press(editor, "\x1b")
+    assert.equal(editor.getText(), "my draft", `${label}: Esc restores the draft`)
+  }
+})
+
+test("I7: a no-op Ctrl+K at the end of the draft keeps history browsing", () => {
+  const { editor } = makeEditor()
+  editor.addToHistory("recalled entry")
+  editor.setText("my draft")
+  renderAt(editor, 80)
+
+  press(editor, "\x10")
+  assert.equal(editor.getText(), "recalled entry")
+  assert.equal(editor.ccIsBrowsingHistory(), true)
+
+  press(editor, "\x05") // Ctrl+E: end of the recalled entry
+  assert.deepEqual(editor.getCursor(), { line: 0, col: 14 })
+  press(editor, "\x0b") // Ctrl+K: nothing left to kill on the last line
+
+  assert.equal(editor.getText(), "recalled entry", "Ctrl+K at the end of the draft is a no-op")
+  assert.equal(editor.ccIsBrowsingHistory(), true, "a no-op Ctrl+K must not end browsing")
+  assert.deepEqual(editor.ccGetKillRing(), [], "a no-op Ctrl+K pushes nothing onto the kill ring")
+
+  press(editor, "\x1b")
+  assert.equal(editor.getText(), "my draft", "Ctrl+K: Esc still restores the pre-browsing draft")
+})
+
+/**
+ * The history-preserving wrappers are installed by name on the vendored
+ * Editor. A silently skipped wrapper (upstream rename/removal) would quietly
+ * lose a documented rule, so the install asserts instead of logging.
+ */
+test("I7: the seam install asserts every history-preserving wrapper target exists", async () => {
+  const { Editor } = await import("#pi-tui")
+  const descriptor = Object.getOwnPropertyDescriptor(Editor.prototype, "deleteToEndOfLine")
+  assert.ok(descriptor, "the vendored editor still has deleteToEndOfLine")
+
+  // A cache-busted copy of the seam module has its own `installed` flag, so the
+  // install can run again against the same (temporarily incomplete) Editor.
+  const specifier: string = "../src/input/pi-tui-seam.js?seam-missing-wrapper"
+  const fresh = (await import(specifier)) as { installPiTuiSeam: () => void }
+  delete (Editor.prototype as unknown as Record<string, unknown>).deleteToEndOfLine
+  try {
+    assert.throws(
+      () => fresh.installPiTuiSeam(),
+      /deleteToEndOfLine/,
+      "a missing upstream method must fail the install instead of silently skipping the wrapper",
+    )
+  } finally {
+    Object.defineProperty(Editor.prototype, "deleteToEndOfLine", descriptor)
+  }
+
+  // The assertion does not misfire: a complete seam installs without throwing.
+  const healthySpecifier: string = "../src/input/pi-tui-seam.js?seam-complete"
+  const healthy = (await import(healthySpecifier)) as { installPiTuiSeam: () => void }
+  assert.doesNotThrow(() => healthy.installPiTuiSeam())
+})
+
+test("I7: a real Ctrl+W deletion still leaves history browsing", () => {
+  const { editor } = makeEditor()
+  editor.addToHistory("older entry")
+  editor.addToHistory("alpha beta")
+  renderAt(editor, 80)
+
+  press(editor, "\x10")
+  assert.equal(editor.getText(), "alpha beta")
+  assert.equal(editor.ccIsBrowsingHistory(), true)
+
+  press(editor, "\x17") // deletes "beta" for real
+  assert.equal(editor.getText(), "alpha ")
+  assert.equal(editor.ccIsBrowsingHistory(), false, "a real edit ends browsing")
+  assert.deepEqual(editor.ccGetKillRing(), ["beta"])
+})
+
+// --- I8: a held paste prefix is released as ordinary keys ---------------
+
+test("I8: a held paste prefix released at the deadline is not swallowed", async () => {
+  const { editor } = makeEditor({ pasteHoldTimeoutMs: 10 })
+  const actions: string[] = []
+  editor.onAction = (event) => {
+    actions.push(event.id)
+  }
+  renderAt(editor, 80)
+
+  type(editor, "ab")
+  editor.handleInput("\x1b[2") // a strict prefix of ESC[200~: held, not dispatched
+  assert.equal(editor.isPasting(), true)
+  assert.equal(editor.getText(), "ab")
+
+  await sleep(40)
+  assert.equal(editor.isPasting(), false)
+  assert.equal(
+    editor.getText(),
+    "ab[2",
+    "the released prefix is ordinary input: ESC becomes Escape, ESC[2 leaves [2 behind",
+  )
+  assert.deepEqual(actions, [], "the released ESC is consumed by the input layer: no host sees app.cancel")
+
+  type(editor, "~")
+  assert.equal(editor.getText(), "ab[2~", "the late ~ is typed text, never the tail of the held sequence")
+  assert.deepEqual(actions, [], "releasing the hold emits nothing else")
+
+  // A physical Escape is still a cancel: the consumption is scoped to the
+  // released held bytes, never to the Escape key.
+  press(editor, "\x1b")
+  assert.deepEqual(actions, ["app.cancel"], "a real Escape still reaches the host")
+})
+
+test("I8: a released held prefix is not a cancel for the history layer either", async () => {
+  const { editor } = makeEditor({ pasteHoldTimeoutMs: 10 })
+  const actions: string[] = []
+  editor.onAction = (event) => {
+    actions.push(event.id)
+  }
+  editor.addToHistory("recalled entry")
+  editor.setText("my draft")
+  renderAt(editor, 80)
+
+  press(editor, "\x10")
+  assert.equal(editor.getText(), "recalled entry")
+  assert.equal(editor.ccIsBrowsingHistory(), true)
+
+  editor.handleInput("\x1b[2")
+  await sleep(40)
+  assert.equal(
+    editor.getText(),
+    "recalled entry[2",
+    "the synthetic Escape neither forwarded app.cancel nor restored the pre-browsing draft",
+  )
+  assert.deepEqual(actions, [], "nothing reached a host")
+})
+
+test("I8: ESC[Z is untouched, whole or fragmented inside the deadline", async () => {
+  const whole = makeEditor({ pasteHoldTimeoutMs: 10 })
+  const wholeActions: string[] = []
+  whole.editor.onAction = (event) => {
+    wholeActions.push(event.id)
+  }
+  renderAt(whole.editor, 80)
+  type(whole.editor, "ab")
+  whole.editor.handleInput("\x1b[Z") // Shift+Tab arrives in one chunk
+  assert.equal(whole.editor.getText(), "ab", "a complete sequence is never inserted as text")
+  assert.deepEqual(wholeActions, ["app.mode.cycle"])
+  await sleep(40)
+  assert.equal(whole.editor.getText(), "ab", "the sequence is not re-released as text after the deadline")
+
+  // Fragmented inside the hold window: the bytes are still one Shift+Tab, not
+  // Escape + "[" + "Z" (the hold only exists for a possible paste marker).
+  const split = makeEditor({ pasteHoldTimeoutMs: 500 })
+  const splitActions: string[] = []
+  split.editor.onAction = (event) => {
+    splitActions.push(event.id)
+  }
+  renderAt(split.editor, 80)
+  type(split.editor, "ab")
+  split.editor.handleInput("\x1b[")
+  assert.equal(split.editor.isPasting(), true)
+  split.editor.handleInput("Z")
+  assert.equal(split.editor.isPasting(), false)
+  assert.equal(split.editor.getText(), "ab")
+  assert.deepEqual(splitActions, ["app.mode.cycle"])
+  await sleep(20)
+  assert.equal(split.editor.getText(), "ab")
 })

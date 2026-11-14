@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '#pi-tui'
+import type { TuiMouseEventResult } from '#pi-tui'
 import { asTui, createFakeTui, loadInputModule, testEditorTheme } from '../src/input/testing/harness.ts'
 
 // Real input subsystem (vendored Pi TUI + CC seam), no fallback editor.
@@ -62,6 +63,8 @@ function makePicker(options: {
   keymap?: CcKeymap
   loading?: boolean
   error?: string
+  title?: string
+  routeLabel?: string
   onSelect?: (id: string) => void
   onCancel?: () => void
   onInterrupt?: () => void
@@ -81,6 +84,8 @@ function makePicker(options: {
     models: options.models,
     ...(options.loading === undefined ? {} : { loading: options.loading }),
     ...(options.error === undefined ? {} : { error: options.error }),
+    ...(options.title === undefined ? {} : { title: options.title }),
+    ...(options.routeLabel === undefined ? {} : { routeLabel: options.routeLabel }),
     currentProvider: options.currentProvider,
     currentModel: options.currentModel,
     keymap: options.keymap ?? keymap(),
@@ -117,6 +122,32 @@ const fieldFocused = (dialog: Picker, width = 80): boolean =>
 
 function typeText(dialog: Picker, value: string): void {
   for (const char of value) dialog.handleInput(char)
+}
+
+/**
+ * The painted footer action chip for `label`, addressed by its own cells.
+ *
+ * A disabled action owns no hitbox, so its press/click come back `undefined`;
+ * that difference is exactly what separates "a real, if unobvious, target"
+ * from "looks selectable and silently swallows the gesture".
+ */
+function footerChip(
+  dialog: Picker,
+  label: string,
+  width = 80,
+): { row: number; col: number; press(): TuiMouseEventResult | undefined; click(): TuiMouseEventResult | undefined } {
+  const rendered = dialog.render(width)
+  const pattern = new RegExp(`\\[[^\\]]*${label}[^\\]]*\\]`)
+  const row = rendered.findIndex(line => pattern.test(stripTerminalSequences(line)))
+  assert.ok(row >= 0, `footer action chip "${label}" is painted`)
+  const plain = stripTerminalSequences(rendered[row]!)
+  const col = visibleWidth(plain.slice(0, plain.indexOf(label)))
+  const base = { button: 'left' as const, width, height: rendered.length, shift: false, alt: false, ctrl: false }
+  const send = (type: 'press' | 'click'): TuiMouseEventResult | undefined => dialog.handleMouse({
+    ...base, type, x: col, y: row, screenX: col, screenY: row,
+    ...(type === 'click' ? { clickCount: 1 } : {}),
+  })
+  return { row, col, press: () => send('press'), click: () => send('click') }
 }
 
 const roster: Item[] = [
@@ -796,4 +827,326 @@ test('setModels falls back to the first group when the explicit provider is gone
   assert.match(text(p.dialog), /provider 1\/1/)
   assert.match(text(p.dialog), /One/)
   assert.deepEqual(p.selected, [])
+})
+
+// ---------------------------------------------------------------------------
+// Caller-supplied presentation (default-model surface) and refresh safety
+
+/** Mouse press/click on the painted row containing `needle`. */
+function mouseRow(
+  dialog: Picker,
+  lines: string[],
+  needle: string,
+): { press: () => void; click: () => void; y: number } {
+  const y = lines.findIndex(line => stripTerminalSequences(line).includes(needle))
+  assert.ok(y > 0, `row "${needle}" is painted`)
+  const base = { button: 'left' as const, x: 6, width: 80, height: lines.length, shift: false, alt: false, ctrl: false }
+  return {
+    y,
+    press: () => { dialog.handleMouse({ ...base, type: 'press', y, screenX: 6, screenY: y }) },
+    click: () => { dialog.handleMouse({ ...base, type: 'click', y, screenX: 6, screenY: y, clickCount: 1 }) },
+  }
+}
+
+test('title and route label default to the historical presentation', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  const rendered = text(p.dialog)
+  assert.match(rendered, /Choose model/)
+  assert.match(rendered, /a-two\s+current/)
+  assert.match(rendered, /current alpha\/a-two/)
+  assert.doesNotMatch(rendered, /Choose default model/)
+  assert.doesNotMatch(rendered, /default alpha\/a-two/)
+  assert.deepEqual(p.selected, [], 'opening never selects')
+})
+
+test('a caller title and route label rename only the heading, badge word and status prefix', () => {
+  const p = makePicker({
+    models: roster,
+    currentProvider: 'alpha',
+    currentModel: 'a-two',
+    title: 'Choose default model',
+    routeLabel: 'default',
+  })
+  const rendered = text(p.dialog)
+  assert.match(rendered, /^┌─ Choose default model/)
+  assert.doesNotMatch(rendered, /Choose model/, 'the historical heading is fully replaced')
+  assert.match(rendered, /a-two\s+default/, 'the badge uses the caller word')
+  assert.match(rendered, /default alpha\/a-two/, 'the status prefix uses the caller word')
+  assert.doesNotMatch(rendered, /current/, 'no stale current marker survives')
+  // Still presentation only: identical rows, order, geometry and selection.
+  assert.match(rendered, /Alpha One/)
+  assert.match(rendered, /3 models/)
+  assert.match(rendered, /provider 1\/2/)
+  assert.deepEqual(p.selected, [])
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['alpha/a-two'], 'the default surface still submits the exact opaque id')
+})
+
+test('the route label marks only the exact provider/model tuple', () => {
+  const shared: Item[] = [
+    { id: 'alpha/shared', provider: 'alpha', model: 'shared', label: 'Shared' },
+    { id: 'beta/shared', provider: 'beta', model: 'shared', label: 'Shared' },
+  ]
+  const p = makePicker({
+    models: shared,
+    currentProvider: 'alpha',
+    currentModel: 'shared',
+    title: 'Choose default model',
+    routeLabel: 'default',
+  })
+  let rendered = text(p.dialog)
+  assert.match(rendered, /❯ Shared  shared  default/)
+  assert.match(rendered, /default alpha\/shared/)
+  p.dialog.handleInput(KEY.tab)
+  rendered = text(p.dialog)
+  assert.match(rendered, /provider 2\/2/)
+  assert.doesNotMatch(rendered, /❯ Shared  shared  default/, 'the same model name in another provider is not marked')
+  assert.match(rendered, /default alpha\/shared/, 'the marked route itself does not move')
+  assert.equal(p.dialog.isDone, false)
+  assert.deepEqual(p.selected, [])
+})
+
+test('caller presentation strings are sanitized, bounded and width-safe', () => {
+  const long = 'Choose default ' + 'x'.repeat(300)
+  const injected = `Choose default model \x1b]0;evil-title\x07\x1b[31m`
+  const cases = [long, injected, '默认模型选择 一个很长很长的标题'.repeat(6)]
+  for (const title of cases) {
+    for (const routeLabel of ['默认', 'default ' + 'y'.repeat(80), '\x1b]0;evil-label\x07high']) {
+      for (const width of [30, 48, 64, 80]) {
+        const p = makePicker({
+          models: roster,
+          currentProvider: 'alpha',
+          currentModel: 'a-two',
+          title,
+          routeLabel,
+          rows: 24,
+          columns: width,
+        })
+        const lines = p.dialog.render(width)
+        for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}`)
+        const painted = stripTerminalSequences(lines.join('\n'))
+        assert.match(painted, /^┌─ /, 'the frame stays closed at every width')
+        assert.match(painted.split('\n').at(-1) ?? '', /^└─+┘$/, 'the footer stays inside the viewport')
+        assert.doesNotMatch(painted, /evil-title|evil-label/, 'terminal sequences in caller strings are stripped')
+        assert.match(painted, /a-two\s+\S+/, 'the exact tuple keeps a badge word')
+        assert.deepEqual(p.selected, [], 'rendering a long label never selects')
+      }
+    }
+  }
+})
+
+test('empty or control-only caller strings fall back to the historical defaults', () => {
+  for (const title of ['', '   ', '\x1b[31m', '\x1b]0;only-sequence\x07']) {
+    for (const routeLabel of ['', '\t ', '\x00', '\x1b[1m']) {
+      const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two', title, routeLabel })
+      const rendered = text(p.dialog)
+      assert.match(rendered, /Choose model/, `blank title falls back (${JSON.stringify(title)})`)
+      assert.match(rendered, /a-two\s+current/, `blank route label falls back (${JSON.stringify(routeLabel)})`)
+      assert.match(rendered, /current alpha\/a-two/)
+      assert.deepEqual(p.selected, [])
+    }
+  }
+})
+
+test('metadata refresh keeps caller presentation and never selects or submits', () => {
+  const p = makePicker({
+    models: roster,
+    currentProvider: 'alpha',
+    currentModel: 'a-two',
+    title: 'Choose default model',
+    routeLabel: 'default',
+  })
+  p.dialog.setCurrentRoute('beta', 'b-one')
+  p.dialog.setModels(roster)
+  p.dialog.setLoading(false)
+  const rendered = text(p.dialog)
+  assert.match(rendered, /Choose default model/)
+  assert.match(rendered, /default beta\/b-one/, 'the settled native route refreshes only the status/badge')
+  assert.equal(p.dialog.isDone, false)
+  assert.deepEqual(p.selected, [], 'a catalog/route refresh never answers for the user')
+  assert.match(rendered, /❯.*Alpha Two/, 'the selected row survives the refresh')
+})
+
+test('a held refresh blocks Enter and mouse confirmation without marking the picker done', () => {
+  const p = makePicker({
+    models: roster,
+    currentProvider: 'alpha',
+    currentModel: 'a-two',
+    title: 'Choose default model',
+    routeLabel: 'default',
+  })
+  p.dialog.render(80)
+  p.dialog.setLoading(true)
+  let lines = p.dialog.render(80)
+  const two = mouseRow(p.dialog, lines, 'Alpha Two')
+
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'Enter during a held refresh confirms nothing')
+  assert.equal(p.dialog.isDone, false, 'the surface stays open for the refreshed roster')
+
+  two.press()
+  two.click()
+  assert.deepEqual(p.selected, [], 'a mouse release during a held refresh confirms nothing')
+  assert.equal(p.dialog.isDone, false)
+  assert.match(text(p.dialog), /Choose default model/, 'the caller heading survives the held refresh')
+
+  // Successful retry: the same row, highlighted where the user left it.
+  p.dialog.setLoading(false)
+  lines = p.dialog.render(80)
+  assert.match(stripTerminalSequences(lines.join('\n')), /❯.*Alpha Two/)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['alpha/a-two'], 'exactly one confirmation after the refresh settles')
+  assert.equal(p.dialog.isDone, true)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['alpha/a-two'], 'a settled picker never submits twice')
+})
+
+test('a held catalog refresh with rows on screen shows Refreshing… and disables the footer Select', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  p.dialog.render(80)
+  p.dialog.setLoading(true)
+  const lines = p.dialog.render(80)
+  const painted = stripTerminalSequences(lines.join('\n'))
+  // The previous roster stays readable so the highlight and query survive it…
+  assert.match(painted, /Alpha One/)
+  assert.match(painted, /❯.*Alpha Two/)
+  // …but the pending refresh is visible instead of hiding behind a dead chip.
+  assert.match(painted, /Refreshing…/, 'a held refresh with an old catalog says so')
+  assert.doesNotMatch(painted, /Loading models…/, 'a loaded catalog is not the empty loading state')
+
+  // The Select chip is disabled: it owns no hitbox, so neither press nor click
+  // is claimed on top of the already-guarded Enter.
+  const chip = footerChip(p.dialog, 'Select')
+  assert.equal(chip.press(), undefined, 'a disabled Select chip claims no press')
+  assert.equal(chip.click(), undefined, 'a disabled Select chip claims no click')
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'Enter still cannot confirm the stale catalog')
+  assert.equal(p.dialog.isDone, false, 'the surface stays open for the refreshed catalog')
+
+  // The refresh settles: the status line goes away and the same chip is live.
+  p.dialog.setLoading(false)
+  assert.doesNotMatch(text(p.dialog), /Refreshing…/)
+  assert.match(text(p.dialog), /❯.*Alpha Two/, 'the highlight survives the refresh')
+  const live = footerChip(p.dialog, 'Select')
+  assert.equal(live.press()?.handled, true, 'the Select chip claims a press once the catalog settles')
+  assert.equal(live.click()?.handled, true)
+  assert.deepEqual(p.selected, ['alpha/a-two'], 'exactly one confirmation through the restored chip')
+  assert.equal(p.dialog.isDone, true)
+})
+
+test('native model-picker error text cannot inject terminal sequences', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  p.dialog.setError('native failure \x1b[2J\x1b]0;owned-title\x07')
+  const raw = p.dialog.render(90).join('\n')
+  assert.doesNotMatch(raw, /\x1b\[2J/)
+  assert.doesNotMatch(raw, /\x1b\]0;owned-title/)
+  assert.doesNotMatch(raw, /owned-title/)
+})
+
+test('a visible native error stays informational: Enter, chip and mouse still confirm the painted roster', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  typeText(p.dialog, 'three')
+  p.dialog.render(80)
+  p.dialog.setError('Native catalog refresh failed.')
+  let lines = p.dialog.render(80)
+  const painted = stripTerminalSequences(lines.join('\n'))
+  assert.match(painted, /Native catalog refresh failed\./)
+  assert.match(painted, /Alpha Three/, 'the roster stays readable under the failure')
+
+  // The Select chip keeps its hitbox: an error never turns it into a dead control.
+  const chip = footerChip(p.dialog, 'Select')
+  assert.equal(chip.press()?.handled, true, 'an error leaves the Select chip pressable')
+  assert.equal(chip.click()?.handled, true, 'an error leaves the Select chip clickable')
+  assert.deepEqual(p.selected, ['alpha/a-three'], 'the chip confirms the highlighted row')
+  assert.equal(p.dialog.isDone, true)
+
+  // Enter is the same confirmation path.
+  const enter = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  typeText(enter.dialog, 'three')
+  enter.dialog.setError('Native catalog refresh failed.')
+  enter.dialog.handleInput(KEY.enter)
+  assert.deepEqual(enter.selected, ['alpha/a-three'], 'Enter under a visible failure confirms the highlighted row')
+  assert.equal(enter.dialog.isDone, true)
+
+  // A press/release pair on a roster row confirms that row too.
+  const mouse = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  mouse.dialog.setError('Native catalog refresh failed.')
+  lines = mouse.dialog.render(80)
+  const three = mouseRow(mouse.dialog, lines, 'Alpha Three')
+  three.press()
+  three.click()
+  assert.deepEqual(mouse.selected, ['alpha/a-three'], 'a mouse release under a visible failure confirms the row')
+  assert.equal(mouse.dialog.isDone, true)
+})
+
+test('a held native refresh still blocks confirmation, visible error or not', () => {
+  const p = makePicker({
+    models: roster,
+    currentProvider: 'alpha',
+    currentModel: 'a-two',
+    error: 'Native catalog refresh failed.',
+  })
+  p.dialog.render(80)
+  p.dialog.setLoading(true)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'loading blocks confirmation even with an informational error')
+  assert.equal(p.dialog.isDone, false)
+  const chip = footerChip(p.dialog, 'Select')
+  assert.equal(chip.press(), undefined, 'a held refresh still removes the Select hitbox')
+  assert.equal(chip.click(), undefined)
+
+  // Once the refresh settles, the stored error is painted again and the same
+  // roster is confirmable: an error is information, not a lock.
+  p.dialog.setLoading(false)
+  assert.match(text(p.dialog), /Native catalog refresh failed\./)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, ['alpha/a-two'], 'exactly one confirmation after the refresh settles')
+  assert.equal(p.dialog.isDone, true)
+})
+
+test('a retry after an error shows Refreshing… instead of the stale failure', () => {
+  const p = makePicker({ models: roster, currentProvider: 'alpha', currentModel: 'a-two' })
+  p.dialog.setError('Previous catalog failure')
+  p.dialog.setLoading(true)
+  const raw = text(p.dialog)
+  assert.match(raw, /Refreshing…/)
+  assert.doesNotMatch(raw, /Previous catalog failure/)
+  p.dialog.handleInput(KEY.enter)
+  assert.deepEqual(p.selected, [], 'a loading retry still cannot confirm the old roster')
+  p.dialog.setLoading(false)
+  const settled = text(p.dialog)
+  assert.match(settled, /Previous catalog failure/, 'the stored failure returns once loading ends')
+})
+
+test('a press recorded before an invalidation can never click afterwards', () => {
+  const models: Item[] = [
+    { id: 'p/one', provider: 'p', model: 'one', label: 'One' },
+    { id: 'p/two', provider: 'p', model: 'two', label: 'Two' },
+  ]
+  const p = makePicker({ models, title: 'Choose default model', routeLabel: 'default' })
+  let lines = p.dialog.render(80)
+  let two = mouseRow(p.dialog, lines, 'Two')
+
+  // Error invalidation retires the press even when the error is cleared again.
+  two.press()
+  p.dialog.setError('held')
+  p.dialog.setError(undefined)
+  lines = p.dialog.render(80)
+  two = mouseRow(p.dialog, lines, 'Two')
+  two.click()
+  assert.deepEqual(p.selected, [], 'the pre-error press cannot answer the refreshed state')
+  assert.equal(p.dialog.isDone, false)
+
+  // A roster replacement retires it too, even with an identical shape.
+  two.press()
+  p.dialog.setModels(models.map(item => ({ ...item })))
+  p.dialog.render(80)
+  two.click()
+  assert.deepEqual(p.selected, [], 'the pre-refresh press cannot answer the new roster')
+
+  // A fresh press/click pair still confirms exactly once.
+  two.press()
+  two.click()
+  assert.deepEqual(p.selected, ['p/two'])
+  assert.equal(p.dialog.isDone, true)
 })

@@ -61,8 +61,8 @@ SessionManager, transport or domain store.
   or public snapshot, workingDirectory/get, whitelisted plugin inventory and
   exact-Agent tools definitions/executable. Read-only; output does not consume
   the model cursor. No job controller/supervisor/goal engine/tool resolution is copied.
-- `native-management.ts`: explicit native user-title rename; only two safe default
-  fields resolved by public Loader package identity, projected `describe` form and
+- `native-management.ts`: explicit native user-title rename; only the allowlisted
+  safe default fields resolved by public Loader package identity, projected `describe` form and
   confirmed native revision. `plainSchema` removes the volatile flag, so field
   membership in that native projected form is the proof; `mutate/isVolatilePath`
   remains final authority. No secret/config dump, generic editor or direct FS writes.
@@ -146,8 +146,11 @@ materialized defaults must not be pinned as explicit choices. The adapter
 still runs once. A different configured summarization target, a missing
 explicit effort and every non-compaction purpose keep
 the native request unchanged; messages, tools, tool history, output budget,
-session id and cancellation are preserved. Listener disposal follows the same
-HMR lifecycle as the TUI plugin.
+session id and cancellation are preserved. The plugin mounts the install inside
+its own `ctx.effect` (`effectOwner: 'caller'`), so the listener has exactly one
+owner: the plugin effect disposes it on HMR unload, no nested second effect
+disposes it twice, and a host without `effect` support still gets a removable,
+single-detach listener instead of a leaked `llm/stream` hook.
 
 For a failed native `/compact`, the adapter correlates the synchronous live
 `compaction/end.data.error` by both session id and `sourceCommandId`. It keeps
@@ -181,6 +184,32 @@ function createDshBackend(ctx: DshHostContext, options): DshContextBackend
 
 `transcriptCodec` is available before the first `ready`; a missing native codec
 fails `connect()` loudly rather than substituting a mirror.
+
+The live projection is incremental in its **fold/join** work, which is all this
+codec claims: it keeps one memo per accessor (full and interrupted) of one
+assembler instance, folds each native block once and reuses that fold plus the
+joined `text`/`thinking`/`toolNames`/`content` projection while the blocks it
+already saw are unchanged (object identity, or a shallow `type`/`text`/`name`
+compare when the adapter rebuilt the array). An unchanged or purely appended
+stream therefore costs one native read plus the appended tail instead of
+re-folding every block per chunk. That is not a general complexity bound: a
+changed block that is not the open tail, a shrinking list or an image/file
+reference leaves the incremental path and re-folds and re-joins that projection
+from the memo's prefix, and a re-join is always a full join of one field's
+pieces. Every path is value-identical to a one-shot projection of the same
+blocks, and `assemble()` (the durable path) always projects once from scratch.
+
+`snapshot()` also falls back to `assembler.interruptedBlocks()` projected
+through the **full** memo when `assembler.blocks()` throws (a tentative stream
+may hold an open unknown block). That fallback is value-equivalent — it is
+exactly a projection of the interrupted blocks — but it relaxes the
+one-order-per-memo rule for the rest of that stream: the next readable
+`blocks()` read compares the interrupted order positionally and re-folds
+whatever differs, so later values stay correct while the fallback itself stays a
+contract detail worth knowing. The durable `assemble()` path never suppresses a
+validation error that way.
+`test/backend-native-codec.test.ts` pins all of this with read
+counters, fallback and full-equality checks, not timings.
 
 `SessionInfo.title?: string | null` is a read-only native title baseline from
 `sessionTitle.get(session)` (or public `snapshot(session,['title'])` when the
@@ -274,7 +303,9 @@ carrier and keeps the existing 8 s `nativeUiRead` bound/identity guard; a
 pre-cancelled call starts no native work. `settings.mutate` takes no signal:
 its carrier is adapter-owned cancellation only, so an aborted write may still
 settle natively and its real outcome is reported rather than fabricated as a
-cancel.
+cancel. If the attachment moves during that flight, the success read-back can be
+dropped by the attachment fence; this is an inherent native-write limit, not a
+cancellation guarantee.
 
 `ensureCurrent()` re-checks `closed` and the exact staged observation after the
 only async factory boundary and again before the `ready` announcement. An Agent
@@ -524,12 +555,63 @@ DSH's own owners when live:
   and ids are preserved. Pending sessions stage; live selection delegates to
   native `select(exactAgent,id)` and only its locked refusal becomes `locked`.
   No guessed lock precheck;
-- native defaults: `native-defaults` reads both allowlisted fields;
-  `native-default-update` applies one exact-path, revision-fenced
+- native defaults: `native-defaults` reads every allowlisted field —
+  `selectedDefault`, `defaultPreset` and the native `agent-default-model`
+  selection; `native-default-update` applies one revision-fenced
   `settings.mutate` and returns the native read-back outcome (`ok`, conflict/
   stale/unavailable outcomes included). The write is an active command for the
   reload gate as described above. The adapter never writes a profile file,
-  reads a credential, or invents a revision;
+  reads a credential, or invents a revision. `agent-default-model` is one
+  target because DSH reads `provider`/`model`/`reasoningEffort` as one
+  selection: a model change writes both pair fields and, when the stored level
+  is not advertised by the new model, the native `unset` that removes it (the
+  same semantic as `saveSelection()` omitting the field) in that one mutate.
+  The read reports the persisted pair, the advertised/default/effective level
+  and a `reasoningAvailable`/`reasoningSupported` split so missing metadata is
+  never flattened into "this model has no levels"; it performs exactly one
+  `llm.resolveModelInfo` for the default pair and no provider-catalog walk. An
+  unreadable roster does not clear the target's proven native writability: the
+  effort row stays unavailable through its own `reasoningAvailable` gate, while
+  the Default model picker remains usable so a stale or broken saved pair can be
+  replaced from the native catalog. Two reasoning refusals are therefore
+  distinct: an **explicit** level whose target metadata cannot be read is
+  refused with no mutation (it cannot be validated), while a model switch that
+  merely carries a **stored** level whose new metadata cannot be read still
+  applies and removes that level with the native `unset` — omitting it is
+  exactly what `saveSelection()` does, and refusing would strand the broken
+  saved pair this target exists to repair. Confirming the selection that is
+  already stored changes nothing, so it is a successful no-op
+  (`ok:true, changed:false`) carrying the current native revision/pair from a
+  fresh read-back, never a rejected request and never a mutation. A
+  `currentSelection()`/descriptor disagreement, an unresolved
+  namespace/field/revision and a missing write path stay read-only. A separately
+  confirmed effort-only edit uses the persisted pair as `value` and needs no
+  catalog read. A stale confirmed revision is refused as a conflict before this
+  target starts any bounded catalog/metadata read, and the native catalog's
+  isolated provider failures are never folded into an empty successful catalog:
+  when no row loaded the refusal is `unavailable` with the redacted provider
+  failure text, and a catalog that did load rows stays selectable while still
+  reporting the missing providers. Every async phase is followed by an attachment,
+  carrier-cancellation, revision and owner re-check (the unique Loader namespace
+  and the mounted `currentSelection()` are re-read from the live services), so a
+  deadline, a moved attachment or a recomposed owner never reaches the mutation;
+  this owner re-check also covers the preset/permission targets after their
+  asynchronous roster read. Bounded waits match the surrounding read rather than
+  inventing a second deadline: the default-model read's exact-route metadata
+  probe is bounded at 4 s *inside* the 8 s `nativeUiRead` bound so it can answer
+  `reasoningAvailable:false` instead of being abandoned as one opaque timeout,
+  while the write is an active command with no outer deadline of its own, so its
+  fresh catalog read and its preset roster read each carry the same 8 s order.
+  All three are bounded waits on this process's own `await`: a caller-owned
+  signal is still passed to the native read, and an
+  already-cancelled operation observes a late rejection instead of
+  letting it become an unhandled rejection. A `SETTINGS_CONFLICT` stays a
+  conflict, a home/CLI overlay refusal stays `write-failed`, and `changed` is
+  exact read-back equality rather than a fulfilled setter — except for the
+  documented current-selection no-op, which reports `changed:false` even though
+  the read-back already matches, because nothing was written. The session `/model`
+  and `/effort` commands keep their native `saveSelection` side effect; this
+  target only edits the startup default;
 - permissions: `permissionPresets.catalog()/current(session)` passthrough;
   switching executes the mounted native `/permission` command, and native
   `/plan` remains independent. A pending attachment has no native Session, so
@@ -588,7 +670,13 @@ DSH's own owners when live:
   pending/live route and attachment-identity check, so a late answer cannot
   overwrite a switch. A missing resolver means no level can be carried; model
   selection itself still works and `efforts` retains its existing capability
-  semantics.
+  semantics. The single `resolveModelInfo` seam documents an implicit contract:
+  **a caller-supplied signal disables the adapter's local deadline** (the
+  signal is passed to the native read unchanged and the caller owns the bound),
+  and only a call without one gets the local `EFFORT_METADATA_TIMEOUT_MS`
+  (8 s) `withTimeout` wrapper. The native failure itself is rethrown untouched so
+  each caller keeps its own error code; the seam never walks a catalog, never
+  substitutes the session route and never invents a roster.
 
 ## Skills metadata
 

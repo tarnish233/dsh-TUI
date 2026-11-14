@@ -41,6 +41,31 @@ test("bare LF resolves to newline (registry order), CR submits", () => {
   assert.equal(actionId(keymap.resolve("\x1b\r", "editor")), "editor.newline")
 })
 
+test("bare LF never doubles as Enter in modal or completion contexts", () => {
+  const keymap = createCcKeymap()
+  // Completion and search chains still reach editor.newline after their local
+  // Enter rows are skipped; modal chains without the editor layer are inert.
+  assert.equal(actionId(keymap.resolve("\n", "autocomplete")), "editor.newline")
+  assert.equal(actionId(keymap.resolve("\n", "historySearch")), "editor.newline")
+  assert.equal(actionId(keymap.resolve("\n", "modalSearch")), "editor.newline")
+  assert.equal(actionId(keymap.resolve("\n", "dialog")), "editor.newline")
+  for (const context of ["list", "keybindingsList", "modalList", "settingsList", "subagentList", "toolDetails"] as const) {
+    assert.equal(keymap.resolve("\n", context).kind, "none", `${context} must not confirm on Ctrl+J`)
+  }
+  // CR remains the real Enter everywhere.
+  assert.equal(actionId(keymap.resolve("\r", "list")), "list.select")
+  assert.equal(actionId(keymap.resolve("\r", "autocomplete")), "autocomplete.accept")
+  assert.equal(actionId(keymap.resolve("\r", "dialog")), "dialog.confirm")
+
+  // `return` is a configured alias of the same Enter byte and must follow the
+  // same LF rule; otherwise a keybindings.json override re-opens the bug.
+  const aliased = createCcKeymap({ bindings: { "list.select": ["return"], "dialog.confirm": ["return"] } })
+  assert.equal(aliased.resolve("\n", "list").kind, "none")
+  assert.notEqual(actionId(aliased.resolve("\n", "dialog")), "dialog.confirm")
+  assert.equal(actionId(aliased.resolve("\r", "list")), "list.select")
+  assert.equal(actionId(aliased.resolve("\r", "dialog")), "dialog.confirm")
+})
+
 test("modifier aliases match legacy bytes and CSI-u sequences", () => {
   const keymap = createCcKeymap()
   // Ctrl+W: legacy ^W, xterm modifyOtherKeys, Kitty CSI-u.
@@ -292,4 +317,59 @@ test("CC_ACTIONS registry covers the required families with honest statuses", ()
   for (const context of contexts) {
     assert.ok(mod.CC_CONTEXTS.includes(context))
   }
+})
+
+/**
+ * Hot-path contract for `resolve()`: the fallback chain of every context is
+ * compiled once in `rebuild()` (`contextBindings`), so a keystroke never walks
+ * `CONTEXT_FALLBACK_CHAINS` with flatMap/`Map.get` again.
+ *
+ * Deterministic identity checks only — no wall-clock timing: the cached arrays
+ * survive repeated keystrokes, resolution no longer reads the per-context
+ * index, and only a configuration change recompiles (without mutating the
+ * previous arrays in place). Returned `keys` stay copies, so a caller cannot
+ * corrupt a cached binding.
+ */
+test("resolve reads one precompiled chain per context instead of rebuilding it per key", () => {
+  const keymap = createCcKeymap()
+  const internals = keymap as unknown as {
+    index: Map<CcContext, unknown[]>
+    contextBindings: Map<CcContext, unknown[]>
+  }
+  const chains = internals.contextBindings
+  // One array per context, present for every context the resolver accepts.
+  assert.equal(chains.size, mod.CC_CONTEXTS.length)
+  for (const context of mod.CC_CONTEXTS) {
+    assert.ok(Array.isArray(chains.get(context)), `missing precompiled chain for ${context}`)
+  }
+  const editorChain = chains.get("editor")
+  assert.ok(editorChain && editorChain.length > 0, "the editor chain carries the shipped bindings")
+
+  // Repeated keystrokes reuse the same compiled arrays.
+  for (let press = 0; press < 200; press += 1) {
+    assert.equal(actionId(keymap.resolve("\x17", "editor")), "editor.kill.whitespace-backward")
+  }
+  assert.equal(chains.get("editor"), editorChain)
+
+  // Resolution reads the compiled chain, not the per-context index: emptying
+  // the index must not change what a key resolves to.
+  internals.index = new Map()
+  assert.equal(actionId(keymap.resolve("\x17", "editor")), "editor.kill.whitespace-backward")
+  assert.equal(keymap.resolve("\x18", "editor").kind, "pending")
+  assert.equal(actionId(keymap.resolve("\x05", "editor")), "app.editor.external")
+
+  // The resolved `keys` array is a copy of the cached binding.
+  const resolved = keymap.resolve("\x17", "editor")
+  assert.equal(resolved.kind, "action")
+  if (resolved.kind === "action") resolved.keys[0] = "ctrl+mutated"
+  const again = keymap.resolve("\x17", "editor")
+  assert.deepEqual(again.kind === "action" ? again.keys : undefined, ["ctrl+w"])
+
+  // Only a configuration change recompiles, and it never rewrites the old
+  // arrays in place (a pending chord must never see half-updated state).
+  keymap.setBindings({ "editor.kill.whitespace-backward": "alt+w" })
+  assert.notEqual(internals.contextBindings, chains)
+  assert.equal(chains.get("editor"), editorChain)
+  assert.equal(actionId(keymap.resolve("\x1bw", "editor")), "editor.kill.whitespace-backward")
+  assert.equal(keymap.resolve("\x17", "editor").kind, "none")
 })

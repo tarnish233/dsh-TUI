@@ -1057,10 +1057,6 @@ export class TerminalIntegration {
   // -------------------------------------------------------------------------
   // Derivation + emission
 
-  #preferences(): TerminalIntegrationSettings {
-    return this.#settings
-  }
-
   #sync(): void {
     const snapshot = this.#snapshot
     const preferences = this.#settings

@@ -4,8 +4,9 @@
 actions on the **current root attachment**, plus one pure preparation helper:
 
 1. rename the current session through DSH's own title owner;
-2. read and write exactly two allowlisted native defaults (`selectedDefault`,
-   `defaultPreset`) with the native revision fence;
+2. read and write the **three** allowlisted native default targets — `selectedDefault`,
+   `defaultPreset` and the one native `agent-default-model` selection
+   (`provider`/`model`/`reasoningEffort`) — always with the native revision fence;
 3. `buildInteractiveForkInput` (pure) prepares the parent's native `/fork` creation.
 
 The seam exposes **no** session-only `SessionStore.fork` adapter: such a child owns no
@@ -24,7 +25,9 @@ persistence. This module:
 
 - calls only public service methods: `ctx.sessionTitle.get/rename`,
   `ctx.sessions.get`, `ctx.settings.describe/mutate`, `ctx.loader.entries()`,
-  `ctx.agentPresets.list/defaultId`, `ctx.permissionPresets.catalog()`;
+  `ctx.agentPresets.list/defaultId`, `ctx.permissionPresets.catalog()`, plus the three
+  **injected** default-model faces (`agentDefaultModel.currentSelection`, one exact-route
+  `llm.resolveModelInfo` and the adapter's own model catalog);
 - never creates, resumes, prompts, cancels or switches an Agent, and never touches
   `agentOptions`, `agentPresets.mount`, `agents.create/resume` or the attachment;
 - never writes a file, never reconciles/repairs a settings document, never calls
@@ -133,23 +136,34 @@ that this process never created.
 
 ### Namespace resolution (no hardcoded profile ids)
 
-| target | public package name | allowlisted field |
+| target | public package name | allowlisted field(s) — the real write/read paths |
 | --- | --- | --- |
 | `agent-preset-default` | `@deepseek-ai/dsh-agent-preset-registry` | `selectedDefault` |
 | `permission-default-preset` | `@deepseek-ai/dsh-permission-presets` | `defaultPreset` |
+| `agent-default-model` | `@deepseek-ai/dsh-agent-default-model` | `provider`, `model`, `reasoningEffort` (in write order) |
+
+Each target's `fields` list is the **only** allowlist representation: schema membership,
+the read path, the write ops and the public `field` label all derive from it. `field` is
+just that derived display/route label (`selectedDefault`, `defaultPreset`, or
+`provider,model,reasoningEffort`) — it is **not** one native config path, so a consumer
+must use the target's `fields`/documented paths and never write `field` as a single key.
+The multi-field target cannot be split into three targets: DSH reads the three paths as
+one selection, so two writes could leave a provider/model pair the composition cannot
+route.
 
 `ctx.loader.entries()` is scanned for the package name; the profile entry id
 (`entry.options.id`) is the settings namespace, cross-checked against
 `settings.describe()`'s `ns`. Zero matches ⇒ `namespace-unresolved`, more than one ⇒
 `namespace-ambiguous` (two owners could be mounted; never guess), a missing live
 descriptor ⇒ `namespace-unavailable`. No web id (`permission`,
-`agent-preset-registry`) and no config file/env value is used or assumed.
+`agent-preset-registry`, `agent-default-model`) and no config file/env value is used or
+assumed.
 
 ### Read isolation
 
 `settings.describe({redactSecrets:true})` is the only read. Native `describe` already
 projects only `volatile` form fields and redacts declared secrets, but the adapter still
-copies exactly one allowlisted scalar per target, plus the native revision, the resolved
+copies exactly the target's allowlisted scalars, plus the native revision, the resolved
 namespace and the native option ids.
 
 **Actual native form shape (verified in the installed `0.2.2-rc.1`, not assumed):**
@@ -166,25 +180,30 @@ native `settings.mutate()` still validates `isVolatilePath` as the final write a
 A non-string value is `value-malformed`, never coerced.
 
 Verified against the real native scene in a temp owned profile (safe metadata only): both
-targets read `available:true, writable:true`, namespaces resolved from the public Loader
-(`dsh-tui-preset-registry`, `permission`), native revisions present, fields unset with
-native effective fallbacks (`standard`, `workspace-write`), zero warnings. Evidence:
-`.cache/native-ui-expansion/management/safe-schema-native.log` and
+single-field targets read `available:true, writable:true`, namespaces resolved from the
+public Loader (`dsh-tui-preset-registry`, `permission`), native revisions present, fields
+unset with native effective fallbacks (`standard`, `workspace-write`), zero warnings.
+Evidence: `.cache/native-ui-expansion/management/safe-schema-native.log` and
 `.../safe-defaults-native.log` (keys/booleans/counts only; no values, credentials, other
-namespaces or config dumps). `value` is the exact
-stored scalar; `effectiveValue` is the native resolver fallback
-(`agentPresets.defaultId` / `catalog.defaultPreset`) and only when that native read
-succeeds. Options come from the native rosters (`agentPresets.list()` excluding `broken`
-rows, `catalog().defaultOptions`); an unreadable roster makes the target read-only
-(`options-unavailable`) instead of an empty authoritative enum.
+namespaces or config dumps). The `agent-default-model` target shares that form shape and
+is proven by the offline native-shaped fixtures (`test/backend-default-model-settings.test.ts`);
+its live acceptance stays the parent's owned-profile check. `value` is the exact
+stored scalar (`provider/model` pair + level for the model target); `effectiveValue` is
+the native resolver fallback (`agentPresets.defaultId` / `catalog.defaultPreset`) and only
+when that native read succeeds. Options come from the native rosters
+(`agentPresets.list()` excluding `broken` rows, `catalog().defaultOptions`); an unreadable
+roster makes the target read-only (`options-unavailable`) instead of an empty
+authoritative enum. The default-model target carries no `options` at all: its pair list
+belongs to the adapter's model catalog, and its effort row is gated by
+`reasoningAvailable`/`reasoningSupported` plus the advertised level list.
 
 ### Explicit confirmed write
 
-`updateDefault({ target, value, expectedRevision, attachmentId? })` requires the revision
-returned by the confirmed read. It re-resolves namespace/field/schema, refuses a value the
-native roster does not advertise (`not-an-option`, no native call), refuses a changed
-revision (`conflict` with `expectedRevision`/`actualRevision` and a fresh view, no native
-call), then calls exactly:
+`updateDefault({ target, value, expectedRevision, attachmentId?, reasoningEffort? })`
+requires the revision returned by the confirmed read. It re-resolves
+namespace/field/schema, refuses a value the native roster does not advertise
+(`not-an-option`, no native call), refuses a changed revision (`conflict` with
+`expectedRevision`/`actualRevision` and a fresh view, no native call), then calls exactly:
 
 ```ts
 settings.mutate(ns, [{ op: 'set', path: [field], value }], expectedRevision)
@@ -198,6 +217,51 @@ confirmed by a fresh `describe` read-back: `changed` is true only when the store
 equals the requested value, and `revision` is the new native revision. No automatic retry,
 no wildcard write, no `update`/`replace`, no file write.
 
+### `agent-default-model`: one selection, one mutate
+
+`provider`/`model`/`reasoningEffort` are one native selection, so this target never uses
+the single-field op above. One `settings.mutate(ns, ops, expectedRevision)` carries:
+
+- a pair change: `set provider`, `set model`, then the reasoning decision;
+- an effort-only edit (`value` is the persisted `provider/model` pair or the bare model
+  id): only the level op.
+
+`requestedEffort` semantics: an explicit level id is `set` and must be advertised by the
+**target** model; `null` is the native `unset` (the model/adapter default applies again);
+omitted keeps the stored level only when the new model still advertises it. Otherwise the
+level is removed with the same native `unset`, which is exactly the native
+`saveSelection()` omission semantic. Two refusals stay deliberately distinct:
+
+- an **explicit** level whose target metadata is unreadable/malformed is refused
+  (`unavailable`, no mutation) — it cannot be validated;
+- a **stored** level whose new-model metadata is unreadable does **not** block the model
+  switch: the write applies and removes the old level with that `unset`, and reports
+  `reasoningEffortReset: true`. Refusing instead would strand the broken saved pair this
+  target exists to repair, and DSH's own selection writer omits an unprovable level too.
+
+Confirming the selection that is already stored produces **no ops**, so it is a successful
+no-op rather than a malformed request: `ok:true, changed:false` with the current native
+`revision`/`value`/`provider`/`model`/`reasoningEffort` taken from a fresh `describe`
+read-back, the resolved `namespace`/`field`, `attachmentId` when supplied and
+`stillCurrent`. Nothing is mutated, so no revision moves and no fence is needed. Without
+a readable descriptor the confirmation fails `unavailable` instead of inventing a shape.
+
+Every asynchronous phase (fresh native catalog read, exact-route metadata probe) is
+followed by a cancellation, attachment, revision, pair and **owner** re-check: the unique
+Loader namespace and the mounted `currentSelection()` are re-read from the live services,
+so a deadline, a moved attachment, a moved revision, a recomposed owner or a runtime owner
+that no longer reports this entry never reaches the mutation. A confirmed revision that
+has already moved is a `conflict` before any bounded read is paid.
+
+Bounded waits (each owns one cleared timer, nothing runs in the background): the
+`llm.resolveModelInfo` probe of the **read** is bounded at 4 s, inside the shared 8 s
+`nativeUiRead` bound, so the read can answer `reasoningAvailable:false` instead of being
+abandoned as one opaque timeout; the write is an active command with no outer deadline of
+its own, so its fresh catalog read and the preset roster read each carry an 8 s bound of
+the same order. A caller-owned signal is still passed to the native read (the bound only
+ends *this* wait), and an already-cancelled operation observes a late rejection instead of
+letting it become an unhandled rejection. Expiry/cancellation never continues to a write.
+
 Invalidation is the parent's: on the settled `settings/document-updated(ns, revision)` /
 `app-boot/config-reload()` signal it emits `native_ui_changed{domain:'settings'}` and
 re-reads `defaultSettings()` only while the safe-defaults surface is open (single-flight
@@ -206,8 +270,9 @@ raw config changed since the previous read; that is a native read, not a write.
 
 ## Tests
 
-`test/backend-native-management.test.ts` (12) and
-`test/backend-native-management-settings.test.ts` (17) run offline with synthetic
+`test/backend-native-management.test.ts` (12),
+`test/backend-native-management-settings.test.ts` (22) and
+`test/backend-default-model-settings.test.ts` (25) run offline with synthetic
 native-shaped doubles and no real profile, credential, session log, file or model call:
 
 - rename: exact accepted/normalized title, previous-title fact vs unknown, invalid-title
@@ -223,6 +288,15 @@ native-shaped doubles and no real profile, credential, session log, file or mode
   view, redacted write failure, non-roster value refusal, attachment fence for read and
   write, native-normalizing read-back (`changed:false`), unmounted-service and
   invalid-contract paths;
+- default model: persisted pair/level read and one exact-route metadata probe, distinct
+  unsupported vs unreadable vs malformed metadata, effort-only `set`/`unset` in one
+  mutate, carried vs dropped stored level by the **new** model, a model switch with
+  unreadable new metadata applying with `reasoningEffortReset` while an explicit level on
+  the same target is refused with zero mutations, all-provider and partial catalog
+  failures, empty-catalog never becoming "not an option", stale revision before any
+  bounded read, moved revision/pair/owner/attachment/cancel fences, the successful
+  current-selection no-op (`changed:false`, fresh read-back, no mutate) and the unchanged
+  native `saveSelection` side effect of `/model` and `/effort`;
 - settings schema proof: the **actual** native serialized form (stripped `volatile`
   marker, field unset in `value`/`user`) is accepted; a field present only in `value`, an
   unresolvable ref, an explicit `volatile:false` and a missing field stay fail-closed.
@@ -233,8 +307,13 @@ native-shaped doubles and no real profile, credential, session log, file or mode
 - Interactive forking stays the parent's atomic `agents.create` parity flow (§ above); the
   session-only `SessionStore.fork` artifact is deliberately not adapted because its child
   can never own an Agent.
-- Only the two allowlisted volatile fields are writable. There is no generic settings
-  editor, credential/provider/endpoint management or document reconcile.
+- Only the three allowlisted targets (four native paths: `selectedDefault`,
+  `defaultPreset`, and the `provider`/`model`/`reasoningEffort` selection) are writable.
+  There is no generic settings editor, credential/provider/endpoint management or document
+  reconcile.
+- The model target reports `changed:false` for a confirmed current selection. A consumer
+  that paints every `changed:false` as a warning must special-case that documented no-op,
+  because the native read-back is exactly the requested state and nothing was written.
 - `settings.describe` is the native read authority; an older/partial composition without
   it (or without the Loader tree) hides the whole surface (`missing-settings-service` /
   `missing-loader`) rather than showing an empty authoritative default.

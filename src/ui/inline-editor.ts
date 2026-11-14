@@ -20,11 +20,10 @@
  */
 import {
   CURSOR_MARKER,
-  matchesKey,
   renderFakeCursor,
   type TUI,
 } from '#pi-tui'
-import { CcEditor, type CcKeymap } from '../input/index.ts'
+import { CcEditor, matchesConfiguredKey, type CcKeymap } from '../input/index.ts'
 import { cc, editorTheme, t } from './theme.ts'
 import { wrap } from './text.ts'
 
@@ -105,9 +104,12 @@ export class InlineAnswer {
   }
 
   private boundTo(actionId: string, data: string): boolean {
+    // `matchesConfiguredKey` (not the bare Pi match) keeps a bare LF (Ctrl+J)
+    // distinct from Enter, so a `enter`/`return` binding of line-up/down can
+    // never consume the newline byte here. A real CR still matches.
     return this.keymap
       .getBindings(actionId)
-      .some(binding => binding.split(' ').length === 1 && matchesKey(data, binding as Parameters<typeof matchesKey>[1]))
+      .some(binding => binding.split(' ').length === 1 && matchesConfiguredKey(data, binding))
   }
 
   /** Forward one raw terminal input to the single editor state. */

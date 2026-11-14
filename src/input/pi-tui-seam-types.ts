@@ -141,7 +141,6 @@ declare module "#pi-tui" {
     ccHistoryPrevious(): void
     ccHistoryNext(): void
     ccIsBrowsingHistory(): boolean
-    ccExitHistoryBrowsing(): void
     ccGetHistory(): string[]
     ccSetHistory(entries: string[]): void
     ccInsertCharacter(text: string): void
@@ -150,7 +149,6 @@ declare module "#pi-tui" {
     ccInsertNewLine(): void
     ccSubmit(): void
     ccShouldSubmitOnBackslashEnter(data: string): boolean
-    ccDropUndoSnapshot(): void
     ccReplaceRange(
       from: { line: number; col: number },
       to: { line: number; col: number },

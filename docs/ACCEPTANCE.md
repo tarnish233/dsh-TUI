@@ -1,5 +1,56 @@
 # 原生 DSH 边界与交互语义验收
 
+## v0.1.7：简化/优化与整体 review
+
+在 P2 修复之上完成简化/优化，并做四路只读 review。版本为 `0.1.7/private:true`；按用户授权创建 release commit、annotated `v0.1.7` tag 并 push 到 `origin`。
+
+- **输入**：keymap context 绑定在 `rebuild()` 预编译，`resolve()` 不再每键 flatMap；删除 44 项 `APP_FALLBACK_ACTIONS`，统一以 `implementor` 转发；删除无消费者的 seam/boundaries 导出。
+- **UI/state**：`TranscriptStore.items` 按 list/project/session 记忆化；subagent 锚点一次遍历二分；`OutputTracker` 增量 total、`rate()` 不再 shift；12 处 `CLOSE_ACTIONS` 收敛；keybinding labels 使用 action description；死 UI 导出/未使用 helper 清理。
+- **Backend**：native-codec 每流增量 fold/join，保留 full/interrupted 两套 memo；native-management `fields` 单一 allowlist、`describeNow` 复用、resolveModelInfo 包装合一；删除 `LoaderEntryLike`/`messageFacts`。
+- **构建约束**：根 tsconfig 启用 `erasableSyntaxOnly`/`verbatimModuleSyntax`；package tarball 仍包含 native prebuild。
+- **验证**：整体 review 修复后完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，577994ms，EXIT 0）；547 个 tracked/untracked 输入前后一致；证据 `.cache/overall-fixes/{before-final3.sha256,full-check-final3.log,full-check-final3-result.txt,after-final3.sha256}`。门禁后只补本 README／CHANGELOG／验收文件。
+- **整体 review 已修复**：pre-ready 只重放增量帧，decision 配额优先，溢出只报一次；坏 keybindings 错误签名去重；`execve` 有受控 fallback；compaction 自有 effect/disposer；ModelPicker error 可确认（与 SelectDialog 一致）、loading 阻断；坏旧 effort + 新模型 metadata 不可读时 unset 修复；重选当前默认模型返回成功无变化；`docs/NATIVE-MANAGEMENT.md` 更新三 target；synthetic Escape 在 input 层消费。启动 connect 提前的优化因 native acceptance 挂起已回退，保留原顺序。仍记录：非首个 ready 的会话切换、512 上限静默丢弃、两个不可达 dismiss 路径、metadata/catalog 预算性能未实测。没有真实模型／Provider、真实用户 profile/session/credentials 或全局安装；Git 操作仅限本次授权的版本提交、tag 和 push。Schedule 仍暂缓。
+
+## 当前工作树：P2 用户可见与打包修复
+
+在 P1 review 修复之上继续完成 P2 清单。版本仍为 `0.1.6/private:true`，没有新 commit/tag 或发布。
+
+- **打包**：`package.json` files 加入 `vendor/pi-tui/native`；package-pack 断言 darwin/linux/win32 预构建 `.node` 随 tarball 发布，原生剪贴板不再在归档安装中缺失。
+- **App 状态**：subscribe→首个 ready 之间的 session-scoped 事件进入 `preReadyEvents`，`applyInfo` 后按序重放并按 session/attachment 过滤；decision 替换 Settings 子面板时清 `settingsReturnState/settingsFeedback`；keybinding 警告按配置签名去重，pre-ready 副本只重放一次；已有模型 picker 刷新进入 loading 并重绘。
+- **UI**：SelectDialog/ModelPicker 有旧 roster 且 loading 时显示 `Refreshing…`、Select 无 hitbox；error 时 ModelPicker Select 同样禁用，error+loading 优先显示刷新态；Settings `activateHit` 以稳定 row id 为准，按下行消失时拒绝旧 index。
+- **输入**：历史浏览中的空 Ctrl+W、Ctrl+U、Backspace、Delete 不再退出浏览，只有真实删除才结束；held paste prefix 超时/flush 按普通输入释放，不再吞字节；合成 Escape 带 `synthetic` 标记，App 不把它当成用户中断，不会取消 busy turn、释放队列或清草稿。
+- **Backend**：默认模型 catalog `failures` 保留并脱敏限长，provider 故障与模型不存在分开报告；确认 revision 在 catalog/metadata 读前提前检查，最终 fence 保留；preset 写入使用 live Loader owner recheck。
+- **验证**：P2 首轮完整冻结 `pnpm check` **2860/2860**；review 补漏后 **2863/2863**；再补输入边界后最终 **2865/2865**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，568415ms，EXIT 0）。各轮均 545 个 tracked/untracked 输入前后一致；证据 `.cache/p2-fixes/{before.sha256,full-check.log,full-check-result.txt,before-review-fixes.sha256,full-check-review-fixes.log,full-check-review-fixes-result.txt,after-review-fixes.sha256,before-final.sha256,full-check-final.log,full-check-final-result.txt,after-final.sha256}`。门禁后只补本 README／CHANGELOG／验收文件。
+- **仍记录为后续**：非首个 ready 的会话切换仍按旧 info 丢弃新会话帧；pre-ready 缓冲的 512 上限仍会静默丢弃最新帧；两个低风险 dismiss 路径未清 Settings 返回态（当前不可从 Settings 子面板抵达）。没有真实模型／Provider、真实用户 profile/session/credentials、全局安装或 Git 操作；Schedule 仍暂缓。
+
+## 当前工作树：P1 Review 修复（在默认模型功能之上）
+
+用户要求整体 review 后修复 P1；四个问题均已修复并补回归。产品源码仍基于本地 `v0.1.6` 工作树，没有新 commit/tag。
+
+- **输入边界**：裸 LF 是 Ctrl+J，不再被 Pi 的 legacy `enter`/`return` 别名当作 Enter；`matchesConfiguredKey` 统一 keymap 解析与 search field／picker／modal lookahead。补全菜单、SelectDialog/DecisionDialog、Tools find 字段和 keybindings 编辑器均有组件级回归。
+- **决策净化**：`DecisionDialog` 的 message／question／header／detail／option label/description／preview／notice/error/review，以及只读详情 markdown、multi-file proposal 路径、ModelPicker native error 行均在样式化前 `sanitize`；OSC/CSI 注入测试覆盖单题、多选、多题 tabs 和详情覆盖层。
+- **`/effort` 收敛**：`available:false` 或空 levels 时 `setLoading(false)` 并重绘；错误可见、可取消，不再永久 Loading 或让 Enter 静默失效。
+- **preset 写入安全**：`agentPresets.list()` 通过 bounded wait 读取；`updateDefault` 在 await 后、mutation 前重新检查 abort，超时／取消／attachment 改变不会再落盘。abort 测试证明零 native mutate。
+- **验证**：新增回归后第一轮完整冻结 `pnpm check` **2838/2838**；review 补漏（`return` 别名、find 字段、多选/proposal/error 净化）后第二轮 **2842/2842**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，569551ms，EXIT 0）。两轮均 545 个 tracked/untracked 输入前后一致；证据 `.cache/p1-fixes/{before.sha256,full-check.log,before-second.sha256,full-check-second.log,full-check-second-result.txt,after-second.sha256}`。门禁后只补本 README／CHANGELOG／验收文件。
+- **边界**：没有真实模型／Provider、真实用户 profile／session／credentials、全局安装或 Git 操作；不声称新修复进入原 `v0.1.6` tag。Schedule 仍暂缓。
+
+## 当前工作树：Settings 默认模型与模型 effort
+
+对应用户“默认模型和模型 effort 在 Settings 中配置”的请求。合同见 `MODEL-DEFAULT-SETTINGS.md`；两个 `cloudagent/glm-5.3` 分别负责窄 backend 和 picker/UI 接缝，Parent 核对原生 APIs、共享 App/controller、独立测试及最终门禁。版本仍为 `0.1.6/private:true`，现有 tag 没有移动，本次没有提交或发布授权。
+
+- **原生配置**：`Default model`／`Default model effort` 两行只编辑 DSH 的同一个 `agent-default-model` 选择；按唯一 package Loader entry 找到 namespace，三个 schema-declared volatile 字段在同一次 `settings.mutate` 中通过 native revision guard 写入，ConfigEditor 拥有落盘与重组合。DTO 的 `value`／provider/model/effort 返回真实 read-back，`changed:false` 不冒称成功。默认值不来自当前会话／第一个 provider，也不写 TUI `settings.json`。
+- **语义**：保存默认模型只携带新模型仍声明支持的已存 effort；`Default` 是 native unset，复用原生继承／模型默认语义。不导入 Pi 的默认表／凭据／per-model effort map，不造第二模型／endpoint／auth subsystem。`/model`／`/effort` 本来同时改当前选择和提交原生默认，该 DSH 行为保留；新默认项不调用当前 Agent model selector，logged／CLI pin／resume 原生优先级不变。
+- **未知与失败**：无服务／namespace 不唯一／字段不 volatile／owner 不一致时明确不可写；unsupported 和 unreadable/malformed reasoning 分开。旧默认 metadata 不可读时 effort 禁用、模型仍可通过有效 catalog 修复；必要的新 reasoning decision 不可验证时拒绝写入。读／catalog timeout、取消、attachment／revision 改变在真正 mutation 前拒绝，原生无 signal 的 ConfigEditor mutation 不被包装成可取消事务。home／CLI overlay 拒绝不被绕过。
+- **UI 与输入**：复用现有 ModelPicker 的 `title`／`routeLabel` 和 SelectDialog；不改 input actions／contexts／vendor editor。默认模型标记只来自自己的 native tuple，不被会话 `model_route` 覆盖。native 通知只刷新已开 surface，单 flight＋一次 trailing read；加载／错误阶段不能确认旧项，pointer 退休。Settings 子操作保持 workspace，返回保留 row/query/scroll、唯一主 Editor 和完整 draft/undo/paste；局部 Ctrl+C 不清草稿或中断 busy native root。
+- **独立专项**：`app-model-default-settings` **20/20**，`backend-default-model-settings` **20/20**，真实 `acceptance-model-default-settings` **3/3**，合计 **43/43**，证据 `.cache/model-default-settings/independent-focused-final.log`。parent 直接验证 native ID/revision/null、当前/default effort 名册隔离、局部 cancel、读／写／read-back 失败、metadata burst、旧 surface、未读取/改写本地 TUI 模型配置；不是只信 Agent 意图。
+- **真实 native restart**：inline/fullscreen 各经真实 Settings 选择默认模型、effort → ConfigEditor 改 owned profile → 完全新 DSH launcher 读取并创建未显式选择的 pending session → Settings native unset → 第三次 launcher 确认移除；另一个场景修复 unregistered 的旧默认。累计 **7** 次独立 native 启动，所有配置／provider 声明只在 owned temp HOME/workspace，closed loopback＋synthetic key，零 Agent／request/header／模型 prompt；provider 定义和主草稿保持。证明来自 fresh process，不是持有 getter/cache 或直接 native service setter 代替用户操作。
+- **验收修正**：首次 native fixture 使用了 `balanced/precise/inspect/thorough/session` 作为 llm-pi-ai effort key，原生 schema 只接受 `off|minimal|low|medium|high|xhigh|max`，所以插件未注册而返回 `NO_ADAPTER`。这不是产品取消 signal 错误（公共 `resolveModelInfo` 第三参确为可选 AbortSignal）。改 fixture 为真实 native low/high 子集，同时保留“current 仅 high、default 仅 low”、不支持的已存等级被移除和 reboot/reset 断言；没有放宽原生校验。旧失败证据在 `.cache/model-default-settings/native-restart{,-diagnostic,-metadata}.log`，有效双模式结果见独立专项。
+- **变异**：Parent 两项直接 source App/controller 变异使 provenance 与 native-unset 回归真实 `AssertionError`，finally 立即恢复，before/after hash 相同，`.cache/model-default-settings/parent-mutations.json`。最后的 namespace／runtime owner 并发回归先在原代码上实际 red（旧 revision 不变仍错误写入），再补一次真正 mutation 前的 live owner re-proof；独立最终 43 项再次全部通过。Backend 3 项（attachment、revision、carry）及 UI 1 项（loading/error selection）也由 owner 临时撤修复证明 red 后恢复；Parent 后续专项再次绿。最初采集器的短 tail 漏掉 assertion 标题，未当作完成证明；改成布尔 provenance 断言后重做，保留同一语义。
+- **完整门禁首轮**：**2829/2831**，仅 `app-modal` 中双模式原生权限导航测试失败：原“三次向下”的固定 offset 选中了新增默认项，不是权限逻辑回归。只把测试改为按 `native:native.permission` 稳定 ID 导航，原二次确认／默认保留权限／未执行原生 command 断言全部保留，整个文件 **15/15**。首轮全部 **545** 个输入 fingerprint 前后相同，`.cache/model-default-settings/{full-check-first.log,first-frozen-tree.sha256,first-post-check-tree.sha256}`；没有运行中修改文件。未将此失败轮次记为通过。
+- **最终完整门禁**：新增正式回归 **59** 项；第二轮冻结 `pnpm check` **2831/2831**（**227** 个测试文件，build＋strict TypeScript＋serial tests，0 fail/cancel/skip/todo，572220ms，EXIT 0）。`.cache/model-default-settings/full-check.log` 与 `full-check-result.txt`；全部 **545** 个 tracked/untracked 输入在 `frozen-tree.sha256`／`post-check-tree.sha256` 完全一致，TREE_SHA256 `0d496b121fa702352bc87ce6e267a8c15a1971d0e900bebbc89ca2e2d212391d`。运行期间没有文件修改，不以先前聚焦／2772 基线代替本次门禁。
+- **门禁环境与后续核验**：使用 owned 临时 HOME/DSH_HOME，空 npm auth 配置，pnpm offline＋禁止 run 前依赖准备，registry/proxy 限制为 closed loopback；只复用既有依赖，不宣称全新空 cache 安装已验证。运行的是原有 `check` 的 build/typecheck/test 脚本，包含真实 source-only pack 和全部原生／PTY／input/UI 回归。门禁后只补 README／CHANGELOG／本验收文件的结果，产品源码、测试与脚本 checksum 再次核对不变；manifest／lock／vendor 源与改动前一致。
+- **边界**：manifest／lock／版本／vendor 源未改；没有真实模型 Provider、真实用户 profile／session／credentials、全局安装或 symlink 替换，没有 commit/tag/push/publish。新功能基于本地 v0.1.6 的工作树，不声称已进入原 tag。Schedule 仍暂缓。
+
 ## v0.1.6：本地版本标记
 
 用户明确选择 `v0.1.6`，授权将已验收项目改动纳入本地版本提交，再创建 annotated tag；不 push、不发布 registry、不更换全局程序，`private:true` 保持。只提交源码、正式测试、manifest、bundle 和文档；缓存、构建产物、运行状态与凭据不入库。

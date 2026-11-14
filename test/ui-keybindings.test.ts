@@ -96,7 +96,9 @@ test('shortcut settings render grouped keys/actions, including unbound entries, 
   assert.match(rendered, /Key\(s\).*Action/)
   assert.match(rendered, /Home \/ Ctrl\+A/)
   assert.match(rendered, /Not bound/)
-  assert.match(rendered, /Todo panel \(not implemented\)/)
+  assert.match(rendered, /Toggle native todos above the editor/)
+  assert.match(rendered, /Paste clipboard content/)
+  assert.doesNotMatch(rendered, /not implemented/)
   assert.match(rendered, /Cycle DSH permission/)
   assert.match(rendered, /Keyboard shortcuts/)
   assert.match(rendered, /\/temporary\/config\/keybindings\.json/)
@@ -133,6 +135,35 @@ test('the search field filters by action, label, group and current binding', () 
   for (const char of 'ctrl+alt') binding.dialog.handleInput(char)
   assert.equal(binding.dialog.query, 'ctrl+alt')
   assert.match(text(binding.dialog), /No shortcuts match/)
+})
+
+test('Ctrl+J inserts a newline in the binding editor instead of saving', async () => {
+  const f = fixture(0)
+  f.dialog.handleInput(ENTER)
+  assert.equal(f.dialog.isEditing, true)
+  f.dialog.handleInput('\x15') // clear the existing binding
+  for (const char of 'ctrl+p') f.dialog.handleInput(char)
+  f.dialog.handleInput('\n')
+  await tick()
+  assert.equal(f.dialog.isEditing, true, 'Ctrl+J is a newline, not a save')
+  assert.deepEqual(f.writes, [], 'an incomplete binding is not submitted')
+  f.dialog.handleInput(ESC)
+  assert.equal(f.dialog.isEditing, false)
+})
+
+test('a bare LF never triggers an enter/return cancel fallback in the binding editor', () => {
+  // `app.clear` plus a close action are the local cancel fallback. Bound to
+  // `enter`, only a real CR may cancel: a bare LF is Ctrl+J (newline), so the
+  // entered byte stays text instead of silently abandoning the edit.
+  const f = fixture(0, { 'app.clear': 'enter', 'app.cancel': 'enter' })
+  f.dialog.handleInput(ENTER)
+  assert.equal(f.dialog.isEditing, true)
+  f.dialog.handleInput('\n')
+  assert.equal(f.dialog.isEditing, true, 'Ctrl+J is a newline, not the cancel fallback')
+  assert.equal(f.dialog.bindingText, 'home\nctrl+a\n', 'the LF byte stayed in the editor')
+  f.dialog.handleInput('\r')
+  assert.equal(f.dialog.isEditing, false, 'a real CR still runs the configured Enter cancel')
+  assert.deepEqual(f.writes, [], 'abandoning the edit writes nothing')
 })
 
 test('one inline CC editor saves multiple alternatives and a chord without closing the list', async () => {

@@ -61,7 +61,7 @@ import type { SessionInfo, SubagentEntry } from '../backend/types.ts'
 import { createCcKeymap, type CcKeymap } from '../input/index.ts'
 import type { TranscriptStore } from '../state/transcript.ts'
 import type { TranscriptView } from './transcript.ts'
-import { modalBinding, modalHeight, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, modalBinding, modalHeight, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import {
   subagentCanReply,
   subagentCanStop,
@@ -128,8 +128,6 @@ export interface ChildSessionViewOptions {
    */
   loading?: boolean
 }
-
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 /** Body line while the parent's native child snapshot is pending. */
 const LOADING_TEXT = 'Loading child session…'

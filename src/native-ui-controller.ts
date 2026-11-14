@@ -1,12 +1,13 @@
 /** App-only native views. No tools, domain loop, persistence, timers or profile composition. */
 import type { Component, TUI } from '#pi-tui'
 import type { Backend, BackendEvent, SessionInfo } from './backend/types.ts'
-import { redactDiagnostic } from './backend/errors.ts'
+import { asBackendError, redactDiagnostic } from './backend/errors.ts'
 import type { CcKeymap } from './input/index.ts'
 import type { GoalRead, WorkingDirectoryRead } from './backend/native-inspection.ts'
 import type { ContinuedQuestionRow } from './backend/native-questions.ts'
 import type { DefaultSettingTarget, NativeDefaultSettingView, NativeDefaultSettingsRead } from './backend/native-management.ts'
 import { DecisionDialog, SelectDialog } from './ui/dialogs.ts'
+import { ModelPickerDialog, type ModelPickerItem } from './ui/model-picker.ts'
 import type { InteractionPlacement } from './ui/interaction.ts'
 import type { DecisionDetailContent } from './ui/decision-details.ts'
 import { JobsDialog } from './ui/jobs-dialog.ts'
@@ -41,6 +42,8 @@ export interface NativeViewHost {
   interrupt(): Promise<void>
   returnToSettings(): void
   settingsOpen(): boolean
+  /** A Settings-owned result message, not a conversation notice. False = no Settings owner. */
+  settingsMessage?(message: string, error?: boolean): boolean
   details?(parent: DecisionDialog, content: DecisionDetailContent): void
   goal(value: GoalRead | undefined): void
   directory(value: WorkingDirectoryRead | undefined): void
@@ -48,7 +51,7 @@ export interface NativeViewHost {
   sessionCommand(name: string, args: Record<string, unknown>): Promise<unknown>
 }
 
-type ViewKind = 'jobs' | 'inventory' | 'questions' | 'answer' | 'defaults' | 'default-values' | 'confirm-default' | 'rename' | 'fork'
+type ViewKind = 'jobs' | 'inventory' | 'questions' | 'answer' | 'defaults' | 'default-values' | 'default-model' | 'default-effort' | 'confirm-default' | 'rename' | 'fork'
 interface View {
   readonly kind: ViewKind
   readonly dialog: Component
@@ -89,8 +92,22 @@ export class NativeUiController {
     else this.host.goal(undefined)
     if (capabilities.includes('native-working-directory')) void this.status('working-directory', true)
     else this.host.directory(undefined)
+    if (this.host.settingsOpen()) this.refreshSettings()
     const view = this.view
     if (view !== undefined && this.active(view)) this.refresh(view, true)
+  }
+
+  /** The default picker has its own route provenance; session metadata must not relabel it. */
+  ownsDefaultModelPicker(dialog: Component | undefined): boolean {
+    return this.view?.kind === 'default-model' && this.view.dialog === dialog && this.active(this.view)
+  }
+
+  /** Catalog signals refresh existing default surfaces only, never open a picker. */
+  modelsChanged(): void {
+    if (this.disposed) return
+    if (this.host.settingsOpen()) this.refreshSettings()
+    const view = this.view
+    if (view !== undefined && this.active(view) && (view.kind === 'default-model' || view.kind === 'default-effort')) this.refresh(view, true)
   }
 
   invalidate(event: Extract<BackendEvent, { type: 'native_ui_changed' }>): void {
@@ -104,7 +121,7 @@ export class NativeUiController {
     if ((event.domain === 'jobs' && view.kind === 'jobs') ||
         ((event.domain === 'inventory' || event.domain === 'tools') && view.kind === 'inventory') ||
         (event.domain === 'questions' && (view.kind === 'questions' || view.kind === 'answer')) ||
-        (event.domain === 'settings' && (view.kind === 'defaults' || view.kind === 'default-values'))) this.refresh(view, true)
+        (event.domain === 'settings' && (view.kind === 'defaults' || view.kind === 'default-values' || view.kind === 'default-model' || view.kind === 'default-effort'))) this.refresh(view, true)
   }
 
   private active(view: View): boolean {
@@ -161,10 +178,18 @@ export class NativeUiController {
               view.dialog.setReads({ plugins: { available: false, reason: 'native-failed' }, tools: { available: false, reason: 'native-failed' }, capabilities: this.host.info()?.capabilities ?? [] })
               view.dialog.setLoading(false)
             }
-            if (view.dialog instanceof SelectDialog) { view.dialog.setLoading(false); view.dialog.setMessage(message, true) }
-            this.host.report(message, true)
+            if (view.dialog instanceof SelectDialog) {
+              if (view.kind === 'default-effort') view.dialog.setItems([])
+              view.dialog.setLoading(false); view.dialog.setMessage(message, true)
+            }
+            if (view.dialog instanceof ModelPickerDialog) { view.dialog.setLoading(false); view.dialog.setError(message) }
+            if (view.kind !== 'default-model' && view.kind !== 'default-effort') this.host.report(message, true)
           } else if (key === 'status:goal') this.host.goal(undefined)
           else if (key === 'status:working-directory') this.host.directory(undefined)
+          else if (key === 'settings-summary') {
+            this.defaults = { available: false, targets: [], limitation: message }
+            this.host.render()
+          }
         }
       } finally {
         if (this.requests.get(key) === request) {
@@ -195,6 +220,8 @@ export class NativeUiController {
     } else if (view.kind === 'inventory') void this.inventory(view, dirty)
     else if (view.kind === 'questions' || view.kind === 'answer') void this.questions(view, dirty)
     else if (view.kind === 'defaults' || view.kind === 'default-values') void this.defaultRead(view, dirty)
+    else if (view.kind === 'default-model') void this.defaultModelRead(view, dirty)
+    else if (view.kind === 'default-effort') void this.defaultEffortRead(view, dirty)
   }
 
   openJobs(): void {
@@ -346,7 +373,121 @@ export class NativeUiController {
     finally { if (this.host.isCurrent(view.context)) this.host.returnToSettings() }
   }
 
+  private modelDefault(read: NativeDefaultSettingsRead | undefined): NativeDefaultSettingView | undefined {
+    return read?.targets.find(field => field.target === 'agent-default-model')
+  }
+
+  openDefaultModel(): void {
+    const capabilities = this.host.info()?.capabilities ?? []
+    if (!capabilities.includes('native-defaults') || !capabilities.includes('models')) return
+    const field = this.modelDefault(this.defaults)
+    let view: View | undefined
+    const dialog = new ModelPickerDialog(this.host.tui, {
+      title: 'Choose default model', routeLabel: 'default', models: [], loading: true,
+      currentProvider: field?.provider, currentModel: field?.model, keymap: this.host.keymap,
+      onCancel: () => this.close(view), onInterrupt: () => { void this.host.interrupt() },
+      onSelect: value => {
+        if (view === undefined || !this.active(view)) return
+        const field = this.modelDefault(view.defaults)
+        if (field === undefined || !field.available || !field.writable || field.revision === undefined) return
+        const context = view.context
+        this.close(view, false)
+        void this.writeDefault(context, 'agent-default-model', value, field.revision)
+      },
+    })
+    view = this.mount('default-model', dialog)
+    if (view !== undefined) void this.defaultModelRead(view)
+  }
+
+  private defaultModelRead(view: View, dirty = false): Promise<void> {
+    if (view.dialog instanceof ModelPickerDialog) view.dialog.setLoading(true)
+    return this.request('default-model', view, dirty, async () => await Promise.all([
+      this.host.backend.command('native-defaults'), this.host.backend.command('models'),
+    ]), value => {
+      if (!Array.isArray(value) || value.length !== 2) throw new Error('DSH returned an invalid default model view.')
+      const read = readNativeDefaults(value[0])
+      if (read === undefined) throw new Error('DSH returned an invalid native defaults view.')
+      this.defaults = read; view.defaults = read
+      const field = this.modelDefault(read), dialog = view.dialog
+      if (!(dialog instanceof ModelPickerDialog)) return
+      if (field === undefined || !field.available || !field.writable || field.revision === undefined) {
+        dialog.setModels([])
+        dialog.setError(field?.limitation ?? read.limitation ?? 'The native default model is not writable in this composition.')
+        this.host.render(); return
+      }
+      if (!Array.isArray(value[1])) throw new Error('DSH returned an invalid native model catalog.')
+      const models: ModelPickerItem[] = value[1].flatMap(value => {
+        const row = object(value)
+        if (row === undefined || typeof row.id !== 'string' || !row.id || typeof row.provider !== 'string' || !row.provider || typeof row.model !== 'string' || !row.model) return []
+        return [{ id: row.id, provider: row.provider, model: row.model,
+          label: typeof row.label === 'string' && row.label ? row.label : row.model,
+          ...(typeof row.description === 'string' ? { description: row.description } : {}) }]
+      })
+      // This is the persisted default tuple, never the live session route. The
+      // picker marks it once via routeLabel, not an inferred isDefault flag.
+      dialog.setCurrentRoute(field.provider, field.model)
+      dialog.setModels(models)
+      dialog.setError(models.length > 0 ? undefined : 'No native models are available in this composition.')
+      dialog.setLoading(false)
+      this.host.render()
+    })
+  }
+
+  openDefaultEffort(): void {
+    if (!this.host.info()?.capabilities.includes('native-defaults')) return
+    let view: View | undefined
+    const dialog = new SelectDialog(this.host.tui, {
+      title: 'Default model effort', subtitle: 'Saved DSH default; levels belong to the default model.',
+      loading: true, items: [], keymap: this.host.keymap,
+      onCancel: () => this.close(view), onInterrupt: () => { void this.host.interrupt() },
+      onSelect: value => {
+        if (view === undefined || !this.active(view) || typeof value !== 'string') return
+        const field = this.modelDefault(view.defaults)
+        if (field === undefined || !field.available || !field.writable || field.revision === undefined ||
+            typeof field.value !== 'string' || !field.value || field.reasoningAvailable !== true || field.reasoningSupported !== true ||
+            (value !== '' && !field.reasoningEfforts?.some(level => level.id === value))) return
+        const context = view.context
+        this.close(view, false)
+        void this.writeDefault(context, 'agent-default-model', field.value, field.revision, value === '' ? null : value)
+      },
+    })
+    view = this.mount('default-effort', dialog)
+    if (view !== undefined) void this.defaultEffortRead(view)
+  }
+
+  private defaultEffortRead(view: View, dirty = false): Promise<void> {
+    if (view.dialog instanceof SelectDialog) view.dialog.setLoading(true)
+    return this.request('default-effort', view, dirty, () => this.host.backend.command('native-defaults'), value => {
+      const read = readNativeDefaults(value)
+      if (read === undefined) throw new Error('DSH returned an invalid native defaults view.')
+      this.defaults = read; view.defaults = read
+      const field = this.modelDefault(read), dialog = view.dialog
+      if (!(dialog instanceof SelectDialog)) return
+      dialog.setMessage(undefined)
+      const levels = field?.reasoningEfforts ?? []
+      const limitation = field === undefined || !field.available || !field.writable || field.revision === undefined || typeof field.value !== 'string' || !field.value
+        ? field?.limitation ?? read.limitation ?? 'The native default model is not writable in this composition.'
+        : field.reasoningAvailable !== true ? 'Native reasoning metadata for the default model is unavailable.'
+        : field.reasoningSupported !== true || levels.length === 0 ? 'The default model exposes no native reasoning levels.' : undefined
+      if (limitation !== undefined || field === undefined) {
+        dialog.setItems([]); dialog.setMessage(limitation, true); dialog.setLoading(false)
+        this.host.render(); return
+      }
+      dialog.setItems([
+        { value: '', label: 'Default' + (field.reasoningEffort === undefined ? ' · default' : ''),
+          description: field.defaultReasoningEffort === undefined ? 'Use the native model/adapter default; remove the explicit override.'
+            : 'Model default (' + field.defaultReasoningEffort + '); remove the explicit override.' },
+        ...levels.map(level => ({ value: level.id,
+          label: (level.label ?? level.id) + (level.id === field.reasoningEffort ? ' · default'
+            : level.id === field.effectiveReasoningEffort ? ' · effective' : ''), description: level.description ?? level.id })),
+      ], { preserveValue: true })
+      dialog.setLoading(false)
+      this.host.render()
+    })
+  }
+
   openDefaults(target?: DefaultSettingTarget): void {
+    if (target === 'agent-default-model') { this.openDefaultModel(); return }
     if (!this.host.info()?.capabilities.includes('native-defaults')) return
     let view: View | undefined
     const dialog = new SelectDialog(this.host.tui, {
@@ -356,7 +497,7 @@ export class NativeUiController {
       onSelect: value => {
         if (view === undefined || !this.active(view) || typeof value !== 'string') return
         if (view.target === undefined) {
-          if (value === 'agent-preset-default' || value === 'permission-default-preset') this.openDefaults(value)
+          if (value === 'agent-preset-default' || value === 'permission-default-preset' || value === 'agent-default-model') this.openDefaults(value)
         } else {
           const field = view.defaults?.targets.find(field => field.target === view?.target)
           if (field !== undefined) this.confirmDefault(view, field, value)
@@ -385,7 +526,7 @@ export class NativeUiController {
       view.dialog.setMessage(undefined)
       if (view.target === undefined) {
         view.dialog.setItems(read.targets.map(field => ({ value: field.target,
-          label: (field.target === 'agent-preset-default' ? 'Agent preset' : 'Permission preset') + ' · ' + (field.effectiveValue ?? field.value ?? 'Unavailable'),
+          label: (field.target === 'agent-preset-default' ? 'Agent preset' : field.target === 'agent-default-model' ? 'Model' : 'Permission preset') + ' · ' + (field.effectiveValue ?? field.value ?? 'Unavailable'),
           description: field.limitation ?? (field.writable ? 'Native revision-guarded default' : 'Read-only') })), { preserveValue: true })
       } else {
         const field = read.targets.find(field => field.target === view.target)
@@ -420,16 +561,58 @@ export class NativeUiController {
     confirmation = this.mount('confirm-default', dialog, context)
   }
 
-  private async writeDefault(context: NativeViewContext, target: DefaultSettingTarget, value: string, expectedRevision: number): Promise<void> {
+  private async writeDefault(context: NativeViewContext, target: DefaultSettingTarget, value: string, expectedRevision: number, reasoningEffort?: string | null): Promise<void> {
+    const modelDefault = target === 'agent-default-model'
+    const feedback = (message: string, error = false): void => {
+      if (!modelDefault || this.host.settingsMessage?.(message, error) !== true) this.host.report(message, error)
+    }
+    // A summary started before this explicit write must not later restore an
+    // obsolete default. Existing native notifications provide the same fence.
+    const summary = this.requests.get('settings-summary')
+    if (summary !== undefined) summary.dirty = true
     try {
-      const result = object(await this.host.backend.command('native-default-update', { target, value, expectedRevision, attachmentId: context.attachmentId }))
+      const result = object(await this.host.backend.command('native-default-update', {
+        target, value, expectedRevision, attachmentId: context.attachmentId,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      }))
       if (!this.host.isCurrent(context)) return
-      if (result?.ok === true) this.host.report(result.changed === true ? 'Native default updated through DSH.' : 'DSH accepted the write, but the read-back value is not confirmed.', result.changed !== true)
-      else if (result?.ok === false) this.host.report(typeof result.message === 'string' ? result.message : 'Native default was not changed: ' + String(result.reason), true)
-      else throw new Error('DSH returned an invalid native default result.')
+      let message: string, error: boolean
+      if (result?.ok === true) {
+        const unchanged = result.unchanged === true
+        error = result.changed !== true && !unchanged
+        message = unchanged ? 'The native default already has this selection.'
+          : error ? 'DSH accepted the write, but the read-back value is not confirmed.'
+          : modelDefault ? (reasoningEffort === undefined ? 'Default model saved through DSH.' : 'Default model effort saved through DSH.')
+          : 'Native default updated through DSH.'
+      } else if (result?.ok === false) {
+        error = true
+        message = typeof result.message === 'string' ? result.message : 'Native default was not changed: ' + String(result.reason)
+      } else throw new Error('DSH returned an invalid native default result.')
       this.defaults = undefined
-    } catch (error) { if (this.host.isCurrent(context)) this.host.report(diagnostic(error, 'Native default update failed.'), true) }
-    finally { if (this.host.isCurrent(context)) this.host.returnToSettings() }
+      if (modelDefault) {
+        // Refresh before restoring the Settings frame, using native read-back
+        // rather than projecting the requested value as a persistence fact.
+        try {
+          const read = readNativeDefaults(await this.host.backend.command('native-defaults'))
+          if (!this.host.isCurrent(context)) return
+          if (read === undefined) throw new Error('DSH returned an invalid native defaults view.')
+          this.defaults = read
+        } catch (readError) {
+          if (!this.host.isCurrent(context)) return
+          const limitation = diagnostic(readError, 'Could not refresh native defaults.')
+          this.defaults = { available: false, targets: [], limitation }
+          message += ' Native state could not be refreshed; reopen Settings to retry.'
+        }
+      }
+      feedback(message, error)
+    } catch (error) {
+      if (this.host.isCurrent(context)) {
+        this.defaults = undefined
+        // A local cancel is not a failed native write. The surface still returns
+        // to Settings; only real failures become a red result line.
+        if (asBackendError(error).code !== 'ABORTED') feedback(diagnostic(error, 'Native default update failed.'), true)
+      }
+    } finally { if (this.host.isCurrent(context)) this.host.returnToSettings() }
   }
 
   /** A literal /rename title is already an explicit user mutation. */

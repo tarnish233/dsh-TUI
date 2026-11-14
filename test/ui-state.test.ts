@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import type { BackendEvent, SessionEvent, SessionInfo, StreamPresentation, TranscriptCodec } from '../src/backend/types.ts'
+import type { BackendEvent, SessionEvent, SessionInfo, StreamPresentation, SubagentEntry, TranscriptCodec } from '../src/backend/types.ts'
 import { TranscriptStore } from '../src/state/transcript.ts'
 import { DEMO_TRANSCRIPT_CODEC } from '../src/demo.ts'
 
@@ -540,4 +540,76 @@ test('ignores synthetic user-role context and reports local notices', () => {
   assert.equal(notice.text, 'local error')
   feed(store, { type: 'error', message: 'backend exploded' })
   assert.equal(store.items.length, 2)
+})
+// ---------------------------------------------------------------------------
+// `items` memoization
+
+const childEntry = (overrides: Partial<SubagentEntry> = {}): SubagentEntry => ({
+  id: 'child-1',
+  parentSessionId: 'session-a',
+  mode: 'one-shot',
+  status: 'running',
+  ...overrides,
+})
+
+test('items is memoized: unchanged reads share one array, real changes rebuild it', () => {
+  const store = newStore({ events: [sessionEvent('user/message', 1, userMessage('hello'))] })
+  const first = store.items
+  assert.equal(store.items, first, 'two reads with no change return the identical array')
+  assert.equal(store.items, first)
+  assert.deepEqual(first.map(item => item.kind), ['user'])
+
+  // A catalog entry without a parent seq adds no transcript row: the projection
+  // is the durable list itself, so even a recomposition returns that one array.
+  feed(store, { type: 'subagents', sessionId: 'session-a', value: { entries: [childEntry()] } })
+  const catalogNoAnchor = store.items
+  assert.deepEqual(catalogNoAnchor.map(item => item.kind), ['user'])
+  assert.equal(catalogNoAnchor, first, 'a catalog change with no anchor projects the durable list itself')
+  assert.equal(catalogNoAnchor[0], first[0], 'unchanged durable entries keep their identity')
+  assert.equal(store.items, catalogNoAnchor)
+
+  // A replayed, identical catalog is a no-op: no notify, no recomposition.
+  feed(store, { type: 'subagents', sessionId: 'session-a', value: { entries: [childEntry()] } })
+  assert.equal(store.items, catalogNoAnchor, 'an idempotent catalog replay keeps the cached array')
+
+  // A trustworthy anchor is a real projection change.
+  feed(store, { type: 'subagent', sessionId: 'session-a', value: childEntry({ catalogSeq: 1 }) })
+  const anchored = store.items
+  assert.notEqual(anchored, catalogNoAnchor)
+  assert.deepEqual(anchored.map(item => item.kind), ['user', 'subagent'])
+  assert.equal(store.items, anchored)
+
+  // A local notice mutates the durable list only.
+  store.report('note')
+  const withNotice = store.items
+  assert.notEqual(withNotice, anchored)
+  assert.deepEqual(withNotice.map(item => item.kind), ['user', 'subagent', 'notice'])
+  assert.equal(store.items, withNotice)
+
+  // A new session id re-anchors nothing: the same catalog yields no child row.
+  store.reset({ ...baseInfo(), sessionId: 'session-b' })
+  const otherSession = store.items
+  assert.notEqual(otherSession, withNotice)
+  assert.deepEqual(otherSession.map(item => item.kind), [])
+
+  // `clear()` empties the projection without changing the session id.
+  store.report('again')
+  assert.deepEqual(store.items.map(item => item.kind), ['notice'])
+  const beforeClear = store.items
+  store.clear()
+  assert.notEqual(store.items, beforeClear)
+  assert.equal(store.items.length, 0)
+})
+
+test('the items cache never hides an anchored child removed by a later snapshot', () => {
+  const store = newStore({ events: [sessionEvent('user/message', 5, userMessage('anchor'))] })
+  feed(store, { type: 'subagents', sessionId: 'session-a', value: { entries: [childEntry({ catalogSeq: 4 })] } })
+  assert.deepEqual(store.items.map(item => item.kind), ['subagent', 'user'])
+  const withChild = store.items
+  // The catalog no longer lists the child: the removed row must disappear even
+  // though no entry revision was bumped by the removal itself.
+  feed(store, { type: 'subagents', sessionId: 'session-a', value: { entries: [] } })
+  const without = store.items
+  assert.notEqual(without, withChild)
+  assert.deepEqual(without.map(item => item.kind), ['user'])
 })

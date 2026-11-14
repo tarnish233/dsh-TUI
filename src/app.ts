@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { watch, type FSWatcher } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import {
   Container, getNativeClipboard, isKeyRelease, isViewportTUI,
   matchesKey, ProcessTerminal, ScrollView, Spacer, Text, truncateToWidth, visibleWidth,
@@ -122,6 +122,37 @@ const SUSPEND_ROLLBACK_MS = 500
 const WORKING_SPINNER_FRAMES = ['·', '✻', '✶', '✳'] as const
 /** Bound on graceful DSH close after the terminal is already restored. */
 const SHUTDOWN_CLOSE_MS = 8_000
+/**
+ * Pre-ready frames worth replaying because they carry an increment the ready
+ * snapshot cannot contain: a pending approval, durable native events, a status
+ * flip, live stream frames and per-child progress. Order is preserved.
+ */
+const PRE_READY_REPLAY: ReadonlySet<BackendEvent['type']> = new Set<BackendEvent['type']>([
+  'decision', 'decision_closed', 'session_event', 'status',
+  'stream_start', 'stream_chunk', 'stream_end', 'subagent',
+])
+/**
+ * Pre-ready last-writer-wins projections replayed only as their newest frame.
+ * `ready` carries no todos/plan value and nothing re-reads them afterwards, so
+ * dropping the newest snapshot would lose a resumed checklist/plan state;
+ * replaying older copies of the same projection would only resurrect staleness.
+ */
+const PRE_READY_LATEST: ReadonlySet<BackendEvent['type']> = new Set<BackendEvent['type']>(['todos', 'plan'])
+/*
+ * Everything else observed pre-ready (`permissions`, `model_route`, `title`,
+ * `subagents`, `metrics`, the `*_changed` invalidations and
+ * `native_ui_changed`) is either already in the ready snapshot or re-read by
+ * `applyInfo`/`refreshQueue`; a buffered copy is older than both, so it is
+ * dropped instead of overwriting fresher state.
+ */
+/** Bound on the pre-ready buffer; a decision frame evicts older non-decisions. */
+const PRE_READY_LIMIT = 512
+/**
+ * Local bound on one model-catalog read. A native read that never settles must
+ * not leave the picker on "Refreshing"; the picker degrades to a retryable
+ * error instead.
+ */
+const MODEL_CATALOG_TIMEOUT_MS = 10_000
 /** Shared 品牌蓝 (brand blue) for the prompt, working status and chrome. */
 const accent = t.accent
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
@@ -344,6 +375,11 @@ export interface AppOptions {
    * startup instead of resuming a known id. Esc keeps the fresh session.
    */
   resumePicker?: boolean
+  /**
+   * Bound on one native model-catalog read. Offline tests shrink it to prove an
+   * unanswered read cannot leave the picker loading forever.
+   */
+  modelCatalogTimeoutMs?: number
 }
 
 /**
@@ -505,6 +541,10 @@ export class App {
   private clipboardPending = false
   private decisionId?: string
   private readonly decisions: PendingDecision[] = []
+  /** Session-scoped frames observed between subscribe() and the first ready. */
+  private readonly preReadyEvents: BackendEvent[] = []
+  /** Pre-ready frames the bounded buffer discarded; reported once at replay. */
+  private preReadyDropped = 0
   private readonly activeCommands = new Map<string, string>()
   private nativeCommands: CommandCatalogEntry[] = []
   private catalogRequest?: { sessionId: string; attachmentId: string | undefined; dirty: boolean; promise: Promise<void> }
@@ -571,6 +611,8 @@ export class App {
   private readonly output = new OutputTracker()
   private chordHint?: string[]
   private readonly warnings: string[] = []
+  /** Last read keybinding document, used to skip duplicate watcher diagnostics. */
+  private lastKeyConfigSignature?: string
   private readonly signals: Array<[NodeJS.Signals, () => void]> = []
   private offCrash?: () => void
   /** Set by the first escaping error; a crash loop must not paint repeatedly. */
@@ -663,6 +705,14 @@ export class App {
       dialog: () => this.dialog, show: (dialog, placement) => this.showDialog(dialog, false, placement), dismiss: () => this.dismissDialog(),
       render: () => this.render(), report: (message, error) => this.store.report(message, error ? 'error' : 'info'),
       interrupt: () => this.interrupt(), returnToSettings: () => this.returnToSettings(), settingsOpen: () => this.dialog instanceof SettingsDialog,
+      settingsMessage: (message, error = false) => {
+        const pending = this.settingsReturnState
+        if (pending === undefined || !this.sameAttachment(pending.context)) return false
+        if (this.dialog instanceof SettingsDialog) { this.dialog.setMessage(message, error); return true }
+        if (this.dialog !== undefined) return false
+        this.settingsFeedback = { message, error, context: this.context() }
+        return true
+      },
       details: (parent, content) => this.openDecisionDetails(parent, content),
       goal: value => { this.goalProgress.status = value }, directory: value => { this.nativeDirectory = value },
       renamed: (sessionId, title) => {
@@ -901,8 +951,6 @@ export class App {
     this.gitRefresher.refresh()
     this.gitTimer = setInterval(() => this.gitRefresher?.refresh(), 10_000)
     this.gitTimer.unref()
-    // The connect task starts before the overlay opens so the picker's async
-    // listing can await it; the DSH runtime boots behind a visible dialog.
     this.connecting = this.options.backend.connect()
     if (this.options.resumePicker) this.openStartupSessionPicker()
     try {
@@ -915,6 +963,7 @@ export class App {
       this.refreshQueue()
       void this.queryAutoTitle()
       for (const warning of [...this.warnings, ...this.settings.warnings, ...this.history.warnings]) this.store.report(warning, 'error')
+      this.warnings.length = 0
       if (!this.options.resumePicker && this.options.initialPrompt) await this.submit(this.options.initialPrompt)
     } catch (error) {
       this.connected = false; this.fatal = true
@@ -1772,6 +1821,48 @@ export class App {
     this.prompt.focused = this.prompt.focused
   }
 
+  /**
+   * Replay pre-ready frames in arrival order. Incremental facts are replayed as
+   * observed, the two snapshot-only projections replay their newest frame, and
+   * everything the ready payload (or its refetches) supersedes is dropped.
+   */
+  private flushPreReadyEvents(info: SessionInfo): void {
+    const events = this.preReadyEvents.splice(0)
+    const dropped = this.preReadyDropped
+    this.preReadyDropped = 0
+    // The newest frame per last-writer-wins projection, replayed in order.
+    const newest = new Map<BackendEvent['type'], BackendEvent>()
+    for (const event of events) if (PRE_READY_LATEST.has(event.type)) newest.set(event.type, event)
+    for (const event of events) {
+      if (PRE_READY_LATEST.has(event.type)) {
+        if (newest.get(event.type) !== event) continue
+        newest.delete(event.type)
+      } else if (!PRE_READY_REPLAY.has(event.type)) continue
+      if ('sessionId' in event && event.sessionId !== info.sessionId) continue
+      if ('attachmentId' in event && event.attachmentId !== undefined && event.attachmentId !== info.attachmentId) continue
+      this.handleEvent(event)
+    }
+    // One summary, never one notice per dropped frame.
+    if (dropped > 0) {
+      this.store.report('Dropped ' + dropped + ' startup event' + (dropped === 1 ? '' : 's') +
+        ' before the session was ready; reload the session if a decision or live output is missing.', 'error')
+    }
+  }
+
+  /**
+   * Hold a pre-ready frame inside the bounded buffer. A decision is the one
+   * fact a later ready cannot represent, so it outranks the oldest buffered
+   * non-decision frame; everything else is dropped and counted for one summary.
+   */
+  private bufferPreReadyEvent(event: BackendEvent): void {
+    if (this.preReadyEvents.length < PRE_READY_LIMIT) { this.preReadyEvents.push(event); return }
+    if (event.type === 'decision' || event.type === 'decision_closed') {
+      const index = this.preReadyEvents.findIndex(pending => pending.type !== 'decision' && pending.type !== 'decision_closed')
+      if (index >= 0) { this.preReadyEvents.splice(index, 1); this.preReadyEvents.push(event); return }
+    }
+    this.preReadyDropped += 1
+  }
+
   private applyInfo(info: SessionInfo): void {
     this.infoStamp += 1
     const codec = this.options.backend.transcriptCodec
@@ -1860,6 +1951,7 @@ export class App {
     }
     void this.refreshSkills()
     this.nativeUi.attached()
+    this.flushPreReadyEvents(info)
     this.render()
   }
 
@@ -1894,6 +1986,13 @@ export class App {
 
   private handleEvent(event: BackendEvent): void {
     if (this.closing) return
+    if (this.info === undefined && 'sessionId' in event) {
+      // The backend subscription starts before connect() resolves. Hold
+      // session-scoped frames instead of filtering them against an absent info;
+      // applyInfo() replays them in order once the first attachment is known.
+      this.bufferPreReadyEvent(event)
+      return
+    }
     if (event.type === 'ready') { this.applyInfo(event.info); this.terminalIntegration.observe(event); return }
     if (event.type === 'native_ui_changed') { this.nativeUi.invalidate(event); return }
     if (event.type === 'todos' && (event.sessionId !== this.info?.sessionId ||
@@ -1916,7 +2015,7 @@ export class App {
       info.provider = event.provider; info.model = event.model
       if (event.reasoningEffort === undefined) delete info.reasoningEffort
       else info.reasoningEffort = event.reasoningEffort
-      if (this.dialog instanceof ModelPickerDialog) this.dialog.setCurrentRoute(event.provider, event.model)
+      if (this.dialog instanceof ModelPickerDialog && !this.nativeUi.ownsDefaultModelPicker(this.dialog)) this.dialog.setCurrentRoute(event.provider, event.model)
       this.render()
       return
     }
@@ -1933,8 +2032,9 @@ export class App {
     if (event.type === 'models_changed') {
       if (event.sessionId !== this.info?.sessionId ||
         (event.attachmentId !== undefined && event.attachmentId !== this.info?.attachmentId)) return
+      this.nativeUi.modelsChanged()
       const dialog = this.dialog
-      if (!(dialog instanceof ModelPickerDialog)) return
+      if (!(dialog instanceof ModelPickerDialog) || this.nativeUi.ownsDefaultModelPicker(dialog)) return
       const request = this.modelCatalogRequest
       if (request?.dialog === dialog && this.sameContext(request.context)) request.dirty = true
       else void this.refreshModelPicker(dialog)
@@ -2338,6 +2438,13 @@ export class App {
   }
 
   private showDialog(dialog: Component, decision = false, placement: InteractionPlacement = 'workspace'): void {
+    if (decision) {
+      // A native decision is not a Settings child surface. Once it replaces
+      // Settings (or one of its panels), a later unrelated dialog close must
+      // not resurrect the old Settings view.
+      this.settingsReturnState = undefined
+      this.settingsFeedback = undefined
+    }
     if (this.decisionId && !decision) {
       if (this.dialog !== dialog) disposeComponent(dialog)
       this.store.report('Resolve the pending DSH decision before opening another dialog.')
@@ -3089,8 +3196,13 @@ export class App {
       this.render()
       return result
     } catch (error) {
-      if (['new', 'resume'].includes(name) || this.sameContext(context)) this.store.report(errorText(error), 'error')
-      if (this.settingsReturnState !== undefined && this.sameAttachment(context)) this.settingsFeedback = { message: errorText(error), error: true, context }
+      const message = errorText(error)
+      // A Settings sub-panel owns its own feedback plane. The same failure is
+      // not repeated in the transcript; the default-model/settings contract
+      // keeps it in Settings until the panel closes.
+      if (this.settingsReturnState !== undefined && this.sameAttachment(context)) {
+        this.settingsFeedback = { message, error: true, context }
+      } else if (['new', 'resume'].includes(name) || this.sameContext(context)) this.store.report(message, 'error')
       return undefined
     }
   }
@@ -3280,13 +3392,35 @@ export class App {
     const surface = this.surfaceGeneration
     const existing = this.modelCatalogRequest
     if (existing?.dialog === dialog && existing.surface === surface && this.sameContext(existing.context)) return existing.promise
+    dialog.setLoading(true)
+    this.render()
     const request = { context, dialog, surface, dirty: false, promise: Promise.resolve() }
     this.modelCatalogRequest = request
     request.promise = (async () => {
       try {
-        const result = await this.runRemote('models')
+        // The native read is the only awaited step here; bound it locally so an
+        // unanswered service degrades to a retryable error, not a permanent
+        // "Refreshing" picker. `runRemote` never rejects, so the loser of the
+        // race needs no rejection handling.
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const outcome = await Promise.race<{ value: unknown } | { timedOut: true }>([
+          this.runRemote('models').then(value => ({ value })),
+          new Promise<{ timedOut: true }>(resolve => {
+            timer = setTimeout(() => resolve({ timedOut: true }), this.options.modelCatalogTimeoutMs ?? MODEL_CATALOG_TIMEOUT_MS)
+            timer.unref()
+          }),
+        ])
+        clearTimeout(timer)
         if (this.modelCatalogRequest !== request || this.dialog !== dialog || surface !== this.surfaceGeneration) return
         if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
+        if ('timedOut' in outcome) {
+          if (request.dirty) return
+          dialog.setError('Could not load native models: the native catalog read did not answer. Close and reopen to try again.')
+          dialog.setLoading(false)
+          this.render()
+          return
+        }
+        const result = outcome.value
         if (request.dirty) return
         if (!Array.isArray(result)) {
           dialog.setError('Could not load native models. Close and reopen to try again.')
@@ -3509,7 +3643,15 @@ export class App {
     if (this.dialog !== dialog || surface !== this.surfaceGeneration) return
     if (!this.sameContext(context)) { this.dismissDialog(); this.returnToSettings(); return }
     const levels = Array.isArray(data?.efforts) ? data.efforts.map(object).filter(item => typeof item?.id === 'string') : []
-    if (data?.available !== true || levels.length === 0) { dialog.setError('This native model exposes no reasoning levels.'); return }
+    if (data?.available !== true || levels.length === 0) {
+      dialog.setError('This native model exposes no reasoning levels.')
+      // The picker starts in loading mode. An unavailable roster is a settled
+      // failure, not a request still in flight; without this the body keeps
+      // saying "Loading options…" and the loading guard makes Enter inert.
+      dialog.setLoading(false)
+      this.render()
+      return
+    }
     const selected = typeof data.reasoningEffort === 'string' ? data.reasoningEffort : undefined
     const effective = typeof data.effectiveEffort === 'string' ? data.effectiveEffort : undefined
     const items: DecisionOption[] = [
@@ -3580,13 +3722,30 @@ export class App {
     const defaults = this.nativeUi.defaults
     const presetDefault = defaults?.targets.find(target => target.target === 'agent-preset-default')
     const permissionDefault = defaults?.targets.find(target => target.target === 'permission-default-preset')
+    const modelDefault = defaults?.targets.find(target => target.target === 'agent-default-model')
+    const modelDefaultWritable = capabilities.includes('native-defaults') && capabilities.includes('native-default-update') &&
+      modelDefault?.available === true && modelDefault.writable && modelDefault.revision !== undefined
+    const defaultEffort = modelDefault === undefined ? (defaults === undefined ? 'Reading native state…' : 'Unavailable')
+      : modelDefault.reasoningAvailable !== true ? 'Reasoning metadata unavailable'
+      : modelDefault.reasoningSupported !== true ? 'Not supported by default model'
+      : modelDefault.reasoningEffort === undefined ? (modelDefault.defaultReasoningEffort === undefined ? 'Model default' : 'Model default (' + modelDefault.defaultReasoningEffort + ')')
+      : modelDefault.reasoningEffort + (modelDefault.reasoningEfforts?.some(level => level.id === modelDefault.reasoningEffort) ? ' · default' : ' · unsupported')
     return [
       { id: 'native.model', label: 'Current model', value: this.info === undefined ? 'Starting DSH…' : this.info.provider + '/' + this.info.model,
         description: 'DSH owns the catalog. Selection also submits the native default; profile persistence remains host-owned.', available: capabilities.includes('models'),
         onActivate: navigate(() => { void this.pickModel() }) },
       { id: 'native.effort', label: 'Reasoning effort', value: this.info?.reasoningEffort ?? 'Model default',
-        description: 'Available levels come from the selected native model.', available: capabilities.includes('efforts'),
-        onActivate: navigate(() => { void this.pickEffort() }) },
+        description: 'Sets this session and submits the native default; levels come from the current model.', available: capabilities.includes('efforts'),
+        keywords: 'current session effort reasoning level', onActivate: navigate(() => { void this.pickEffort() }) },
+      { id: 'native.defaultModel', label: 'Default model', value: modelDefault?.value ?? modelDefault?.effectiveValue ?? (defaults === undefined ? 'Reading native state…' : 'Unavailable'),
+        description: modelDefault?.limitation ?? defaults?.limitation ?? 'Saved DSH startup default. New/unselected sessions follow it; explicit or logged model selections stay unchanged.',
+        keywords: 'default model provider startup new sessions', available: modelDefaultWritable && capabilities.includes('models'),
+        onActivate: navigate(() => this.nativeUi.openDefaultModel()) },
+      { id: 'native.defaultEffort', label: 'Default model effort', value: defaultEffort,
+        description: modelDefault?.limitation ?? defaults?.limitation ?? 'Levels belong to the saved default model, not the current session. This changes execution, not the display-only Thinking preferences.',
+        keywords: 'default effort reasoning level saved model provider',
+        available: modelDefaultWritable && modelDefault?.reasoningAvailable === true && modelDefault.reasoningSupported === true,
+        onActivate: navigate(() => this.nativeUi.openDefaultEffort()) },
       { id: 'native.preset', label: 'Agent preset', value: this.nextPreset === undefined ? this.info?.preset ?? 'Native default' : this.nextPreset + ' · staged',
         description: 'Native composition; the current preset is locked once its conversation starts.', available: capabilities.includes('presets'),
         onActivate: navigate(() => { void this.pickPreset() }) },
@@ -3892,23 +4051,44 @@ export class App {
   private reloadKeys(): boolean {
     let applied = false
     try {
-      this.keymap.setBindings({ ...this.modeBindings, ...this.keybindings.read() })
+      const config = this.keybindings.read()
+      const signature = JSON.stringify(config)
+      const unchanged = signature === this.lastKeyConfigSignature
+      this.lastKeyConfigSignature = signature
+      this.keymap.setBindings({ ...this.modeBindings, ...config })
       this.viewOptions.hints = this.viewHints()
       this.viewOptions.imageDetailsHint = this.keymap.getBindings('app.images.details')[0]
       this.transcript.invalidate()
       const diagnostics = this.keymap.getDiagnostics()
       applied = !diagnostics.some(diagnostic => diagnostic.severity === 'error')
-      for (const diagnostic of diagnostics) {
-        if (diagnostic.severity !== 'error') continue
-        const warning = 'Keybinding: ' + diagnostic.message
-        this.warnings.push(warning); this.store.report(warning, 'error')
+      if (!unchanged) {
+        for (const diagnostic of diagnostics) {
+          if (diagnostic.severity !== 'error') continue
+          this.recordKeyWarning('Keybinding: ' + diagnostic.message)
+        }
       }
     } catch (error) {
-      const warning = 'Keybindings not applied: ' + errorText(error)
-      this.warnings.push(warning); this.store.report(warning, 'error')
+      // The failed read is the file's current state: fold the error text into
+      // the signature so a watcher storm over one broken file reports once, and
+      // a repaired file clears the dedupe again.
+      const signature = 'error:' + errorText(error)
+      const unchanged = signature === this.lastKeyConfigSignature
+      this.lastKeyConfigSignature = signature
+      if (!unchanged) this.recordKeyWarning('Keybindings not applied: ' + errorText(error))
     }
     this.render()
     return applied
+  }
+
+  /** Keep one startup copy for replay; report directly once connected. */
+  private recordKeyWarning(warning: string): void {
+    if (this.connected) {
+      // A pre-ready copy will be replayed after applyInfo; do not also report it
+      // now. Post-startup reloads have an empty replay buffer and report here.
+      if (!this.warnings.includes(warning)) this.store.report(warning, 'error')
+      return
+    }
+    if (!this.warnings.includes(warning)) this.warnings.push(warning)
   }
 
   private async watchKeys(): Promise<void> {

@@ -1,12 +1,12 @@
-# DSH TUI · v0.1.6
+# DSH TUI · v0.1.7
 
 ![DSH TUI app icon](assets/icon/dsh-tui.svg)
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.6**（`private: true`）。问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
+当前版本为 **v0.1.7**（`private: true`）。问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
 
-本版本同时收录 v0.1.5 之后的原生历史、Workspace 变更与审批 Proposal、渲染／高亮／测量缓存、显示列导航和全面 Review 修复。功能基线完整 `pnpm check` **2772/2772**（224 测试文件）；版本专项与完整边界见 [验收记录](docs/ACCEPTANCE.md)。按用户授权，仅创建本地版本提交和 annotated `v0.1.6` tag，**不推送远端、不发布包、不更换全局程序**。构建后退出旧 TUI，再运行 `dsh-tui` 即可加载新版本；`dsh-tui --version` 应为 `0.1.6`。
+本版本收录 v0.1.6 之后的 **Default model / Default model effort**、P1/P2 Review 修复和输入/渲染/会话状态简化优化：`/settings → DSH` 直接读写 DSH 原生默认选择；Ctrl+J/LF 与决策面板转义注入、preset 写入取消、pre-ready 事件、packing prebuild、历史空删除/分片 paste、catalog failure/revision 等均已收口。最终完整 `pnpm check` **2905/2905**（227 测试文件）。完整边界与验收见 [默认模型设置](docs/MODEL-DEFAULT-SETTINGS.md) 与 [验收记录](docs/ACCEPTANCE.md)。按用户授权，创建版本提交、annotated `v0.1.7` tag 并 push 到 `origin`；不发布包、不更换全局程序。构建后退出旧 TUI，再运行 `dsh-tui` 即可加载新版本；`dsh-tui --version` 应为 `0.1.7`。
 
 Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
 
@@ -35,7 +35,7 @@ dsh-tui
 - **其他 profile。** `dsh-tui --profile <name>` 对指定 profile 做相同安全检查；不会自动关闭它原有的前端。`--dsh` 指向原生 DSH launcher，不能是无法定位公开 SDK 的任意 shell wrapper。
 - **仍可手动用 DSH 管理。** `dsh plugin --profile dsh-tui add /Users/fulei/workspace/dsh-tui` 是可选的显式安装方式。之后也可直接 `dsh --profile dsh-tui`；原生 `dsh` 本身不会替一个尚未包含本插件的 profile 做 TUI 的自动挂载。
 - 通过 native DSH 启动时，应用版本参数要越过 launcher 边界：`dsh --profile dsh-tui -- --version`。裸 `--version` 属于 DSH 启动器。直接运行别名时 `dsh-tui --version` 由别名自身处理。
-- `dsh-tui` 在 POSIX 上用 `process.execve` 把自己替换成 native `dsh`：TUI 与 DSH 处于同一进程，没有前端/后端 IPC 或 supervisor。没有 `execve` 的平台只做整应用委托（spawn native dsh），不保留 TUI 壳层。
+- `dsh-tui` 在 POSIX 上用 `process.execve` 把自己替换成 native `dsh`：TUI 与 DSH 处于同一进程，没有前端/后端 IPC 或 supervisor。没有 `execve` 的平台只做整应用委托（spawn native dsh），不保留 TUI 壳层。宿主拒绝替换（sandbox/权限/缺少 `/usr/bin/env`）时也回落到同一条子进程委托路径，只输出一行受控提示，不冒泡原始原生错误或堆栈。
 
 ### 离线 demo（不需要 DSH）
 
@@ -59,7 +59,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 - **没有第二套 Harness**：不存在 bridge/protocol/discover/runtime-home/native-profile，不存在 scratch home、profile 镜像、YAML 合并器、第二个 Agent loop、调度器或前端/后端 IPC。`src/backend/context.ts` 只是同进程薄适配，直接使用宿主 Cordis context 的公开服务。
 - **preset**：从宿主 `profileContext.installAnchor`（嵌入宿主可用公开 `pluginPackages` lookup）解析 DSH 公开 resource 和原生 `AgentPreset` 类，用 native `loadOverlayPatches` / `composeEntries` 组合；不从本包目录找可选 peer、不挂 Web 前端，也不复制工具清单、权限规则或 plan 语义。
 - **模型目录**：`ctx.llm.listProviders()` / `listModels()` / `resolveModelInfo()` 加 native `agentDefaultModel` 的只读投影（`src/backend/model-view.ts`）；不挂完整 SessionController，不导入 Pi 目录/凭据，不维护第二套默认策略。
-- **默认保存**：模型/effort 的落盘由真实 native ConfigEditor 负责。适配器无法从 getter 证明已落盘，因此正常确认返回 `defaultsPersisted:false` / `defaultPersistence:'native'`；正常成功只更新底栏，不向对话区追加确认，失效/未知警告仍然可见。
+- **默认保存**：模型/effort 的落盘由真实 native ConfigEditor 负责。兼容 `/model`／`/effort` 的 setter 确认仍保守返回 `defaultsPersisted:false` / `defaultPersistence:'native'`；显式 Settings 默认编辑使用原生 `settings.describe/mutate` 的 revision guard、同一次 provider/model/effort 操作与真实 read-back。正常成功显示在 Settings／底栏，不刷对话区；失败、overlay 拒绝和未知警告仍可见。本层不直接写 profile 或凭据。
 - **工具**：优先消费原生 `presentCall/presentResult`；模型提出调用不等于已执行，没有结果不冒充成功/失败。命令执行、校验与审计由 DSH 拥有。
 - **流式与会话**：真实订阅 `agent/assistant-stream`、`session/event`、`agent/status`、`agent/error`；保留原生 `surfaceOp` / `sourceEventSeqs`，模型上下文裁剪不覆盖人类历史。普通启动不创建 Agent，首次真正发送或需要会话的命令才物化；`--resume` / `-r` 显式恢复。
 - **附件与图片**：`ctx.attachments` 原生准入与按引用读取；同进程没有 8 MiB IPC 帧或 6 MiB 图像传输上限，图像仍受 DSH 存储/准入限制和本层显示/编辑内存预算约束。模型 vision 准入仍归 DSH。
@@ -79,7 +79,7 @@ demo 始终是离线 fixture，不加载 DSH、不读 profile、不调用模型�
 - 附件：`[Image #N]`／`[File #N]` 在同一 Editor 中原子编辑、undo／stash／history；`/attach [local-path]` 显式经 DSH 存储输入一般文件，32 MiB 是本地 frontend transfer-memory budget，不是 native 文件规则。文件-only／mixed／重复 refs 保序；queue 显示 image/file counts，文件 refs 直接恢复 ready，图片仍按原生引用读取；`history.json` 只存文字，不写 bytes/base64。原生命令图片按 descriptor 准入，当前未挂载 receipt owner 的命令文件明确不可用。
 - Subagents：编辑框上方的 Pi 风格两行活动进度树，运行图标与 Working 共用动态帧，根会话 ready 时也转但不改根状态。名字链接立即打开只读子会话／加载界面；连续目录／结算／任务消息分组，正文与非名字单元不导航。已结算项退场，目录／历史通过 `/agent`／Agents 树查看；保留原生 Stop/Reply 与子审批来源。
 - Todo／Goal／Subagent 固定区：由一个 `StatusDockStack` 统一顺序、预算、间距和鼠标行区间；先保留有用内容，宽裕时统一一行间距，紧凑时全部零间距，最后一个区域后没有空行。完整 Todo 最多五项，一行预算保留 counts／首个未完成项，空／隐藏／完成／settled 区域不占位。Ctrl+T 显隐不追加历史、不改原生事实；[整体编排](docs/PRESENTATION-COMPOSITION.zh-CN.md) 与 [CC 边界](docs/TODO-UX.md)。
-- 原生 UI：`/jobs` 只读列表／非消费式输出；Goal phase／rounds 固定展示；`/rename [title]`、确认 `/fork` 到可继续输入的 native root；Settings 中两个 allowlisted 原生默认值以确认＋revision guard 修改；`/inspect` 只读能力摘要，`/questions` 只回答原生 continued call，不增加 timeout／loop。
+- 原生 UI：`/jobs` 只读列表／非消费式输出；Goal phase／rounds 固定展示；`/rename [title]`、确认 `/fork` 到可继续输入的 native root；Settings 中默认 preset／permission 以确认＋revision guard 修改，默认模型与 effort 共用一个原生选择 target；`/inspect` 只读能力摘要，`/questions` 只回答原生 continued call，不增加 timeout／loop。
 - 状态栏：原生 usage/sessionStats 投影、上下文占用、缓存命中、速率/TTFT、workspace／native effective cwd 区分，以及 git 只读状态。
 - 终端集成：通用 OSC 7501 根／子状态、原生 DSH 标题、OSC 7 workspace、Ghostty 焦点安全的 OSC 777 通知及兼容进度；Rex 使用用户接受的 `app=terminal` 通用活动分类，以显示原生 `>_` 图标（Terminal status On）；标题只保留静态 `🐳`，已去掉鲸鱼前的星号／工作符号及标题动画时钟接缝；Terminal title 可关闭标题展示，普通 UI 动画不变。Rex 默认由其 Program Activity 决定提醒，不叠加通知。取消／历史／尝试结算不冒充成功，原生 command 完成与 turn 完成分开。
 - 品牌蓝主题与共享 semantic surfaces：Settings／弹窗继承主界面的终端 canvas，不再使用独立黑板；foreground、raised／selected 和 syntax/diff 分层，嵌套 ANSI reset／padding 统一处理。静态字符块 DeepSeek logo，无启动动画、无原生图片 logo。
@@ -146,14 +146,15 @@ macOS Option/Alt 快捷键需要终端发送 Meta；无法区分的控制字节�
 - **Subagent 更新分组**：连续的目录状态行、`Subtask status updated` 和 `Task message received` 合成一个 Tools 风格组；真实 user／assistant／tool／attempt／notice 等内容会中断分组，不跨边界、不改原生顺序或文字。折叠时保留各记录的名字与归属摘要，点击组标题或 Ctrl+O 展开真实正文；`Settings → Agents → Group agent messages` 独立控制这一展示，旧版本首次读取会沿用当时 `Group tool calls` 的值，迁移后与 Tools 完全独立，恢复默认也不回读 Tools。只有已知可打开 child 的名字为蓝色加粗下划线链接，其余标题、图标、状态、正文和空白可拖选复制，不导航；展开正文也不是折叠按钮。未知／external sender 是诚实的普通文字，显示链接不会额外读 child session。
 
 - **原生能力入口**：`/jobs`、`/inspect`、`/questions`、`/rename [title]`、`/fork`、`/attach [local-path]` 只按当前 mounted capability 开放；已读到的同名原生命令优先。Settings 的默认 agent/permission preset 仍是安全 allowlist，不提供 raw profile、credentials 或 tool-policy 编辑。Goal 和 permission／Plan 不合并；timed 工具未挂载时不自动启用。完整边界见 [两批记录](docs/NATIVE-UI-BATCHES.zh-CN.md)。
-- **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。
-- **`/effort`**：来自目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。
+- **`/model` / Alt+P**：按原生 provider 分组；输入文字过滤模型 ID/名称/描述，切换 provider 保留查询；Enter 明确选择，Esc 关闭。字母/数字是查询文本，不是快捷键。搜索框复用同一个 `CcEditor`。保留 DSH 原生行为：选择当前模型也提交原生默认；读取失败／刷新未完成时不能确认旧名册。
+- **`/effort`**：来自当前目标模型的原生 `resolveModelInfo().reasoning`；`default` 清除显式等级，回到模型/适配器默认，同时按既有 DSH 行为提交默认选择。模型选择后只携带目标仍声明支持的显式等级，不把目标默认值提升为显式设置。
+- **Settings → DSH → Default model / Default model effort**：只编辑原生启动默认，不调用当前会话的 model selector。新／未显式选择的会话沿用 DSH 默认跟随规则，已有 CLI pin、logged selection／request 和恢复会话不被改写。模型选择器标记 `default`，effort 名册来自保存的默认模型（可以与当前会话不同）；`Default` 移除显式 effort override。不支持／读不到 reasoning 时 effort 不可编辑，仍可选择有效模型修复旧默认；无原生写入服务时不退回本地设置。保存或取消返回同一 Settings 行、搜索与滚动位置，主草稿不变。详见 [合同与验收](docs/MODEL-DEFAULT-SETTINGS.md)。
 - **`/preset`**：原生 Agent preset 名册；空白会话可原地切换，已开始的会话保留给下一次 `/new`，底栏用 `next preset` 区分。
 - **正常成功不刷对话区**：模型、effort、权限和 preset 的成功切换只更新底栏（自动标题显示在 Settings）；失败、保存异常和原生警告仍可见。`/preset status`、`/effort status`、裸 `/permission` 不回显状态列表，当前值看底栏。
 - **取消与排队**：中断调用原生 `Agent.cancel({kind:'user'}, {keepInbox:true})`；草稿与两个 inbox 队列保留，取消本身不主动续发。空输入 Up/Ctrl+P 取回可编辑的人类文本；后台任务唤醒仍归 DSH。已完成工具副作用不回滚。
 - **审批与问题**：编辑框上方显示当前 native 决策；问题中 Ctrl+C／Esc 以原生 `{cancelled:true}` 结算，审批返回原生 `rejected`，不额外全局 abort。Ctrl+O 打开 supplied native detail／pure Proposal 的只读完整内容，返回保留原回答；显式 `app.interrupt` 的回合 abort 仍与局部取消区分。
 - **`/reload`**：空闲且无待决策时，先做本层 idle 检查，再调用 `hmr.runExclusive(() => hmr.reconcileProfile())`。当前 Agent、会话、transcript、草稿和缓存不重建；结果与 restart/pending 提示来自 DSH。忙碌、保留队列或待决策时拒绝。普通配置与插件启停由 DSH 原生重组；需要重启的情况以原生结果为准。直接重载前端插件会卸载/重建界面，不自动恢复最近会话。
-- **`/settings`**：可搜索、可滚动的**连续单页**，用 **General / Thinking / Tools & Diff / Agents / Images / DSH / Keyboard** 分组标题分隔，不再切换 tab 页面。Up/Down 跨组逐项移动；Tab/Shift+Tab（或 Right/Left）跳到下一／上一组，搜索不会被清空。原有 Tools／Diff、Thinking、screen、auto title 与 Keyboard shortcuts 都保留；新增 Agents 进度、Agents 独立分组、图片自动／文本预览、全屏选字复制、队列默认折叠、减少动态效果，以及 General 的终端状态／标题／通知。布尔直接切换，枚举和数字进入明确选择／编辑，每项可恢复默认；保存失败只回退该项并在当前弹窗显示。DSH 分类只提供当前 model／effort／preset／permission／Skills／plan 的状态与已有 picker／command 导航，默认 preset／permission 等 profile 写入仍须安全 native 接缝，未用本地设置冒充。设置写同一个 `settings.json`，不增加 profile/覆盖层级。
+- **`/settings`**：可搜索、可滚动的**连续单页**，用 **General / Thinking / Tools & Diff / Agents / Images / DSH / Keyboard** 分组标题分隔，不再切换 tab 页面。Up/Down 跨组逐项移动；Tab/Shift+Tab（或 Right/Left）跳到下一／上一组，搜索不会被清空。原有 Tools／Diff、Thinking、screen、auto title 与 Keyboard shortcuts 都保留；新增 Agents 进度、Agents 独立分组、图片自动／文本预览、全屏选字复制、队列默认折叠、减少动态效果，以及 General 的终端状态／标题／通知。布尔直接切换，枚举和数字进入明确选择／编辑，每项可恢复默认；保存失败只回退该项并在当前弹窗显示。DSH 分类保留当前 model／effort／preset／permission／Skills／plan 的状态与导航，并提供 Default model／Default model effort、默认 preset／permission 的安全 native 编辑。Thinking 分组只控制显示，不是模型 effort。显示偏好仍写同一个 `settings.json`；模型和 effort 默认值只交给 DSH 原生 Settings／ConfigEditor，不增加配置层级。
 - **`/resume`**：启动参数 `--resume <id>` / `-r <id>`，或 `-r` 不带 id 打开当前目录会话选择器（`Ctrl+A` 切当前目录/全部，模糊搜索，Esc 保留新会话）；不自动选择最近会话。重复恢复当前 id 按 DSH 原生语义保留已有 Agent/attachment，不取消流式、队列或待决策；切换其他 id 先准备成功再释放旧连接，失败仍可继续使用当前会话。
 - **状态栏**：第一行模型、effort、状态、preset、上下文占用、缓存命中、速率/TTFT 与瞬态提示；第二行 cwd、git 分支/状态、权限值。usage/sessionStats 来自原生投影，git 只读本地轮询，绝不 fetch/写索引。
 
@@ -182,6 +183,7 @@ pnpm test
 pnpm check          # build + typecheck + test
 ```
 
+- **native 二进制只来自 tarball。** `package.json` 的 `files` 只发布 `vendor/pi-tui/native/*/prebuilds` 下的预构建 `.node`；native 源码、header 和 build 脚本只是仓库构建输入，不进安装包。`pnpm build`/`prepack` 只编译 JS，从源码重新生成 native prebuild 不是打包或安装的一部分（需要在对应平台用本地工具链单独构建）。
 - 离线测试使用临时 home/workspace 与 fake Cordis 宿主；不读真实 profile、凭据、会话日志，也不访问真实 provider。
 - 覆盖同进程原生流式/结算、模型选择器（搜索/effort）、权限/取消/ask/approval、HMR 配置重组合，以及原有 UI/input/image 回归。插件化之前的图片/PTY 与旧 CloudAgent 实网数字标为**历史记录**，不构成当前健康证明；本轮原生图片与 PTY 验收单独记录。
 - 私有 native PTY（`test/plugin-pty.test.ts`）保留 inline/fullscreen × 正常退出、外部 SIGINT 130、demo 和卸载-重挂载的 8 个 case；`test/plugin-attachment-pty.test.ts` 额外覆盖无参数首启、全新 profile、幂等再启、同源旧名称升级、包操作失败/取消，以及整个前端行被禁用。全部使用临时 profile，要求终端恢复，不发送模型 prompt。当前完整结果见 [验收记录](docs/ACCEPTANCE.md)。
@@ -192,7 +194,7 @@ pnpm check          # build + typecheck + test
 
 - 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。
 - Pi 式 TUI 扩展热插拔暂未纳入；`/reload` 只做 native HMR 配置重组合，不重载 TUI 核心源码。
-- 模型能力、上下文、推理级别与网关参数以 DSH 原生目录为准；TUI 不推断或另存第二份模型定义。默认模型的持久化由宿主 ConfigEditor 负责，本层只能如实报告 `defaultsPersisted:false`。
+- 模型能力、上下文、推理级别与网关参数以 DSH 原生目录为准；TUI 不推断或另存第二份模型定义。默认模型持久化归宿主 ConfigEditor；兼容 setter 不以 fulfilled promise 冒称落盘，显式 Settings 写入则核验 native revision/read-back。临时 profile 重启验收不代表可以绕过只读 composition 或 home／CLI overlay 的原生拒绝。
 - 历史恢复有事件数/UTF-8 字节预算，截断会提示；完整持久日志仍在 DSH 数据 home。工具耗时包含审批/策略等待，不另抓取逐行输出；大 Diff 超预算时提示并保留完整 Before/After 源。
 - 图片显示转换独立于模型 vision；被拒绝的附件不会绕过 DSH 准入。终端 inline-image 能力由 Pi TUI 公共实现决定，tmux/screen 等未确认环境保守降级文字。
 - 主屏在 resize 或视口上方更新时可能全量重绘；全屏可避开原生 scrollback 限制。不要把任何 TUI 写入同一终端的普通日志。
@@ -203,7 +205,7 @@ pnpm check          # build + typecheck + test
 - [输入 API 与限制](docs/INPUT-API.md) · [输入行为](docs/INPUT.md) · [输入生命周期](docs/INPUT-LIFECYCLE.md)
 - [Tools 分组、详情与设置](docs/TOOLS.md) · [工具 Diff 归属](docs/TOOLS-DIFF-ATTRIBUTION.md)
 - [图片投影、预览、附件输入与边界](docs/IMAGES.md)
-- [模型/provider 原生投影](docs/PROVIDERS.md) · [Skills 原生接入](docs/SKILLS.md)
+- [模型/provider 原生投影](docs/PROVIDERS.md) · [默认模型与 effort 设置](docs/MODEL-DEFAULT-SETTINGS.md) · [Skills 原生接入](docs/SKILLS.md)
 - [DSH 同进程集成](docs/BACKEND.md)
 - [输入邻近交互合同](docs/COMPOSER-INTERACTION-CONTRACT.md) · [原生历史与工作区](docs/NATIVE-HISTORY-WORKSPACE.md) · [审批 Proposal](docs/APPROVAL-PROPOSAL.md)
 - [Rex / Ghostty 终端支持](docs/TERMINALS.md) · [Grok Build / CC 深度对照](docs/TERMINAL-RESEARCH.zh-CN.md)

@@ -63,7 +63,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { modalHeight, type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, modalHeight, type ModalAction, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { bold, dim, t, type Style } from './theme.ts'
 
@@ -228,7 +228,6 @@ interface OutputMeta {
   readonly channels: readonly string[]
 }
 
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 export class JobsDialog implements Component, Focusable {
   readonly capturesViewportInput = true
   readonly modalSize: ModalSize = 'standard'

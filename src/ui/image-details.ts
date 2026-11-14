@@ -45,7 +45,7 @@ import { imageAttachmentKey } from '../attachments.ts'
 import { formatImageBytes, imageRefSummary, imageRefTitle } from './image-data.ts'
 import { isAbortError, loadImageItem } from './image-loader.ts'
 import type { DisplayImage } from './image-codec.ts'
-import { ModalFrame, type ModalAction, type ModalFrameOptions, type ModalGeometry, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS as MODAL_CLOSE_ACTIONS, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalGeometry, type ModalSize } from './modal.ts'
 import { cc, dim, t } from './theme.ts'
 import { fit, oneLine, sanitize } from './text.ts'
 
@@ -56,7 +56,8 @@ type LoadState =
   | { readonly status: 'ready'; readonly display: DisplayImage; readonly component: Image }
   | { readonly status: 'error'; readonly reason: string }
 
-const CLOSE_ACTIONS = ['image.details.close', 'list.cancel', 'dialog.cancel', 'app.cancel'] as const
+/** The viewer's own close action comes first, then the shared modal close family. */
+const CLOSE_ACTIONS: readonly string[] = ['image.details.close', ...MODAL_CLOSE_ACTIONS]
 
 const MIN_IMAGE_ROWS = 4
 const DEFAULT_IMAGE_ROWS = 24

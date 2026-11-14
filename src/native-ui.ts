@@ -120,15 +120,21 @@ export function readContinuedQuestions(value: unknown): ContinuedQuestionsView |
 export function readNativeDefaults(value: unknown): NativeDefaultSettingsRead | undefined {
   const row = object(value)
   if (row === undefined || typeof row.available !== 'boolean' || !Array.isArray(row.targets) || !optionalString(row.limitation)) return undefined
+  const option = (value: unknown): boolean => {
+    const row = object(value)
+    return row !== undefined && string(row.id) && optionalString(row.label) && optionalString(row.description)
+  }
   if (!row.targets.every(value => {
     const target = object(value)
-    return target !== undefined && (target.target === 'agent-preset-default' || target.target === 'permission-default-preset') &&
+    return target !== undefined && (target.target === 'agent-preset-default' || target.target === 'permission-default-preset' || target.target === 'agent-default-model') &&
       string(target.field) && typeof target.available === 'boolean' && typeof target.writable === 'boolean' &&
       optionalString(target.namespace) && optionalString(target.value) && optionalString(target.effectiveValue) && optionalNumber(target.revision) &&
-      optionalString(target.limitation) && Array.isArray(target.options) && target.options.every(value => {
-        const option = object(value)
-        return option !== undefined && string(option.id) && optionalString(option.label) && optionalString(option.description)
-      })
+      optionalString(target.limitation) && Array.isArray(target.options) && target.options.every(option) &&
+      optionalString(target.provider) && optionalString(target.model) && optionalString(target.reasoningEffort) &&
+      optionalString(target.defaultReasoningEffort) && optionalString(target.effectiveReasoningEffort) &&
+      (target.reasoningAvailable === undefined || typeof target.reasoningAvailable === 'boolean') &&
+      (target.reasoningSupported === undefined || typeof target.reasoningSupported === 'boolean') &&
+      (target.reasoningEfforts === undefined || (Array.isArray(target.reasoningEfforts) && target.reasoningEfforts.every(option)))
   })) return undefined
   return value as NativeDefaultSettingsRead
 }

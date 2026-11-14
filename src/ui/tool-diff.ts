@@ -236,7 +236,9 @@ function splitBodyRows(rows: readonly SplitRow[], width: number, options: DiffRe
 
 function summaryRow(text: string, width: number): string {
   if (width === 0) return ''
-  return fit(t.muted(text), width)
+  // File paths are native tool-supplied text; sanitize before styling so a
+  // multi-file heading cannot carry an OSC/CSI sequence into the terminal.
+  return fit(t.muted(sanitize(text)), width)
 }
 
 /**

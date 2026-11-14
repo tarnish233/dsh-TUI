@@ -1,6 +1,7 @@
 /**
- * Native management seam: explicit current-root session rename and the two safe
- * native default-setting fields (`selectedDefault` / `defaultPreset`).
+ * Native management seam: explicit current-root session rename and the safe
+ * native default settings (`selectedDefault`, `defaultPreset`, and the one
+ * `agent-default-model` selection: `provider`/`model`/`reasoningEffort`).
  *
  * DSH remains the owner of titles, sessions, presets, permissions and config.
  * This module is a thin, validating adapter over public services only:
@@ -11,22 +12,34 @@
  *   hardcoded web id) and `ctx.settings.describe/mutate` for the allowlisted
  *   volatile fields, always with the native revision fence;
  * - `ctx.agentPresets.list/defaultId` and `ctx.permissionPresets.catalog()`
- *   only as the native option authority for those two fields.
+ *   only as the native option authority for those two fields;
+ * - injected default-model faces (`agentDefaultModel.currentSelection`, one
+ *   exact-route `llm.resolveModelInfo` and the existing adapter model catalog)
+ *   so this module never walks or keeps a provider catalog itself.
  *
  * It never creates, resumes, prompts or switches an Agent; never writes a file;
  * never reads a credential, an unrelated namespace or an unrelated field; and
- * keeps no store, timer, cache or scheduler. Read-only paths materialize
- * nothing. `buildInteractiveForkInput` is the pure helper for the parent's own
- * native `/fork` flow (public `snapshotEvents` + native `buildForkSeed` + native
- * `agents.create`); this module deliberately exposes no session-only
- * `SessionStore.fork` adapter, because such a child owns no Agent and no public
- * API can attach one (native `SessionStore.prepare` rejects the existing id, so
- * pre-forking would also block the parent's own `agents.create`).
+ * keeps no store, cache, polling loop, scheduler or durable state (the bounded
+ * per-operation waits below own one cleared timer each). Read-only paths
+ * materialize nothing. `buildInteractiveForkInput` is the pure helper for the
+ * parent's own native `/fork` flow (public `snapshotEvents` + native
+ * `buildForkSeed` + native `agents.create`); this module deliberately exposes
+ * no session-only `SessionStore.fork` adapter, because such a child owns no
+ * Agent and no public API can attach one (native `SessionStore.prepare` rejects
+ * the existing id, so pre-forking would also block the parent's own
+ * `agents.create`).
  *
  * @module dsh-tui/backend/native-management
  */
-import { asBackendError, backendError } from './errors.ts'
+import { asBackendError, backendError, redactDiagnostic } from './errors.ts'
 import type { NativeUiAccess, NativeUiScope } from './native-ui-scope.ts'
+import {
+  carriedEffort,
+  reasoningView,
+  selectModelRow,
+  type ModelReasoningView,
+  type ModelRow,
+} from './model-view.ts'
 
 /** Why a root-scoped operation refused to run. */
 export type ManagementRejectReason =
@@ -40,8 +53,16 @@ export type ManagementRejectReason =
   | 'missing-service'
   | 'native-failed'
 
-/** The two allowlisted native default-setting targets. */
-export type DefaultSettingTarget = 'agent-preset-default' | 'permission-default-preset'
+/**
+ * The allowlisted native default-setting targets.
+ *
+ * `agent-default-model` is one native selection (`provider`/`model`/
+ * `reasoningEffort` on the `@deepseek-ai/dsh-agent-default-model` profile
+ * entry), so it is one target written by one revision-fenced
+ * `settings.mutate()`: splitting it into three targets would allow an
+ * intermediate provider/model pair that DSH cannot route.
+ */
+export type DefaultSettingTarget = 'agent-preset-default' | 'permission-default-preset' | 'agent-default-model'
 
 /** Why one default-setting target cannot be read or written. */
 export type DefaultSettingUnavailableReason =
@@ -75,7 +96,12 @@ export interface NativeDefaultOption {
 /** One allowlisted default setting, projected from the native descriptor. */
 export interface NativeDefaultSettingView {
   readonly target: DefaultSettingTarget
-  /** Allowlisted field name: `selectedDefault` or `defaultPreset`. */
+  /**
+   * Display name of the allowlisted native field(s): `selectedDefault`,
+   * `defaultPreset`, or the ordered `provider,model,reasoningEffort` list of
+   * the default-model target. Derived from that target's one allowlisted path
+   * list, so it can never disagree with what is actually read or written.
+   */
   readonly field: string
   /** True only when the descriptor and the allowlisted field were isolated. */
   readonly available: boolean
@@ -94,9 +120,31 @@ export interface NativeDefaultSettingView {
   readonly reason?: DefaultSettingUnavailableReason
   /** One redacted sentence explaining an unavailable/read-only target. */
   readonly limitation?: string
+
+  // -- `agent-default-model` only -----------------------------------------
+  /** Persisted native provider of the default selection. */
+  readonly provider?: string
+  /** Persisted native model id of the default selection. */
+  readonly model?: string
+  /** Persisted reasoning level; absent means the native default applies. */
+  readonly reasoningEffort?: string
+  /** Adapter-advertised default level; never promoted into an explicit selection. */
+  readonly defaultReasoningEffort?: string
+  /** Level DSH will apply when no explicit level is stored, or the stored one when advertised. */
+  readonly effectiveReasoningEffort?: string
+  /**
+   * True only when the mounted metadata resolver answered for the exact default
+   * pair. `false` disables the effort choice but never the model row: the native
+   * Settings write itself stays available so a broken saved pair can be repaired.
+   */
+  readonly reasoningAvailable?: boolean
+  /** True only when that exact pair advertises at least one reasoning level. */
+  readonly reasoningSupported?: boolean
+  /** Advertised levels of the default pair, in native order (empty when unsupported). */
+  readonly reasoningEfforts?: readonly NativeDefaultOption[]
 }
 
-/** Both allowlisted targets, resolved on every read. */
+/** Every allowlisted target, resolved on every read. */
 export interface NativeDefaultSettingsRead {
   readonly available: boolean
   readonly targets: readonly NativeDefaultSettingView[]
@@ -107,12 +155,24 @@ export interface NativeDefaultSettingsRead {
 /** Explicit, confirmed default-setting write request. */
 export interface NativeDefaultSettingUpdateRequest {
   readonly target: DefaultSettingTarget
-  /** Exact native id from the target's `options` (never a free-form value). */
+  /**
+   * Exact native id from the target's `options` (never a free-form value).
+   *
+   * For `agent-default-model` this is either the persisted provider/model
+   * tuple (an effort-only edit) or one native model row id resolved by the
+   * mounted catalog (`command('models')` grammar).
+   */
   readonly value: string
   /** Revision returned by the confirmed read; required, never a wildcard. */
   readonly expectedRevision: number
   /** Optional exact-attachment fence captured with the read. */
   readonly attachmentId?: string
+  /**
+   * `agent-default-model` only: a native level id to store, or `null` to remove
+   * the stored level so the native model/adapter default applies. Omitted keeps
+   * the stored level when the target still advertises it.
+   */
+  readonly reasoningEffort?: string | null
 }
 
 /** Outcome of one explicit default-setting write. */
@@ -127,9 +187,17 @@ export type NativeDefaultSettingOutcome =
       revision: number
       /** True only when the read-back value equals the requested value. */
       changed: boolean
+      /** True when the confirmed choice was already the persisted selection. */
+      unchanged?: boolean
       attachmentId?: string
       /** False when the attachment moved while the native write was in flight. */
       stillCurrent: boolean
+      /** `agent-default-model`: native read-back provider/model/level. */
+      provider?: string
+      model?: string
+      reasoningEffort?: string
+      /** `agent-default-model`: an unsupported stored level was removed by this write. */
+      reasoningEffortReset?: boolean
     }
   | {
       ok: false
@@ -179,11 +247,43 @@ export interface NativeManagementCapabilities {
   readonly targets: readonly DefaultSettingTarget[]
 }
 
+/**
+ * Exact-route reasoning metadata probe result.
+ *
+ * `available:false` means the metadata could not be read at all (no resolver,
+ * failure or deadline); it is never flattened into "this model has no levels".
+ */
+export type NativeReasoningProbe =
+  | { readonly available: true; readonly reasoning?: ModelReasoningView }
+  | { readonly available: false; readonly limitation: string }
+
+/**
+ * Native model/configuration faces used only by the default-model target.
+ *
+ * They are injected by the owning backend adapter so this module never walks a
+ * provider catalog, keeps one, or talks to an LLM itself. Every face is optional
+ * so a partial composition stays loadable: an absent metadata face makes the
+ * reasoning decision unknowable (an explicit level is then refused and a
+ * stored level is removed by the model switch's native `unset`, while a proven
+ * native Settings write stays usable so a stale default can be repaired), and
+ * an absent selection face simply skips the runtime consistency check.
+ */
+export interface NativeDefaultModelFaces {
+  /** Public `ctx.agentDefaultModel.currentSelection()` getter. */
+  currentSelection?(): unknown
+  /** `ctx.llm.resolveModelInfo(provider, model, signal).reasoning`, one exact route. */
+  resolveReasoning?(provider: string, model: string, signal: AbortSignal): Promise<unknown>
+  /** Fresh native model rows plus isolated provider failures; a model change only. */
+  modelCatalog?(): Promise<{ readonly items: readonly ModelRow[]; readonly failures: readonly string[] }>
+}
+
 /** Construction options (the shared seam is injected, never modified). */
 export interface NativeManagementOptions {
   readonly access: NativeUiAccess
   /** Redacted diagnostic sink; defaults to the access `warn` hook. */
   readonly warn?: (message: string) => void
+  /** Native default-model faces; absent means the target stays read-only/unavailable. */
+  readonly native?: NativeDefaultModelFaces
 }
 
 /** Public `buildForkSeed` signature from `@deepseek-ai/dsh-session`. */
@@ -223,16 +323,108 @@ export type InteractiveForkInputOutcome =
       message?: string
     }
 
+/**
+ * The `agent-default-model` native paths of the one selection it persists.
+ *
+ * They are named once and reused by the allowlist above, the write ops and the
+ * schema diagnostics, so a path can never be written but not checked (or the
+ * reverse).
+ */
+const MODEL_PROVIDER_PATH = 'provider'
+const MODEL_PATH = 'model'
+const MODEL_EFFORT_PATH = 'reasoningEffort'
+
 interface TargetSpec {
   readonly target: DefaultSettingTarget
   readonly packageName: string
-  readonly field: string
+  /**
+   * The single allowlist representation: exact native config paths of this
+   * target, in write order. Schema membership, the read/write path and the
+   * public DTO label all derive from this one list.
+   */
+  readonly fields: readonly string[]
 }
 
 const TARGETS: readonly TargetSpec[] = [
-  { target: 'agent-preset-default', packageName: '@deepseek-ai/dsh-agent-preset-registry', field: 'selectedDefault' },
-  { target: 'permission-default-preset', packageName: '@deepseek-ai/dsh-permission-presets', field: 'defaultPreset' },
+  {
+    target: 'agent-preset-default',
+    packageName: '@deepseek-ai/dsh-agent-preset-registry',
+    fields: ['selectedDefault'],
+  },
+  {
+    target: 'permission-default-preset',
+    packageName: '@deepseek-ai/dsh-permission-presets',
+    fields: ['defaultPreset'],
+  },
+  {
+    target: 'agent-default-model',
+    packageName: '@deepseek-ai/dsh-agent-default-model',
+    fields: [MODEL_PROVIDER_PATH, MODEL_PATH, MODEL_EFFORT_PATH],
+  },
 ]
+
+/**
+ * Public DTO label of one target: its allowlisted native paths in write order.
+ *
+ * Kept derived (never stored twice) so the allowlist cannot disagree with what
+ * the UI and `NativeDefaultSettingView.field` already report.
+ */
+function fieldLabel(spec: TargetSpec): string {
+  return spec.fields.join(',')
+}
+
+/**
+ * The exact native config path of a single-field target.
+ *
+ * The multi-field default-model target has its own write path; reaching this
+ * with more than one allowlisted path would mean writing a comma list as one
+ * key, so it fails closed instead.
+ */
+function singleFieldPath(spec: TargetSpec): string {
+  const field = spec.fields[0]
+  if (field === undefined || spec.fields.length !== 1) {
+    throw backendError('INVALID_ARGUMENT', `the "${spec.target}" target writes more than one native config path`)
+  }
+  return field
+}
+
+/**
+ * Bound for one exact-route reasoning metadata read (one phase of a read/write).
+ *
+ * Relationship to `nativeUiRead` (`NATIVE_UI_READ_TIMEOUT_MS`, 8 s in
+ * `context.ts`, the only outer wall-clock bound): the read face runs *inside*
+ * it, so a shorter inner bound lets this phase answer `available:false` with
+ * its own diagnostic instead of being abandoned as one opaque read timeout. It
+ * is a bound on this wait only (an adapter may ignore the passed signal); it is
+ * never a native service deadline and never a retry.
+ */
+const DEFAULT_REASONING_TIMEOUT_MS = 4_000
+/**
+ * Bound for the fresh native model catalog read of one explicit model change.
+ *
+ * The default-setting *write* is an active command, not a `nativeUiRead`, so
+ * this phase has no outer deadline of its own: this is the only wall-clock
+ * bound on it. It uses the same 8 s order as `NATIVE_UI_READ_TIMEOUT_MS` so the
+ * write cannot outlive the bound the equivalent native read would get, and the
+ * caller still never continues to a mutation after it expires.
+ */
+const DEFAULT_MODEL_CATALOG_TIMEOUT_MS = 8_000
+/**
+ * Bound for one async native agent-preset roster read (write preparation); same
+ * 8 s `nativeUiRead` order and the same "expire ⇒ no mutation" rule as the
+ * catalog phase above.
+ */
+const DEFAULT_PRESET_ROSTER_TIMEOUT_MS = 8_000
+/** Longest one-line native catalog failure detail carried by one refusal. */
+const MODEL_CATALOG_FAILURE_MAX_CHARS = 400
+/** A signal that never aborts, for internal callers without a carrier. */
+const NEVER_ABORTED = new AbortController().signal
+
+/** What one default-model write does to the stored reasoning level. */
+type EffortPlan =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'set'; readonly id: string }
+  | { readonly kind: 'unset' }
 
 interface SessionTitleLike {
   get?(session: unknown): unknown
@@ -244,15 +436,16 @@ interface SettingsLike {
   mutate?(namespace: string, ops: readonly SettingsPathOp[], expectedRevision?: number): Promise<unknown>
 }
 
-interface SettingsPathOp {
-  readonly op: 'set'
-  readonly path: readonly string[]
-  readonly value: unknown
-}
-
-interface LoaderEntryLike {
-  readonly options?: { readonly id?: string; readonly name?: string }
-}
+type SettingsPathOp =
+  | {
+      readonly op: 'set'
+      readonly path: readonly string[]
+      readonly value: unknown
+    }
+  | {
+      readonly op: 'unset'
+      readonly path: readonly string[]
+    }
 
 interface LoaderLike {
   entries?(): Iterable<unknown>
@@ -299,6 +492,103 @@ function integer(value: unknown): number | undefined {
 /** Redacted one-line diagnostic; never serializes a native object or stack. */
 function diagnostic(error: unknown): string {
   return asBackendError(error).message
+}
+
+/**
+ * One redacted, single-line summary of the native catalog's isolated provider
+ * failures, or undefined when there is nothing to report.
+ *
+ * The mounted catalog already redacts each provider error; this still bounds
+ * the text (a native message may be multi-line or arbitrarily long) and re-runs
+ * the adapter redaction, so one refusal can never echo a credential or a stack.
+ */
+function catalogFailureText(failures: readonly string[]): string | undefined {
+  const parts: string[] = []
+  for (const failure of failures) {
+    const text = redactDiagnostic(failure).replace(/\s+/g, ' ').trim()
+    if (text.length > 0) parts.push(text)
+  }
+  if (parts.length === 0) return undefined
+  const joined = parts.join('; ')
+  return joined.length > MODEL_CATALOG_FAILURE_MAX_CHARS
+    ? `${joined.slice(0, MODEL_CATALOG_FAILURE_MAX_CHARS)}…`
+    : joined
+}
+
+/** Adapter-owned cancellation reason for the exact carrier signal. */
+function cancellationError(signal: AbortSignal, label: string): Error {
+  const reason = signal.reason
+  return reason instanceof Error ? reason : backendError('ABORTED', `${label} was cancelled`)
+}
+
+/**
+ * Bound one native metadata/catalog phase of a default-setting operation.
+ *
+ * The public LLM reads accept an optional `AbortSignal` and this adapter passes
+ * it, but an adapter may ignore it, so the bound only ends *this* wait. The
+ * caller never continues to a later write after a deadline or cancellation,
+ * which is what keeps a timed-out read from becoming a late mutation. No timer
+ * outlives the race, and nothing is scheduled in the background.
+ */
+async function bounded<T>(promise: Promise<T>, ms: number, label: string, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    // The caller had to create the native read before invoking `bounded`, so a
+    // pre-cancelled operation still owns that promise. Observe its eventual
+    // rejection before returning; otherwise a late native failure becomes an
+    // unhandled rejection (which this app treats as fatal), even though the
+    // operation was already cancelled.
+    void promise.catch(() => {})
+    throw cancellationError(signal, label)
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(backendError('RUNTIME_REQUEST_FAILED', `${label} timed out after ${ms}ms`)), ms)
+        timer.unref?.()
+        onAbort = () => reject(cancellationError(signal, label))
+        signal.addEventListener('abort', onAbort, { once: true })
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** One persisted native default-model selection, read without guessing. */
+interface DefaultModelSelection {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** Read `{provider, model, reasoningEffort?}` from a native selection value. */
+function readDefaultSelection(value: unknown): DefaultModelSelection | undefined {
+  const item = record(value)
+  if (item === undefined) return undefined
+  const provider = nonEmpty(item.provider)
+  const model = nonEmpty(item.model)
+  if (provider === undefined || model === undefined) return undefined
+  const reasoningEffort = nonEmpty(item.reasoningEffort)
+  return {
+    provider,
+    model,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+  }
+}
+
+/** The UI correlation key for one native provider/model pair. */
+function pairKey(provider: string, model: string): string {
+  return `${provider}/${model}`
+}
+
+/** Exact equality of the three native selection facts. */
+function sameSelection(left: DefaultModelSelection, right: DefaultModelSelection): boolean {
+  return left.provider === right.provider && left.model === right.model &&
+    left.reasoningEffort === right.reasoningEffort
 }
 
 function readSessionIdentity(value: unknown): SessionIdentity | undefined {
@@ -544,6 +834,7 @@ export function buildInteractiveForkInput(request: InteractiveForkInputRequest):
 export class NativeManagement {
   private readonly access: NativeUiAccess
   private readonly warn: (message: string) => void
+  private readonly faces: NativeDefaultModelFaces
 
   constructor(options: NativeManagementOptions) {
     const access = options?.access
@@ -551,6 +842,7 @@ export class NativeManagement {
       throw backendError('INVALID_OPTIONS', 'NativeManagement requires the supplied NativeUiAccess seam')
     }
     this.access = access
+    this.faces = options.native ?? {}
     this.warn = typeof options.warn === 'function'
       ? options.warn
       : (message: string): void => {
@@ -580,7 +872,7 @@ export class NativeManagement {
   }
 
   /** Read both allowlisted native defaults; never touches another namespace. */
-  async defaultSettings(): Promise<NativeDefaultSettingsRead> {
+  async defaultSettings(signal: AbortSignal = NEVER_ABORTED): Promise<NativeDefaultSettingsRead> {
     const captured = this.captureScope()
     if (captured === undefined) {
       return { available: false, targets: [], reason: 'no-attachment', limitation: 'no current DSH attachment' }
@@ -604,16 +896,7 @@ export class NativeManagement {
       }
     }
     const resolutions = this.resolveNamespaces(loader)
-    const describe = (): readonly unknown[] | undefined => {
-      try {
-        const value = settings.describe?.({ redactSecrets: true })
-        return Array.isArray(value) ? value : undefined
-      } catch (error) {
-        this.warn(`settings describe failed: ${diagnostic(error)}`)
-        return undefined
-      }
-    }
-    const descriptors = describe()
+    const descriptors = this.describeNow(settings)
     if (descriptors === undefined) {
       return {
         available: false,
@@ -624,8 +907,9 @@ export class NativeManagement {
     }
     const writablePath = typeof settings.mutate === 'function'
     const views = await Promise.all(
-      resolutions.map(async (resolution) => this.attachOptions(this.projectTarget(resolution, descriptors, writablePath))),
+      resolutions.map(async (resolution) => await this.attachOptions(this.projectTarget(resolution, descriptors, writablePath), signal)),
     )
+    if (signal.aborted) throw cancellationError(signal, 'native defaults read')
     if (!this.stillCurrent(captured)) {
       return {
         available: false,
@@ -650,7 +934,7 @@ export class NativeManagement {
    * Uses `settings.mutate(ns, [{op:'set', path:[field], value}], expectedRevision)`
    * only: exact path, native revision fence, unrelated settings preserved.
    */
-  async updateDefault(request: NativeDefaultSettingUpdateRequest): Promise<NativeDefaultSettingOutcome> {
+  async updateDefault(request: NativeDefaultSettingUpdateRequest, signal: AbortSignal = NEVER_ABORTED): Promise<NativeDefaultSettingOutcome> {
     const spec = defaultTarget(record(request)?.target)
     if (spec === undefined) throw backendError('INVALID_ARGUMENT', 'unknown native default-setting target')
     const value = nonEmpty(request.value)
@@ -700,9 +984,42 @@ export class NativeManagement {
         current,
       }
     }
-    const withOptions = await this.attachOptions(current)
+    if (target === 'agent-default-model') {
+      return await this.updateDefaultModel({
+        captured,
+        settings,
+        namespace: resolution.namespace,
+        resolution,
+        current,
+        value,
+        expectedRevision,
+        request,
+        signal,
+      })
+    }
+    const withOptions = await this.attachOptions(current, signal)
+    // The native settings write has no AbortSignal of its own. This final fence
+    // is the only thing that prevents a roster read completed after Esc/close
+    // from becoming a late mutation; the model target has the same recheck.
+    if (signal.aborted) throw cancellationError(signal, 'native default update')
     if (!this.stillCurrent(captured)) {
       return { ok: false, target, reason: 'stale-attachment', message: 'the attachment changed while the write was prepared', current: withOptions }
+    }
+    // The roster read is asynchronous. Re-prove that the profile owner is still
+    // the same Loader entry before writing; a recomposition during the read must
+    // not target the stale namespace captured above.
+    const liveLoader = this.service<LoaderLike>('loader')
+    const liveResolution = liveLoader === undefined
+      ? undefined
+      : this.resolveNamespaces(liveLoader).find(candidate => candidate.spec.target === target)
+    if (liveResolution?.namespace !== resolution.namespace) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: 'the native settings owner changed while the write was prepared',
+        current: withOptions,
+      }
     }
     if (withOptions.options.length === 0) {
       return {
@@ -736,7 +1053,7 @@ export class NativeManagement {
     try {
       await settings.mutate(
         resolution.namespace,
-        [{ op: 'set', path: [resolution.spec.field], value }],
+        [{ op: 'set', path: [singleFieldPath(resolution.spec)], value }],
         expectedRevision,
       )
     } catch (error) {
@@ -778,12 +1095,471 @@ export class NativeManagement {
       ok: true,
       target,
       namespace: resolution.namespace,
-      field: resolution.spec.field,
+      field: fieldLabel(resolution.spec),
       value: accepted,
       revision: after.revision,
       changed: accepted === value,
       ...(captured.scope.attachmentId === undefined ? {} : { attachmentId: captured.scope.attachmentId }),
       stillCurrent: this.stillCurrent(captured),
+    }
+  }
+
+  /**
+   * Explicit confirmed write of the native default model selection.
+   *
+   * One `settings.mutate()` carries `provider`, `model` and the reasoning
+   * decision under one native revision fence, because DSH reads them as one
+   * selection: two writes could leave a pair the composition cannot route.
+   * Every asynchronous metadata/catalog phase is followed by an attachment,
+   * cancellation and revision re-check, so a deadline or a moved attachment can
+   * never reach the native mutation.
+   */
+  private async updateDefaultModel(input: {
+    readonly captured: CapturedScope
+    readonly settings: SettingsLike
+    readonly namespace: string
+    readonly resolution: NamespaceResolution
+    readonly current: NativeDefaultSettingView
+    readonly value: string
+    readonly expectedRevision: number
+    readonly request: NativeDefaultSettingUpdateRequest
+    readonly signal: AbortSignal
+  }): Promise<NativeDefaultSettingOutcome> {
+    const target = 'agent-default-model' as const
+    const { captured, settings, namespace, resolution, current, value, expectedRevision, request, signal } = input
+    const requestedEffort = request.reasoningEffort
+    if (requestedEffort !== undefined && requestedEffort !== null && nonEmpty(requestedEffort) === undefined) {
+      throw backendError('INVALID_ARGUMENT', 'reasoningEffort must be a non-empty native level id, null, or omitted')
+    }
+    // A confirmed revision that has already moved can never become current
+    // again, so refuse before paying the bounded catalog/metadata reads below.
+    // A revision or owner that moves *during* those reads is still caught by
+    // the final re-checks, so this is an early exit, never a replacement fence.
+    const confirmedRevision = current.revision
+    if (confirmedRevision !== undefined && confirmedRevision !== expectedRevision) {
+      return {
+        ok: false,
+        target,
+        reason: 'conflict',
+        expectedRevision,
+        actualRevision: confirmedRevision,
+        message: 'the native default changed since it was confirmed',
+        current,
+      }
+    }
+    const persistedProvider = nonEmpty(current.provider)
+    const persistedModel = nonEmpty(current.model)
+    const persistedEffort = nonEmpty(current.reasoningEffort)
+    if (persistedProvider === undefined || persistedModel === undefined) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: 'the native default model selection is unreadable',
+        current,
+      }
+    }
+    const persisted: DefaultModelSelection = {
+      provider: persistedProvider,
+      model: persistedModel,
+      ...(persistedEffort === undefined ? {} : { reasoningEffort: persistedEffort }),
+    }
+    // The mounted runtime service, not this descriptor, decides the startup
+    // default. A proven disagreement means writing this profile row would not
+    // change what a fresh Agent reads, so the write is refused instead.
+    const runtime = this.readDefaultSelection()
+    if (runtime !== undefined && !sameSelection(runtime, persisted)) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: 'the mounted native default service does not read this profile entry, so a write could not change the startup default',
+        current,
+      }
+    }
+
+    // A value equal to the persisted pair edits only the level. Any other value
+    // must be one advertised native model row; the catalog is read fresh and
+    // the existing pure projector decides, so no second catalog is introduced.
+    const effortOnly = value === pairKey(persisted.provider, persisted.model) || value === persisted.model
+    let selected: DefaultModelSelection = persisted
+    if (!effortOnly) {
+      const catalog = await this.freshModelRows(signal)
+      this.recheck(captured, signal, 'the native default model selection was prepared')
+      if (!catalog.ok) {
+        return {
+          ok: false,
+          target,
+          reason: 'unavailable',
+          message: `the native model catalog could not be read: ${catalog.message}`,
+          current,
+        }
+      }
+      const row = selectModelRow(catalog.items, { id: value })
+      // Provider failures are part of the native answer: they are never turned
+      // into an empty successful catalog, and they are reported alongside the
+      // rows that did load so a provider outage is distinguishable from a model
+      // id this catalog genuinely does not advertise.
+      const failures = catalogFailureText(catalog.failures)
+      if (row === undefined) {
+        if (catalog.items.length === 0 && failures !== undefined) {
+          return {
+            ok: false,
+            target,
+            reason: 'unavailable',
+            message: `the native model catalog could not be read: ${failures}`,
+            current,
+          }
+        }
+        return {
+          ok: false,
+          target,
+          reason: 'not-an-option',
+          message: `the native model catalog does not advertise "${value}"${failures === undefined
+            ? ''
+            : `; some native providers could not be read: ${failures}`}`,
+          current,
+        }
+      }
+      selected = { provider: row.provider, model: row.model }
+    }
+
+    const plan = await this.effortPlan({ requestedEffort, effortOnly, persisted, selected, signal })
+    if ('refusal' in plan) {
+      return { ok: false, target, reason: plan.reason, message: plan.refusal, current }
+    }
+
+    const ops: SettingsPathOp[] = []
+    if (!effortOnly) {
+      ops.push({ op: 'set', path: [MODEL_PROVIDER_PATH], value: selected.provider })
+      ops.push({ op: 'set', path: [MODEL_PATH], value: selected.model })
+    }
+    if (plan.kind === 'set') ops.push({ op: 'set', path: [MODEL_EFFORT_PATH], value: plan.id })
+    if (plan.kind === 'unset') ops.push({ op: 'unset', path: [MODEL_EFFORT_PATH] })
+    if (ops.length === 0) {
+      // Confirming the selection that is already stored changes nothing, so it
+      // is a successful no-op rather than a malformed request: the model
+      // picker's own current row must stay confirmable. No mutation is prepared
+      // (the revision fence has nothing to protect), and the outcome still
+      // carries the native read-back shape — fresh `revision`/`value` and the
+      // persisted pair — so the caller can repaint from native facts only.
+      this.recheck(captured, signal, 'the native default model selection was confirmed')
+      const observed = this.freshTarget(resolution, settings)
+      const observedValue = observed === undefined ? undefined : nonEmpty(observed.value)
+      if (observed === undefined || !observed.available || observed.revision === undefined || observedValue === undefined) {
+        return {
+          ok: false,
+          target,
+          reason: 'unavailable',
+          message: observed?.limitation ?? 'the native settings descriptor could not be re-read to confirm the current default',
+          ...(observed === undefined ? {} : { current: observed }),
+        }
+      }
+      const observedEffort = nonEmpty(observed.reasoningEffort)
+      return {
+        ok: true,
+        target,
+        namespace,
+        field: fieldLabel(resolution.spec),
+        value: observedValue,
+        revision: observed.revision,
+        changed: false,
+        unchanged: true,
+        ...(captured.scope.attachmentId === undefined ? {} : { attachmentId: captured.scope.attachmentId }),
+        stillCurrent: this.stillCurrent(captured),
+        ...(observed.provider === undefined ? {} : { provider: observed.provider }),
+        ...(observed.model === undefined ? {} : { model: observed.model }),
+        ...(observedEffort === undefined ? {} : { reasoningEffort: observedEffort }),
+      }
+    }
+    const desiredEffort = plan.kind === 'set'
+      ? plan.id
+      : plan.kind === 'unset'
+        ? undefined
+        : persistedEffort
+
+    // Final pre-write gate: cancellation, attachment and the native revision
+    // are re-proven after every asynchronous phase above.
+    this.recheck(captured, signal, 'the native default model selection was prepared')
+    const fresh = this.freshTarget(resolution, settings)
+    if (fresh === undefined || !fresh.available || fresh.revision === undefined) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: fresh?.limitation ?? 'the native settings descriptor could not be re-read before the write',
+        ...(fresh === undefined ? {} : { current: fresh }),
+      }
+    }
+    if (fresh.revision !== expectedRevision) {
+      return {
+        ok: false,
+        target,
+        reason: 'conflict',
+        expectedRevision,
+        actualRevision: fresh.revision,
+        message: 'the native default changed since it was confirmed',
+        current: fresh,
+      }
+    }
+    const movedPair = fresh.provider !== persisted.provider || fresh.model !== persisted.model ||
+      (nonEmpty(fresh.reasoningEffort) ?? undefined) !== persistedEffort
+    if (movedPair) {
+      return {
+        ok: false,
+        target,
+        reason: 'conflict',
+        expectedRevision,
+        actualRevision: fresh.revision,
+        message: 'the native default model selection changed while this write was prepared',
+        current: fresh,
+      }
+    }
+    // Owner re-proof after the asynchronous phases: a profile recomposition can
+    // add/replace the default-model Loader entry or hand `currentSelection()` to
+    // another service without touching this descriptor's revision. Re-resolve
+    // the unique namespace and re-read the mounted owner from the live access
+    // services, never from a cached ownership record; a moved owner is refused
+    // with no mutation and the native revision fence stays in place.
+    const liveLoader = this.service<LoaderLike>('loader')
+    const liveResolution = liveLoader === undefined
+      ? undefined
+      : this.resolveNamespaces(liveLoader).find((candidate) => candidate.spec.target === target)
+    if (liveResolution === undefined || liveResolution.namespace === undefined || liveResolution.namespace !== namespace) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: liveResolution?.reason === 'namespace-ambiguous'
+          ? 'more than one profile entry now declares this plugin, so the owner namespace is no longer unique'
+          : 'the native settings namespace for this target changed while the write was prepared',
+        current: fresh,
+      }
+    }
+    const freshProvider = nonEmpty(fresh.provider)
+    const freshModel = nonEmpty(fresh.model)
+    if (freshProvider === undefined || freshModel === undefined) {
+      return {
+        ok: false,
+        target,
+        reason: 'unavailable',
+        message: 'the native default model selection is unreadable',
+        current: fresh,
+      }
+    }
+    const freshEffort = nonEmpty(fresh.reasoningEffort)
+    const liveRuntime = this.readDefaultSelection()
+    if (liveRuntime !== undefined && !sameSelection(liveRuntime, {
+      provider: freshProvider,
+      model: freshModel,
+      ...(freshEffort === undefined ? {} : { reasoningEffort: freshEffort }),
+    })) {
+      return {
+        ok: false,
+        target,
+        reason: 'conflict',
+        expectedRevision,
+        actualRevision: fresh.revision,
+        message: 'the mounted native default service reports a different selection; the obsolete write was not applied',
+        current: fresh,
+      }
+    }
+
+    try {
+      const mutate = settings.mutate
+      if (typeof mutate !== 'function') {
+        return { ok: false, target, reason: 'unavailable', message: 'the native settings write path is not mounted', current }
+      }
+      await mutate.call(settings, namespace, ops, expectedRevision)
+    } catch (error) {
+      const conflict = this.conflictOf(error)
+      if (conflict !== undefined) {
+        const after = this.freshTarget(resolution, settings)
+        return {
+          ok: false,
+          target,
+          reason: 'conflict',
+          expectedRevision: conflict.expected ?? expectedRevision,
+          actualRevision: conflict.actual,
+          message: 'the native default changed while it was being written',
+          ...(after === undefined ? {} : { current: after }),
+        }
+      }
+      this.warn(`native default model write failed: ${diagnostic(error)}`)
+      return {
+        ok: false,
+        target,
+        reason: 'write-failed',
+        message: diagnostic(error),
+        current: this.freshTarget(resolution, settings),
+      }
+    }
+    const readBack = this.describeNow(settings)
+    const after = readBack === undefined ? undefined : this.projectTarget(resolution, readBack, true)
+    const accepted = after === undefined ? undefined : nonEmpty(after.value)
+    if (after === undefined || !after.available || after.revision === undefined || accepted === undefined) {
+      this.warn('native default model write was accepted but its read-back failed')
+      return {
+        ok: false,
+        target,
+        reason: 'write-failed',
+        message: 'the native write was accepted but its read-back failed; re-read the native default',
+      }
+    }
+    const readBackEffort = nonEmpty(after.reasoningEffort)
+    const changed = after.provider === selected.provider && after.model === selected.model &&
+      readBackEffort === desiredEffort
+    return {
+      ok: true,
+      target,
+      namespace,
+      field: fieldLabel(resolution.spec),
+      // The native read-back pair, never the requested one: `changed` compares
+      // the two, so `value` must describe what the document actually holds.
+      value: accepted,
+      revision: after.revision,
+      changed,
+      ...(captured.scope.attachmentId === undefined ? {} : { attachmentId: captured.scope.attachmentId }),
+      stillCurrent: this.stillCurrent(captured),
+      ...(after.provider === undefined ? {} : { provider: after.provider }),
+      ...(after.model === undefined ? {} : { model: after.model }),
+      ...(readBackEffort === undefined ? {} : { reasoningEffort: readBackEffort }),
+      ...(plan.kind === 'unset' && readBackEffort === undefined ? { reasoningEffortReset: true } : {}),
+    }
+  }
+
+  /**
+   * Decide the reasoning operation for one default-model write.
+   *
+   * The stored level survives only when the target still advertises it (the
+   * same rule the session route uses); otherwise the field is removed, which is
+   * exactly the native `saveSelection()` omission semantic. An unreadable
+   * metadata answer refuses an **explicit** level (it cannot be validated), but
+   * never blocks a model switch: the stored level is then removed with the same
+   * native `unset` instead of being guessed as still supported. Refusing the
+   * switch would strand exactly the broken saved pair this target exists to
+   * repair, and omitting the level is what the native selection writer does
+   * when it cannot confirm the target's roster.
+   */
+  private async effortPlan(input: {
+    readonly requestedEffort: string | null | undefined
+    readonly effortOnly: boolean
+    readonly persisted: DefaultModelSelection
+    readonly selected: DefaultModelSelection
+    readonly signal: AbortSignal
+  }): Promise<EffortPlan | { readonly refusal: string; readonly reason: 'not-an-option' | 'unavailable' }> {
+    const { requestedEffort, effortOnly, persisted, selected, signal } = input
+    if (requestedEffort === null) return { kind: 'unset' }
+    if (requestedEffort !== undefined) {
+      const probe = await this.reasoningProbe(selected.provider, selected.model, signal)
+      if (!probe.available) return { refusal: probe.limitation, reason: 'unavailable' }
+      const efforts = probe.reasoning?.efforts ?? []
+      if (!efforts.some((level) => level.id === requestedEffort)) {
+        const available = efforts.map((level) => level.id).join(', ')
+        return {
+          refusal: `the native model ${pairKey(selected.provider, selected.model)} does not advertise reasoning effort "${requestedEffort}"${available === '' ? '' : `; available: ${available}`}`,
+          reason: 'not-an-option',
+        }
+      }
+      return { kind: 'set', id: requestedEffort }
+    }
+    if (effortOnly || persisted.reasoningEffort === undefined) return { kind: 'none' }
+    const probe = await this.reasoningProbe(selected.provider, selected.model, signal)
+    // Unreadable NEW metadata is unknown, never "supports nothing": the carried
+    // level cannot be proven, so the model switch proceeds and omits it (native
+    // `saveSelection()` semantics, a native `unset` in the same mutate). Only
+    // an explicit level needs a readable answer, and that is refused above.
+    if (!probe.available) return { kind: 'unset' }
+    const carried = carriedEffort(probe.reasoning, persisted.reasoningEffort)
+    if (carried === undefined) return { kind: 'unset' }
+    return carried === persisted.reasoningEffort ? { kind: 'none' } : { kind: 'set', id: carried }
+  }
+
+  /** Cancellation/attachment re-check after one asynchronous phase. */
+  private recheck(captured: CapturedScope, signal: AbortSignal, label: string): void {
+    if (signal.aborted) throw cancellationError(signal, 'native default update')
+    if (!this.stillCurrent(captured)) {
+      throw backendError('STALE_SESSION', `${label}; the obsolete selection was not written`)
+    }
+  }
+
+  /** One exact-route reasoning metadata read; never a provider catalog walk. */
+  private async reasoningProbe(provider: string, model: string, signal: AbortSignal): Promise<NativeReasoningProbe> {
+    const face = this.faces.resolveReasoning
+    if (typeof face !== 'function') {
+      return { available: false, limitation: 'the runtime mounted no native model metadata resolver' }
+    }
+    try {
+      const raw = await bounded(
+        Promise.resolve(face(provider, model, signal)),
+        DEFAULT_REASONING_TIMEOUT_MS,
+        `native reasoning metadata for ${pairKey(provider, model)}`,
+        signal,
+      )
+      // `undefined` legitimately means "this route advertises no levels". A
+      // present non-record payload is malformed metadata, not an empty roster.
+      if (raw !== undefined && record(raw) === undefined) {
+        this.warn(`the native reasoning metadata for ${pairKey(provider, model)} is not a record`)
+        return {
+          available: false,
+          limitation: `the native reasoning metadata for ${pairKey(provider, model)} is malformed`,
+        }
+      }
+      const reasoning = reasoningView(raw)
+      return { available: true, ...(reasoning === undefined ? {} : { reasoning }) }
+    } catch (error) {
+      if (signal.aborted) throw cancellationError(signal, 'native reasoning metadata read')
+      this.warn(`could not read native reasoning metadata for ${pairKey(provider, model)}: ${diagnostic(error)}`)
+      return {
+        available: false,
+        limitation: `the native reasoning metadata for ${pairKey(provider, model)} could not be read`,
+      }
+    }
+  }
+
+  /** Fresh native model rows for one explicit model change. */
+  private async freshModelRows(
+    signal: AbortSignal,
+  ): Promise<
+    | { readonly ok: true; readonly items: readonly ModelRow[]; readonly failures: readonly string[] }
+    | { readonly ok: false; readonly message: string }
+  > {
+    const face = this.faces.modelCatalog
+    if (typeof face !== 'function') return { ok: false, message: 'the runtime mounted no native model catalog' }
+    try {
+      const value = await bounded(
+        Promise.resolve(face()),
+        DEFAULT_MODEL_CATALOG_TIMEOUT_MS,
+        'native model catalog read',
+        signal,
+      )
+      const items = Array.isArray(value?.items) ? value.items : []
+      // Isolated provider failures are retained, never folded into the rows: a
+      // partially failed catalog is still usable, and the caller reports the
+      // remaining failures instead of pretending the catalog was complete.
+      const rawFailures: unknown = value?.failures
+      const failures = Array.isArray(rawFailures)
+        ? (rawFailures as readonly unknown[]).flatMap((entry) => (typeof entry === 'string' ? [entry] : []))
+        : []
+      const summary = catalogFailureText(failures)
+      if (summary !== undefined) this.warn(`could not read some native model providers: ${summary}`)
+      return { ok: true, items, failures }
+    } catch (error) {
+      if (signal.aborted) throw cancellationError(signal, 'native model catalog read')
+      this.warn(`could not read the native model catalog: ${diagnostic(error)}`)
+      return { ok: false, message: diagnostic(error) }
+    }
+  }
+
+  /** The mounted native default selection, read defensively and never cached. */
+  private readDefaultSelection(): DefaultModelSelection | undefined {
+    const face = this.faces.currentSelection
+    if (typeof face !== 'function') return undefined
+    try {
+      return readDefaultSelection(face())
+    } catch (error) {
+      this.warn(`native default model selection read failed: ${diagnostic(error)}`)
+      return undefined
     }
   }
 
@@ -958,7 +1734,7 @@ export class NativeManagement {
   private unresolvedTargets(reason: DefaultSettingUnavailableReason): readonly NativeDefaultSettingView[] {
     return TARGETS.map((spec) => ({
       target: spec.target,
-      field: spec.field,
+      field: fieldLabel(spec),
       available: false,
       writable: false,
       options: [],
@@ -983,8 +1759,9 @@ export class NativeManagement {
     return this.projectTarget(resolution, descriptors, typeof settings.mutate === 'function')
   }
 
-  private async attachOptions(view: NativeDefaultSettingView): Promise<NativeDefaultSettingView> {
+  private async attachOptions(view: NativeDefaultSettingView, signal: AbortSignal = NEVER_ABORTED): Promise<NativeDefaultSettingView> {
     if (!view.available) return view
+    if (view.target === 'agent-default-model') return await this.attachDefaultModel(view, signal)
     if (view.target === 'permission-default-preset') {
       const permissions = this.service<PermissionPresetsLike>('permissionPresets')
       if (typeof permissions?.catalog !== 'function') {
@@ -1026,8 +1803,17 @@ export class NativeManagement {
     }
     let roster: unknown
     try {
-      roster = await presets.list()
+      // The roster read is asynchronous and native `settings.mutate()` is not
+      // abortable. Bound this phase and let the caller's final signal fence
+      // stop a write that completed after cancellation.
+      roster = await bounded(
+        Promise.resolve(presets.list()),
+        DEFAULT_PRESET_ROSTER_TIMEOUT_MS,
+        'native agent-preset roster read',
+        signal,
+      )
     } catch (error) {
+      if (signal.aborted) throw cancellationError(signal, 'native agent-preset roster read')
       this.warn(`native agent-preset roster read failed: ${diagnostic(error)}`)
       return this.optionsUnavailable(view, diagnostic(error))
     }
@@ -1052,6 +1838,84 @@ export class NativeManagement {
       return this.optionsUnavailable(view, 'the native agent-preset roster advertises no usable preset')
     }
     return this.withOptions(view, options, effectiveValue)
+  }
+
+  /**
+   * Enrich the default-model target with the exact pair and its native reasoning
+   * metadata.
+   *
+   * One `resolveModelInfo` call for the persisted pair only: no provider
+   * catalog walk here, so the outer native-UI read bound still covers the whole
+   * read. Missing/failed metadata is reported as `reasoningAvailable:false` and
+   * never flattened into "this model has no levels"; a genuine empty roster is
+   * `reasoningSupported:false`. Neither condition clears the model row's proven
+   * native writability: the effort row gates itself on
+   * `reasoningAvailable`, and the model picker is exactly how a default whose
+   * old pair metadata is broken gets repaired through the native catalog. A
+   * model switch with unreadable target metadata therefore still applies and
+   * removes the stored level; only an explicit level is refused.
+   */
+  private async attachDefaultModel(
+    view: NativeDefaultSettingView,
+    signal: AbortSignal,
+  ): Promise<NativeDefaultSettingView> {
+    const provider = nonEmpty(view.provider)
+    const model = nonEmpty(view.model)
+    if (provider === undefined || model === undefined) {
+      return this.optionsUnavailable(view, 'the native default provider/model pair is unreadable')
+    }
+    const stored = nonEmpty(view.reasoningEffort)
+    // The runtime service owns the startup default. A proven disagreement means
+    // this profile row is not what a fresh Agent reads, so edits cannot change
+    // that default and must not be advertised as writable.
+    const runtime = this.readDefaultSelection()
+    if (runtime !== undefined && !sameSelection(runtime, {
+      provider,
+      model,
+      ...(stored === undefined ? {} : { reasoningEffort: stored }),
+    })) {
+      return {
+        ...view,
+        writable: false,
+        reason: 'write-unavailable',
+        limitation: 'the mounted native default service does not read this profile entry; a write could not change the startup default',
+      }
+    }
+    const probe = await this.reasoningProbe(provider, model, signal)
+    if (!probe.available) {
+      // The native Settings write path and this namespace/revision are already
+      // proven (`view.writable`); an unreadable reasoning roster only disables
+      // the effort choice. Keeping the model row writable is what lets a user
+      // replace a stale/broken default with a valid native catalog row.
+      return {
+        ...view,
+        reason: 'options-unavailable',
+        limitation: probe.limitation,
+        reasoningAvailable: false,
+      }
+    }
+    const efforts = probe.reasoning?.efforts ?? []
+    const supported = efforts.length > 0
+    const defaultEffort = probe.reasoning?.defaultEffort
+    const advertised = stored === undefined ? undefined : efforts.some((level) => level.id === stored)
+    const effective = stored === undefined ? defaultEffort : advertised === true ? stored : undefined
+    const unsupportedStored = stored !== undefined && supported && advertised === false
+    return {
+      ...view,
+      reasoningAvailable: true,
+      reasoningSupported: supported,
+      reasoningEfforts: efforts.flatMap((level) => {
+        const option = readDefaultOption({ id: level.id, label: level.name, ...(level.description === undefined ? {} : { description: level.description }) })
+        return option === undefined ? [] : [option]
+      }),
+      ...(defaultEffort === undefined ? {} : { defaultReasoningEffort: defaultEffort }),
+      ...(effective === undefined ? {} : { effectiveReasoningEffort: effective }),
+      ...(unsupportedStored
+        ? {
+            limitation: `the stored reasoning effort "${stored}" is not advertised by ${pairKey(provider, model)}; DSH rejects it when a request is prepared`,
+          }
+        : {}),
+    }
   }
 
   private withOptions(
@@ -1087,9 +1951,10 @@ export class NativeManagement {
     writablePath: boolean,
   ): NativeDefaultSettingView {
     const spec = resolution.spec
+    const label = fieldLabel(spec)
     const base = (reason: DefaultSettingUnavailableReason, limitation: string): NativeDefaultSettingView => ({
       target: spec.target,
-      field: spec.field,
+      field: label,
       available: false,
       writable: false,
       options: [],
@@ -1113,18 +1978,44 @@ export class NativeManagement {
     }
     const revision = integer(descriptor.revision)
     if (revision === undefined) return base('value-malformed', 'the native settings revision is unreadable')
-    if (!schemaDeclaresField(descriptor.schema, spec.field)) {
-      return base('field-not-volatile', `the native settings form does not declare "${spec.field}" as a live field`)
+    const missing = spec.fields.find((field) => !schemaDeclaresField(descriptor.schema, field))
+    if (missing !== undefined) {
+      return base('field-not-volatile', `the native settings form does not declare "${missing}" as a live field`)
     }
     const value = record(descriptor.value)
     if (value === undefined) return base('value-malformed', 'the native settings value is unreadable')
-    const fieldValue = value[spec.field]
+    if (spec.target === 'agent-default-model') {
+      const provider = nonEmpty(value[MODEL_PROVIDER_PATH])
+      const model = nonEmpty(value[MODEL_PATH])
+      if (provider === undefined || model === undefined) {
+        return base('value-malformed', 'the native default model provider/model pair is unreadable')
+      }
+      const reasoningEffort = value[MODEL_EFFORT_PATH]
+      if (reasoningEffort !== undefined && typeof reasoningEffort !== 'string') {
+        return base('value-malformed', `the native "${MODEL_EFFORT_PATH}" value is not a string`)
+      }
+      return {
+        target: spec.target,
+        field: label,
+        available: true,
+        writable: writablePath,
+        namespace: resolution.namespace,
+        provider,
+        model,
+        value: pairKey(provider, model),
+        ...(nonEmpty(reasoningEffort) === undefined ? {} : { reasoningEffort: nonEmpty(reasoningEffort) }),
+        revision,
+        options: [],
+        ...(writablePath ? {} : { reason: 'write-unavailable', limitation: 'the native settings write path is not mounted' }),
+      }
+    }
+    const fieldValue = value[singleFieldPath(spec)]
     if (fieldValue !== undefined && typeof fieldValue !== 'string') {
-      return base('value-malformed', `the native "${spec.field}" value is not a string`)
+      return base('value-malformed', `the native "${label}" value is not a string`)
     }
     return {
       target: spec.target,
-      field: spec.field,
+      field: label,
       available: true,
       writable: writablePath,
       namespace: resolution.namespace,

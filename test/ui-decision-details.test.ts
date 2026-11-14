@@ -67,6 +67,14 @@ function proposalDetails(rows = 30, columns = 80): Details {
 // ---------------------------------------------------------------------------
 // Content: complete, never truncated, bounded by the viewport
 
+test('native detail markdown cannot inject terminal control sequences', () => {
+  const details = markdownDetails(30, 100, `# Plan\n\nSafe step\n\x1b[2J\x1b]0;owned-title\x07`)
+  const raw = details.render(90).join('\n')
+  assert.doesNotMatch(raw, /\x1b\[2J/)
+  assert.doesNotMatch(raw, /\x1b\]0;owned-title/)
+  assert.doesNotMatch(raw, /owned-title/)
+})
+
 test('native markdown detail is fully readable by scrolling, with honest metadata', () => {
   const details = markdownDetails()
   const lines = details.render(80)

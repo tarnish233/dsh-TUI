@@ -9,7 +9,7 @@ import {
   testEditorTheme,
   typeText,
 } from "../src/input/testing/harness.ts"
-import type { CcActionEvent, CcEditorOptions } from "../src/input/index.ts"
+import type { CcActionDefinition, CcActionEvent, CcContext, CcEditorOptions } from "../src/input/index.ts"
 import type { AutocompleteProvider } from "#pi-tui"
 
 const mod = await loadInputModule()
@@ -595,4 +595,75 @@ test("autocomplete: Ctrl+P/N navigate, Tab accepts, Enter accepts, Escape closes
   press(editor, "\x10") // Ctrl+P wraps to the last item
   press(editor, "\r") // Enter accepts (plain completion, no submit)
   assert.equal(editor.getText(), "@gamma")
+
+  editor.setText("")
+  editor.handleInput("@")
+  await sleep(60)
+  assert.equal(editor.isShowingAutocomplete(), true)
+  press(editor, "\n") // Ctrl+J is newline, not Enter/submit
+  assert.equal(editor.getText(), "@\n")
+  assert.equal(editor.isShowingAutocomplete(), false)
+})
+/**
+ * `CcEditor` forwards by `action.implementor === "app"`, not by an id list.
+ *
+ * The old 44-entry whitelist had to be edited whenever a list/dialog/overlay
+ * row was added (and it already lagged the registry: `app.images.details`,
+ * `modal.search`, `subagent.filter.toggle`, `tool.details.wrap`, the queue and
+ * settings rows never appeared in it). This sweep pins the registry-driven
+ * rule: every app-implemented action reaches the App, and an app-implemented
+ * action from a custom registry needs no change in the input layer.
+ */
+test("every app-implemented registry action is forwarded to the App (no id whitelist)", () => {
+  const { editor, events } = makeEditor()
+  const dispatch = (
+    editor as unknown as {
+      runAction(action: CcActionDefinition, data: string, context: CcContext): void
+    }
+  ).runAction.bind(editor)
+
+  const appActions = mod.CC_ACTIONS.filter((action) => action.implementor === "app")
+  assert.ok(appActions.length > 0)
+  for (const action of appActions) {
+    events.length = 0
+    dispatch(action, "x", "editor")
+    assert.equal(events.at(-1)?.id, action.id, `${action.id} must be forwarded to the App`)
+    assert.equal(events.length, 1, `${action.id} must be forwarded exactly once`)
+  }
+
+  const custom: CcActionDefinition = {
+    id: "demo.app.action",
+    family: "app",
+    contexts: ["editor"],
+    defaultBindings: ["alt+q"],
+    implementor: "app",
+    status: "tui-extension",
+    description: "Test-only app action from a custom registry.",
+  }
+  events.length = 0
+  dispatch(custom, "x", "editor")
+  assert.deepEqual(events.map((event) => event.id), ["demo.app.action"])
+
+  // Nothing is silently dropped: an editor action this editor does not
+  // implement is still forwarded instead of being swallowed.
+  const unknownEditor: CcActionDefinition = { ...custom, id: "demo.editor.action", implementor: "editor" }
+  events.length = 0
+  dispatch(unknownEditor, "x", "editor")
+  assert.deepEqual(events.map((event) => event.id), ["demo.editor.action"])
+})
+
+/**
+ * `isActionBoundToKey` (and the `autocomplete.accept` guard) inspect configured
+ * bindings outside `keymap.resolve()`, so they must use the same bare-LF rule
+ * as the keymap: Pi matches LF as `enter`/`return` on legacy terminals, and a
+ * user binding must not resurrect that alias.
+ */
+test("a configured Enter/Return alias is never matched by bare LF", () => {
+  const { editor } = makeEditor({ bindings: { "app.exit": ["enter"], "app.redraw": ["return"] } })
+
+  assert.equal(editor.isActionBoundToKey("app.exit", "\r"), true, "CR is the real Enter")
+  assert.equal(editor.isActionBoundToKey("app.exit", "\n"), false, "bare LF is Ctrl+J, never Enter")
+  assert.equal(editor.isActionBoundToKey("app.redraw", "\r"), true, "CR is the real Return")
+  assert.equal(editor.isActionBoundToKey("app.redraw", "\n"), false, "bare LF is Ctrl+J, never Return")
+  assert.equal(editor.isActionBoundToKey("app.exit", "\x04"), false, "an unrelated key is still unbound")
 })

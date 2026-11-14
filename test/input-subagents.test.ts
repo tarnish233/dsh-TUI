@@ -501,7 +501,7 @@ test("both subagent surfaces reuse list, dialog and global keys with no editor l
     assert.equal(actionId(keymap, "\x1b[F", context), "list.last")
     assert.equal(actionId(keymap, "1", context), "list.select-digit")
     assert.equal(actionId(keymap, "\r", context), "list.select")
-    assert.equal(actionId(keymap, "\n", context), "list.select", "legacy ^J/^M share the Enter byte group")
+    assert.equal(actionId(keymap, "\n", context), undefined, "a bare LF is Ctrl+J/newline, never Enter")
     assert.equal(actionId(keymap, "\x1b", context), "list.cancel")
 
     // global fallback and the shared local cancel.

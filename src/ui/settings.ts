@@ -77,7 +77,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { modalBinding, type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, modalBinding, type ModalAction, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, tildePath, visibleWidth, wrap } from './text.ts'
 import { bold, cc, dim, t } from './theme.ts'
 
@@ -113,6 +113,13 @@ export interface NativeSettingsEntry {
   description?: string
   /** False renders the row as a clearly unavailable native capability. */
   available?: boolean
+  /**
+   * Search aliases owned by the parent (defaults to the supplied
+   * label/description plus the historical `native dsh` prefix). Only the
+   * search haystack uses it: it is never painted, never writes a preference and
+   * never decides a row's value/availability.
+   */
+  keywords?: string
   /** Existing parent operation (open picker/command). Omitted = information. */
   onActivate?: () => void
 }
@@ -197,10 +204,6 @@ interface PickerEntry {
   readonly value: SettingValue | 'custom'
 }
 
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
-
-const CANCEL_ACTIONS = CLOSE_ACTIONS
-
 /**
  * The one embedded text field in this surface (numeric value entry) runs on the
  * CC editor context, where default Ctrl+C resolves `app.clear` instead of a
@@ -216,7 +219,7 @@ function cancelFallback(keymap: CcKeymap, data: string): boolean {
   const simple = (binding: string): boolean =>
     !binding.includes(' ') && matchesKey(data, binding as Parameters<typeof matchesKey>[1])
   if (!keymap.getBindings('app.clear').some(simple)) return false
-  return [...CANCEL_ACTIONS].some(id => keymap.getBindings(id).some(simple))
+  return [...CLOSE_ACTIONS].some(id => keymap.getBindings(id).some(simple))
 }
 
 const TOOL_LABELS: Record<typeof TOOL_SETTING_KEYS[number], string> = {
@@ -800,7 +803,7 @@ export class SettingsDialog implements Component, Focusable {
         description: entry.description ?? 'Native DSH status; DSH owns the value and any persistence',
         kind: entry.onActivate === undefined ? 'info' : 'action',
         available,
-        keywords: `native dsh ${entry.label} ${entry.description ?? ''}`,
+        keywords: entry.keywords ?? `native dsh ${entry.label} ${entry.description ?? ''}`,
         ...(entry.onActivate === undefined ? {} : { activate: entry.onActivate }),
       }
     })
@@ -1313,7 +1316,7 @@ export class SettingsDialog implements Component, Focusable {
           return
         }
         default:
-          if (CANCEL_ACTIONS.has(action.id)) this.cancel()
+          if (CLOSE_ACTIONS.has(action.id)) this.cancel()
           // Any other global/app action stays inert inside this modal.
           return
       }
@@ -1404,7 +1407,7 @@ export class SettingsDialog implements Component, Focusable {
         return
       }
       default:
-        if (CANCEL_ACTIONS.has(action.id)) this.closePicker()
+        if (CLOSE_ACTIONS.has(action.id)) this.closePicker()
         return
     }
   }
@@ -1720,10 +1723,23 @@ export class SettingsDialog implements Component, Focusable {
       return
     }
     if (this.mode !== 'browse') return
-    const row = this.visibleRows()[hit.index]
+    const rows = this.visibleRows()
+    // The press pin is the row's stable id. A roster that was rebuilt between
+    // the press and the release (a native settings push can drop the roster
+    // cache without a repaint) makes the painted index point at a *different*
+    // row, so the id wins and the index is only the fallback for a hit without
+    // one (a plain click resolved against the current paint).
+    const pinned = hit.key === undefined ? -1 : rows.findIndex(row => row.id === hit.key)
+    // A press identified by a row id whose row disappeared must not fall back to
+    // the old index: that index now addresses a different row after a native
+    // roster push. Only a hit without a key (a plain click) uses the painted
+    // index.
+    if (hit.key !== undefined && pinned < 0) return
+    const index = pinned >= 0 ? pinned : hit.index
+    const row = rows[index]
     if (row === undefined) return
     const wasSelected = this.activeRowId === row.id
-    this.moveTo(hit.index)
+    this.moveTo(index)
     if (wasSelected) this.activateRow(row)
     this.tui.requestRender()
   }

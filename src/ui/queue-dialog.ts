@@ -28,6 +28,7 @@ import { isInterruptKey } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import {
+  CLOSE_ACTIONS,
   ModalFrame,
   modalHeight,
   type ModalAction,
@@ -68,8 +69,6 @@ interface ResolvedModalAction {
   readonly id: string
   readonly keys: string[]
 }
-
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 const errorText = (error: unknown): string => sanitize(error instanceof Error ? error.message : String(error))
 

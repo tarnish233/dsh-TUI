@@ -1214,12 +1214,12 @@ function sameCatalog(
 /**
  * Is the item order the same projection input as the cached one?
  *
- * `store.items` is composed per read (native child rows are spliced into the
- * declared order), so the array is not a stable token. Item objects are
- * immutable — every content change replaces the object with the next `version` —
- * so identity is the token, with `kind`/`id`/`version` as the fallback for a
- * recomposed-but-unchanged row. Nothing here reads a clock or a counter of the
- * renderer: an unchanged input really is unchanged.
+ * `store.items` is memoized per (list version, catalog change token, session),
+ * but a recomposition can still hand over a fresh array of unchanged rows. Item
+ * objects are immutable — every content change replaces the object with the next
+ * `version` — so identity is the token, with `kind`/`id`/`version` as the
+ * fallback for a recomposed-but-unchanged row. Nothing here reads a clock or a
+ * counter of the renderer: an unchanged input really is unchanged.
  */
 function sameProjectionInput(previous: readonly TranscriptItem[], next: readonly TranscriptItem[]): boolean {
   if (previous.length !== next.length) return false

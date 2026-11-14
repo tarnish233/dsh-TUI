@@ -191,11 +191,6 @@ async function loadSharp(): Promise<typeof import('sharp').default> {
   return sharpLoader
 }
 
-/** Test hook: drop the memoized module handle (the addon itself stays loaded). */
-export function resetSharpLoader(): void {
-  sharpLoader = undefined
-}
-
 /**
  * Prepare image bytes for display.
  *

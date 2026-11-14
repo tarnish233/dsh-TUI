@@ -11,6 +11,7 @@ import {
   rmSync,
   symlinkSync,
 } from 'node:fs'
+import { createRequire } from 'node:module'
 import { devNull, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,6 +19,18 @@ import test from 'node:test'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { version: string }
+
+/**
+ * The vendored native helper this platform would load, mirroring
+ * `vendor/pi-tui/src/native-platform.ts`. Undefined where no prebuild exists.
+ */
+function currentPrebuild(): string | undefined {
+  const { platform, arch } = process
+  if (arch !== 'x64' && arch !== 'arm64') return undefined
+  if (platform !== 'darwin' && platform !== 'win32' && platform !== 'linux') return undefined
+  const suffix = platform === 'linux' ? '-x11' : ''
+  return `vendor/pi-tui/native/${platform}/prebuilds/${platform}-${arch}/${platform}-platform${suffix}.node`
+}
 
 /** Copy only source inputs; never let an old local build satisfy the pack. */
 function sourceOnlyCopy(destination: string): void {
@@ -83,9 +96,27 @@ test('pnpm pack builds a source-only checkout and ships runnable native entries'
     'package/lib/plugin/index.d.ts',
     'package/vendor/pi-tui/dist/index.js',
     'package/vendor/pi-tui/dist/index.d.ts',
+    'package/vendor/pi-tui/native/darwin/prebuilds/darwin-arm64/darwin-platform.node',
+    'package/vendor/pi-tui/native/darwin/prebuilds/darwin-x64/darwin-platform.node',
+    'package/vendor/pi-tui/native/linux/prebuilds/linux-arm64/linux-platform-x11.node',
+    'package/vendor/pi-tui/native/linux/prebuilds/linux-x64/linux-platform-x11.node',
+    'package/vendor/pi-tui/native/win32/prebuilds/win32-arm64/win32-platform.node',
+    'package/vendor/pi-tui/native/win32/prebuilds/win32-x64/win32-platform.node',
     'package/bin/dsh-tui.mjs',
     'package/cordis.patch.yml',
   ]) assert.ok(entries.includes(required), `the tarball contains ${required}`)
+  // Only prebuilt binaries publish: native sources, headers and build scripts
+  // stay repository inputs and are never regenerated from an installed tarball.
+  for (const excluded of [
+    'package/vendor/pi-tui/native/napi.h',
+    'package/vendor/pi-tui/native/clipboard.h',
+    'package/vendor/pi-tui/native/darwin/build.sh',
+    'package/vendor/pi-tui/native/darwin/src/darwin-platform.m',
+    'package/vendor/pi-tui/native/linux/build.sh',
+    'package/vendor/pi-tui/native/linux/src/linux-platform-x11.c',
+    'package/vendor/pi-tui/native/win32/build.mjs',
+    'package/vendor/pi-tui/native/win32/src/win32-platform.c',
+  ]) assert.equal(entries.includes(excluded), false, `the tarball excludes native source ${excluded}`)
 
   const unpacked = join(temporary, 'unpacked')
   mkdirSync(unpacked)
@@ -98,4 +129,16 @@ test('pnpm pack builds a source-only checkout and ships runnable native entries'
     encoding: 'utf8',
   }).trim()
   assert.equal(version, MANIFEST.version, 'the packed public CLI executes against its own compiled entries')
+
+  // Packaging smoke only: the archive's own binary for this platform must load
+  // through a public resolver. No clipboard/display call is made here.
+  const prebuild = currentPrebuild()
+  if (prebuild !== undefined) {
+    const packed = join(packageRoot, prebuild)
+    assert.ok(existsSync(packed), `this platform's prebuild is packed: ${prebuild}`)
+    const helper = createRequire(join(packageRoot, 'vendor/pi-tui/dist/index.js'))(packed) as Record<string, unknown> | null
+    assert.ok(helper !== null && typeof helper === 'object', 'the packed prebuild is a loadable native module')
+    assert.equal(typeof helper.getText, 'function', 'the packed prebuild exposes its text clipboard entry')
+    assert.equal(typeof helper.getImage, 'function', 'the packed prebuild exposes its image clipboard entry')
+  }
 })

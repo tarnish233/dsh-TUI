@@ -65,7 +65,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { modalHeight, type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, type ModalAction, type ModalSize } from './modal.ts'
 import { TranscriptView } from './transcript.ts'
 import { fit, oneLine, sanitize, truncateToWidth, wrap } from './text.ts'
 import { bold, dim, t } from './theme.ts'
@@ -165,7 +165,6 @@ export type HistoryTurnsState = 'unread' | 'loading' | 'ready' | 'unavailable' |
 const DEFAULT_MAX_EVENTS = 1200
 const DEFAULT_MAX_BYTES = 1024 * 1024
 const DEFAULT_MAX_PAGES = 40
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 const isRecord = (value: unknown): value is JsonRecord =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -1196,12 +1195,6 @@ export class HistoryDialog implements Component, Focusable {
 
   // -------------------------------------------------------------------------
   // Rendering
-
-  private heightCap(): number {
-    const rows = this.tui.terminal?.rows
-    if (!Number.isFinite(rows) || rows <= 0) return 200
-    return Math.max(1, Math.floor(this.options.maxHeight ?? modalHeight(this.tui, this.modalSize)))
-  }
 
   private ownerKey(): string {
     const entry = this.detail?.entry

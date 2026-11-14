@@ -51,11 +51,11 @@ class ModelBackend implements Backend {
   }
 }
 
-async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen', bindings?: JsonRecord) {
+async function fixture(screen: 'inline' | 'fullscreen' = 'fullscreen', bindings?: JsonRecord, extra: { modelCatalogTimeoutMs?: number } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-parent-model-picker-'))
   if (bindings) await writeFile(join(directory, 'keybindings.json'), JSON.stringify(bindings))
   const backend = new ModelBackend(directory), terminal = new VirtualTerminal(110, 42)
-  const app = new App({ backend, cwd: directory, configDir: directory, terminal, screen, registerSignals: false })
+  const app = new App({ backend, cwd: directory, configDir: directory, terminal, screen, registerSignals: false, ...extra })
   await app.start(); await paint(terminal)
   return { app, backend, terminal, directory, async close() {
     try { await app.shutdown() } finally { terminal.dispose(); await rm(directory, { recursive: true, force: true }) }
@@ -244,5 +244,22 @@ test('parent model picker: a late model roster cannot replace Settings', async (
     release(); await opening; await paint(f.terminal)
     assert.match(f.terminal.screen(), /Settings/)
     assert.doesNotMatch(f.terminal.screen(), /Choose model/)
+  } finally { await f.close() }
+})
+
+test('parent model picker: an unanswered catalog read degrades instead of loading forever', async () => {
+  const f = await fixture('fullscreen', undefined, { modelCatalogTimeoutMs: 60 })
+  try {
+    let release!: () => void
+    f.backend.catalogGate = new Promise(resolve => { release = resolve })
+    await f.app.submit('/model')
+    await until(() => /did not answer/.test(f.terminal.screen()), 'the bounded read reports instead of loading forever')
+      .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+    assert.match(f.terminal.screen(), /Choose model/, 'the picker stays open for a retry')
+    assert.doesNotMatch(f.terminal.screen(), /Loading options/)
+    // A roster landing after the bound cannot repaint over the settled error.
+    release(); await paint(f.terminal); await paint(f.terminal)
+    assert.doesNotMatch(f.terminal.screen(), /Alpha Needle/, 'the late catalog is discarded')
+    assert.match(f.terminal.screen(), /did not answer/)
   } finally { await f.close() }
 })

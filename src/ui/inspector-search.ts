@@ -18,8 +18,8 @@
  * - `render` is width-safe and keeps `CURSOR_MARKER` for the renderer.
  * - `dispose` releases only this field's editor listener and pending chord.
  */
-import { matchesKey, type KeyId, type TUI } from '#pi-tui'
-import type { CcKeymap } from '../input/index.ts'
+import type { TUI } from '#pi-tui'
+import { matchesConfiguredKey, type CcKeymap } from '../input/index.ts'
 import { InlineAnswer, type InlineKey } from './inline-editor.ts'
 
 /** Key outcome: InlineAnswer's field keys plus an explicit confirm. */
@@ -85,7 +85,7 @@ export class SearchField {
   isBound(raw: string, actionId: string): boolean {
     return this.keymap
       .getBindings(actionId)
-      .some(binding => !binding.includes(' ') && matchesKey(raw, binding as KeyId))
+      .some(binding => !binding.includes(' ') && matchesConfiguredKey(raw, binding))
   }
 
   /** Replace the query (one editor state; never a second buffer). */

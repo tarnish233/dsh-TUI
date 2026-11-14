@@ -596,15 +596,15 @@ test('an item whose content changes re-plans even when its identity stays the sa
   assert.equal(view1.projectionBuilds, builds + 1, 'the re-planned frame is reused')
 })
 
-test('anchored child rows are re-composed per read but do not re-plan an unchanged frame', () => {
+test('anchored child rows are memoized per read and do not re-plan an unchanged frame', () => {
   const entries: SubagentEntry[] = [
     { id: 'child-a', parentSessionId: 's1', catalogSeq: 2, mode: 'one-shot', status: 'running', label: 'Alpha' },
     { id: 'child-b', parentSessionId: 's1', catalogSeq: 3, mode: 'one-shot', status: 'completed', label: 'Beta' },
   ]
   const store = newStore([userEvent(1, 'spawn the children')], { entries })
-  // `store.items` composes a fresh array (and fresh subagent rows) on every read;
-  // the plan cache must compare the items, not the array object.
-  assert.notEqual(store.items, store.items)
+  // `store.items` reuses the composed array until a real projection change; the
+  // plan cache must still compare the items, not the array object.
+  assert.equal(store.items, store.items)
   const view1 = view(store)
   view1.render(70)
   const builds = view1.projectionBuilds

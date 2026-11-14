@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from '#pi-tui'
+import type { TuiMouseEvent, TuiMouseEventResult } from '#pi-tui'
 import type { DecisionRequest } from '../src/backend/types.ts'
 import { asTui, createFakeTui, loadInputModule } from '../src/input/testing/harness.ts'
 
@@ -21,6 +22,32 @@ function keymap(bindings: Record<string, string | string[] | null | undefined> =
 
 function assertWidths(lines: string[], width: number): void {
   for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`)
+}
+
+/**
+ * The painted footer action chip for `label`, addressed by its own cells.
+ *
+ * A disabled action owns no hitbox, so its press/click come back `undefined`;
+ * that difference is exactly what separates "a real, if unobvious, target"
+ * from "looks selectable and silently swallows the gesture".
+ */
+function footerChip(
+  dialog: { render(width: number): string[]; handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined },
+  label: string,
+  width = 80,
+): { row: number; col: number; press(): TuiMouseEventResult | undefined; click(): TuiMouseEventResult | undefined } {
+  const rendered = dialog.render(width)
+  const pattern = new RegExp(`\\[[^\\]]*${label}[^\\]]*\\]`)
+  const row = rendered.findIndex(line => pattern.test(stripTerminalSequences(line)))
+  assert.ok(row >= 0, `footer action chip "${label}" is painted`)
+  const plain = stripTerminalSequences(rendered[row]!)
+  const col = visibleWidth(plain.slice(0, plain.indexOf(label)))
+  const base = { button: 'left' as const, width, height: rendered.length, shift: false, alt: false, ctrl: false }
+  const send = (type: 'press' | 'click'): TuiMouseEventResult | undefined => dialog.handleMouse?.({
+    ...base, type, x: col, y: row, screenX: col, screenY: row,
+    ...(type === 'click' ? { clickCount: 1 } : {}),
+  })
+  return { row, col, press: () => send('press'), click: () => send('click') }
 }
 
 test('SelectDialog navigates with Ctrl+P/N, numbered choices and opaque values', () => {
@@ -157,6 +184,98 @@ test('approval DecisionDialog returns the exact opaque option value', () => {
   })
   second.handleInput('1')
   assert.deepEqual(result, allow)
+})
+
+test('bare LF never confirms a chooser or an approval', () => {
+  const tui = fakeTui()
+  let selected: unknown = 'unset'
+  const chooser = new SelectDialog(tui, {
+    title: 'Choose',
+    items: [{ label: 'One', value: 'one' }, { label: 'Two', value: 'two' }],
+    onSelect: value => { selected = value },
+    onCancel: () => { selected = 'cancelled' },
+  })
+  chooser.handleInput('\n')
+  assert.equal(selected, 'unset', 'Ctrl+J is not Enter in a list')
+  chooser.handleInput('\r')
+  assert.equal(selected, 'one', 'CR remains Enter')
+
+  let result: unknown = 'unset'
+  const approval = new DecisionDialog(tui, {
+    request: {
+      id: 'lf-approval',
+      kind: 'approval',
+      title: 'Allow?',
+      options: [{ label: 'Allow', value: 'allowed-once' }, { label: 'Reject', value: 'rejected' }],
+    },
+    onSubmit: value => { result = value },
+    onCancel: () => { result = 'cancelled' },
+  })
+  approval.handleInput('\n')
+  assert.equal(result, 'unset', 'Ctrl+J must not answer an approval')
+  approval.handleInput('\r')
+  assert.equal(result, 'allowed-once')
+})
+
+test('native decision text is stripped of terminal control sequences', () => {
+  const tui = fakeTui(45, 120)
+  const injection = '\x1b[2J\x1b]0;owned-title\x07'
+  const dialog = new DecisionDialog(tui, {
+    request: {
+      id: 'inject',
+      kind: 'question',
+      title: `Title${injection}`,
+      message: `Message${injection}`,
+      questions: [{
+        question: `Question${injection}`,
+        header: `Header${injection}`,
+        detail: `Detail ${injection} text`,
+        options: [{
+          label: `Label${injection}`,
+          description: `Description${injection}`,
+          preview: `Preview ${injection} block`,
+        }],
+      }],
+    },
+    onSubmit: () => {},
+    onCancel: () => {},
+  })
+  dialog.focused = true
+  const raw = dialog.render(110).join('\n')
+  assert.doesNotMatch(raw, /\x1b\[2J/)
+  assert.doesNotMatch(raw, /\x1b\]0;owned-title/)
+  assert.doesNotMatch(raw, /owned-title/)
+})
+
+test('multi-select labels and multi-question tabs are sanitized too', () => {
+  const tui = fakeTui(45, 120)
+  const injection = '\x1b[2J\x1b]0;owned-title\x07'
+  const dialog = new DecisionDialog(tui, {
+    request: {
+      id: 'inject-multi',
+      kind: 'question',
+      title: `Title${injection}`,
+      questions: [
+        {
+          question: `Multi${injection}`,
+          header: `Header${injection}`,
+          multiSelect: true,
+          options: [{
+            label: `Label${injection}`,
+            description: `Description${injection}`,
+          }],
+        },
+        { question: 'Second', header: 'Second', options: [{ label: 'A' }] },
+      ],
+    },
+    onSubmit: () => {},
+    onCancel: () => {},
+  })
+  dialog.focused = true
+  const raw = dialog.render(110).join('\n')
+  assert.doesNotMatch(raw, /\x1b\[2J/)
+  assert.doesNotMatch(raw, /\x1b\]0;owned-title/)
+  assert.doesNotMatch(raw, /owned-title/)
 })
 
 test('question DecisionDialog returns ordered answers across tabs and multi-select', () => {
@@ -699,6 +818,123 @@ test('SelectDialog async setters never auto-select and keep loading/empty/error 
   assert.equal(dialog.selectedIndex, 0)
   dialog.handleInput('\r')
   assert.deepEqual(picked, ['first'])
+})
+
+test('a held SelectDialog refresh cannot be confirmed by Enter, a digit or a mouse release', () => {
+  const picked: unknown[] = []
+  const tui = fakeTui()
+  const dialog = new SelectDialog(tui, {
+    title: 'Default model effort',
+    items: [
+      { label: 'Default', description: 'Native/provider default', value: '' },
+      { label: 'Low', value: 'low' },
+      { label: 'High', value: 'high' },
+    ],
+    onSelect: value => { picked.push(value) },
+    onCancel: () => { picked.push('cancelled') },
+  })
+  dialog.focused = true
+  dialog.render(80)
+
+  // A native invalidation holds the previous roster so identity can survive it,
+  // but those rows are not a confirmed choice yet. Navigation stays available.
+  dialog.setLoading(true)
+  dialog.handleInput('\x0e')
+  dialog.handleInput('\r')
+  assert.deepEqual(picked, [], 'Enter during a held refresh submits nothing')
+  dialog.handleInput('3')
+  assert.deepEqual(picked, [], 'a digit during a held refresh submits nothing')
+
+  const lines = dialog.render(80)
+  const row = lines.findIndex(line => stripTerminalSequences(line).includes('High'))
+  assert.ok(row > 0)
+  const base = { button: 'left' as const, x: 8, width: 80, height: lines.length, shift: false, alt: false, ctrl: false }
+  dialog.handleMouse({ ...base, type: 'press', y: row, screenX: 8, screenY: row })
+  dialog.handleMouse({ ...base, type: 'click', y: row, screenX: 8, screenY: row, clickCount: 1 })
+  assert.deepEqual(picked, [], 'a mouse release during a held refresh submits nothing')
+
+  // The refreshed roster arrives: the highlight the blocked mouse click moved
+  // survives by exact value (a click may focus a row without answering it) and
+  // exactly one opaque native id is submitted.
+  dialog.setItems([
+    { label: 'Default', description: 'Native/provider default', value: '' },
+    { label: 'Low (refreshed)', value: 'low' },
+    { label: 'High (refreshed)', value: 'high' },
+  ], { preserveValue: true })
+  dialog.setLoading(false)
+  dialog.handleInput('\r')
+  assert.deepEqual(picked, ['high'], 'exactly one native id after the refresh settles')
+  dialog.handleInput('\r')
+  assert.deepEqual(picked, ['high'], 'a settled chooser never submits twice')
+})
+
+test('a held SelectDialog refresh shows a Refreshing… status and disables the footer Select', () => {
+  const picked: unknown[] = []
+  const dialog = new SelectDialog(fakeTui(), {
+    title: 'Default model effort',
+    items: [{ label: 'Default', value: '' }, { label: 'Low', value: 'low' }],
+    loading: true,
+    onSelect: value => { picked.push(value) },
+    onCancel: () => { picked.push('cancelled') },
+  })
+  dialog.focused = true
+  const lines = dialog.render(80)
+  const painted = stripTerminalSequences(lines.join('\n'))
+  // The previous roster stays readable so a refresh can preserve its identity…
+  assert.match(painted, /1\. Default/)
+  assert.match(painted, /2\. Low/)
+  // …but the pending refresh is visible instead of hiding behind a dead chip.
+  assert.match(painted, /Refreshing…/, 'a held refresh with an old roster says so')
+  assert.doesNotMatch(painted, /Loading options…/, 'a loaded roster is not the empty loading state')
+
+  // The Select chip is disabled: it owns no hitbox, so neither press nor click
+  // is claimed and nothing can be confirmed without the user seeing why.
+  const chip = footerChip(dialog, 'Select')
+  assert.equal(chip.press(), undefined, 'a disabled Select chip claims no press')
+  assert.equal(chip.click(), undefined, 'a disabled Select chip claims no click')
+  dialog.handleInput('\r')
+  dialog.handleInput('1')
+  assert.deepEqual(picked, [], 'Enter and a digit cannot confirm the stale roster')
+
+  // A row release during the refresh only moves the highlight (the parities in
+  // the test above): it still submits nothing.
+  const row = lines.findIndex(line => stripTerminalSequences(line).includes('2. Low'))
+  assert.ok(row > 0)
+  const base = { button: 'left' as const, x: 8, width: 80, height: lines.length, shift: false, alt: false, ctrl: false }
+  dialog.handleMouse({ ...base, type: 'press', y: row, screenX: 8, screenY: row })
+  dialog.handleMouse({ ...base, type: 'click', y: row, screenX: 8, screenY: row, clickCount: 1 })
+  assert.deepEqual(picked, [], 'a row release during a held refresh submits nothing')
+
+  // The refresh settles: the status line goes away and the same chip is live.
+  dialog.setLoading(false)
+  assert.doesNotMatch(stripTerminalSequences(dialog.render(80).join('\n')), /Refreshing…/)
+  const live = footerChip(dialog, 'Select')
+  assert.equal(live.press()?.handled, true, 'the Select chip claims a press once the roster settles')
+  assert.equal(live.click()?.handled, true)
+  assert.deepEqual(picked, ['low'], 'exactly one confirmation through the restored chip')
+})
+
+test('a visible informational error never disables SelectDialog confirmation', () => {
+  const picked: unknown[] = []
+  const dialog = new SelectDialog(fakeTui(), {
+    title: 'Presets',
+    items: [{ label: 'One', value: 'one' }, { label: 'Two', value: 'two' }],
+    onSelect: value => { picked.push(value) },
+    onCancel: () => { picked.push('cancelled') },
+  })
+  dialog.focused = true
+  dialog.setError('native warning: unrelated metadata is unavailable')
+  assert.match(stripTerminalSequences(dialog.render(80).join('\n')), /unrelated metadata is unavailable/)
+  // An informational error is not a pending refresh: unlike `loading`, it never
+  // disables the footer chip, so the failure notice cannot make the chooser
+  // *look* answerable while the press is swallowed.
+  assert.equal(footerChip(dialog, 'Select').press()?.handled, true,
+    'the Select chip stays a real mouse target under an informational error')
+  dialog.handleInput('\x0e')
+  dialog.handleInput('\r')
+  assert.deepEqual(picked, ['two'], 'a legacy informational error keeps the chooser answerable')
+  dialog.handleInput('\x10')
+  assert.deepEqual(picked, ['two'], 'a settled chooser never submits a second answer')
 })
 
 test('unbound actions keep a clickable label without a fake key', () => {

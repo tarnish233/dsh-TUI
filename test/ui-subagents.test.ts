@@ -6,8 +6,8 @@ import test from 'node:test'
 import { stripTerminalSequences, visibleWidth, type TuiMouseEvent, type TuiMouseEventType } from '#pi-tui'
 import type { BackendEvent, SessionEvent, SessionInfo, SubagentEntry, SubagentSnapshot } from '../src/backend/types.ts'
 import { DEMO_HINTS, DEMO_MODEL, DEMO_PROVIDER, DEMO_TRANSCRIPT_CODEC, DemoBackend } from '../src/demo.ts'
-import { SubagentProjection, buildSubagentTree, flattenSubagentTree } from '../src/state/subagents.ts'
-import { TranscriptStore } from '../src/state/transcript.ts'
+import { SubagentProjection, buildSubagentTree, composeSubagentRows, flattenSubagentTree } from '../src/state/subagents.ts'
+import { TranscriptStore, type TranscriptItem } from '../src/state/transcript.ts'
 import { createItemBlock, type TranscriptViewOptions } from '../src/ui/blocks.ts'
 import { TranscriptView } from '../src/ui/transcript.ts'
 import { SubagentGroupBlock } from '../src/ui/subagent-group.ts'
@@ -195,6 +195,94 @@ test('snapshot output stays in canonical native order and live-only rows expose 
   const liveOnly = new SubagentProjection()
   liveOnly.applyEntry(entry({ id: 'live' }))
   assert.deepEqual(liveOnly.snapshot?.entries.map(row => row.id), ['live'])
+})
+
+test('entries is one cached array per change token and invalidates on real changes', () => {
+  const projection = new SubagentProjection()
+  const a = entry({ id: 'a', catalogSeq: 1 })
+  const b = entry({ id: 'b' })
+  projection.applySnapshot(snapshot(a, b))
+  const first = projection.entries
+  assert.deepEqual(first.map(row => row.id), ['a', 'b'])
+  assert.equal(projection.entries, first, 'an unchanged projection reuses the composed array')
+
+  // A replayed catalog is an equal fold: same revision, same array identity,
+  // same frozen row objects.
+  assert.equal(projection.applySnapshot(snapshot({ ...a }, { ...b })), false)
+  assert.equal(projection.entries, first, 'a replayed snapshot keeps the cached array')
+  assert.equal(projection.entries[0], first[0], 'the row object is not re-created')
+
+  // A content change invalidates the cache and exposes the new row.
+  assert.equal(projection.applyEntry({ ...a, status: 'idle', lastActivity: 'reading' }), true)
+  const updated = projection.entries
+  assert.notEqual(updated, first, 'a real change composes a fresh array')
+  assert.deepEqual(updated.map(row => row.id), ['a', 'b'])
+  assert.equal(updated[0]?.status, 'idle')
+  assert.equal(updated[1], first[1], 'untouched rows keep their object identity')
+  assert.equal(projection.entries, updated, 'the fresh array is cached until the next change')
+
+  // A dropped child invalidates it too, so the cache can never serve a ghost.
+  assert.equal(projection.applySnapshot(snapshot({ ...a })), true)
+  const removed = projection.entries
+  assert.notEqual(removed, updated)
+  assert.deepEqual(removed.map(row => row.id), ['a'])
+
+  // Clearing (and a repeated clear) never leaves a stale array behind.
+  assert.equal(projection.clear(), true)
+  assert.deepEqual(projection.entries, [])
+  const empty = projection.entries
+  assert.equal(projection.clear(), false)
+  assert.equal(projection.entries, empty, 'a no-op clear keeps the empty cache')
+
+  // The snapshot getter exposes the same composed rows.
+  projection.applyEntry(entry({ id: 'c' }))
+  assert.equal(projection.snapshot?.entries, projection.entries)
+})
+
+test('removing a child bumps the projection revision the transcript cache keys on', () => {
+  const projection = new SubagentProjection()
+  projection.applySnapshot(snapshot(entry({ id: 'a', catalogSeq: 1 }), entry({ id: 'b' })))
+  const before = projection.revision
+  assert.equal(projection.applySnapshot(snapshot(entry({ id: 'a', catalogSeq: 1 }))), true)
+  assert.ok(projection.revision > before, 'a dropped child is a catalog mutation, not a silent edit')
+  const anchored = projection.revision
+  assert.equal(projection.applySnapshot(snapshot(entry({ id: 'a', catalogSeq: 1 }))), false)
+  assert.equal(projection.revision, anchored, 'an unchanged snapshot still changes nothing')
+})
+
+test('anchored rows keep one stable position per child, in catalog order', () => {
+  const projection = new SubagentProjection()
+  projection.applySnapshot(snapshot(
+    entry({ id: 'late', catalogSeq: 20 }),
+    entry({ id: 'first', catalogSeq: 0 }),
+    entry({ id: 'mid', catalogSeq: 10 }),
+    entry({ id: 'late-2', catalogSeq: 20 }),
+  ))
+  // Durable order is the projection order, not the seq order: a replaced
+  // workspace-changes card can carry a newer seq while keeping its old row.
+  const base: TranscriptItem[] = [
+    { kind: 'user', id: 'user:10', seq: 10, text: 'a', imageCount: 0, version: 1 },
+    { kind: 'assistant', id: 'assistant:20', seq: 20, text: 'b', thinking: '', interrupted: false, version: 1 },
+    { kind: 'notice', id: 'notice:1', level: 'info', text: 'n', version: 1 },
+    { kind: 'user', id: 'user:5', seq: 5, text: 'c', imageCount: 0, version: 1 },
+  ]
+  const rows = composeSubagentRows(base, projection, 's1')
+  assert.deepEqual(rows.map(row => row.kind === 'subagent' ? `subagent:${row.entry.id}` : row.id), [
+    'subagent:first',
+    'user:10',
+    'assistant:20',
+    'notice:1',
+    // `mid`/`late` anchor after the LAST item whose seq is <= theirs, which is
+    // the misplaced tail row (seq 5) — native order wins over seq order, and the
+    // children keep catalog order among themselves.
+    'user:5',
+    'subagent:mid',
+    'subagent:late',
+    'subagent:late-2',
+  ])
+  // No anchored child means the durable list itself is projected (memoized reads
+  // must never copy an unchanged transcript).
+  assert.equal(composeSubagentRows(base, projection, 'other-parent'), base)
 })
 
 test('only direct children with a trustworthy catalogSeq are anchored', () => {

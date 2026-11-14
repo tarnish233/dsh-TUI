@@ -112,6 +112,18 @@ test('multiple files keep their identity, totals and all hidden rows', () => {
   assert.deepEqual(stats, { added: 30, removed: 0, oversized: false })
 })
 
+test('multi-file headings cannot inject terminal sequences through the native path', () => {
+  const diffs = [
+    diff({ path: 'safe.ts' }),
+    diff({ path: 'safe2.ts' }),
+    diff({ path: 'bad\x1b[2J\x1b]0;owned-title\x07.ts' }),
+  ]
+  const raw = renderDiffBlock(diffs, 100, options({ expanded: false, collapsedLines: 16 })).lines.join('\n')
+  assert.doesNotMatch(raw, /\x1b\[2J/)
+  assert.doesNotMatch(raw, /\x1b\]0;owned-title/)
+  assert.doesNotMatch(raw, /owned-title/)
+})
+
 test('oversized hunks are reported honestly instead of materialized', () => {
   const huge = diff({ oldText: '', newText: `${'x'.repeat(160_000)}\n` })
   const result = renderDiffBlock([huge], 80, options())

@@ -56,7 +56,14 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error('Launch dsh-tui through a native DSH profile with the startup plugin mounted')
   }
   const options: TuiOptions = { ...config, ...startup.options }
-  installCompactionReasoningEffort(ctx, { warn: message => ctx.logger.warn(message) })
+  // Owned effect: the plugin effect holds the listener disposer, so no host
+  // shape (with or without its own `effect`) can leak an `llm/stream` hook. The
+  // label stays distinct from the bridge's own effect label, so a nested second
+  // owner (double disposal) is observable.
+  ctx.effect(() => installCompactionReasoningEffort(ctx, {
+    warn: message => ctx.logger.warn(message),
+    effectOwner: 'caller',
+  }), 'dsh-tui.compaction-bridge')
   if (startup.options.resumePicker) delete options.resume
   else if (startup.options.resume !== undefined) options.resumePicker = false
   let disposed = false

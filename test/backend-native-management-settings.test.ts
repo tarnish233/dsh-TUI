@@ -259,7 +259,16 @@ test('defaults resolve the profile-owned namespace ids from the public Loader an
   const state = fixture()
   const read = await adapterOf(state).defaultSettings()
   assert.equal(read.available, true)
-  assert.equal(read.targets.length, 2)
+  assert.deepEqual(
+    read.targets.map((view) => view.target),
+    ['agent-preset-default', 'permission-default-preset', 'agent-default-model'],
+  )
+  // This composition mounts no default-model entry: the target is projected as
+  // unavailable rather than borrowed from the preset/permission namespaces.
+  const model = target(read, 'agent-default-model')
+  assert.equal(model.available, false)
+  assert.equal(model.writable, false)
+  assert.equal(model.reason, 'namespace-unresolved')
   assert.equal(state.presetListCalls.count, 1)
   assert.deepEqual(state.settings.describeOptions, [{ redactSecrets: true }])
 
@@ -548,6 +557,149 @@ test('a value outside the native roster is refused before any native call', asyn
   })
   assert.equal(broken.ok, false)
   assert.equal((broken as Extract<NativeDefaultSettingOutcome, { ok: false }>).reason, 'not-an-option')
+})
+
+test('cancelling a preset-roster read never reaches the native write', async () => {
+  const state = fixture()
+  let release!: () => void
+  let started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  state.presets = {
+    defaultId: 'standard',
+    list: () => {
+      started()
+      return new Promise<unknown>(resolve => { release = () => resolve(state.presetRoster) })
+    },
+  }
+  state.host.services.set('agentPresets', state.presets)
+
+  const controller = new AbortController()
+  const pending = adapterOf(state).updateDefault({
+    target: 'agent-preset-default',
+    value: 'ptc',
+    expectedRevision: 2,
+  }, controller.signal)
+  await entered
+  controller.abort(new Error('user cancelled the confirmation'))
+  release()
+
+  await assert.rejects(pending, /cancelled/)
+  assert.equal(state.settings.mutateCalls.length, 0, 'the aborted preparation never writes a default')
+})
+
+test('a pre-cancelled roster read observes a late rejection instead of crashing the app', async () => {
+  const state = fixture()
+  let rejectLater!: (error: Error) => void
+  let started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  state.presets = {
+    defaultId: 'standard',
+    list: () => {
+      started()
+      return new Promise<unknown>((_resolve, reject) => { rejectLater = reject })
+    },
+  }
+  state.host.services.set('agentPresets', state.presets)
+
+  const controller = new AbortController()
+  controller.abort(new Error('cancelled'))
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const pending = adapterOf(state).updateDefault({
+      target: 'agent-preset-default',
+      value: 'ptc',
+      expectedRevision: 2,
+    }, controller.signal)
+    await entered
+    await assert.rejects(pending, /cancelled/)
+    rejectLater(new Error('late roster failure'))
+    await new Promise<void>(resolve => setImmediate(resolve))
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.deepEqual(unhandled, [], 'the abandoned roster rejection must be observed')
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+  assert.equal(state.settings.mutateCalls.length, 0)
+})
+
+test('a preset-roster deadline is unavailable and never writes', async (t) => {
+  const state = fixture()
+  state.presets = { defaultId: 'standard', list: () => new Promise<unknown>(() => {}) }
+  state.host.services.set('agentPresets', state.presets)
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  const pending = adapterOf(state).updateDefault({
+    target: 'agent-preset-default',
+    value: 'ptc',
+    expectedRevision: 2,
+  })
+  await Promise.resolve()
+  await Promise.resolve()
+  t.mock.timers.tick(8_000)
+  const outcome = await pending
+  assert.equal(outcome.ok, false)
+  assert.equal((outcome as Extract<NativeDefaultSettingOutcome, { ok: false }>).reason, 'unavailable')
+  assert.equal(state.settings.mutateCalls.length, 0)
+  assert.match(state.host.warnings.join('\n'), /timed out after 8000/)
+})
+
+test('a preset write never targets a namespace that moved during the roster read', async () => {
+  const state = fixture()
+  let release!: () => void
+  let started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  state.presets = {
+    defaultId: 'standard',
+    list: () => {
+      started()
+      return new Promise<unknown>(resolve => { release = () => resolve(state.presetRoster) })
+    },
+  }
+  state.host.services.set('agentPresets', state.presets)
+
+  const pending = adapterOf(state).updateDefault({
+    target: 'agent-preset-default',
+    value: 'ptc',
+    expectedRevision: 2,
+  })
+  await entered
+  state.host.services.set('loader', {
+    entries: () => [
+      { options: { id: 'moved-presets', name: PRESET_PACKAGE } },
+      { options: { id: PERMISSION_NS, name: PERMISSION_PACKAGE } },
+    ],
+  })
+  release()
+
+  const outcome = await pending
+  assert.equal(outcome.ok, false)
+  assert.equal((outcome as Extract<NativeDefaultSettingOutcome, { ok: false }>).reason, 'unavailable')
+  assert.equal(state.settings.mutateCalls.length, 0, 'a moved owner is never written')
+})
+
+test('the final fence blocks a permission catalog abort before mutate', async () => {
+  const state = fixture()
+  const controller = new AbortController()
+  state.permissions = {
+    catalog: () => {
+      controller.abort(new Error('cancelled'))
+      return {
+        defaultOptions: [{ value: 'read-only', name: 'Read only' }, { value: 'workspace-write', name: 'Write' }],
+        defaultPreset: 'workspace-write',
+      }
+    },
+  }
+  state.host.services.set('permissionPresets', state.permissions)
+
+  const pending = adapterOf(state).updateDefault({
+    target: 'permission-default-preset',
+    value: 'read-only',
+    expectedRevision: 5,
+  }, controller.signal)
+  await assert.rejects(pending, /cancelled/)
+  assert.equal(state.settings.mutateCalls.length, 0, 'the fence is the only guard for this target')
 })
 
 test('the attachment fence invalidates a read and a write with no native call', async () => {

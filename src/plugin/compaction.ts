@@ -64,6 +64,16 @@ export interface CompactionSeamHost {
 export interface CompactionSeamOptions {
   /** Receives one redaction-safe warning if the seam degrades. */
   warn?(message: string): void
+  /**
+   * Who owns the listener's lifetime.
+   *
+   * `'host'` (default) registers this install inside a host `effect`, so host
+   * fiber unload removes it even when the caller drops the returned disposer.
+   * `'caller'` registers the listener directly and hands back its disposer for
+   * a caller that already runs this install inside its own `ctx.effect`; that
+   * keeps one owner and one disposal instead of a nested second effect.
+   */
+  effectOwner?: 'host' | 'caller'
 }
 
 /** Narrow an unknown value to a plain record. */
@@ -157,11 +167,16 @@ function inheritedRequest(host: CompactionSeamHost, options: unknown): Record<st
  * issued from a scoped agent context is covered too, and it degrades to
  * `next()` for every request it does not fully validate.
  *
+ * Lifetime is never dropped: with `effectOwner: 'host'` the listener lives in a
+ * host effect, and with `effectOwner: 'caller'` the caller owns the returned
+ * disposer inside its own effect. A host without `effect` still gets a
+ * removable listener either way, so no `llm/stream` hook can outlive its owner.
+ *
  * @param host - live Cordis context of the mounted TUI plugin; only the public
  *   `get`/`on`/`effect` members are touched, so the mount site needs no cast.
- * @param options - optional warning sink.
- * @returns an idempotent disposer; Cordis also disposes the listener with the
- *   owning fiber, so HMR unload removes it exactly once.
+ * @param options - optional warning sink and effect ownership.
+ * @returns an idempotent disposer that removes the listener; when the host owns
+ *   the effect, fiber unload removes it as well and the second call is a no-op.
  */
 export function installCompactionReasoningEffort(host: unknown, options: CompactionSeamOptions = {}): () => void {
   const seam = record(host)
@@ -200,16 +215,25 @@ export function installCompactionReasoningEffort(host: unknown, options: Compact
   }
   let listenerDisposer: (() => void) | undefined
   const register = (): (() => void) => {
+    let detach: () => void
     try {
       const dispose = target.on(STREAM_EVENT, listener, { global: true, prepend: true })
-      listenerDisposer = typeof dispose === 'function' ? dispose as () => void : () => {}
+      detach = typeof dispose === 'function' ? dispose as () => void : () => {}
     } catch {
       warn('dsh-tui could not observe native compaction requests; compaction keeps the native defaults')
-      listenerDisposer = () => {}
+      detach = () => {}
+    }
+    // One listener, one detach: a caller-owned effect and later fiber teardown
+    // may both reach this disposer.
+    let released = false
+    listenerDisposer = () => {
+      if (released) return
+      released = true
+      detach()
     }
     return listenerDisposer
   }
-  if (typeof target.effect === 'function') {
+  if ((options.effectOwner ?? 'host') === 'host' && typeof target.effect === 'function') {
     try {
       const dispose = target.effect(() => register(), EFFECT_LABEL)
       if (typeof dispose === 'function') return dispose as () => void

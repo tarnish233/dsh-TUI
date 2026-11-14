@@ -42,7 +42,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, type ModalAction, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { bold, dim, t } from './theme.ts'
 import {
@@ -56,7 +56,6 @@ import { renderWorkspaceFileDiff, workspaceDiffFacts } from './workspace-diff.ts
 
 const DOWN_ACTIONS: ReadonlySet<string> = new Set(['list.next', 'list.page-down'])
 const UP_ACTIONS: ReadonlySet<string> = new Set(['list.previous', 'list.page-up'])
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 export interface WorkspaceChangesViewState {
   readonly selectedIndex: number
   readonly listScroll: number

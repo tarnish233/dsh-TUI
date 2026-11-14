@@ -78,9 +78,10 @@ Editor methods that matter to the app:
 - `flushInputBuffer()` – release held paste-prefix bytes immediately. No longer
   required for correctness: the hold always has a deadline
   (`pasteHoldTimeoutMs`, 50 ms default, unref'd timer) after which the bytes are
-  dispatched as ordinary keys, so a fragmented `ESC[` cannot swallow the next
-  keystroke. `dispose()` and `restoreDraft()`/`replaceDraftText()` clear the
-  timer and the pending bytes.
+  dispatched as ordinary keys — a leading ESC as Escape, the remaining bytes as
+  normal input — so a fragmented `ESC[` cannot swallow the next keystroke or
+  leave a later `~` to be typed as text. `dispose()` and
+  `restoreDraft()`/`replaceDraftText()` clear the timer and the pending bytes.
 - `cancelChord()` – one cancellation entry point: clears the chord timer and
   the keymap's pending prefix, notifying `onChordChange` once.
 - `dispose()` – idempotent teardown: clears this editor's chord timer, detaches
@@ -241,7 +242,7 @@ send gate must count file parts too (`part.type === 'image' || part.type === 'fi
 | `app.stash` | `ctrl+s` | CC override, not flow control |
 | `app.editor.external` | `ctrl+g`, chord `ctrl+x ctrl+e` | parent editor |
 | `app.tools.expand` | `ctrl+o` | CC override |
-| `app.tools.details` | `ctrl+x ctrl+o` | TUI extension (DSH TUI capability, not a verified CC default); opens the tools inspector on the latest tool and is forwarded through `CcEditor` APP_FALLBACK actions to the App. Plain Ctrl+O stays expand/collapse. |
+| `app.tools.details` | `ctrl+x ctrl+o` | TUI extension (DSH TUI capability, not a verified CC default); opens the tools inspector on the latest tool and is forwarded to the App by `CcEditor` like every other `implementor: "app"` action. Plain Ctrl+O stays expand/collapse. |
 | `tool.details.previous-tool` | `[`, `alt+left` | `toolDetails` only; ASCII `[` and Alt+Left stay text/word motion in the editor |
 | `tool.details.next-tool` | `]`, `alt+right` | `toolDetails` only; ASCII `]` and Alt+Right stay text/word motion in the editor |
 | `tool.details.next-section` | `tab`, `right` | `toolDetails` only |
@@ -306,8 +307,8 @@ list) and `subagentSession` (one agent's session view):
 `subagentList → list → dialog → global` and
 `subagentSession → list → dialog → global`, both **without** an editor layer.
 `app.subagents.details` (`ctrl+x ctrl+a`, TUI extension) opens it and is
-forwarded through the same `APP_FALLBACK_ACTIONS` path as the other overlay
-openers. The surface reuses `list.previous/next/pageUp/pageDown/first/last/
+forwarded to the App through the same app-implemented action path
+(`action.implementor === "app"`) as the other overlay openers. The surface reuses `list.previous/next/pageUp/pageDown/first/last/
 select/cancel/select-digit`, `dialog.*` and the global app layer, and adds
 exactly two overlay-local, app-implemented actions:
 

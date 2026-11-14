@@ -35,6 +35,7 @@ class CancelFixtureBackend implements Backend {
   staleModelResponses = new Set<string>()
   effortGate?: Promise<void>
   staleEffortResponse = false
+  effortsAvailable = true
   info: SessionInfo
   private decisionIds: string[] = []
 
@@ -121,7 +122,9 @@ class CancelFixtureBackend implements Backend {
         this.info = { ...this.info, model: requested }
         return { ...this.info, ...(this.modelDefaultWarning === undefined ? {} : { defaultWarning: this.modelDefaultWarning }) }
       }
-      case 'efforts': await this.effortsGate; return { available: true, efforts: [{ id: 'low', name: 'Low', description: 'low' }] }
+      case 'efforts': await this.effortsGate; return this.effortsAvailable
+        ? { available: true, efforts: [{ id: 'low', name: 'Low', description: 'low' }] }
+        : { available: false, efforts: [] }
       case 'effort': {
         await this.effortGate
         if (this.staleEffortResponse) return { provider: 'fixture', model: 'old-model', reasoningEffort: 'low', effectiveEffort: 'low' }
@@ -285,6 +288,25 @@ test('busy Esc cancels the turn and sends the queue without clearing the draft',
     assert.equal(f.app.editor.getText(), 'busy draft', 'Esc never sends or clears the draft')
     assert.equal(f.backend.sends.length, 0, 'the queue leaves through queue-send-now, not a second prompt send')
     assert.doesNotMatch(notice(f.app), /retained/)
+  } finally { await f.close() }
+})
+
+test('a timed-out fragmented paste prefix never cancels a busy turn', async () => {
+  const f = await fixture()
+  try {
+    let release!: () => void
+    f.backend.sendGate = new Promise<void>(resolve => { release = resolve })
+    const sending = f.app.submit('busy prompt')
+    await until(() => f.backend.sends.length === 1, 'prompt is in flight')
+    f.backend.emit({ type: 'status', sessionId: f.backend.info.sessionId, status: 'running' })
+    await until(() => f.app.isBusy, 'fixture turn running')
+
+    f.app.editor.handleInput('\x1b[2')
+    await delay(80)
+    assert.equal(f.backend.cancels, 0, 'a synthetic Escape from a paste prefix never interrupts')
+    assert.match(f.app.editor.getText(), /\[2/, 'the printable remainder is delivered')
+    release()
+    await sending
   } finally { await f.close() }
 })
 
@@ -537,6 +559,21 @@ test('late catalog results after attachment or route change cannot open a stale 
     f.backend.info = { ...f.backend.info, model: 'route-changed-model' }
     f.backend.emit({ type: 'ready', info: f.backend.info })
     releaseEfforts()
+    await paint(f.terminal)
+    assert.doesNotMatch(f.terminal.screen(), /Choose reasoning effort/)
+  } finally { await f.close() }
+})
+
+test('/effort with no native levels settles the picker instead of staying in loading', async () => {
+  const f = await fixture()
+  try {
+    f.backend.effortsAvailable = false
+    await f.app.submit('/effort')
+    await paint(f.terminal)
+    assert.match(f.terminal.screen(), /exposes no reasoning levels/)
+    assert.doesNotMatch(f.terminal.screen(), /Loading options/)
+    // The settled error surface remains local and cancellable.
+    f.terminal.type('\x1b')
     await paint(f.terminal)
     assert.doesNotMatch(f.terminal.screen(), /Choose reasoning effort/)
   } finally { await f.close() }

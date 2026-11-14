@@ -312,3 +312,38 @@ test('identity preservation keeps focus, shared keymap, frame and width safety',
   f.dialog.handleInput('\r')
   assert.deepEqual(f.picked, ['b'], 'Enter still answers the preserved row')
 })
+test('a default-effort roster keeps the empty native reset id across a metadata refresh', () => {
+  // The default-effort chooser carries the native "use the model/provider
+  // default" row as the empty string, then the model's own level ids. A
+  // metadata refresh must keep that reset row selected by exact id and submit
+  // the empty string, never re-map it to a level id.
+  const f = harness([
+    { label: 'Default', description: 'Native/provider default', value: '' },
+    { label: 'Low', value: 'low' },
+    { label: 'High', value: 'high' },
+  ])
+  move(f.dialog, 2)
+  assert.equal(f.dialog.selectedIndex, 2)
+  f.dialog.setItems([
+    { label: 'Default (refreshed)', description: 'Native/provider default', value: '' },
+    { label: 'High (refreshed)', value: 'high' },
+    { label: 'Low (refreshed)', value: 'low' },
+  ], { preserveValue: true })
+  assert.equal(f.dialog.selectedIndex, 1, 'the High row moves with its exact id')
+  assert.deepEqual(f.picked, [])
+  move(f.dialog, 1)
+  assert.equal(f.dialog.selectedIndex, 2, 'list navigation wraps through the reordered roster')
+  f.dialog.handleInput('\r')
+  assert.deepEqual(f.picked, ['low'], 'exactly one native id is submitted')
+  const reset = harness([
+    { label: 'Default', description: 'Native/provider default', value: '' },
+    { label: 'Low', value: 'low' },
+  ])
+  reset.dialog.setItems([
+    { label: 'Low (refreshed)', value: 'low' },
+    { label: 'Default (refreshed)', description: 'Native/provider default', value: '' },
+  ], { preserveValue: true })
+  assert.equal(reset.dialog.selectedIndex, 1, 'the reset row survives by its empty id')
+  reset.dialog.handleInput('\r')
+  assert.deepEqual(reset.picked, [''], 'the empty reset id is submitted unchanged')
+})

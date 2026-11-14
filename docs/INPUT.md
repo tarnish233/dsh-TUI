@@ -91,7 +91,7 @@ capability that is not a verified CC default), **unverified**, **unsupported**.
 | Undo | Ctrl+_ / Ctrl+- / Ctrl+Shift+- | restores text+cursor+paste registry; typing coalesced, kills/yanks/pastes atomic. match (byte equivalence documented) |
 | Submit/newline | Enter, Shift+Enter, Ctrl+J, Alt+Enter, backslash+Enter | Enter submits; others newline; backslash fallback. match |
 | Completion | Tab, Enter/Esc with menu, Ctrl+P/N in menu | menu owns nav/accept/cancel; editor editing works beneath. Exact `/name` ranks first (exact → prefix → fuzzy in the menu's name namespace), so an exact Skill is never replaced by an earlier prefix-sibling command; explicit navigation still wins, Tab only edits, Enter accepts then submits for a slash name. `@file` mentions are native (DSH grammar + `fileReferences`) and Enter/Tab only fill them; a second Enter submits. unverified for the remaining CC accept/submit split |
-| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a held prefix has a **bounded 50 ms** lifetime (`pasteHoldTimeoutMs`, unref'd timer, cleared by `dispose()`/flush) after which its bytes are released as ordinary keys, so a fragmented `ESC[` can never swallow the next keystroke; `isPasting()` is true while a prefix is held; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands; a large paste never takes an id that existing `[paste #N]` marker text already uses (hand-typed markers stay literal). match |
+| Paste | bracketed paste, Ctrl+V | fragmented start/end markers reassembled; a held prefix has a **bounded 50 ms** lifetime (`pasteHoldTimeoutMs`, unref'd timer, cleared by `dispose()`/flush) after which its bytes are released as ordinary keys (leading ESC → Escape, remaining bytes → normal input, never silently dropped), so a fragmented `ESC[` can never swallow the next keystroke or turn a later `~` into text; `isPasting()` is true while a prefix is held; a paste start cancels any pending chord; pasted bytes never dispatched as keys/chords/global actions; large paste → `[paste #n ...]` marker with undo/snapshot preservation; submit expands; a large paste never takes an id that existing `[paste #N]` marker text already uses (hand-typed markers stay literal). match |
 | Editing aids | Ctrl+L, Ctrl+G / Ctrl+X Ctrl+E, Ctrl+S, Ctrl+R | forwarded to the app; editor forwards after closing completion / restoring history draft. app override |
 | App overrides | Ctrl+T/O/V/S/G, Alt+P, Shift+Tab, Ctrl+Z | `app.todo/tools.expand/clipboard.pasteImage/stash/editor.external`, `app.model.select`, `app.mode.cycle`, `app.suspend`. app override |
 | Tool details | Ctrl+X Ctrl+O, `[`/`]`, Alt+Left/Right, Tab/Right, Shift+Tab/Left, c | `app.tools.details` opens the tools inspector on the **latest tool** (TUI extension, not a CC default; plain Ctrl+O keeps expand/collapse). The read-only modal context `toolDetails → list → dialog → global` adds previous/next tool (`[` + Alt+Left, `]` + Alt+Right; Pi's legacy ESC-b/ESC-f reads alias Alt+Left/Right in this context), next/previous section, copy, shared list scrolling (`Up/Down`, `Ctrl+P/N`, `j/k`, PageUp/Down, Home/End), `Esc`/`list.cancel` close. `c` and brackets exist only in `toolDetails`, so they are ordinary text in the editor; unbound printable bytes are inert in the modal. |
@@ -218,6 +218,22 @@ why Esc still reaches the app after local layers consume their turn. Default
 Ctrl+C reaches the focused local cancel row first; only the root prompt (and
 its completion overlay) resolves it to `app.clear`.
 
+Each chain is **precompiled once per rebuild** (`rebuild()` →
+`contextBindings`, one resolver-ordered array per context; layer order and
+within-layer order preserved). `resolve()` runs for every keystroke and only
+reads that array — it never re-walks `CONTEXT_FALLBACK_CHAINS` with
+flatMap/lookups per key. `setBindings()` replaces the arrays instead of
+mutating them, and `test/input-keymap.test.ts` pins this with deterministic
+identity checks (no wall-clock timing): the cached array survives repeated
+keys, resolution no longer reads the per-context index, and only a
+configuration change recompiles.
+
+App-implemented actions (`action.implementor === "app"`) are forwarded to the
+host through one path in `CcEditor#runAction`; there is no separate id
+whitelist to keep in sync when a list/dialog/overlay row is added. An action a
+custom registry adds that this editor does not implement is forwarded the same
+way instead of being silently dropped.
+
 In `modelPickerList`, `modelPickerSearch`, `toolDetails`, `imageDetails`,
 `subagentList`, `subagentSession`, `settingsList`, `keybindingsList`,
 `modalList`, `queueList` and `modalSearch`, an **explicitly configured simple**
@@ -309,6 +325,28 @@ Picker specifics (details: `docs/MODEL-INPUT-API.md`):
   rather than disposing.
 - `app.exit` remap/disable is honoured contextually for Ctrl+D, and the
   empty-draft guard applies before any global fallback.
+
+### Bare LF is never Enter/Return
+
+`matchesConfiguredKey` (`src/input/keymap.ts`) is the **one** rule for every
+view of a configured binding: it rejects `enter`/`return` for a bare LF (`\n`,
+Ctrl+J). Pi's terminal layer aliases LF to Enter for legacy terminals, so
+without the rule Ctrl+J would submit/confirm through any local `enter` binding
+(`autocomplete.accept`, `list.select`, `dialog.confirm`) or make a contextual
+binding check (`isActionBoundToKey`, e.g. for `app.exit`) treat Ctrl+J as the
+configured key.
+
+- Bare LF resolves to `editor.newline` in every editor-bearing chain and to
+  nothing in pure list contexts; real CR (`\r`) keeps all Enter behaviour.
+- The rule lives in the keymap resolver, in `CcEditor`'s `autocomplete.accept`
+  guard and in `isActionBoundToKey`; it is never duplicated per surface and a
+  `keybindings.json` override (including the `return` alias) cannot re-open it.
+- Consequence for legacy terminals: a terminal that sends LF for the physical
+  Enter key (some embedded/browser clients and `stty`-style setups that map CR
+  to LF on input; Ctrl+M is translated the same way) cannot confirm with Enter
+  here — Ctrl+J is newline/inert, not a hidden Enter. Bind a different key for
+  that action or use a terminal that keeps Enter as CR; Kitty
+  CSI-u/modifyOtherKeys keep the two bytes distinct.
 
 ## Draft / stash / search / external editor
 
@@ -444,7 +482,9 @@ what guarantees:
 
 - Legacy terminals cannot distinguish Ctrl+H/Backspace, Ctrl+M/Enter,
   Ctrl+[/Esc, Ctrl+_/Ctrl+-. Kitty CSI-u or modifyOtherKeys is needed for
-  Option/Alt+Backspace vs Ctrl+W, Ctrl+Shift+-, etc.
+  Option/Alt+Backspace vs Ctrl+W, Ctrl+Shift+-, etc. Separately, a bare LF is
+  **never** treated as Enter/Return (see *Bare LF is never Enter/Return*), so a
+  terminal that sends LF for Enter cannot confirm dialogs/lists with it.
 - macOS Option-as-Meta is terminal-configuration dependent; without CSI-u,
   Option+Delete may arrive as Ctrl+W.
 - tmux/screen prefix keys and SSH splitting: paste markers are reassembled;
@@ -452,6 +492,16 @@ what guarantees:
   prefix is held for at most `pasteHoldTimeoutMs` (50 ms default): a last-resort
   split in the middle of `ESC[200~` later than that is delivered as ordinary
   keys, which is the same fragmentation cost as sending the bytes unreassembled.
+  Ordinary keys means the held ESC is a real Escape press and the remaining
+  bytes (`[`, `2`, ...) are typed as input; nothing is silently consumed. The
+  released Escape is consumed **inside the input layer** for the cancel
+  actions: `CcEditor` drops the resulting `editor.cancel`/`app.cancel` before
+  forwarding, so no host (inline editor, picker, App) sees an `app.cancel` for
+  it — no busy-turn interrupt, queue release, draft clear or history-draft
+  restore. `onAction` therefore only reports physical Escapes and
+  `CcActionEvent` carries no `synthetic` flag a host would have to interpret. A
+  release while a completion menu is open keeps the ordinary-Escape menu
+  behaviour (`autocomplete.cancel` resolves locally before the cancel layer).
 - Lone ESC is treated as Escape immediately; a paste marker fragmented to a
   single leading ESC byte is not reassembled (documented trade-off).
 - IME composition/commit sequences are not interpreted here.
@@ -484,7 +534,8 @@ what guarantees:
 `node --test test/input*.test.ts` (offline, no model calls, no readline):
 
 - `test/input-keymap.test.ts` — defaults, contexts, fallback chains, aliases,
-  chords (3000 ms), timeout/mismatch, disable/remap, diagnostics, help.
+  chords (3000 ms), timeout/mismatch, disable/remap, diagnostics, help, and the
+  precompiled-chain hot path (identity, no wall-clock timing).
 - `test/input-keymap-shadow.test.ts` — review R6/R11 cross-context regressions:
   full-sequence analysis with real `resolve()` outcomes and real `CcEditor`
   dispatch (an identical chord reused from another layer is reported as stolen
@@ -506,8 +557,10 @@ what guarantees:
   Ctrl+A/E/B/F, Ctrl+D/Delete semantics, fragmented
   paste, large-paste marker + submit expansion, chord actions/cancel/timer,
   app overrides, disabled/remapped keys, printable vs list, submit/newline,
-  completion nav/accept/edit-fallback.
-- `test/input-regressions.test.ts` — the I1–I6 input-defect regressions, named
+  completion nav/accept/edit-fallback, the bare-LF rule for a configured
+  `enter`/`return` binding (`isActionBoundToKey`), and a registry sweep proving
+  every `implementor: "app"` action reaches the App (no id whitelist).
+- `test/input-regressions.test.ts` — the I1–I8 input-defect regressions, named
   after the invariant each protects: history browsing never orphans the draft's
   image/file payloads (typing/undo/insert after Up, both families, recalled
   entries keep their own payloads); CJK/emoji/ZWJ and atomic paste markers
@@ -517,7 +570,13 @@ what guarantees:
   expanded by the next large paste; a held fragmented-paste prefix is released
   after its deadline (and by `dispose()`) so the next keystroke types; submit
   `text` and `content` are trimmed identically (including whitespace-only and
-  padded-attachment drafts).
+  padded-attachment drafts); a no-op kill (Ctrl+W at column 0) or no-op Ctrl+U/Backspace/Delete/Ctrl+K is not an
+  edit and keeps history browsing so Esc still restores the pre-browsing draft,
+  while a real deletion still leaves browsing, and the seam install asserts the
+  wrapper targets it needs still exist; a held paste prefix released at
+  the deadline is delivered as ordinary keys (ESC → Escape, `[2` → input), its
+  synthetic Escape never reaches a host as `app.cancel` and does not restore the
+  history draft, and a whole or briefly fragmented `ESC[Z` stays one Shift+Tab.
 - `test/input-skills.test.ts` — slash menu over native command/skill metadata:
   exact-name priority in the mixed command+skill catalog (exact Skill vs
   longer prefix command, pure-command and same-name controls), explicit

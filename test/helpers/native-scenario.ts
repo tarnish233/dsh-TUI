@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { nativeProfileFixture, type NativeProfileFixture } from './native-profile.ts'
@@ -42,9 +42,15 @@ export async function runNativeScene(
     timeout?: number
     /** Prepare synthetic files in the isolated fixture before native services or catalog caches start. */
     prepare?: (fixture: NativeProfileFixture) => Promise<void>
+    /** Caller-owned temporary profile, reused only for native restart/persistence acceptance. */
+    fixture?: NativeProfileFixture
+    /** Keep that owned profile's native edits on the next fresh launcher invocation. */
+    preserveProfilePatch?: boolean
   } = {},
 ): Promise<void> {
-  const fixture = await nativeProfileFixture()
+  if (options.preserveProfilePatch && options.fixture === undefined) throw new Error('Profile reuse requires a caller-owned native fixture')
+  const ownsFixture = options.fixture === undefined
+  const fixture = options.fixture ?? await nativeProfileFixture()
   const resultPath = join(fixture.directory, 'result.json')
   const scenarioPath = join(fixture.cwd, 'scenario.mjs')
   const runnerPath = join(fixture.cwd, 'runner.mjs')
@@ -56,6 +62,9 @@ export async function runNativeScene(
   }
   try {
     await options.prepare?.(fixture)
+    // A previous process's success marker is never evidence that this fresh
+    // launcher activated and completed the new scenario.
+    await rm(resultPath, { force: true })
     await writeFile(scenarioPath, `export const run = ${scenario.toString()};\n`)
     await writeFile(runnerPath, `
 import assert from 'node:assert/strict';
@@ -105,7 +114,7 @@ export function apply(ctx) {
       ...(options.extraPatch ?? []),
       { insert: [{ id: 'native-offline-stream', name: mock }, { id: 'native-parent-scene', name: pathToFileURL(runnerPath).href }] },
     ]
-    await writeFile(join(fixture.profileDir, 'cordis.patch.yml'), JSON.stringify(patch))
+    if (!options.preserveProfilePatch) await writeFile(join(fixture.profileDir, 'cordis.patch.yml'), JSON.stringify(patch))
     const output = await new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
       execFile(process.execPath, fixture.args(), {
         cwd: fixture.cwd,
@@ -116,5 +125,5 @@ export function apply(ctx) {
     let result: { ok?: boolean; error?: string } = {}
     try { result = JSON.parse(await readFile(resultPath, 'utf8')) as typeof result } catch { /* native failure before scene activation */ }
     if (output.code !== 0 || result.ok !== true) throw new Error(result.error ?? ('Native scene did not complete:\n' + output.stdout + output.stderr).slice(-10000))
-  } finally { await fixture.cleanup() }
+  } finally { if (ownsFixture) await fixture.cleanup() }
 }

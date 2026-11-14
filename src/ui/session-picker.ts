@@ -69,7 +69,7 @@ import {
 import { BRACKETED_PASTE_START, createCcKeymap, type CcKeymap, printableInput } from '../input/index.ts'
 import { bodyHitAt, modalAction, renderModalBody, textPaint, type BodyPaint, type HitRange, type ResolvedModalAction } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
-import { ModalFrame, modalHeight, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, ModalFrame, modalHeight, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { bold, cc, dim, t } from './theme.ts'
 import { fit, oneLine, sanitize, tildePath, truncateToWidth, visibleWidth, wrap } from './text.ts'
 
@@ -130,8 +130,6 @@ export interface SessionPickerOptions {
 /** Scope of the directory filter (Pi's Current Folder ↔ All toggle). */
 type Scope = 'directory' | 'all'
 
-const isCancelAction = (id: string): boolean =>
-  id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel'
 const isSelectAction = (id: string): boolean => id === 'list.select' || id === 'dialog.confirm'
 const SCOPE_TOGGLE = 'session.scope.toggle'
 /** Modal-list actions that stay available while the search field owns text. */
@@ -556,7 +554,7 @@ export class SessionPickerDialog implements Component, Focusable {
 
   /** Whether a resolved browse action keeps its meaning over the query field. */
   private dispatchable(action: ResolvedModalAction): boolean {
-    if (isCancelAction(action.id) || action.id === 'app.interrupt') return true
+    if (CLOSE_ACTIONS.has(action.id) || action.id === 'app.interrupt') return true
     // The scope toggle belongs to the browse list only (see the mode comment).
     if (action.id === SCOPE_TOGGLE) return true
     if (action.id === 'modal.search') return true
@@ -620,7 +618,7 @@ export class SessionPickerDialog implements Component, Focusable {
       this.interrupt()
       return
     }
-    if (isCancelAction(action.id)) {
+    if (CLOSE_ACTIONS.has(action.id)) {
       // Esc cancels the whole picker even with an active query (Pi behaviour);
       // Backspace/editing is what clears the query.
       this.cancel()

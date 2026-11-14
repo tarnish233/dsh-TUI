@@ -347,6 +347,19 @@ function renderText(dialog: Details, width: number): string {
 // ---------------------------------------------------------------------------
 // Find (CC input field)
 
+test('Ctrl+J in the find field is a newline, not Enter/confirm', () => {
+  const item = tool({ resultText: ['alpha', 'beta MATCH'].join('\n') })
+  const { dialog } = harness({ item, section: 'output' })
+  dialog.handleInput(CTRL_F)
+  type(dialog, 'match')
+  dialog.handleInput('\n')
+  assert.equal(dialog.searchFocused, true, 'Ctrl+J keeps the field focused')
+  assert.equal(dialog.searchQuery, 'match', 'the query survives the newline')
+  dialog.handleInput(ENTER)
+  assert.equal(dialog.searchFocused, false, 'CR still confirms')
+  assert.equal(dialog.searchQuery, 'match')
+})
+
 test('Ctrl+F focuses a real CC search field that filters the focused section', () => {
   const item = tool({ resultText: ['alpha', 'beta MATCH', 'gamma', 'MATCH again'].join('\n') })
   const { dialog, copies } = harness({ item, section: 'output' })

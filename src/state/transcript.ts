@@ -569,6 +569,18 @@ export class TranscriptStore {
   private liveErrorSinceTurnStart = false
   private noticeCounter = 0
   private versionCounter = 0
+  /**
+   * Bumped by every observable mutation (see `notify`). `items` is a pure
+   * projection of the durable list plus the subagent catalog, so a render frame
+   * that reads it several times must not re-compose it each time.
+   */
+  private listVersion = 0
+  private itemsCache: {
+    readonly listVersion: number
+    readonly projectionRevision: number
+    readonly sessionId: string | undefined
+    readonly rows: readonly TranscriptItem[]
+  } | undefined
   /** Called after every observable mutation. Parent assigns this to request a render. */
   onChange: () => void
 
@@ -597,9 +609,29 @@ export class TranscriptStore {
     return this.codecValue !== undefined
   }
 
-  /** Read-only view of the projected entries, in session order. */
+  /**
+   * Read-only view of the projected entries, in session order.
+   *
+   * Memoized on (durable list version, subagent catalog change token, session
+   * id): the projection is pure, so repeated reads between two mutations return
+   * the same array instance instead of recomposing rows and re-anchoring
+   * children.
+   */
   get items(): readonly TranscriptItem[] {
-    return composeSubagentRows(this.list, this.subagentProjection, this.sessionIdValue)
+    const cached = this.itemsCache
+    const projectionRevision = this.subagentProjection.revision
+    if (cached !== undefined
+      && cached.listVersion === this.listVersion
+      && cached.projectionRevision === projectionRevision
+      && cached.sessionId === this.sessionIdValue) return cached.rows
+    const rows = composeSubagentRows(this.list, this.subagentProjection, this.sessionIdValue)
+    this.itemsCache = {
+      listVersion: this.listVersion,
+      projectionRevision,
+      sessionId: this.sessionIdValue,
+      rows,
+    }
+    return rows
   }
 
   /**
@@ -1570,26 +1602,43 @@ export class TranscriptStore {
    * DSH's native `todos` projection is the whole live checklist of a turn, so
    * it is one item: append it once, replace it in place afterwards, and drop it
    * when the fold reports null. The statuses are DSH's; nothing is inferred.
+   *
+   * A replayed snapshot that is identical to the stored one (or a repeated
+   * null) changes nothing at all, exactly like `applyWorkspaceChanges`: no
+   * version bump, no item replacement, no notify, so a repaint/cached block
+   * never happens for data that did not move.
    */
   private applyTodos(value: TodosSnapshot): void {
     const index = this.list.findIndex(item => item.kind === 'todos')
+    const current = index >= 0 ? this.list[index] : undefined
     if (value === null) {
-      if (index >= 0) this.list.splice(index, 1)
+      // Already dropped (or never published): a repeated null is a no-op.
+      if (current === undefined) return
+      this.list.splice(index, 1)
       this.notify()
       return
     }
+    const todos = value.map(todo => ({ content: todo.content, status: todo.status }))
+    if (current !== undefined && current.kind === 'todos' && sameTodos(current.todos, todos)) return
     const item: TodosTranscriptItem = {
       kind: 'todos',
       id: TODOS_ITEM_ID,
-      todos: value.map(todo => ({ content: todo.content, status: todo.status })),
+      todos,
       version: ++this.versionCounter,
     }
-    if (index < 0) this.list.push(item)
+    if (current === undefined || current.kind !== 'todos') this.list.push(item)
     else this.list[index] = item
     this.notify()
   }
 
+  /**
+   * Every path that mutates the projected list or its catalog ends here, so this
+   * is also the one place that invalidates the `items` memo. The bump happens
+   * before `onChange` so a render requested by the listener already sees the
+   * fresh projection.
+   */
   private notify(): void {
+    this.listVersion += 1
     this.onChange()
   }
 }
@@ -1646,6 +1695,17 @@ function asWorkspaceChangeFile(value: unknown): WorkspaceChangeFile | undefined 
     ...(value.binary === true ? { binary: true } : {}),
     ...(value.oversized === true ? { oversized: true } : {}),
   }
+}
+
+/** Same projected checklist: identical content and status in native order. */
+function sameTodos(left: readonly TodoItem[], right: readonly TodoItem[]): boolean {
+  if (left.length !== right.length) return false
+  for (const [index, todo] of right.entries()) {
+    const current = left[index]
+    if (current === undefined) return false
+    if (current.content !== todo.content || current.status !== todo.status) return false
+  }
+  return true
 }
 
 function sameWorkspaceChanges(

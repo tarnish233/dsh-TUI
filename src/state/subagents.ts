@@ -239,8 +239,15 @@ export class SubagentProjection {
   private revisionCounter = 0
   private truncatedValue = false
   private knownSnapshot = false
+  private entriesCache?: { revision: number; entries: readonly SubagentEntry[] }
 
-  /** Number of accepted catalog mutations (diagnostics/tests). */
+  /**
+   * Change token for the catalog state: it moves whenever membership or row
+   * content changes and never for a replayed equal fold.
+   *
+   * Diagnostics/tests read it, and memoized consumers (the transcript's item
+   * projection, `entries` below) key on it instead of rescanning the map.
+   */
   get revision(): number {
     return this.revisionCounter
   }
@@ -253,9 +260,22 @@ export class SubagentProjection {
     return this.states.size
   }
 
-  /** Every known child, direct or nested, in stable native order. */
+  /**
+   * Every known child, direct or nested, in stable native order.
+   *
+   * The composed array is cached per change token: repeated reads of an
+   * unchanged projection return the *same* array (and the same frozen entry
+   * objects), so a consumer can compare identity instead of content. Any real
+   * mutation (`applySnapshot`/`applyEntry`/`clear`) moves the token first, so
+   * the cache can never serve a dropped or replaced row. The array is shared:
+   * callers treat it as read-only.
+   */
   get entries(): readonly SubagentEntry[] {
-    return [...this.states.values()].map(state => state.entry).sort(compareEntries)
+    const cached = this.entriesCache
+    if (cached !== undefined && cached.revision === this.revisionCounter) return cached.entries
+    const entries = [...this.states.values()].map(state => state.entry).sort(compareEntries)
+    this.entriesCache = { revision: this.revisionCounter, entries }
+    return entries
   }
 
   /** Rows that can be anchored in THIS parent transcript. */
@@ -333,11 +353,16 @@ export class SubagentProjection {
         this.states.set(id, { entry, revision: ++this.revisionCounter })
       }
     }
+    let removed = false
     for (const id of [...this.states.keys()]) {
-      if (!next.has(id)) {
-        this.states.delete(id)
-      }
+      if (next.has(id)) continue
+      this.states.delete(id)
+      removed = true
     }
+    // A dropped child is a catalog mutation too: `revision` is the projection's
+    // change token, so a memoized transcript projection (or the `entries` cache)
+    // must never miss it.
+    if (removed) this.revisionCounter += 1
     return changed
   }
 }
@@ -358,20 +383,33 @@ export function composeSubagentRows(
 ): readonly TranscriptItem[] {
   const anchored = projection.anchoredFor(parentSessionId)
   if (anchored.length === 0) return items
-  const out: TranscriptItem[] = [...items]
+  const seqs: number[] = []
   for (const state of anchored) {
-    const entry = state.entry
-    const seq = entry.catalogSeq
-    if (seq === undefined) continue
-    const index = anchorIndex(out, seq)
-    out.splice(index, 0, {
+    const seq = state.entry.catalogSeq
+    if (seq !== undefined) seqs.push(seq)
+  }
+  // `anchoredFor` sorts by catalog seq first, so the targets ascend and every
+  // position is found in one pass instead of rescanning per child.
+  const positions = anchorPositions(items, seqs)
+  const out: TranscriptItem[] = []
+  let cursor = 0
+  let child = 0
+  for (const state of anchored) {
+    // `anchoredFor` only returns states with a numeric catalog seq, so the anchor
+    // is never synthesized and `positions` stays index-aligned with `anchored`.
+    const seq = state.entry.catalogSeq!
+    const position = positions[child]!
+    child += 1
+    for (; cursor < position; cursor += 1) out.push(items[cursor]!)
+    out.push({
       kind: 'subagent',
-      id: `subagent:${entry.id}`,
-      entry,
+      id: `subagent:${state.entry.id}`,
+      entry: state.entry,
       seq,
       version: state.revision,
     })
   }
+  for (; cursor < items.length; cursor += 1) out.push(items[cursor]!)
   return out
 }
 
@@ -391,13 +429,42 @@ function itemSeq(item: TranscriptItem): number | undefined {
   }
 }
 
-function anchorIndex(items: readonly TranscriptItem[], seq: number): number {
-  let last = -1
+/**
+ * Insertion positions for ascending anchor targets.
+ *
+ * A position is one past the last item whose native seq is <= its target (0 when
+ * none is). Because the targets ascend, `position[i]` is
+ * `1 + max{ index : seq(index) <= targets[i] }`, and the already-sorted catalog
+ * order makes the resulting positions ascending too — one transcript pass plus
+ * one binary search per item, instead of one full rescan per child.
+ */
+function anchorPositions(items: readonly TranscriptItem[], targets: readonly number[]): number[] {
+  // Highest qualifying item index per first target it can anchor; a later item
+  // always supersedes an earlier one, hence the plain overwrite.
+  const highest: number[] = new Array<number>(targets.length).fill(-1)
   for (let index = 0; index < items.length; index += 1) {
-    const eventSeq = itemSeq(items[index]!)
-    if (eventSeq !== undefined && eventSeq <= seq) last = index
+    const seq = itemSeq(items[index]!)
+    if (seq === undefined) continue
+    const from = lowerBound(targets, seq)
+    if (from < targets.length) highest[from] = index
   }
-  return last + 1
+  let best = -1
+  return highest.map(value => {
+    if (value > best) best = value
+    return best + 1
+  })
+}
+
+/** First index of an ascending array whose entry is >= `value`. */
+function lowerBound(values: readonly number[], value: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const middle = (low + high) >> 1
+    if (values[middle]! < value) low = middle + 1
+    else high = middle
+  }
+  return low
 }
 
 // ---------------------------------------------------------------------------

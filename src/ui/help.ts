@@ -66,7 +66,7 @@ import type { SkillCatalogEntry, SkillCatalogSnapshot } from '../backend/types.t
 import { type CcKeymap } from '../input/index.ts'
 import { modalAction, renderModalBody, textPaint, type BodyPaint, type ResolvedModalAction } from './dialogs.ts'
 import { InlineAnswer } from './inline-editor.ts'
-import { ModalFrame, modalHeight, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { isCloseAction, ModalFrame, modalHeight, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { bold, cc, dim, t } from './theme.ts'
 import { fit, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 
@@ -267,9 +267,6 @@ function skillSectionLines(skills: SkillCatalogSnapshot, width: number, entries:
 function padRight(line: string, width: number): string {
   return line + ' '.repeat(Math.max(0, width - visibleWidth(line)))
 }
-
-const isCloseAction = (id: string): boolean =>
-  id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel'
 
 const matches = (haystack: string, query: string): boolean =>
   query === '' || haystack.toLowerCase().includes(query)

@@ -17,14 +17,13 @@ import {
   Editor,
   isKeyRelease,
   isKeyRepeat,
-  matchesKey,
   type EditorOptions,
   type EditorTheme,
   type TUI,
 } from "#pi-tui"
 import type { CcActionDefinition, CcContext } from "./actions.ts"
 import { graphemes } from "./boundaries.ts"
-import { CcKeymap, createCcKeymap, type CcKeymapConfig } from "./keymap.ts"
+import { CcKeymap, createCcKeymap, matchesConfiguredKey, type CcKeymapConfig } from "./keymap.ts"
 import { BracketedPasteFilter, type PasteToken } from "./paste.ts"
 import { assertCcEditorSeam, type CcEditorSnapshot } from "./pi-tui-seam-types.ts"
 import { installPiTuiSeam } from "./pi-tui-seam.js"
@@ -128,54 +127,6 @@ export interface CcExternalEditorRequest {
   text: string
   cursor: { line: number; col: number }
 }
-
-/** Actions that exist in the registry but are implemented by the app. */
-const APP_FALLBACK_ACTIONS = new Set([
-  "app.interrupt",
-  "app.clear",
-  "app.cancel",
-  "app.exit",
-  "app.redraw",
-  "app.history.search",
-  "app.stash",
-  "app.editor.external",
-  "app.tools.expand",
-  "app.tools.details",
-  "app.subagents.details",
-  "subagent.reply",
-  "subagent.interrupt",
-  "app.todo",
-  "app.thinking.toggle",
-  "app.model.select",
-  "app.mode.cycle",
-  "app.clipboard.pasteImage",
-  "app.suspend",
-  "app.message.sendNow",
-  "app.message.steer",
-  "app.message.followUp",
-  "app.help",
-  "list.previous",
-  "list.next",
-  "list.page-up",
-  "list.page-down",
-  "list.first",
-  "list.last",
-  "list.select",
-  "list.cancel",
-  "list.select-digit",
-  "dialog.confirm",
-  "dialog.cancel",
-  "dialog.details",
-  "tool.details.next-section",
-  "tool.details.previous-section",
-  "tool.details.previous-tool",
-  "tool.details.next-tool",
-  "tool.details.copy",
-  "historySearch.next",
-  "historySearch.previous",
-  "historySearch.accept",
-  "historySearch.cancel",
-])
 
 /**
  * App actions that only make sense for the focused root prompt editor: they
@@ -450,6 +401,12 @@ export class CcFileBudgetError extends Error {
 export class CcEditor extends Editor {
   /** App-level action sink. Set after construction or via options.onAction. */
   onAction?: (event: CcActionEvent) => boolean | void
+  /**
+   * True only while a held paste prefix is being released as Escape. The
+   * synthetic Escape is consumed here (it never becomes `app.cancel` for a
+   * host), so this flag never leaves the input layer.
+   */
+  private syntheticHeldEscape = false
   /** Called whenever a chord prefix is opened/closed (for a key hint UI). */
   onChordChange?: (prefix: string[] | null) => void
   /**
@@ -496,10 +453,14 @@ export class CcEditor extends Editor {
     this.pasteFilter = new BracketedPasteFilter({
       holdTimeoutMs: options.pasteHoldTimeoutMs,
       onHoldTimeout: (data) => {
-        // The held prefix was not a fragmented paste marker: release it through the
-        // normal key path so it cannot swallow the next keystroke.
+        // The held prefix was not a fragmented paste marker: release it as the
+        // ordinary keys it turned out to be. It is a strict prefix of
+        // `ESC[200~` (`ESC[`, `ESC[2`, ...), so a leading ESC becomes Escape and
+        // the remaining bytes go through normal input. Handing the whole
+        // fragment to `dispatchKeys` would consume it as an unbound control
+        // sequence: the prefix would vanish and a later `~` would be typed.
         if (this.disposed) return
-        this.dispatchKeys(data)
+        this.dispatchHeldPrefix(data)
         this.requestRender()
       },
     })
@@ -1109,7 +1070,34 @@ export class CcEditor extends Editor {
   /** Flush bytes held back while waiting for a fragmented paste marker. */
   flushInputBuffer(): void {
     if (this.disposed) return
-    this.dispatchTokens(this.pasteFilter.flush())
+    for (const token of this.pasteFilter.flush()) {
+      if (token.kind === "keys") this.dispatchHeldPrefix(token.data)
+      else this.dispatchTokens([token])
+    }
+  }
+
+  /**
+   * Release bytes that were held for a possible fragmented paste marker after
+   * the hold deadline (or an explicit flush): they were ordinary keys after
+   * all, so no byte is consumed silently.
+   *
+   * A held fragment is always a strict prefix of the paste start marker, i.e.
+   * `ESC` followed by printable bytes (`ESC[2`). Delivering it as one chunk
+   * would make `dispatchKeys` treat the leading ESC as a control byte and drop
+   * the rest, so the next keystroke (`~`) would be typed as plain text. The
+   * leading ESC is therefore delivered as an ordinary Escape key and the
+   * remaining bytes as normal input. Because it is not a physical Escape press,
+   * `runAction` consumes a cancel (`editor.cancel`/`app.cancel`) instead of
+   * forwarding it: no host ever sees a synthetic `app.cancel`.
+   */
+  private dispatchHeldPrefix(data: string): void {
+    const hasEscape = data.startsWith("\x1b")
+    if (hasEscape) {
+      this.syntheticHeldEscape = true
+      try { this.dispatchKeys("\x1b") } finally { this.syntheticHeldEscape = false }
+    }
+    const rest = hasEscape ? data.slice(1) : data
+    if (rest.length > 0) this.dispatchKeys(rest)
   }
 
   // --- drafts ------------------------------------------------------------
@@ -1314,9 +1302,12 @@ export class CcEditor extends Editor {
         if (resolution.action.id === "app.clear" && isKeyRepeat(data)) return
         this.runAction(resolution.action, data, context)
         // A completion menu goes stale as soon as a non-completion action edits
-        // or moves the draft; close it rather than showing a wrong prefix.
+        // or moves the draft; close it rather than showing a wrong prefix. The
+        // released held prefix changed nothing (its cancel was consumed above),
+        // so it must not dismiss the menu either.
         if (
           context === "autocomplete" &&
+          !this.syntheticHeldEscape &&
           !resolution.action.id.startsWith("autocomplete.") &&
           this.isShowingAutocomplete()
         ) {
@@ -1383,6 +1374,13 @@ export class CcEditor extends Editor {
   // --- action dispatch ---------------------------------------------------
 
   private runAction(action: CcActionDefinition, data: string, context: CcContext): void {
+    // A synthetic Escape released from a timed-out fragmented paste prefix is
+    // not user intent: consume the cancel here, before any editor command runs
+    // and before `onAction`. Forwarding `app.cancel` would let every host
+    // (inline editor, picker, App) cancel/interrupt a turn for released paste
+    // bytes, and running `editor.cancel` would close a completion menu or
+    // restore the history draft. No host needs a `synthetic` flag of its own.
+    if (this.syntheticHeldEscape && (action.id === "app.cancel" || action.id === "editor.cancel")) return
     // Root-only editor commands (movement, kill, undo, submit, completion, ...)
     // act on the single root prompt state. A read-only surface has no editable
     // draft, so these fail closed even if a custom registry, a completion
@@ -1534,7 +1532,12 @@ export class CcEditor extends Editor {
         this.ccAutocompletePage(1)
         return
       case "autocomplete.accept":
-        if (matchesKey(data, "enter")) {
+        // A bare LF is Ctrl+J and `matchesConfiguredKey` never treats it as
+        // Enter/Return (Pi's legacy `enter` alias is excluded), so a custom
+        // binding of this action cannot submit the draft; the keymap normally
+        // resolves LF to `editor.newline` first, and this guard keeps the
+        // accept path safe for an explicit override. Real CR still confirms.
+        if (matchesConfiguredKey(data, "enter")) {
           // Apply the highlighted candidate on this same Editor state first,
           // then capture the content-aware payload immediately before Pi clears
           // the draft. Capturing before the apply would submit the typed
@@ -1554,12 +1557,11 @@ export class CcEditor extends Editor {
     // binding priority: disabling/rebinding forward-delete (so Ctrl+D falls
     // through to global app.exit) must not make a non-empty draft exit.
     if (action.id === "app.exit" && !this.ccIsEmpty()) return
-    if (APP_FALLBACK_ACTIONS.has(action.id) || action.implementor === "app") {
-      this.emitAction(action.id, data, context)
-      return
-    }
-    // Unknown editor-side action from a custom registry: forward to the app
-    // instead of silently dropping the key.
+    // Every app-implemented action is forwarded, and so is an action a custom
+    // registry added that this editor does not implement: forwarding is the
+    // single "not handled here" path, so a key is never silently dropped. The
+    // registry's `implementor` is the only source of truth — an id whitelist
+    // here would silently rot whenever a list/dialog/overlay row is added.
     this.emitAction(action.id, data, context)
   }
 
@@ -1567,17 +1569,22 @@ export class CcEditor extends Editor {
    * True when `data` is one of the enabled physical bindings of `actionId`.
    * Used for contextual app actions such as Ctrl+D (exit only when the key is
    * still bound to app.exit, so remapped/disabled exit genuinely disables it).
+   * `matchesConfiguredKey` keeps bare LF (Ctrl+J) from matching a configured
+   * `enter`/`return` alias, so the two views of the same key can never disagree.
    */
   isActionBoundToKey(actionId: string, data: string): boolean {
     return this.keymapInstance
       .getBindings(actionId)
-      .some((binding) => binding.split(" ").length === 1 && matchesKey(data, binding as Parameters<typeof matchesKey>[1]))
+      .some((binding) => binding.split(" ").length === 1 && matchesConfiguredKey(data, binding))
   }
 
   private emitAction(id: string, data: string, context: CcContext): boolean {
     // A disposed editor consumes app keys without acting on them: the key must
     // not fall through to a default edit, and the app must not see an action.
     if (this.disposed) return true
+    // Backstop for the same rule in `runAction`: a synthetic Escape is never a
+    // cancel for a host, whichever path reaches the forwarding point.
+    if (this.syntheticHeldEscape && id === "app.cancel") return true
     const event: CcActionEvent = {
       id,
       key: data,

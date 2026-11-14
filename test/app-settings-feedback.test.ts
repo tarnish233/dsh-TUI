@@ -293,6 +293,44 @@ test('native auto-title details and an unconfirmed effective value stay in the r
   }
 })
 
+test('a failed Settings sub-panel read stays in Settings instead of double-reporting', async () => {
+  const f = await fixture()
+  try {
+    // The model picker is reached from the Settings row, so the App has a
+    // Settings return state while its native catalog read fails.
+    f.backend.replies.set('models', new Error('native catalog unavailable'))
+    await f.app.submit('/settings'); await paint(f.terminal)
+    f.terminal.type('\x06')
+    for (const char of 'current model') f.terminal.type(char)
+    await paint(f.terminal)
+    await until(() => f.terminal.screen().includes('Current model'), 'the native model row is visible')
+      .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+    const before = notices(f.app).length
+    f.terminal.type('\r'); await paint(f.terminal)
+    await until(() => /Could not load native models/.test(f.terminal.screen()), 'the picker settles out of loading')
+      .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+    assert.equal(notices(f.app).length, before, 'the same failure is not written to the transcript')
+    assert.equal(notices(f.app).some(item => item.text.includes('native catalog unavailable')), false)
+    f.terminal.type('\x1b'); await paint(f.terminal)
+    await until(() => f.terminal.screen().includes('native catalog unavailable'), 'the error is kept in Settings feedback')
+      .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+  } finally { await f.close() }
+})
+
+test('a non-Settings control failure still reaches the transcript', async () => {
+  const f = await fixture()
+  try {
+    // No Settings return state: the failure must stay visible as a notice.
+    f.backend.replies.set('models', new Error('native catalog unavailable'))
+    f.terminal.type('\x1bp')
+    await paint(f.terminal)
+    await until(() => f.terminal.screen().includes('Choose model'), 'the model picker opens from the composer')
+      .catch(error => { throw new Error(String(error) + '\n' + f.terminal.screen()) })
+    await paint(f.terminal)
+    assert.ok(notices(f.app).some(item => item.text === 'native catalog unavailable'), 'a composer-opened picker reports the native failure')
+  } finally { await f.close() }
+})
+
 test('an unwritable local settings path cannot turn the native auto-title row into a write', async () => {
   const f = await fixture()
   try {

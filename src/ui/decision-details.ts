@@ -39,9 +39,9 @@ import {
   modalAction,
   type ResolvedModalAction,
 } from './dialogs.ts'
-import { ModalFrame, modalHeight, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, ModalFrame, modalHeight, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { dim, markdownTheme, t } from './theme.ts'
-import { fit } from './text.ts'
+import { fit, sanitize } from './text.ts'
 
 /**
  * One already-supplied native detail. Both variants are display-only snapshots:
@@ -59,7 +59,6 @@ export interface DecisionDetailsOptions {
   readonly onInterrupt?: () => void
 }
 
-const CLOSE_ACTIONS = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 /** Wheel rows per notch; the same feel as the other read-only inspectors. */
 const WHEEL_ROWS = 3
 /** Left pad of one column so native text never touches the frame border. */
@@ -256,7 +255,7 @@ export class DecisionDetailsDialog implements Component, Focusable {
         lines = decisionProposalRows(diffs, contentWidth, { expanded: true }).lines
       }
     } else {
-      this.markdown.setText(this.options.content.text)
+      this.markdown.setText(sanitize(this.options.content.text))
       const rendered = this.markdown.render(contentWidth)
       while (rendered.length > 0 && (rendered[0] ?? '').trim() === '') rendered.shift()
       while (rendered.length > 0 && (rendered[rendered.length - 1] ?? '').trim() === '') rendered.pop()

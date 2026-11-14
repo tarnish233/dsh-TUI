@@ -184,6 +184,92 @@ test('mouse: a press on a mutating footer action cannot act on a different row a
   assert.deepEqual(resets, [], 'a pressed action with a changed owner is invalidated')
 })
 
+test('mouse: activateHit rejects a pinned row id that disappeared', () => {
+  const activated: string[] = []
+  let includeGamma = true
+  const native = (id: string, label: string, value: string) => ({
+    id, label, value, onActivate: () => { activated.push(id) },
+  })
+  const { dialog } = harness({
+    rows: 40,
+    maxHeight: 26,
+    nativeEntries: () => [
+      native('alpha', 'Native Alpha', 'a'),
+      ...(includeGamma ? [native('gamma', 'Native Gamma', 'g')] : []),
+      native('beta', 'Native Beta', 'b'),
+    ],
+  })
+  goTo(dialog, 'dsh')
+  // Select beta first so an erroneous index fallback would activate it.
+  const betaRow = rowOf(dialog, 'Native Beta')
+  const betaColumn = columnOf(dialog, betaRow, 'Native Beta')
+  mouse(dialog, 'click', betaRow, betaColumn)
+  mouse(dialog, 'click', betaRow, betaColumn)
+  assert.equal(dialog.activeRowId, 'native:beta')
+  assert.deepEqual(activated, ['beta'])
+
+  includeGamma = false
+  dialog.setSettings({ ...defaults })
+  const internals = dialog as unknown as { activateHit(hit: { index: number; key?: string }): void }
+  internals.activateHit({ index: 1, key: 'native:gamma' })
+  assert.equal(dialog.activeRowId, 'native:beta', 'the vanished pinned row does not address its old index')
+  assert.deepEqual(activated, ['beta'], 'a vanished pinned row runs nothing')
+})
+
+test('mouse: a roster rebuilt between press and release still activates the pressed row', () => {
+  const activated: string[] = []
+  let order: 'forward' | 'reversed' = 'forward'
+  const native = (id: string, label: string, value: string) => ({
+    id, label, value, onActivate: () => { activated.push(id) },
+  })
+  const { dialog } = harness({
+    rows: 40,
+    maxHeight: 26,
+    // The parent re-reads native rows on every roster build.
+    nativeEntries: () => (order === 'forward'
+      ? [native('alpha', 'Native Alpha', 'a'), native('beta', 'Native Beta', 'b'), native('gamma', 'Native Gamma', 'g')]
+      : [native('gamma', 'Native Gamma', 'g'), native('beta', 'Native Beta', 'b'), native('alpha', 'Native Alpha', 'a')]),
+  })
+  goTo(dialog, 'dsh')
+  const gammaRow = rowOf(dialog, 'Native Gamma')
+  const gammaColumn = columnOf(dialog, gammaRow, 'Native Gamma')
+
+  // A first click only selects the native action row.
+  mouse(dialog, 'click', gammaRow, gammaColumn)
+  assert.equal(dialog.activeRowId, 'native:gamma')
+  assert.deepEqual(activated, [], 'the first click only selects')
+
+  // A press pins that row by its id…
+  mouse(dialog, 'press', gammaRow, gammaColumn)
+  const height = lines(dialog, 80).length
+
+  // …and the native roster is rebuilt before the release arrives, without a
+  // repaint: the painted index of the pressed row now addresses another row.
+  order = 'reversed'
+  dialog.setSettings({ ...defaults })
+  assert.deepEqual(dialog.getVisibleRows().filter(row => row.id.startsWith('native:')).map(row => row.id),
+    ['native:gamma', 'native:beta', 'native:alpha'], 'the roster really reordered')
+
+  // The release answers the pressed row (its id), never the row that moved into
+  // the pressed row\'s old index.
+  dialog.handleMouse({
+    type: 'click', button: 'left', x: gammaColumn, y: gammaRow, screenX: gammaColumn, screenY: gammaRow,
+    width: 80, height, shift: false, alt: false, ctrl: false, clickCount: 1,
+  })
+  assert.equal(dialog.activeRowId, 'native:gamma', 'the pinned row id wins over the reordered index')
+  assert.deepEqual(activated, ['gamma'], 'exactly the pressed native row ran')
+
+  // A plain click (no recorded press) still resolves the row painted under the
+  // pointer, and only a click on the selected row activates it.
+  const alphaRow = rowOf(dialog, 'Native Alpha')
+  const alphaColumn = columnOf(dialog, alphaRow, 'Native Alpha')
+  mouse(dialog, 'click', alphaRow, alphaColumn)
+  assert.equal(dialog.activeRowId, 'native:alpha')
+  assert.deepEqual(activated, ['gamma'], 'a selecting click never activates')
+  mouse(dialog, 'click', alphaRow, alphaColumn)
+  assert.deepEqual(activated, ['gamma', 'alpha'], 'a click on the selected row still activates it')
+})
+
 test('a disabled/unbound footer action keeps a clickable label without a fake key', () => {
   const tui = createFakeTui(24, 100)
   const keymap = input.createCcKeymap({ bindings: { 'settings.reset': null, 'modal.search': null } })

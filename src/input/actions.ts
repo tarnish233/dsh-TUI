@@ -659,7 +659,7 @@ export const CC_ACTIONS: readonly CcActionDefinition[] = [
     implementor: "app",
     status: "tui-extension",
     description: "Open tools inspector (initial latest)",
-    note: "DSH TUI capability, not a verified CC default. Plain Ctrl+O keeps the CC expand/collapse meaning; the chord is app-owned and forwards to the App like other APP_FALLBACK actions. The inspector always opens on the latest tool; browse with tool.details.previous-tool/next-tool.",
+    note: "DSH TUI capability, not a verified CC default. Plain Ctrl+O keeps the CC expand/collapse meaning; the chord is app-owned and forwards to the App like other app-implemented actions. The inspector always opens on the latest tool; browse with tool.details.previous-tool/next-tool.",
   },
   {
     id: "app.images.details",

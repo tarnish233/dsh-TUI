@@ -14,8 +14,11 @@
  * Asynchronous rosters: the parent may open the picker before the native catalog
  * is known and then call `setModels`/`setLoading`/`setError`. Loading, an empty
  * catalog, a query with no match and a visible native failure are four distinct
- * states. Late data never selects or submits anything: the selection is
- * preserved when its model id (or provider) still exists. A native
+ * states. Only a *pending* refresh blocks confirmation: a visible native failure
+ * is informational, exactly like `SelectDialog`, so the painted roster stays
+ * answerable instead of turning the Select chip into a dead control. Late data
+ * never selects or submits anything: the selection is preserved when its model
+ * id (or provider) still exists. A native
  * `model_route` event may also settle the route *after* the picker opened: the
  * parent calls `setCurrentRoute`, which only refreshes the `current` badge and
  * status inputs - never the highlight, query, provider group or focus.
@@ -40,8 +43,6 @@ import {
   CURSOR_MARKER,
   type Component,
   type Focusable,
-  type KeyId,
-  matchesKey,
   type TUI,
   type TuiMouseEvent,
   type TuiMouseEventResult,
@@ -51,6 +52,7 @@ import {
   type CcActionEvent,
   type CcContext,
   type CcKeymap,
+  matchesConfiguredKey,
   printableInput,
 } from '../input/index.ts'
 import { bodyHitAt, concatPaint, renderModalBody, textPaint, windowRowsWithHits, type BodyPaint, type HitRange, type RowBlock } from './dialogs.ts'
@@ -89,9 +91,38 @@ export interface ModelPickerOptions {
   loading?: boolean
   /** A visible failure from the native catalog read. */
   error?: string
+  /**
+   * Framed heading (default `Choose model`). Presentation only: the caller uses
+   * it to name the surface it opened (a session route chooser vs a saved
+   * native default chooser) without this file inferring an intent, reading a
+   * default or changing what selection means.
+   */
+  title?: string
+  /**
+   * Word for the exact-tuple route marker (default `current`), used for both the
+   * row badge and the status prefix. Presentation only: which row is marked is
+   * still decided solely by the caller's `currentProvider`/`currentModel`
+   * tuple, and nothing is inferred, selected or saved from the label.
+   */
+  routeLabel?: string
 }
 
 type PickerMode = 'browse' | 'search'
+
+/** Display strings the caller may relabel; identical to the historical defaults. */
+const DEFAULT_TITLE = 'Choose model'
+const DEFAULT_ROUTE_LABEL = 'current'
+
+/**
+ * Normalize one caller-supplied presentation string: strip terminal control
+ * bytes, keep it on one line, bound it by code units and fall back to the
+ * historical default when nothing visible is left. Never reads native state.
+ */
+function presentationText(value: string | undefined, fallback: string, max: number): string {
+  if (value === undefined) return fallback
+  const text = sanitize(oneLine(value, max)).trim()
+  return text === '' ? fallback : text
+}
 
 const BROWSE_CONTEXT: CcContext = 'modelPickerList'
 const SEARCH_CONTEXT: CcContext = 'modelPickerSearch'
@@ -116,7 +147,7 @@ function simpleActionForKey(keymap: CcKeymap, data: string, context: CcContext):
       const bindings = keymap.getBindings(action.id)
       for (const binding of bindings) {
         if (binding.includes(' ')) continue
-        if (matchesKey(data, binding as KeyId)) return action.id
+        if (matchesConfiguredKey(data, binding)) return action.id
       }
     }
   }
@@ -125,7 +156,7 @@ function simpleActionForKey(keymap: CcKeymap, data: string, context: CcContext):
 
 /** True when `data` is a configured single-key binding of `actionId`. */
 function isBoundSingle(keymap: CcKeymap, actionId: string, data: string): boolean {
-  return keymap.getBindings(actionId).some((binding) => !binding.includes(' ') && matchesKey(data, binding as KeyId))
+  return keymap.getBindings(actionId).some((binding) => !binding.includes(' ') && matchesConfiguredKey(data, binding))
 }
 
 /** True when `data` is the first key of a configured chord in this chain. */
@@ -136,7 +167,7 @@ function isChordPrefix(keymap: CcKeymap, data: string, context: CcContext): bool
       for (const binding of keymap.getBindings(action.id)) {
         const keys = binding.split(' ')
         if (keys.length < 2) continue
-        if (matchesKey(data, keys[0] as KeyId)) return true
+        if (matchesConfiguredKey(data, keys[0]!)) return true
       }
     }
   }
@@ -205,6 +236,7 @@ function modelBlocks(
   selected: number,
   width: number,
   isCurrent: (item: ModelPickerItem) => boolean,
+  routeLabel: string,
 ): RowBlock[] {
   return items.map((item, index) => {
     const focused = index === selected
@@ -215,7 +247,7 @@ function modelBlocks(
     const title = label !== '' ? sanitize(label) : nativeModel !== '' ? nativeModel : sanitize(item.id)
     const modelSuffix = nativeModel !== '' && nativeModel !== title ? `  ${nativeModel}` : ''
     const badges: string[] = []
-    if (isCurrent(item)) badges.push('current')
+    if (isCurrent(item)) badges.push(routeLabel)
     if (item.isDefault === true) badges.push('default')
     const head = `${title}${modelSuffix}${badges.length > 0 ? `  ${badges.join(' · ')}` : ''}`
     const lines = wrap(head, available).map((line, lineIndex) => {
@@ -243,6 +275,8 @@ export class ModelPickerDialog implements Component, Focusable {
   private readonly onCancel: () => void
   private readonly onInterrupt?: () => void
   private readonly frame = new ModalFrame()
+  private readonly titleText: string
+  private readonly routeLabelText: string
   private readonly grouped = new Map<string, ModelPickerItem[]>()
   private providers: string[]
   private currentProvider: string | undefined
@@ -269,6 +303,8 @@ export class ModelPickerDialog implements Component, Focusable {
     this.onInterrupt = options.onInterrupt
     this.currentProvider = options.currentProvider
     this.currentModel = options.currentModel
+    this.titleText = presentationText(options.title, DEFAULT_TITLE, 240)
+    this.routeLabelText = presentationText(options.routeLabel, DEFAULT_ROUTE_LABEL, 24)
     this.loadingState = options.loading === true
     this.errorState = options.error
     this.providers = []
@@ -354,6 +390,10 @@ export class ModelPickerDialog implements Component, Focusable {
     const hadProvider = this.providers.length > 0
     const providerName = hadProvider ? this.providers[this.providerIndex] : undefined
     const previousId = hadProvider ? this.visibleModels[this.selectedIndex]?.id : undefined
+    // A press that started against the previous roster can never answer the new
+    // one, even when its length/first id happen to match (SelectDialog's
+    // `setItems` retires its press for the same reason).
+    this.retirePointerTargets()
     this.applyModels(models)
     this.loadingState = false
     // A picker opened with no catalog has no previous provider to preserve, so
@@ -370,11 +410,29 @@ export class ModelPickerDialog implements Component, Focusable {
   /** Enter/leave the phase-1 loading state. */
   setLoading(loading: boolean): void {
     this.loadingState = loading
+    this.retirePointerTargets()
   }
 
   /** Show or clear a visible native failure in the current surface. */
   setError(message?: string): void {
     this.errorState = message === undefined || message.trim() === '' ? undefined : message
+    this.retirePointerTargets()
+  }
+
+  /**
+   * A pending row press and the painted row spans belong to the state that was
+   * current when the gesture started. A held metadata refresh, a visible native
+   * failure or a roster replacement makes that state stale, so the press is
+   * retired here and the shared frame drops its own hitboxes/geometry (the same
+   * invalidation `setCurrentRoute` uses). The next render repopulates both.
+   *
+   * Selection state is not touched: the highlight, provider group, query,
+   * editor, focus, keymap and callbacks all survive, so a successful retry
+   * keeps the user's place instead of resetting it.
+   */
+  private retirePointerTargets(): void {
+    this.press = undefined
+    this.frame.invalidate()
   }
 
   /**
@@ -626,7 +684,14 @@ export class ModelPickerDialog implements Component, Focusable {
   }
 
   private selectCurrent(): void {
-    if (this.done) return
+    // The single confirmation path for Enter, the frame's Select action and the
+    // mouse release. While a native catalog/metadata refresh is held the rows on
+    // screen are not a confirmed choice yet: an old roster may still be painted,
+    // so nothing is selected, submitted or marked done and the surface stays open
+    // for the refreshed roster. A visible native *error* is informational (the
+    // `SelectDialog` contract) and does not block an existing roster; the
+    // highlight/query/provider stay exactly as the user left them either way.
+    if (this.done || this.loadingState) return
     const item = this.visibleModels[this.selectedIndex]
     if (item === undefined) return
     this.done = true
@@ -704,7 +769,7 @@ export class ModelPickerDialog implements Component, Focusable {
     const parts = [query === '' ? `${shown} model${shown === 1 ? '' : 's'}` : `${shown} of ${all} models`]
     if (this.selectedIndex >= 0 && shown > 0) parts.push(`${this.selectedIndex + 1}/${shown}`)
     if (this.currentProvider !== undefined || this.currentModel !== undefined) {
-      parts.push(`current ${sanitize(this.currentProvider ?? '-')}/${sanitize(this.currentModel ?? '-')}`)
+      parts.push(`${this.routeLabelText} ${sanitize(this.currentProvider ?? '-')}/${sanitize(this.currentModel ?? '-')}`)
     }
     if (this.providers.length > 0) parts.push(`provider ${this.providerIndex + 1}/${this.providers.length}`)
     return parts.join(' · ')
@@ -712,12 +777,15 @@ export class ModelPickerDialog implements Component, Focusable {
 
   private baseOptions(): ModalFrameOptions {
     return {
-      title: 'Choose model',
+      title: this.titleText,
       ownerKey: this.ownerKey(),
       actions: [
         { id: 'provider-previous', label: 'Provider', action: PROVIDER_PREVIOUS, onActivate: () => this.switchProvider(-1), disabled: this.providers.length < 2 },
         { id: 'provider-next', label: 'Provider', action: PROVIDER_NEXT, onActivate: () => this.switchProvider(1), disabled: this.providers.length < 2 },
-        { id: 'select', label: 'Select', action: 'list.select', onActivate: () => this.selectCurrent(), disabled: this.visibleModels.length === 0 },
+        // A visible *error* stays informational and keeps the roster answerable
+        // (the same contract as `SelectDialog`): only an empty list or a held
+        // native refresh removes the Select target.
+        { id: 'select', label: 'Select', action: 'list.select', onActivate: () => this.selectCurrent(), disabled: this.visibleModels.length === 0 || this.loadingState },
         { id: 'cancel', label: 'Cancel', action: 'list.cancel', onActivate: () => this.cancel() },
       ],
       onClose: () => this.cancel(),
@@ -746,8 +814,11 @@ export class ModelPickerDialog implements Component, Focusable {
   }
 
   private body(bodyWidth: number, bodyHeight: number): BodyPaint {
-    if (this.errorState !== undefined) {
-      const lines = wrap(this.errorState, Math.max(4, bodyWidth)).map(line => ` ${cc.error(fit(line, Math.max(4, bodyWidth)))}`)
+    // A retry (models_changed) sets loading while the previous failure may still
+    // be stored. The pending refresh is the current state, so it wins over the
+    // stale error text; once loading ends the error is visible again.
+    if (this.errorState !== undefined && !this.loadingState) {
+      const lines = wrap(sanitize(this.errorState), Math.max(4, bodyWidth)).map(line => ` ${cc.error(fit(line, Math.max(4, bodyWidth)))}`)
       const remaining = Math.max(1, bodyHeight - lines.length - 1)
       const rows = this.visibleModels.length === 0
         ? textPaint(this.stateLines(bodyWidth))
@@ -755,15 +826,30 @@ export class ModelPickerDialog implements Component, Focusable {
       return concatPaint([textPaint(lines), textPaint(['']), rows])
     }
     if (this.visibleModels.length === 0) return textPaint(this.stateLines(bodyWidth))
-    return windowRowsWithHits(this.blocks(bodyWidth), bodyHeight)
+    // Loading with the previous roster still painted is its own state: the rows
+    // stay readable (highlight/query survive the refresh) but cannot be
+    // confirmed, so the body names the pending refresh instead of leaving the
+    // footer's Select chip silently inert.
+    const status = this.loadingState ? textPaint([this.refreshingLine(bodyWidth)]) : textPaint([])
+    return concatPaint([status, windowRowsWithHits(this.blocks(bodyWidth), Math.max(1, bodyHeight - status.lines.length))])
+  }
+
+  /** The one visible sentence for a held native refresh with rows on screen. */
+  private refreshingLine(width: number): string {
+    return ` ${t.muted(fit('Refreshing…', Math.max(4, width - 2)))}`
   }
 
   private blocks(bodyWidth: number): RowBlock[] {
-    return modelBlocks(this.visibleModels, this.selectedIndex, bodyWidth, (item) =>
-      this.currentProvider !== undefined &&
-      this.currentModel !== undefined &&
-      item.provider === this.currentProvider &&
-      item.model === this.currentModel,
+    return modelBlocks(
+      this.visibleModels,
+      this.selectedIndex,
+      bodyWidth,
+      (item) =>
+        this.currentProvider !== undefined &&
+        this.currentModel !== undefined &&
+        item.provider === this.currentProvider &&
+        item.model === this.currentModel,
+      this.routeLabelText,
     )
   }
 

@@ -64,7 +64,7 @@ import {
   type SubagentTreeNode,
 } from '../state/subagents.ts'
 import { InlineAnswer } from './inline-editor.ts'
-import { modalBinding, modalHeight, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, modalBinding, modalHeight, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
 import {
   subagentActivity,
@@ -142,8 +142,6 @@ export interface AgentsOverlayOptions {
   /** Clock for the native session-total duration; injectable for tests. */
   now?: () => number
 }
-
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 /** Native statuses this widget treats as current work (never a local guess). */
 const ACTIVE_STATUSES: ReadonlySet<string> = new Set(['running', 'initializing'])

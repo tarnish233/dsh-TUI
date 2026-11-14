@@ -51,7 +51,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { modalHeight, type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, type ModalAction, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { bold, dim, t } from './theme.ts'
 
@@ -110,7 +110,6 @@ interface InspectionSection {
   readonly notes: readonly string[]
 }
 
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 const phaseLabel = (phase: unknown): string => {
   if (phase === null || phase === undefined) return 'no fiber'
   const text = oneLine(sanitize(String(phase)), 40)
@@ -389,12 +388,6 @@ export class NativeInspectionDialog implements Component, Focusable {
 
   // -------------------------------------------------------------------------
   // Rendering
-
-  private heightCap(): number {
-    const rows = this.tui.terminal?.rows
-    if (!Number.isFinite(rows) || rows <= 0) return 200
-    return Math.max(1, Math.floor(this.options.maxHeight ?? modalHeight(this.tui, this.modalSize)))
-  }
 
   private frameActions(): ModalAction[] {
     return [{ id: 'close', label: 'close', action: 'list.cancel', onActivate: () => this.close() }]

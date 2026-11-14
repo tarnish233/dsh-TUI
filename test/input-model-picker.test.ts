@@ -121,9 +121,10 @@ test("search-mode defaults: provider keys, Enter/Esc, text editing and no list s
   assert.equal(actionId(keymap.resolve("\x1b[B", "modelPickerSearch")), "editor.move.line-down")
   assert.equal(actionId(keymap.resolve("\x10", "modelPickerSearch")), "editor.move.line-up")
   assert.equal(actionId(keymap.resolve("\x0e", "modelPickerSearch")), "editor.move.line-down")
-  // Enter/Esc are forwarded as existing list actions.
+  // Enter is forwarded as the existing list action; a bare LF is Ctrl+J and
+  // keeps its editor newline meaning in the query field.
   assert.equal(actionId(keymap.resolve("\r", "modelPickerSearch")), "list.select")
-  assert.equal(actionId(keymap.resolve("\n", "modelPickerSearch")), "list.select")
+  assert.equal(actionId(keymap.resolve("\n", "modelPickerSearch")), "editor.newline")
   assert.equal(actionId(keymap.resolve("\x1b", "modelPickerSearch")), "list.cancel")
   // Ctrl+C cancels the picker locally through its list.cancel row.
   assert.equal(actionId(keymap.resolve("\x03", "modelPickerSearch")), "list.cancel")

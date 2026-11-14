@@ -65,18 +65,17 @@ import {
   matchesKey,
   type Component,
   type Focusable,
-  type KeyId,
   type TUI,
   type TuiMouseEvent,
   type TuiMouseEventResult,
 } from '#pi-tui'
 import type { DecisionOption, DecisionRequest, JsonRecord, Question } from '../backend/types.ts'
-import { createCcKeymap, type CcKeymap } from '../input/index.ts'
+import { createCcKeymap, matchesConfiguredKey, type CcKeymap } from '../input/index.ts'
 import type { DecisionDetailContent } from './decision-details.ts'
 import { subscribeHighlightRuntime } from './highlight.ts'
 import { InlineAnswer } from './inline-editor.ts'
 import type { ComposerInteraction, InteractionLayout } from './interaction.ts'
-import { ModalFrame, modalHeight, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, isCloseAction, ModalFrame, modalHeight, type ModalAction, type ModalFrameOptions, type ModalSize } from './modal.ts'
 import { bold, cc, dim, markdownTheme, t } from './theme.ts'
 import { fit, sanitize, truncateToWidth, visibleWidth, wrap } from './text.ts'
 import { renderDiffBlock, diffStats } from './tool-diff.ts'
@@ -91,10 +90,8 @@ export interface ResolvedModalAction {
   keys: string[]
 }
 
-const isCancelAction = (id: string): boolean =>
-  id === 'list.cancel' || id === 'dialog.cancel' || id === 'app.cancel'
 /** Every action that means "settle this surface locally, without answering". */
-const CANCEL_ACTIONS: readonly string[] = ['list.cancel', 'dialog.cancel', 'app.cancel']
+const CANCEL_ACTIONS: readonly string[] = [...CLOSE_ACTIONS]
 const isInterruptAction = (id: string): boolean => id === 'app.interrupt'
 const isSelectAction = (id: string): boolean => id === 'list.select' || id === 'dialog.confirm'
 
@@ -134,17 +131,6 @@ export function modalAction(
   return undefined
 }
 
-/**
- * Legacy shared helper, kept for sibling surfaces (Settings / Keyboard / Queue)
- * that resolve one key as a plain list/dialog action: the same accepted action
- * set as `modalAction` without a surface-specific allow list. A cancelled
- * chord's fresh key is re-dispatched once, like the editor does, so a mismatch
- * is never silently swallowed.
- */
-export function listAction(keymap: CcKeymap, data: string): ResolvedModalAction | undefined {
-  return modalAction(keymap, data)
-}
-
 function isModalActionId(id: string, allow: readonly string[]): boolean {
   return id.startsWith('list.')
     || id === 'dialog.confirm' || id === 'dialog.cancel'
@@ -157,7 +143,7 @@ export function isInterruptKey(keymap: CcKeymap, data: string): boolean {
   if (keymap.isPendingChord()) return false
   return keymap
     .getBindings('app.interrupt')
-    .some(binding => !binding.includes(' ') && matchesKey(data, binding as KeyId))
+    .some(binding => !binding.includes(' ') && matchesConfiguredKey(data, binding))
 }
 
 const digitOf = (action: ResolvedModalAction): number | undefined => {
@@ -232,7 +218,7 @@ export interface RowBlock {
 
 /**
  * Which blocks fit the budget: the focused block first, then alternately one
- * block below and one above. The exact rule `windowRows` has always used.
+ * block below and one above.
  */
 function windowBlockRange(blocks: readonly RowBlock[], budget: number): { start: number; end: number } {
   const total = blocks.reduce((sum, block) => sum + block.lines.length, 0)
@@ -284,22 +270,9 @@ function paintBlocks(blocks: readonly RowBlock[], range: { start: number; end: n
   return { lines, hits }
 }
 
-/** Painted rows for the visible block window (historical helper). */
-export function windowRows(blocks: RowBlock[], budget: number): string[] {
-  return paintBlocks(blocks, windowBlockRange(blocks, budget)).lines
-}
-
 /** Same window plus the body row range of every selectable block. */
 export function windowRowsWithHits(blocks: RowBlock[], budget: number): BodyPaint {
   return paintBlocks(blocks, windowBlockRange(blocks, budget))
-}
-
-/** Offset painted rows (e.g. below a header) and keep index/hit alignment. */
-export function offsetPaint(paint: BodyPaint, offset: number): BodyPaint {
-  return {
-    lines: [...Array.from({ length: offset }, () => ''), ...paint.lines],
-    hits: paint.hits.map(hit => ({ ...hit, startRow: hit.startRow + offset, endRow: hit.endRow + offset })),
-  }
 }
 
 /** Concatenate body segments, keeping hit rows aligned. */
@@ -443,7 +416,7 @@ function planFrame(
 export function boundToKey(keymap: CcKeymap, actionId: string, raw: string): boolean {
   return keymap
     .getBindings(actionId)
-    .some(binding => !binding.includes(' ') && matchesKey(raw, binding as KeyId))
+    .some(binding => !binding.includes(' ') && matchesConfiguredKey(raw, binding))
 }
 
 /**
@@ -456,7 +429,7 @@ function editorClaimsKey(keymap: CcKeymap, raw: string): boolean {
   for (const action of keymap.getActions('editor')) {
     for (const binding of keymap.getBindings(action.id)) {
       const first = binding.split(' ')[0]
-      if (first !== undefined && matchesKey(raw, first as KeyId)) return true
+      if (first !== undefined && matchesConfiguredKey(raw, first)) return true
     }
   }
   return false
@@ -479,11 +452,11 @@ function choiceBlocks(
     const style = chosen ? cc.success : focused ? cc.suggestion : t.text
     const box = multi ? `${checked.has(index) ? cc.success('[✔]') : t.text('[ ]')} ` : ''
     const prefix = `${pointer(focused)} ${numbered ? `${numberLabel(index + 1, numberWidth)} ` : ''}${box}`
-    const label = wrap(item.label, Math.max(4, width - visibleWidth(prefix)))
+    const label = wrap(sanitize(item.label), Math.max(4, width - visibleWidth(prefix)))
     const lines = [`${prefix}${style(label[0] ?? '')}${chosen ? ` ${cc.success('✔')}` : ''}`]
     for (const line of label.slice(1)) lines.push(indent + style(line))
     if (item.description !== undefined && item.description.trim() !== '') {
-      for (const line of wrap(item.description, Math.max(4, width - indent.length))) {
+      for (const line of wrap(sanitize(item.description), Math.max(4, width - indent.length))) {
         lines.push(indent + dim(focused || chosen ? style(line) : t.text(line)))
       }
     }
@@ -494,10 +467,10 @@ function choiceBlocks(
 }
 
 const noticeLines = (text: string, width: number): string[] =>
-  wrap(text, Math.max(4, width)).map(line => ` ${t.muted(fit(line, Math.max(4, width)))}`)
+  wrap(sanitize(text), Math.max(4, width)).map(line => ` ${t.muted(fit(line, Math.max(4, width)))}`)
 
 const errorLines = (text: string, width: number): string[] =>
-  wrap(text, Math.max(4, width)).map(line => ` ${cc.error(fit(line, Math.max(4, width)))}`)
+  wrap(sanitize(text), Math.max(4, width)).map(line => ` ${cc.error(fit(line, Math.max(4, width)))}`)
 
 // ---------------------------------------------------------------------------
 // Approval proposal preview
@@ -807,6 +780,12 @@ export class SelectDialog implements ComposerInteraction, Focusable {
   }
 
   private selectIndex(index: number): void {
+    // The single confirmation path for Enter, a digit and a mouse release. A
+    // held native refresh may still paint the previous roster (so identity can
+    // be preserved), but that roster is not a confirmed choice yet: while
+    // loading, nothing is submitted and `isDone` stays false. Errors are not
+    // part of this guard, because a visible failure can be informational.
+    if (this.loadingState) return
     const item = this.items[index]
     if (item === undefined) return
     this.finish(item.value)
@@ -845,7 +824,7 @@ export class SelectDialog implements ComposerInteraction, Focusable {
       this.interrupt()
       return
     }
-    if (isCancelAction(action.id)) {
+    if (isCloseAction(action.id)) {
       this.cancel()
       return
     }
@@ -912,7 +891,11 @@ export class SelectDialog implements ComposerInteraction, Focusable {
         label: 'Select',
         action: 'list.select',
         onActivate: () => this.selectFocused(),
-        disabled: this.items.length === 0,
+        // A held native refresh keeps painting the previous roster so identity
+        // can survive it, but those rows are not a confirmed choice yet: the
+        // footer says so instead of offering a chip that silently does nothing.
+        // A visible *error* stays informational and keep the chooser answerable.
+        disabled: this.items.length === 0 || this.loadingState,
       },
       { id: 'cancel', label: 'Cancel', action: 'list.cancel', onActivate: () => this.cancel() },
     ]
@@ -936,9 +919,14 @@ export class SelectDialog implements ComposerInteraction, Focusable {
       const message = this.loadingState ? 'Loading options…' : 'No options are available.'
       return concatPaint([header, textPaint(noticeLines(message, bodyWidth))])
     }
-    const budget = Math.max(1, bodyHeight - header.lines.length)
+    // Loading with a previous roster on screen is its own state: the rows stay
+    // readable (identity survives the refresh) but they cannot be confirmed, so
+    // the body names the pending refresh instead of hiding it behind a dead
+    // footer chip.
+    const status: BodyPaint = this.loadingState ? textPaint(noticeLines('Refreshing…', bodyWidth)) : textPaint([])
+    const budget = Math.max(1, bodyHeight - header.lines.length - status.lines.length)
     const blocks = choiceBlocks(this.items, this.index, this.index, bodyWidth, true, false, new Set())
-    return concatPaint([header, windowRowsWithHits(blocks, budget)])
+    return concatPaint([header, status, windowRowsWithHits(blocks, budget)])
   }
 
   /** Same plan `measureRows` reports: one geometry, no render-to-measure recursion. */
@@ -1500,7 +1488,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
   private approvalKey(raw: string, action: ResolvedModalAction | undefined): void {
     if (action === undefined) return
     const count = this.approvalItems.length
-    if (isCancelAction(action.id)) {
+    if (isCloseAction(action.id)) {
       // Esc/local cancel on an approval is a rejection, not a turn cancellation.
       this.rejectApproval()
       return
@@ -1539,7 +1527,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
   }
 
   private applyQuestionAction(action: ResolvedModalAction): void {
-    if (isCancelAction(action.id)) {
+    if (isCloseAction(action.id)) {
       this.dismissQuestion()
       return
     }
@@ -1625,7 +1613,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
 
   private reviewKey(raw: string, action: ResolvedModalAction | undefined): void {
     if (action !== undefined) {
-      if (isCancelAction(action.id)) {
+      if (isCloseAction(action.id)) {
         this.dismissQuestion()
         return
       }
@@ -1807,7 +1795,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
    * single truncated line, which would silently drop native text).
    */
   private messagePaint(width: number): BodyPaint {
-    const message = this.request.message?.trim() ?? ''
+    const message = sanitize(this.request.message?.trim() ?? '')
     if (message === '') return textPaint([])
     return textPaint([...wrap(message, Math.max(4, width - 2)).map(line => ` ${dim(t.text(line))}`), ''])
   }
@@ -1916,7 +1904,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
     const optionMinimum = Math.min(2, Math.max(1, optionLines))
     const markerRows = hasDetail ? 1 : 0
     const headerRoom = Math.max(0, bodyHeight - optionMinimum - markerRows)
-    const titleLines = wrap(question.question, Math.max(4, bodyWidth)).map(line => bold(t.text(line)))
+    const titleLines = wrap(sanitize(question.question), Math.max(4, bodyWidth)).map(line => bold(t.text(line)))
     // A self-presenting question already carries its header as the frame title.
     const tabs = this.presentsOwnBody() ? undefined : this.renderTabs(bodyWidth)
     const header: string[] = []
@@ -1959,8 +1947,8 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
    */
   private detailLines(question: Question, width: number, room: number): string[] {
     if (room < 1) return []
-    const detail = questionDetail(question)
-    if (detail === undefined) return []
+    const detail = sanitize(questionDetail(question) ?? '')
+    if (detail === '') return []
     this.detailMarkdown.setText(detail)
     const body = this.detailMarkdown.render(Math.max(1, width - 1))
     while (body.length > 0 && (body[0] ?? '').trim() === '') body.shift()
@@ -1982,7 +1970,7 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
     const arrows = !(this.questions.length === 1 && this.hideSubmitTab)
     const submit = this.hideSubmitTab ? '' : '✔ Submit'
     const headers = this.questions.map((question, index) => {
-      const label = question.header !== undefined && question.header !== '' ? question.header : `Q${index + 1}`
+      const label = sanitize(question.header !== undefined && question.header !== '' ? question.header : `Q${index + 1}`)
       const answered = this.isAnswered(index)
       return `${answered ? '☒' : '☐'} ${label}`
     })
@@ -2041,11 +2029,13 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
     const blocks: RowBlock[] = question.options.map((option, index) => {
       const focused = state.focus === index
       const style = focused ? cc.suggestion : t.text
-      const label = wrap(option.label, Math.max(4, width - indent.length))
+      const labelText = sanitize(option.label)
+      const label = wrap(labelText, Math.max(4, width - indent.length))
       const lines = [`${pointer(focused)} ${numberLabel(index + 1, numberWidth)} ${box(state.checked.has(index))} ${style(label[0] ?? '')}`]
       for (const line of label.slice(1)) lines.push(indent + style(line))
-      if (option.description !== undefined && option.description.trim() !== '') {
-        for (const line of wrap(option.description, Math.max(4, width - indent.length))) lines.push(indent + cc.inactive(line))
+      const description = option.description === undefined ? '' : sanitize(option.description)
+      if (description.trim() !== '') {
+        for (const line of wrap(description, Math.max(4, width - indent.length))) lines.push(indent + cc.inactive(line))
       }
       return { lines, focused, index, key: `${this.tab}:${index}:${option.label}` }
     })
@@ -2065,8 +2055,10 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
   private previewLines(width: number): string[] {
     if (this.question.multiSelect === true) return []
     const option = this.question.options[this.state.focus]
-    const preview = option?.preview
-    if (preview === undefined || preview.trim() === '') return []
+    const rawPreview = option?.preview
+    if (rawPreview === undefined || rawPreview.trim() === '') return []
+    const preview = sanitize(rawPreview)
+    if (preview.trim() === '') return []
     const inner = Math.max(10, Math.min(width, 72))
     const lines = wrap(preview.replace(/\n+$/, ''), inner - 4).slice(0, 8)
     return [dim(`┌${'─'.repeat(inner - 2)}┐`), ...lines.map(line => `${dim('│')} ${t.muted(line)}`), dim(`└${'─'.repeat(inner - 2)}┘`)]
@@ -2083,8 +2075,8 @@ export class DecisionDialog implements ComposerInteraction, Focusable {
     }
     this.questions.forEach((question, index) => {
       const answer = answers[index]
-      const text = Array.isArray(answer) ? answer.join(', ') : answer
-      const lines = wrap(question.question, Math.max(4, width - 3))
+      const text = sanitize(Array.isArray(answer) ? answer.join(', ') : answer)
+      const lines = wrap(sanitize(question.question), Math.max(4, width - 3))
       blocks.push({ lines: [` ● ${t.text(lines[0] ?? '')}`, ...lines.slice(1).map(line => `   ${t.text(line)}`)], focused: false })
       if (text !== '') blocks.push({ lines: wrap(`→ ${text}`, Math.max(4, width - 3)).map(line => `   ${cc.success(line)}`), focused: false })
     })

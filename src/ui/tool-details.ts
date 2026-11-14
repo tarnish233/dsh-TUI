@@ -86,7 +86,7 @@ import {
 } from '../input/index.ts'
 import { SearchField } from './inspector-search.ts'
 import { HitboxRegistry, type MouseHitbox } from './mouse.ts'
-import { ModalFrame, type ModalAction, type ModalFrameOptions, type ModalGeometry, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, ModalFrame, type ModalAction, type ModalFrameOptions, type ModalGeometry, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, visibleWidth, wrap } from './text.ts'
 import { bold, cc, dim, t } from './theme.ts'
 import { formatToolDuration, toolCopyText, toolDisplayName, toolInputText, toolOutputText } from './tool-io.ts'
@@ -153,8 +153,6 @@ export interface ToolDetailsDialogOptions {
 }
 
 const SECTIONS: readonly ToolIoSection[] = ['input', 'output']
-
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
 
 /** Below this body width the call list would leave no usable content column. */
 const MIN_CALL_LIST_WIDTH = 56
@@ -1564,7 +1562,7 @@ export class ToolDetailsDialog implements Component, Focusable {
 
   private localCancelKey(raw: string): boolean {
     const interrupt = new Set(this.keymap.getBindings('app.interrupt'))
-    return ['list.cancel', 'dialog.cancel', 'app.cancel'].some(id =>
+    return [...CLOSE_ACTIONS].some(id =>
       this.keymap.getBindings(id).some(spec =>
         !spec.includes(' ') &&
         !interrupt.has(spec) &&

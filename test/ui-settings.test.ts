@@ -73,7 +73,7 @@ function harness(options: {
   onCancel?: () => void
   onInterrupt?: () => void
   withInterrupt?: boolean
-  nativeEntries?: () => readonly { id: string; label: string; value: string; description?: string; available?: boolean; onActivate?: () => void }[]
+  nativeEntries?: () => readonly { id: string; label: string; value: string; description?: string; available?: boolean; keywords?: string; onActivate?: () => void }[]
   initialState?: { category: 'general' | 'thinking' | 'tools' | 'agents' | 'images' | 'dsh' | 'keyboard'; rowId?: string; query?: string; scroll?: number }
   maxHeight?: number
   rows?: number
@@ -529,6 +529,145 @@ test('auto title is a read-only native row with no local write or picker', () =>
   assert.equal(dialog.activeCategory, 'dsh')
   assert.deepEqual(patches, [])
   assert.deepEqual(events, [])
+})
+
+test('native keyword overrides replace the generic prefix without hiding label/description matches', () => {
+  /** Search-field helper: focus it, type the terms, keep the query. */
+  const search = (dialog: Dialog, terms: string): void => {
+    dialog.handleInput(CTRL_F)
+    for (const char of terms) dialog.handleInput(char)
+  }
+  const entries = () => [
+    { id: 'defaultModel', label: 'Default model', value: 'deepseek/deepseek-chat', description: 'Saved for new sessions.', keywords: 'saved provider startup choice' },
+    { id: 'autoTitle', label: 'Auto title', value: 'On', description: 'Read-only; profile composition owns it.', keywords: 'title window profile' },
+    // No override: the historical synthetic keywords stay in place.
+    { id: 'legacy', label: 'Legacy row', value: 'x' },
+  ]
+
+  const nativeIds = (dialog: Dialog): string[] =>
+    dialog.rows().map(row => row.id).filter(id => id.startsWith('native:'))
+
+  const model = harness({ nativeEntries: entries })
+  search(model.dialog, 'model')
+  assert.deepEqual(nativeIds(model.dialog), ['native:defaultModel'], 'the label still matches')
+  assert.equal(model.dialog.allRows.find(row => row.id === 'native:defaultModel')?.keywords, 'saved provider startup choice')
+
+  const alias = harness({ nativeEntries: entries })
+  search(alias.dialog, 'provider')
+  assert.deepEqual(nativeIds(alias.dialog), ['native:defaultModel'], 'a keyword alias discovers the row')
+
+  const generic = harness({ nativeEntries: entries })
+  search(generic.dialog, 'native')
+  assert.deepEqual(nativeIds(generic.dialog), ['native:legacy'],
+    'an override drops the synthetic prefix while an unlabelled row keeps it')
+
+  const category = harness({ nativeEntries: entries })
+  search(category.dialog, 'dsh')
+  assert.deepEqual(nativeIds(category.dialog), ['native:defaultModel', 'native:autoTitle', 'native:legacy'],
+    'the DSH category label still makes every native row findable')
+
+  const title = harness({ nativeEntries: entries })
+  search(title.dialog, 'title')
+  assert.deepEqual(nativeIds(title.dialog), ['native:autoTitle'])
+})
+
+test('default model/effort rows keep the supplied order and metadata search order', () => {
+  const entries = () => [
+    { id: 'model', label: 'Current model', value: 'deepseek-chat', description: 'This session only.', keywords: 'session route provider model in use' },
+    { id: 'effort', label: 'Reasoning effort', value: 'high', description: 'This session only.', keywords: 'session effort reasoning level model in use' },
+    { id: 'defaultModel', label: 'Default model', value: 'deepseek/deepseek-chat', description: 'Saved default for new sessions.', keywords: 'default model provider startup new sessions' },
+    { id: 'defaultEffort', label: 'Default model effort', value: 'high · default', description: 'Levels come from the saved default model.', keywords: 'default effort reasoning level saved model provider' },
+  ]
+  const { dialog } = harness({ nativeEntries: entries })
+  jumpToSection(dialog, 'dsh')
+  assert.deepEqual(sectionRows(dialog, 'dsh'), ['native:model', 'native:effort', 'native:defaultModel', 'native:defaultEffort'],
+    'the parent order is the page order')
+  assert.match(text(dialog), /Default model effort/)
+  assert.match(text(dialog), /high · default/)
+
+  dialog.handleInput(CTRL_F)
+  for (const char of 'default') dialog.handleInput(char)
+  const found = dialog.rows().map(row => row.id)
+  assert.equal(found[0], 'screen', 'the local Default screen row still matches (clicking search unchanged)')
+  assert.deepEqual(found.filter(id => id.startsWith('native:')), ['native:defaultModel', 'native:defaultEffort'],
+    'native search results keep metadata order')
+  assert.match(text(dialog), /DSH/, 'the DSH group header is still painted while searching')
+})
+
+test('an unavailable native default row is honest, discoverable and inert', () => {
+  const activated: string[] = []
+  const { dialog, patches, resets } = harness({
+    nativeEntries: () => [{
+      id: 'defaultModel',
+      label: 'Default model',
+      value: 'Unavailable',
+      description: 'The native default-model service is not mounted in this profile.',
+      keywords: 'default model provider startup',
+      available: false,
+      onActivate: () => activated.push('model'),
+    }],
+  })
+  dialog.handleInput(CTRL_F)
+  for (const char of 'default') dialog.handleInput(char)
+  assert.ok(dialog.rows().some(row => row.id === 'native:defaultModel'), 'an unavailable default stays discoverable')
+  dialog.handleInput(ESC)
+  dialog.handleInput(ESC)
+  const reopened = harness({
+    nativeEntries: () => [{
+      id: 'defaultModel', label: 'Default model', value: 'Unavailable',
+      description: 'The native default-model service is not mounted in this profile.',
+      keywords: 'default model provider startup', available: false,
+      onActivate: () => activated.push('model'),
+    }],
+    initialState: { category: 'dsh', rowId: 'native:defaultModel' },
+  })
+  assert.equal(reopened.dialog.activeRowId, 'native:defaultModel')
+  const rendered = text(reopened.dialog)
+  assert.match(rendered, /Unavailable · unavailable/, 'the value never claims a default')
+  assert.match(rendered, /not mounted in this profile/, 'the specific native limitation is visible')
+  reopened.dialog.handleInput(ENTER)
+  assert.deepEqual(activated, [], 'an unavailable default never activates the parent operation')
+  assert.match(text(reopened.dialog), /not available in the current DSH runtime/)
+  assert.deepEqual(patches, [])
+  assert.deepEqual(resets, [])
+  reopened.dialog.handleInput(ESC)
+  assert.equal(reopened.dialog.isDone, true, 'the panel stays closeable')
+})
+
+test('a default row round trip preserves row, query and scroll across a changed value', () => {
+  const entries = (value: string) => () => [
+    { id: 'model', label: 'Current model', value: 'deepseek-chat', description: 'This session only.' },
+    { id: 'defaultModel', label: 'Default model', value, description: 'Saved default for new sessions.', keywords: 'default model provider' },
+    { id: 'defaultEffort', label: 'Default model effort', value: 'high · default', description: 'Levels come from the saved default model.', keywords: 'default effort reasoning level' },
+  ]
+  const source = harness({ maxHeight: 9, nativeEntries: entries('deepseek/deepseek-chat') })
+  jumpToSection(source.dialog, 'dsh')
+  selectRow(source.dialog, 'native:defaultModel')
+  source.dialog.render(64)
+  const view = source.dialog.captureView()
+  assert.equal(view.category, 'dsh')
+  assert.equal(view.rowId, 'native:defaultModel')
+
+  const restored = harness({ maxHeight: 9, nativeEntries: entries('beta/b-two'), initialState: view })
+  restored.dialog.render(64)
+  assert.equal(restored.dialog.activeCategory, 'dsh')
+  assert.equal(restored.dialog.activeRowId, 'native:defaultModel', 'the id is value-independent')
+  assert.match(text(restored.dialog), /beta\/b-two/, 'the restored frame paints the new native value')
+
+  // A search query and the selected row survive the same round trip.
+  const searched = harness({ nativeEntries: entries('deepseek/deepseek-chat') })
+  searched.dialog.handleInput(CTRL_F)
+  for (const char of 'default') searched.dialog.handleInput(char)
+  selectRow(searched.dialog, 'native:defaultEffort')
+  searched.dialog.render(64)
+  const searchView = searched.dialog.captureView()
+  assert.equal(searchView.query, 'default')
+  assert.equal(searchView.rowId, 'native:defaultEffort')
+  const searchRestored = harness({ nativeEntries: entries('deepseek/deepseek-chat'), initialState: searchView })
+  assert.equal(searchRestored.dialog.query, 'default')
+  assert.equal(searchRestored.dialog.activeRowId, 'native:defaultEffort')
+  assert.deepEqual(searchRestored.dialog.rows().map(row => row.id).filter(id => id.startsWith('native:')),
+    ['native:defaultModel', 'native:defaultEffort'])
 })
 
 test('the keyboard category opens the parent shortcut editor', () => {

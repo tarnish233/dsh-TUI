@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
-import { nativeArguments } from '../src/cli.ts'
+import { nativeArguments, delegateToNativeDsh } from '../src/cli.ts'
 import { optionsFromFlags, tuiCommand, DEFAULT_PROFILE, type TuiFlags } from '../src/plugin/options.ts'
 import { VERSION } from '../src/version.ts'
 
@@ -88,4 +88,42 @@ test('continue and a second mode setter are not reintroduced', () => {
 
 test('conflicting terminal modes reject before constructing the UI', () => {
   assert.throws(() => parse(['--inline', '--fullscreen']), /Choose --inline or --fullscreen/)
+})
+
+/**
+ * Run the delegation step with `execve` refusing to replace the process, and
+ * capture only its own stderr lines. Restores the process afterwards.
+ */
+function withRefusedExecve(executable: string, argv: readonly string[]): { lines: string[]; exitCode: number | undefined } {
+  const execve = process.execve
+  const write = process.stderr.write
+  const previousExitCode = process.exitCode
+  const lines: string[] = []
+  try {
+    process.execve = () => { throw new Error('EPERM: operation not permitted') }
+    process.stderr.write = ((chunk: string | Uint8Array) => { lines.push(String(chunk)); return true }) as typeof write
+    process.exitCode = undefined
+    delegateToNativeDsh({ executable, argv, env: { PATH: process.env.PATH } })
+    return { lines: lines.map(line => line.trimEnd()), exitCode: process.exitCode }
+  } finally {
+    process.execve = execve
+    process.stderr.write = write
+    process.exitCode = previousExitCode
+  }
+}
+
+test('a refused execve delegates to a child with one controlled line and no raw stack', { skip: process.platform === 'win32' }, () => {
+  const missing = fileURLToPath(new URL('./missing-native-dsh', import.meta.url))
+  const { lines, exitCode } = withRefusedExecve(missing, ['--profile', 'dsh-tui'])
+  assert.equal(lines.length, 2, `exactly two diagnostics, got ${JSON.stringify(lines)}`)
+  assert.match(lines[0]!, /could not replace this process with native DSH/)
+  assert.match(lines[1]!, /Could not launch native DSH/)
+  assert.equal(lines.some(line => /EPERM|^\s+at /.test(line)), false, 'the refused native error is never echoed')
+  assert.equal(exitCode, 1, 'a failed fallback reports a controlled failure, not a crash')
+})
+
+test('a refused execve still delegates the whole application and keeps its exit code', { skip: process.platform === 'win32' }, () => {
+  const { lines, exitCode } = withRefusedExecve('true', ['--profile', 'dsh-tui'])
+  assert.deepEqual(lines, ['dsh-tui: could not replace this process with native DSH; delegating to a child process instead.'])
+  assert.equal(exitCode, 0, 'the child exit code is the alias exit code')
 })

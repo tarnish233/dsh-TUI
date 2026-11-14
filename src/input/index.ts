@@ -43,6 +43,7 @@ export {
   detectKeybindingPlatform,
   formatBinding,
   isValidKeyId,
+  matchesConfiguredKey,
   parseBindingSpec,
   type CcCancelledChord,
   type CcKeymapConfig,
@@ -98,11 +99,6 @@ export {
 } from "./native-autocomplete.ts"
 
 export {
-  graphemeAfter,
-  graphemeBefore,
   graphemes,
-  isWhitespaceAt,
-  whitespaceBoundaryBackward,
-  whitespaceBoundaryForward,
   type GraphemeSlice,
 } from "./boundaries.ts"

@@ -85,6 +85,18 @@ export function modalHeight(tui: Pick<TUI, 'terminal'>, size: ModalSize = 'stand
   return Math.max(1, Math.min(available, Math.floor(rows * 0.9), size === 'compact' ? 18 : Number.POSITIVE_INFINITY))
 }
 
+/**
+ * The one modal close family: `list.cancel` (a list/dialog surface),
+ * `dialog.cancel` (a focused dialog layer) and `app.cancel` (the global
+ * fallback). Surfaces resolve these through the shared keymap, so a remap or a
+ * disabled row has to change every surface at once — one shared set here instead
+ * of a private copy per component.
+ */
+export const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
+
+/** `switch`-friendly form of {@link CLOSE_ACTIONS}. */
+export const isCloseAction = (id: string): boolean => CLOSE_ACTIONS.has(id)
+
 /** Never print a shortcut which is disabled or actually owned by interrupt. */
 export function modalBinding(keymap: CcKeymap, actionId: string, excludeInterrupt = false): string | undefined {
   const interrupts = excludeInterrupt ? new Set(keymap.getBindings('app.interrupt')) : undefined

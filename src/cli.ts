@@ -119,16 +119,50 @@ export async function main(args: string[]): Promise<void> {
     process.removeListener('SIGTERM', terminate)
   }
   if (interruptedCode !== undefined) { process.exitCode = interruptedCode; return }
-  // POSIX replaces this alias with dsh: TUI and DSH live in one process, no IPC/supervisor.
+  delegateToNativeDsh({ executable, argv, env })
+}
+
+/** Inputs of the one whole-application hand-off to native DSH. */
+export interface DelegateOptions {
+  /** Native DSH command or absolute launcher path. */
+  executable: string
+  /** Native arguments, including the launcher patch that asserts this application. */
+  argv: readonly string[]
+  /** Environment for the native application. */
+  env: NodeJS.ProcessEnv
+}
+
+/**
+ * Hand the whole application to native DSH exactly once.
+ *
+ * POSIX replaces this alias with `execve`, so the TUI and DSH live in one
+ * process and no supervisor or IPC shell remains. Replacement can still be
+ * refused (sandbox, permissions, a missing `/usr/bin/env`); that must not escape
+ * as a raw native error, so it degrades to the same child delegation a platform
+ * without `execve` uses, with one controlled line on stderr.
+ *
+ * @param options - executable, native arguments and environment.
+ */
+export function delegateToNativeDsh({ executable, argv, env }: DelegateOptions): void {
+  // Platforms without execve delegate the whole application; no TUI state remains in this shell.
+  const delegate = (): void => {
+    const result = spawnSync(executable, argv, { env, stdio: 'inherit', shell: process.platform === 'win32' })
+    if (result.error !== undefined) {
+      process.stderr.write('Could not launch native DSH. Install DSH and mount dsh-tui in the selected profile.\n')
+      process.exitCode = 1
+    } else process.exitCode = result.status ?? (result.signal === 'SIGINT' ? 130 : 1)
+  }
   if (process.platform !== 'win32' && typeof process.execve === 'function') {
     const strings = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
-    process.execve('/usr/bin/env', ['env', executable, ...argv], strings)
+    try {
+      process.execve('/usr/bin/env', ['env', executable, ...argv], strings)
+    } catch {
+      // No raw stack and no half-handled native error: report one line, then use
+      // the controlled child delegation.
+      process.stderr.write('dsh-tui: could not replace this process with native DSH; delegating to a child process instead.\n')
+      delegate()
+    }
     return
   }
-  // Platforms without execve delegate the whole application; no TUI state remains in this shell.
-  const result = spawnSync(executable, argv, { env, stdio: 'inherit', shell: process.platform === 'win32' })
-  if (result.error !== undefined) {
-    process.stderr.write('Could not launch native DSH. Install DSH and mount dsh-tui in the selected profile.\n')
-    process.exitCode = 1
-  } else process.exitCode = result.status ?? (result.signal === 'SIGINT' ? 130 : 1)
+  delegate()
 }

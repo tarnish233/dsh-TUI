@@ -24,6 +24,7 @@
 import { matchesKey, type Component, type Focusable, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from '#pi-tui'
 import {
   formatBinding,
+  matchesConfiguredKey,
   parseBindingSpec,
   type CcActionDefinition,
   type CcKeymap,
@@ -39,7 +40,7 @@ import {
   type ListBlock,
   type ListBody,
 } from './modal-list.ts'
-import { modalBinding, type ModalAction, type ModalSize } from './modal.ts'
+import { CLOSE_ACTIONS, modalBinding, type ModalAction, type ModalSize } from './modal.ts'
 import { fit, oneLine, sanitize, tildePath, visibleWidth, wrap } from './text.ts'
 import { bold, cc, dim, t } from './theme.ts'
 
@@ -60,31 +61,23 @@ function groupOf(action: CcActionDefinition): string {
   return 'Editing'
 }
 
-const LABELS: Record<string, string> = {
+/**
+ * The only label overrides: one-line cursor-position labels, where the native
+ * `description` is a sentence ("Move to the start of the current logical line")
+ * that costs a wrapped row in a two-column list. Everything else renders
+ * `action.description` verbatim — a second copy of a description is what let the
+ * old table claim "Todo panel (not implemented)" and "images not implemented"
+ * long after both shipped.
+ */
+const SHORT_LABELS: Readonly<Record<string, string>> = {
   'editor.move.line-start': 'Start of line',
   'editor.move.line-end': 'End of line',
   'editor.move.char-left': 'Move cursor left',
   'editor.move.char-right': 'Move cursor right',
-  'editor.move.line-up': 'Move up / browse history / recall queued text',
-  'editor.move.line-down': 'Move down / browse history',
-  'editor.submit': 'Send message / queue follow-up',
-  'editor.newline': 'New line',
-  'editor.cancel': 'Close completion / interrupt response',
-  'editor.kill.whitespace-backward': 'Delete back to whitespace (whole path/flag)',
-  'editor.kill.word-backward': 'Delete previous word (punctuation boundaries)',
-  'editor.kill.word-forward': 'Delete next word (punctuation boundaries)',
-  'editor.yank': 'Paste most recently deleted text',
-  'editor.yank-pop': 'Cycle deleted text after pasting',
-  'app.clear': 'Clear editor / exit',
-  'app.interrupt': 'Interrupt',
-  'app.todo': 'Todo panel (not implemented)',
-  'app.thinking.toggle': 'Expand or collapse the latest thinking summary (hidden reasoning is revealed first)',
-  'app.clipboard.pasteImage': 'Paste clipboard text (images not implemented)',
-  'app.help': 'Show commands and help',
 }
 
 function labelOf(action: CcActionDefinition): string {
-  return sanitize(LABELS[action.id] ?? action.description)
+  return sanitize(SHORT_LABELS[action.id] ?? action.description)
 }
 
 /** Newlines separate alternatives; spaces retain native multi-key chord syntax. */
@@ -104,8 +97,6 @@ interface ResolvedModalAction {
   readonly keys: string[]
 }
 
-const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cancel', 'app.cancel'])
-
 /**
  * The binding-text field is a real embedded CC editor (`editor` context), where
  * default Ctrl+C resolves the global `app.clear`. It consumes that key as its
@@ -119,8 +110,10 @@ const CLOSE_ACTIONS: ReadonlySet<string> = new Set(['list.cancel', 'dialog.cance
  */
 function cancelFallback(keymap: CcKeymap, data: string): boolean {
   if (keymap.isPendingChord()) return false
+  // `matchesConfiguredKey`, not the bare Pi match: a bare LF is Ctrl+J, never
+  // the Enter of an `enter`/`return` binding. A real CR keeps matching.
   const simple = (binding: string): boolean =>
-    !binding.includes(' ') && matchesKey(data, binding as Parameters<typeof matchesKey>[1])
+    !binding.includes(' ') && matchesConfiguredKey(data, binding)
   if (!keymap.getBindings('app.clear').some(simple)) return false
   return [...CLOSE_ACTIONS].some(id => keymap.getBindings(id).some(simple))
 }
@@ -445,13 +438,16 @@ export class KeybindingsDialog implements Component, Focusable {
       return
     }
     if (!this.answer.editor.isPasting()) {
-      if (matchesKey(raw, 'enter')) {
-        this.saveText(this.answer.raw)
-        return
-      }
+      // A bare LF is Ctrl+J (newline), not Enter. Check the newline aliases
+      // first so a legacy ^J byte cannot save the edit.
       if (matchesKey(raw, 'shift+enter') || matchesKey(raw, 'ctrl+j')) {
         this.answer.editor.ccInsertText('\n')
         this.tui.requestRender()
+        return
+      }
+      // A real CR lands here; a bare LF was already taken as Ctrl+J above.
+      if (matchesKey(raw, 'enter')) {
+        this.saveText(this.answer.raw)
         return
       }
     }
@@ -566,7 +562,8 @@ export class KeybindingsDialog implements Component, Focusable {
     else if (matchesKey(raw, 'pageDown')) this.move(5)
     else if (matchesKey(raw, 'home')) this.moveTo(0)
     else if (matchesKey(raw, 'end')) this.moveTo(this.visibleRows().length - 1)
-    else if (matchesKey(raw, 'enter')) this.edit()
+    // Recovery only: a bare LF is Ctrl+J/newline, never a row edit.
+    else if (raw !== '\n' && matchesKey(raw, 'enter')) this.edit()
   }
 
   private back(): void {

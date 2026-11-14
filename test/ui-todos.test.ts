@@ -93,13 +93,61 @@ test('a todos snapshot appends one item and updates it in place', () => {
   assert.ok((second[0]?.version ?? 0) > (version ?? 0), 'the version advances so the cached block re-renders')
   assert.equal(changes.length, 2)
 
-  // A repeated identical snapshot is still the projection's fact: it notifies.
-  store.handle(todosEvent(progressed))
+  // A replayed identical snapshot changes nothing at all: the stored item
+  // object, its version and the notification count all stay put.
+  const replayed = todosOf(store)[0]
+  store.handle(todosEvent(progressed.map(todo => ({ ...todo }))))
   assert.equal(todosOf(store).length, 1)
+  assert.equal(todosOf(store)[0], replayed, 'an identical snapshot keeps the same item object')
+  assert.equal(todosOf(store)[0]?.version, second[0]?.version, 'the version does not advance')
+  assert.equal(changes.length, 2, 'an identical snapshot does not notify its owner')
 
   // Copies are kept, so a later native mutation cannot rewrite history.
   progressed[0] = { content: 'mutated', status: 'pending' }
   assert.equal(todosOf(store)[0]?.todos[0]?.content, 'Read the current resume flow')
+})
+
+test('an unchanged todos snapshot is a no-op: no version, no replacement, no notify', () => {
+  const store = newStore()
+  const changes: number[] = []
+  store.onChange = () => { changes.push(1) }
+
+  store.handle(todosEvent(PLAN))
+  const first = todosOf(store)[0]
+  assert.ok(first !== undefined)
+  assert.equal(changes.length, 1)
+
+  // A replayed fold (fresh array, fresh objects, same content/status) is equal.
+  store.handle(todosEvent(PLAN.map(todo => ({ ...todo }))))
+  assert.equal(todosOf(store)[0], first, 'an identical replay keeps the same item object')
+  assert.equal(todosOf(store)[0]?.version, first.version, 'no version bump for unchanged data')
+  assert.equal(changes.length, 1, 'no notify for unchanged data')
+
+  // A real change still replaces the item, bumps the version and notifies once.
+  store.handle(todosEvent([
+    PLAN[0]!,
+    { content: PLAN[1]!.content, status: 'completed' },
+    PLAN[2]!,
+  ]))
+  const second = todosOf(store)[0]
+  assert.ok(second !== undefined)
+  assert.notEqual(second, first, 'a real change replaces the item')
+  assert.ok(second.version > first.version, 'a real change bumps the version')
+  assert.equal(changes.length, 2)
+
+  // Native order is part of the projection: the same set reordered is a change.
+  store.handle(todosEvent([...second.todos].reverse()))
+  const third = todosOf(store)[0]
+  assert.ok(third !== undefined)
+  assert.notEqual(third, second, 'a reordered snapshot is a new projection')
+  assert.equal(changes.length, 3)
+
+  // Dropping is a change once; a repeated null afterwards is a no-op.
+  store.handle(todosEvent(null))
+  assert.equal(todosOf(store).length, 0)
+  assert.equal(changes.length, 4)
+  store.handle(todosEvent(null))
+  assert.equal(changes.length, 4, 'a repeated null does not notify')
 })
 
 test('null removes the checklist, another session is ignored and reset clears it', () => {

@@ -162,7 +162,7 @@ interface CommandsLike {
 interface LlmLike {
   listProviders(): readonly { readonly id: string; readonly name?: string }[]
   listModels(provider: string): Promise<readonly { readonly id: string; readonly name?: string; readonly description?: string }[]>
-  resolveModelInfo(provider: string, model: string): Promise<unknown>
+  resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
 }
 
 interface AttachmentsLike {
@@ -506,6 +506,8 @@ const NATIVE_UI_READ_TIMEOUT_MS = 8_000
 const SESSION_QUERY_READ_TIMEOUT_MS = 5_000
 /** Native `sessionQuery.readEvent` raw-window bound (`SESSION_QUERY_READ_WINDOW_MAX` default). */
 const MAX_EVENT_WINDOW = 50
+/** Local bound on one exact-route `llm.resolveModelInfo` metadata read. */
+const EFFORT_METADATA_TIMEOUT_MS = 8_000
 const IDLE_SETTLE_TIMEOUT_MS = 15_000
 const COMMAND_DRAIN_TIMEOUT_MS = 15_000
 const CANCEL_SETTLE_TIMEOUT_MS = 2_000
@@ -944,10 +946,6 @@ function statsOf(value: unknown): StatsSnapshot | undefined {
   return any ? stats : undefined
 }
 
-function messageFacts(value: unknown): Record<string, unknown> | undefined {
-  return record(value)
-}
-
 /** Ephemeral tool-card projection over the mounted native tool registry. */
 class ToolPresenter {
   private readonly tools: ToolsLike
@@ -1213,7 +1211,19 @@ export class DshContextBackend implements Backend {
     })
     this.nativeFiles = new NativeFileInput(this.nativeUiAccess)
     this.nativeQuestions = new NativeQuestionAdapter({ access: this.nativeUiAccess })
-    this.nativeManagement = new NativeManagement({ access: this.nativeUiAccess })
+    this.nativeManagement = new NativeManagement({
+      access: this.nativeUiAccess,
+      // The adapter keeps the LLM seam: the settings module never walks a
+      // provider catalog or talks to a model itself.
+      native: {
+        currentSelection: () => {
+          const defaults = this.service<DefaultModelLike>('agentDefaultModel')
+          return typeof defaults?.currentSelection === 'function' ? defaults.currentSelection() : undefined
+        },
+        resolveReasoning: async (provider, model, signal) => await this.nativeReasoningRaw(provider, model, signal),
+        modelCatalog: () => this.modelCatalog(),
+      },
+    })
     this.subagentBridge = new SubagentBridge({
       host: {
         get: (name: string): unknown => this.service(name),
@@ -3456,18 +3466,34 @@ export class DshContextBackend implements Backend {
         if (typeof params.callId !== 'string' || params.callId === '') throw codedError('INVALID_ARGUMENT', 'native-question-answer requires callId')
         return this.nativeQuestions.answer({ callId: params.callId, answer: params.answer })
       }
-      case 'native-defaults': return this.nativeUiRead('native defaults', () => this.nativeManagement.defaultSettings())
+      case 'native-defaults': return this.nativeUiRead('native defaults', signal => this.nativeManagement.defaultSettings(signal))
       case 'native-default-update': {
         const target = params.target, value = params.value, expectedRevision = params.expectedRevision
-        if ((target !== 'agent-preset-default' && target !== 'permission-default-preset') || typeof value !== 'string' ||
+        const knownTarget = target === 'agent-preset-default' || target === 'permission-default-preset' || target === 'agent-default-model'
+        if (!knownTarget || typeof value !== 'string' ||
             typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 ||
             (params.attachmentId !== undefined && typeof params.attachmentId !== 'string')) throw codedError('INVALID_ARGUMENT', 'native default update requires a target, value and confirmed revision')
-        // Native `settings.mutate` takes no signal: the carrier only makes the
-        // in-flight write visible to the reload gate and shutdown drain. It is
-        // never presented as native cancellation.
+        // `reasoningEffort` belongs to the native default model selection only:
+        // `null` removes the stored level, a string must be an advertised native
+        // level, and omission keeps an advertised stored level. It is refused for
+        // the other targets instead of being silently ignored.
+        const reasoningEffort = params.reasoningEffort
+        if (reasoningEffort !== undefined && (target !== 'agent-default-model' ||
+            (reasoningEffort !== null && (typeof reasoningEffort !== 'string' || reasoningEffort.length === 0)))) {
+          throw codedError('INVALID_ARGUMENT', 'reasoningEffort is a default-model native level, null, or omitted')
+        }
+        // Native `settings.mutate` takes no signal: the carrier makes the
+        // in-flight write visible to the reload gate and shutdown drain, and the
+        // native management seam re-checks it after every async metadata phase
+        // so a cancelled or timed-out read never reaches the mutation.
         const sessionId = this.nativeUiScope()?.sessionId ?? ''
-        return await this.runActiveCommand('native default update', sessionId, async () => this.nativeManagement.updateDefault({ target, value, expectedRevision,
-          ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) }))
+        return await this.runActiveCommand('native default update', sessionId, async signal => this.nativeManagement.updateDefault({
+          target,
+          value,
+          expectedRevision,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}),
+        }, signal))
       }
       case 'session-rename': return this.nativeManagement.renameCurrent({ sessionId: params.sessionId as string, title: params.title as string,
         ...(typeof params.attachmentId === 'string' ? { attachmentId: params.attachmentId } : {}) })
@@ -4249,18 +4275,16 @@ export class DshContextBackend implements Backend {
   // ---------------------------------------------------------------- effort
 
   /**
-   * Read the selected target's native reasoning metadata.
+   * One exact-route `llm.resolveModelInfo` read for the selected model.
    *
-   * The mounted `llm.listModels` DTO is not required to carry `reasoning`;
-   * `llm.resolveModelInfo(provider, model).reasoning` is the authority. A
-   * missing resolver or a failed metadata read leaves the level unknown, so the
+   * The mounted `llm.listModels` DTO is not required to carry `reasoning`, so
+   * this exact `(provider, model)` route is the only authority. A missing
+   * resolver or a failed metadata read leaves the level unknown, so the
    * target's native default applies (nothing is guessed or fabricated).
    */
   private async effortReasoningFor(row: ModelRow): Promise<ModelReasoningView | undefined> {
-    const llm = this.service<LlmLike>('llm')
-    if (typeof llm?.resolveModelInfo !== 'function') return undefined
     try {
-      const resolved = record(await withTimeout(llm.resolveModelInfo(row.provider, row.model), 8_000, 'resolveModelInfo'))
+      const resolved = await this.resolveModelInfo(row.provider, row.model, { timeoutMs: EFFORT_METADATA_TIMEOUT_MS })
       return reasoningView(resolved?.reasoning)
     } catch (error) {
       this.warn(`could not read native reasoning metadata for ${row.provider}/${row.model}: ${errorMessage(error)}`)
@@ -4268,16 +4292,83 @@ export class DshContextBackend implements Backend {
     }
   }
 
-  private async effortMetadata(route: Route): Promise<Record<string, unknown>> {
-    const llm = this.service<LlmLike>('llm')
-    if (typeof llm?.resolveModelInfo !== 'function') {
-      throw codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no model metadata resolver')
+  /**
+   * One exact-route reasoning metadata read for the native default-model target.
+   *
+   * It returns the raw native `reasoning` value (`undefined` legitimately means
+   * the route advertises none) and throws for a missing resolver or a non-record
+   * model-info result, so the settings seam reports unreadable/malformed metadata
+   * honestly instead of calling it "no levels". The caller owns the deadline,
+   * so a slow adapter can never become an unbounded settings wait.
+   */
+  private async nativeReasoningRaw(provider: string, model: string, signal: AbortSignal): Promise<unknown> {
+    const resolved = await this.resolveModelInfo(provider, model, {
+      signal,
+      missing: () => codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no native model metadata resolver'),
+    })
+    if (resolved === undefined) {
+      throw codedError('RUNTIME_REQUEST_FAILED', `the native model metadata for ${provider}/${model} is not a record`)
     }
+    return resolved.reasoning
+  }
+
+  /**
+   * The reasoning metadata of one exact route, for the effort roster.
+   *
+   * A route the native resolver cannot describe is a `MODELS_UNAVAILABLE`
+   * outage; a runtime that mounts no resolver at all is the distinct capability
+   * fact and keeps its own code.
+   */
+  private async effortMetadata(route: Route): Promise<Record<string, unknown>> {
     try {
-      return record(await withTimeout(llm.resolveModelInfo(route.provider, route.model), 8_000, 'resolveModelInfo')) ?? {}
+      const resolved = await this.resolveModelInfo(route.provider, route.model, {
+        timeoutMs: EFFORT_METADATA_TIMEOUT_MS,
+        missing: () => codedError('CAPABILITY_UNAVAILABLE', 'the runtime mounted no model metadata resolver'),
+      })
+      return resolved ?? {}
     } catch (error) {
+      if (backendErrorCodeOf(error) === 'CAPABILITY_UNAVAILABLE') throw error
       throw codedError('MODELS_UNAVAILABLE', `model route ${route.provider}/${route.model} is unavailable: ${errorMessage(error)}`)
     }
+  }
+
+  /**
+   * One exact-route `llm.resolveModelInfo(provider, model)` call.
+   *
+   * This is the single private seam for native model metadata: it never walks a
+   * provider catalog, never substitutes the session route and never guesses a
+   * roster. A caller-owned `signal` is passed straight through; without one the
+   * read gets the adapter's local deadline, so no metadata wait is unbounded.
+   * The native failure is rethrown untouched so each caller keeps its own code.
+   *
+   * @param provider - exact native provider id.
+   * @param model - exact native model id.
+   * @param options.signal - caller-owned native cancellation signal.
+   * @param options.timeoutMs - local deadline, used only when no signal was supplied.
+   * @param options.missing - raised when the runtime mounted no resolver; omitted
+   *   for a soft read that reports "unknown" instead.
+   * @returns the model-info record, or `undefined` when the native service
+   *   answered with a non-record payload (unreadable metadata).
+   */
+  private async resolveModelInfo(
+    provider: string,
+    model: string,
+    options: {
+      readonly signal?: AbortSignal
+      readonly timeoutMs?: number
+      readonly missing?: () => Error
+    },
+  ): Promise<Record<string, unknown> | undefined> {
+    const llm = this.service<LlmLike>('llm')
+    if (typeof llm?.resolveModelInfo !== 'function') {
+      if (options.missing === undefined) return undefined
+      throw options.missing()
+    }
+    const read = async (): Promise<unknown> => await llm.resolveModelInfo(provider, model, options.signal)
+    const pending = options.signal === undefined && options.timeoutMs !== undefined
+      ? withTimeout(read(), options.timeoutMs, 'resolveModelInfo')
+      : read()
+    return record(await pending)
   }
 
   /**

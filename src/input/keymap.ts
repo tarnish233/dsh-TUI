@@ -155,6 +155,30 @@ const sequenceKey = (keys: readonly string[]): string => keys.join(" ")
 const resolutionKey = (context: CcContext, sequence: string): string => `${context}\u0000${sequence}`
 
 /**
+ * Flatten every context's fallback chain into one resolver-ordered list.
+ *
+ * This is a pure function of one compiled index, so `resolve()` — which runs for
+ * every keystroke — can read the result instead of walking
+ * `CONTEXT_FALLBACK_CHAINS` with flatMap/`Map.get` per key. Layer order and
+ * within-layer order are preserved exactly, so resolution precedence (chord
+ * candidate order included) is unchanged.
+ */
+function compileContextBindings(
+  index: ReadonlyMap<CcContext, CompiledBinding[]>,
+): Map<CcContext, CompiledBinding[]> {
+  const chains = new Map<CcContext, CompiledBinding[]>()
+  for (const context of CC_CONTEXTS) {
+    const bindings: CompiledBinding[] = []
+    for (const entry of CONTEXT_FALLBACK_CHAINS[context]) {
+      const layer = index.get(entry)
+      if (layer) bindings.push(...layer)
+    }
+    chains.set(context, bindings)
+  }
+  return chains
+}
+
+/**
  * Action ids whose *effective* binding list differs between the current
  * configuration and the host baseline. Comparing compiled bindings (not raw
  * file entries) keeps an override that merely restates a registry default
@@ -357,9 +381,23 @@ function byteGroup(keyId: string): string | undefined {
   return BYTE_EQUIVALENCE.get(keyId)
 }
 
+/**
+ * Match one configured key id, keeping bare LF (Ctrl+J) distinct from Enter.
+ *
+ * Pi intentionally matches LF as `enter`/`return` on legacy terminals. The
+ * editor layer already lists `editor.newline` before `editor.submit`; modal and
+ * completion surfaces need the same distinction when they inspect configured
+ * bindings outside `resolve()` (search fields, picker mode decisions). Keep this
+ * rule in one place instead of duplicating a partial guard.
+ */
+export function matchesConfiguredKey(data: string, keyId: string): boolean {
+  if (data === "\n" && (keyId === "enter" || keyId === "return")) return false
+  return matchesKey(data, keyId as KeyId)
+}
+
 /** Bindings are validated by `parseBindingSpec` before reaching `matchesKey`. */
 function keyMatches(data: string, keyId: string): boolean {
-  return matchesKey(data, keyId as KeyId)
+  return matchesConfiguredKey(data, keyId)
 }
 
 /** Human-readable label for a binding, e.g. `Ctrl+X Ctrl+E`. */
@@ -407,6 +445,11 @@ export class CcKeymap {
   private readonly baselineConfig: CcKeymapConfig
   private bindingsByAction = new Map<string, CompiledBinding[]>()
   private index = new Map<CcContext, CompiledBinding[]>()
+  /**
+   * Precompiled fallback chain per context, rebuilt only by `rebuild()`.
+   * `resolve()` reads these arrays directly; it never re-derives the chain.
+   */
+  private contextBindings = new Map<CcContext, CompiledBinding[]>()
   private diagnostics: CcKeymapDiagnostic[] = []
   private pending: { since: number; prefix: string[]; candidates: CompiledBinding[]; generation: number } | null = null
   /** Monotonic id for each new pending chord (ownership for shared keymaps). */
@@ -433,16 +476,6 @@ export class CcKeymap {
 
   getChordTimeoutMs(): number {
     return this.chordTimeout
-  }
-
-  /**
-   * Bindings that apply in a context: the context's own bindings first, then
-   * its fallback chain (see `CONTEXT_FALLBACK_CHAINS`). Local bindings win, so
-   * e.g. Ctrl+D stays forward-delete in the editor and only reaches
-   * `app.exit` when the editor action itself forwards it.
-   */
-  private bindingsForContext(context: CcContext): CompiledBinding[] {
-    return CONTEXT_FALLBACK_CHAINS[context].flatMap((entry) => this.index.get(entry) ?? [])
   }
 
   /** Context fallback chain, exposed for diagnostics and help UIs. */
@@ -609,7 +642,11 @@ export class CcKeymap {
       return { kind: "cancelled-chord", reason: "mismatch", prefix: [...prefix], passthrough: data }
     }
 
-    const bindings = this.bindingsForContext(context)
+    // Precompiled in `rebuild()`: the context's own bindings first, then its
+    // fallback chain (see `CONTEXT_FALLBACK_CHAINS`). Local bindings win, so
+    // e.g. Ctrl+D stays forward-delete in the editor and only reaches
+    // `app.exit` when the editor action itself forwards it.
+    const bindings = this.contextBindings.get(context) ?? []
     let simple: CompiledBinding | undefined
     const chordCandidates: CompiledBinding[] = []
     for (const binding of bindings) {
@@ -666,6 +703,7 @@ export class CcKeymap {
     const diagnostics = compiled.diagnostics
     this.bindingsByAction = compiled.bindingsByAction
     this.index = compiled.index
+    this.contextBindings = compileContextBindings(compiled.index)
     this.detectConflicts(diagnostics)
     // The host baseline (`baselineBindings` + registry defaults) is the
     // reference for "by design" precedence: it already contains intentional

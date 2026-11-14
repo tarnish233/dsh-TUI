@@ -150,8 +150,9 @@ export class HistorySearch implements ComposerInteraction, Focusable {
       if (this.results.length) this.selected = (this.selected - 1 + this.results.length) % this.results.length
     } else if (event.id === 'historySearch.accept') {
       // Inline Enter sends; fullscreen Enter/Tab only insert. Esc in inline mode
-      // is bound to accept by the App and inserts too.
-      this.finish(this.results[this.selected], this.mode === 'inline' && matchesKey(event.key, 'enter'))
+      // is bound to accept by the App and inserts too. A bare LF is Ctrl+J:
+      // even a custom accept binding must not turn it into an inline submit.
+      this.finish(this.results[this.selected], this.mode === 'inline' && event.key !== '\n' && matchesKey(event.key, 'enter'))
     } else if (
       event.id === 'historySearch.cancel' ||
       event.id === 'app.interrupt' ||

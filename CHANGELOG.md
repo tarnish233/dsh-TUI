@@ -1,5 +1,19 @@
 # 版本记录
 
+## v0.1.7：Settings 默认模型、Review 修复与简化优化
+
+- **入口**：现有 `/settings → DSH` 新增 `Default model`／`Default model effort`，保留连续单页、同一主 Editor、搜索／滚动返回状态与原有当前模型／effort 操作。
+- **原生所有权**：两行对应同一个 `agent-default-model` 原生选择，通过 Settings 的 namespace／volatile field／revision 守卫一次修改 provider/model/effort；不写本地 `settings.json`，不读 Pi models/auth，不造每模型默认表或第二配置层。
+- **effort**：只列保存的默认模型实际支持的 native IDs；`Default` 执行 native unset，不把有效默认值存成显式 override。换模型只保留新模型仍支持的已存 effort，否则原生移除。思考文本显示偏好独立。
+- **行为与安全**：`/model`／`/effort` 继续沿用 DSH 同时选当前与提交默认的行为；新默认入口不选择 logged／CLI-pinned 会话。坏的旧 reasoning metadata 禁用 effort，但可通过原生模型名册修复默认；namespace／write path／runtime owner 不可证明时不假称可写。读取失败、冲突、被 overlay 拒绝和 read-back 不一致在原界面可见，不重试或写入本地替代值。
+- **呈现与竞态**：复用 ModelPicker 的可定制标题／`default` 标记和 SelectDialog，不加键位。刷新／错误期间不能选旧名册，旧 press、旧 attachment 与迟到 metadata 不可复活；成功反馈留在 Settings，不追加对话消息。
+- **验收**：新 App／native restart／Backend 专项 **43/43**；3 个原生场景通过真实临时 profile 保存 → 新 DSH 进程读取 → 原生 reset → 再次重启，并验证坏默认修复，正式文件每次运行包含 7 次原生启动且不创建 Agent／发送模型请求。新增正式回归 **59** 项，最终完整冻结 `pnpm check` **2831/2831**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo），全部 545 个 tracked/untracked 输入在运行前后相同；首轮旧权限导航 offset 的 2 项失败只修测试为稳定行 ID，原确认／不执行断言保留。详见 `docs/ACCEPTANCE.md`。
+- **P1 Review 修复**：裸 LF（Ctrl+J/`return`）不再在补全、列表、审批和 Tools find 字段中冒充 Enter；DecisionDialog／详情覆盖层的原生文本（含多选 label/description、proposal 路径）统一净化终端控制序列；`/effort` 空名册结束 loading；preset 默认写入对 roster 读取增加取消／超时 fence。新增回归后最终完整 `pnpm check` **2842/2842**（227 文件），首轮 2838/2838 与最终轮均冻结输入一致。
+- **P2 Review 修复**：tarball 补 `vendor/pi-tui/native`；App 缓冲 pre-ready session 事件、清理 Settings 返回态、去重 keybinding 警告、模型刷新进入 loading；SelectDialog/ModelPicker 在旧 roster + loading 时显示 `Refreshing…` 并禁用 Select，error 状态同样不留下死 chip；Settings 鼠标命中使用稳定 row id；历史 browsing 空 Ctrl+W/Ctrl+U/Backspace/Delete 不再退出；分片 paste 超时不再吞前缀，合成 Escape 不会中断 busy turn；默认模型 catalog failures 保留 native 文本，revision 在昂贵读取前提前检查。P2 首轮 **2860/2860**，review 补漏后 **2863/2863**，再补历史空删除与 synthetic Escape 后最终 **2865/2865**；各轮 545 输入冻结一致。
+- **简化与优化**：keymap context 绑定预编译并删除 44 项 `APP_FALLBACK_ACTIONS`；`TranscriptStore.items` 按 list/projection/session 记忆化，subagent 锚点改为一次遍历二分；`OutputTracker` 增量 total 与窗口索引；native-codec 每流增量 fold/join；12 处 `CLOSE_ACTIONS` 收敛；keybinding labels 去漂移；死 seam/boundaries/UI 导出与未使用 helper 清理；tsconfig 启用 `erasableSyntaxOnly`/`verbatimModuleSyntax`。最终完整 `pnpm check` **2881/2881**（227 文件，546 输入冻结一致）。
+- **整体 review 修复**：synthetic Escape 在 input 层消费；ModelPicker error 不再产生死 chip；pre-ready 只重放增量帧/decision 配额优先；坏 keybindings 错误签名去重；Settings 失败不再双写；catalog 读有界超时；坏旧 effort + 新模型 metadata 不可读时 unset 修复；重选当前默认模型成功无变化（`unchanged`）；compaction/execve/prebuild 收尾。启动 connect 提前的“优化”因 native acceptance 挂起已回退。最终完整 `pnpm check` **2905/2905**（227 文件，547 输入冻结一致）。
+- **版本边界**：版本/identity 更新为 `0.1.7`；按用户授权创建本地 release commit 和 annotated `v0.1.7` tag，并 push 到 `origin` main/tag；不发布 registry、不更换全局程序、不改依赖／lock／vendor 源。`v0.1.6` 历史保持不变。Schedule 继续暂缓。
+
 ## v0.1.6（本地 annotated tag）
 
 - **版本范围**：收录 v0.1.5 之后已验收的输入、原生能力、性能与 Review 修复；按用户授权创建本地版本提交与 `v0.1.6` tag，保持 `private:true`，不 push、不发布 registry、不更换全局程序。
