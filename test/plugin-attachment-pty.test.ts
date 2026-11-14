@@ -10,8 +10,8 @@ import { nativeDshManifest, nativeProfileFixture } from './helpers/native-profil
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const ALIAS = join(ROOT, 'bin/dsh-tui.mjs')
 const DRIVER = join(ROOT, 'scripts/pty-attachment-plugin.py')
-const APP = 'dsh-tui'
-const OLD_APP = ['dsh', 'pi', 'tui'].join('-')
+const APP = '@tarnish233/dsh-tui'
+const OLD_APP = 'dsh-tui'
 const OUTPUT = join(ROOT, '.cache/rename-attach/pty')
 const PRESERVED_PATCH = '[]\n# untouched native profile patch fixture\n'
 

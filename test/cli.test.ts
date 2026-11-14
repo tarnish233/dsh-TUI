@@ -28,9 +28,10 @@ test('compatibility alias help/version requires no DSH profile or terminal', () 
 
 test('package metadata and the shared application version agree', () => {
   const manifest: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.ok(manifest !== null && typeof manifest === 'object' && 'version' in manifest && 'private' in manifest)
+  assert.ok(manifest !== null && typeof manifest === 'object' && 'name' in manifest && 'version' in manifest && 'private' in manifest)
+  assert.equal(manifest.name, '@tarnish233/dsh-tui')
   assert.equal(manifest.version, VERSION, 'src/version.ts must move together with package.json')
-  assert.equal(manifest.private, true, 'a local version marker does not publish the package')
+  assert.equal(manifest.private, false, 'the public DSH plugin package must not be private')
 })
 
 test('default native profile remains dsh-tui by user decision', () => {

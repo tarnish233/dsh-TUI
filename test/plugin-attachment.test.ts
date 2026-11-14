@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { ensureNativeAttachment, type AttachmentOptions, type AttachmentRunResult, type NativeAttachmentApi } from '../src/plugin/attachment.ts'
 
-const APP = 'dsh-tui'
-const OLD_APP = ['dsh', 'pi', 'tui'].join('-')
+const APP = '@tarnish233/dsh-tui'
+const OLD_APP = 'dsh-tui'
 interface Document {
   dependencies: Record<string, string>
   dsh: { profile: { bundles: string[]; unrelated: string } }

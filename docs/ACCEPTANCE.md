@@ -1,5 +1,15 @@
 # 原生 DSH 边界与交互语义验收
 
+## v0.1.8：npm 公开发布
+
+v0.1.7 功能冻结后，按用户授权准备 DSH 插件公开发布。
+
+- **包身份**：npm 包 `@tarnish233/dsh-tui`，`private:false`，`publishConfig.access:'public'`；`cordis.patch.yml` 的 startup/main 行与 `assets/launcher.patch.yml` 的 launcher-check 行使用同一 scoped name。默认 profile、`dsh-tui` 命令、Cordis 服务名和配置目录不变。
+- **升级路径**：本地旧 `dsh-tui` link 仍按既有“先 add 新身份、成功后再 remove 旧别名”路径迁移；另一个来源占用同名包、明确禁用 bundle 或其他前端仍不会被覆盖。
+- **打包**：`npm publish --dry-run` 生成 `@tarnish233/dsh-tui@0.1.8`，391 files，1.3 MB tarball / 5.0 MB unpacked；包含编译入口、vendored dist、三平台 prebuild、patch 与许可证。
+- **验证**：包身份、旧依赖迁移、launcher patch 与 tarball 内容的聚焦回归已更新；完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，598290ms，EXIT 0），547 个 tracked/untracked 输入前后一致。首轮 2904/2905 仅 `test/app.test.ts` 的 `/reload` 旧文案断言未匹配稳定输出 “Keybindings were not applied”；修正断言后复跑通过。证据 `.cache/publish/{before2.sha256,full-check.log,after2.sha256}`。
+- **边界**：没有运行时功能变更；没有发布到 `@deepseek-ai` scope；没有替换全局程序，也没有读写真实用户 profile/credentials/session。
+
 ## v0.1.7：简化/优化与整体 review
 
 在 P2 修复之上完成简化/优化，并做四路只读 review。版本为 `0.1.7/private:true`；按用户授权创建 release commit、annotated `v0.1.7` tag 并 push 到 `origin`。

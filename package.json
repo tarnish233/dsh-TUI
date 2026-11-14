@@ -1,10 +1,29 @@
 {
-  "name": "dsh-tui",
-  "version": "0.1.7",
-  "private": true,
+  "name": "@tarnish233/dsh-tui",
+  "version": "0.1.8",
+  "private": false,
   "description": "A native DeepSeek Harness terminal application plugin, using a vendored Pi TUI.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tarnish233/dsh-TUI.git"
+  },
+  "homepage": "https://github.com/tarnish233/dsh-TUI#readme",
+  "bugs": {
+    "url": "https://github.com/tarnish233/dsh-TUI/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "tui",
+    "terminal",
+    "cordis"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "imports": {
     "#pi-tui": "./vendor/pi-tui/dist/index.js",
     "#pi-tui/package.json": "./vendor/pi-tui/package.json",

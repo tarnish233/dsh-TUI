@@ -291,7 +291,7 @@ test('keyboard help lives in Settings; /reload applies TUI resources and keeps t
     await f.app.submit('/reload')
     assert.deepEqual(f.app.keymap.getBindings('app.model.select'), ['ctrl+x ctrl+m'])
     const notices = f.app.store.items.slice(before).filter(item => item.kind === 'notice').map(item => item.text).join('\n')
-    assert.match(notices, /Keybindings not applied/)
+    assert.match(notices, /Keybindings were not applied/)
     assert.match(notices, /TUI reloaded/)
 
     await writeFile(join(f.directory, 'keybindings.json'), JSON.stringify({ 'app.model.select': 'ctrl+x ctrl+d' }))

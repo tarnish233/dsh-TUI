@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const APPLICATION = 'dsh-tui'
+const APPLICATION = '@tarnish233/dsh-tui'
 const PACKAGE_DIR = fileURLToPath(new URL('../../', import.meta.url))
 const OTHER_FRONTENDS = new Set([
   '@deepseek-harness-tui/dsh-tui', '@deepseek-ai/dsh-web-app',

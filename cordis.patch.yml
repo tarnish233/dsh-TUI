@@ -75,6 +75,6 @@
     - id: dsh-tui-session-stats
       name: '@deepseek-ai/dsh-session-stats'
     - id: dsh-tui-startup
-      name: 'dsh-tui/startup'
+      name: '@tarnish233/dsh-tui/startup'
     - id: dsh-tui
-      name: 'dsh-tui'
+      name: '@tarnish233/dsh-tui'

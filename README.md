@@ -1,20 +1,35 @@
-# DSH TUI · v0.1.7
+# DSH TUI · v0.1.8
 
 ![DSH TUI app icon](assets/icon/dsh-tui.svg)
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.7**（`private: true`）。问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
+当前版本为 **v0.1.8**，npm 包为 `@tarnish233/dsh-tui`（public），GitHub 仓库标记 `dsh-plugin` topic。DSH 官方插件市场截至 2026-11-14 尚未开放第三方提交；本版本按官方 bundle 规范发布到 npm，官方市场上线后可直接从该来源收录。默认 profile 与命令名仍是 `dsh-tui`，功能范围与 v0.1.7 一致。
 
-本版本收录 v0.1.6 之后的 **Default model / Default model effort**、P1/P2 Review 修复和输入/渲染/会话状态简化优化：`/settings → DSH` 直接读写 DSH 原生默认选择；Ctrl+J/LF 与决策面板转义注入、preset 写入取消、pre-ready 事件、packing prebuild、历史空删除/分片 paste、catalog failure/revision 等均已收口。最终完整 `pnpm check` **2905/2905**（227 测试文件）。完整边界与验收见 [默认模型设置](docs/MODEL-DEFAULT-SETTINGS.md) 与 [验收记录](docs/ACCEPTANCE.md)。按用户授权，创建版本提交、annotated `v0.1.7` tag 并 push 到 `origin`；不发布包、不更换全局程序。构建后退出旧 TUI，再运行 `dsh-tui` 即可加载新版本；`dsh-tui --version` 应为 `0.1.7`。
+问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
+
+v0.1.7 收录 **Default model / Default model effort**、P1/P2 Review 修复和输入/渲染/会话状态简化优化：`/settings → DSH` 直接读写 DSH 原生默认选择；Ctrl+J/LF 与决策面板转义注入、preset 写入取消、pre-ready 事件、packing prebuild、历史空删除/分片 paste、catalog failure/revision 等均已收口。完整边界与验收见 [默认模型设置](docs/MODEL-DEFAULT-SETTINGS.md) 与 [验收记录](docs/ACCEPTANCE.md)。v0.1.8 仅做公开发布准备：npm 包名改为 `@tarnish233/dsh-tui`、移除 `private`、同步 bundle patch／launcher assertion，并发布 npm／GitHub topic；不更换全局程序。完整 `pnpm check` **2905/2905**（227 文件，598290ms，EXIT 0），547 个输入前后一致；首轮 2904/2905 是 `test/app.test.ts` 旧提示文案断言，修正后复跑通过。
 
 Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
 
 **现场问题边界：** 用户报告的退出卡住仍未确认具体触发步骤。当前工作树已用真实 native plugin PTY 故障注入验证并修复“本地清理卡住会延后 native 退出请求”的缺口；它复用 DSH 既有退出保护，不把历史现场问题的根因或全部退出故障标成已解决。
 
-## 安装与启动（当前本机边界）
+## 安装与启动
 
-需要 Node >= 24.9 与 DSH `0.2.2-rc.1`（与原生 DSH 的最低 Node 要求一致）。插件装载的是编译后的 `lib/*.js`，构建产物（`lib/`、`vendor/pi-tui/dist/`）不提交到仓库，首次使用或有源码变更后需要先构建：
+需要 Node >= 24.9 与 DSH `0.2.2-rc.1`（与原生 DSH 的最低 Node 要求一致）。
+
+### 从 npm 安装
+
+```bash
+dsh plugin --profile dsh-tui add @tarnish233/dsh-tui
+dsh --profile dsh-tui
+```
+
+tarball 已包含编译后的 `lib/*.js`、vendored Pi TUI dist 与三平台 native prebuilds，安装时不需要项目源码或本地构建。`dsh-tui` 兼容别名仍可用于本机源码开发；npm 用户直接使用原生 `dsh --profile dsh-tui` 即可。
+
+### 本地源码开发
+
+插件装载的是编译后的 `lib/*.js`，构建产物（`lib/`、`vendor/pi-tui/dist/`）不提交到仓库，首次使用或有源码变更后需要先构建：
 
 ```bash
 cd /Users/fulei/workspace/dsh-tui
@@ -33,7 +48,7 @@ dsh-tui
 - **默认 fullscreen。** 要主屏/终端 scrollback 才用 `dsh-tui --inline`。显式保存的 screen 偏好仍然生效，`--inline`/`--fullscreen` 可覆盖它。
 - **原生同进程入口。** 本机 `/opt/homebrew/bin/dsh-tui` 软链仍指向项目 `bin`，不需要更换全局可执行文件。包检查/挂载完成后别名委托 native `dsh`，并通过一层原生 startup assertion 验证终端真的激活；不是私有 backend、profile 镜像或第二套启动树。
 - **其他 profile。** `dsh-tui --profile <name>` 对指定 profile 做相同安全检查；不会自动关闭它原有的前端。`--dsh` 指向原生 DSH launcher，不能是无法定位公开 SDK 的任意 shell wrapper。
-- **仍可手动用 DSH 管理。** `dsh plugin --profile dsh-tui add /Users/fulei/workspace/dsh-tui` 是可选的显式安装方式。之后也可直接 `dsh --profile dsh-tui`；原生 `dsh` 本身不会替一个尚未包含本插件的 profile 做 TUI 的自动挂载。
+- **仍可手动用 DSH 管理。** npm 安装使用 `dsh plugin --profile dsh-tui add @tarnish233/dsh-tui`；本地开发使用 `dsh plugin --profile dsh-tui add /Users/fulei/workspace/dsh-tui`。之后也可直接 `dsh --profile dsh-tui`；原生 `dsh` 本身不会替一个尚未包含本插件的 profile 做 TUI 的自动挂载。
 - 通过 native DSH 启动时，应用版本参数要越过 launcher 边界：`dsh --profile dsh-tui -- --version`。裸 `--version` 属于 DSH 启动器。直接运行别名时 `dsh-tui --version` 由别名自身处理。
 - `dsh-tui` 在 POSIX 上用 `process.execve` 把自己替换成 native `dsh`：TUI 与 DSH 处于同一进程，没有前端/后端 IPC 或 supervisor。没有 `execve` 的平台只做整应用委托（spawn native dsh），不保留 TUI 壳层。宿主拒绝替换（sandbox/权限/缺少 `/usr/bin/env`）时也回落到同一条子进程委托路径，只输出一行受控提示，不冒泡原始原生错误或堆栈。
 
@@ -192,7 +207,7 @@ pnpm check          # build + typecheck + test
 
 ## 已知边界
 
-- 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。
+- 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本地应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。npm publish、GitHub topic/release 与 v0.1.8 版本提交是本轮用户明确授权的发布动作；不安装或替换全局可执行文件。
 - Pi 式 TUI 扩展热插拔暂未纳入；`/reload` 只做 native HMR 配置重组合，不重载 TUI 核心源码。
 - 模型能力、上下文、推理级别与网关参数以 DSH 原生目录为准；TUI 不推断或另存第二份模型定义。默认模型持久化归宿主 ConfigEditor；兼容 setter 不以 fulfilled promise 冒称落盘，显式 Settings 写入则核验 native revision/read-back。临时 profile 重启验收不代表可以绕过只读 composition 或 home／CLI overlay 的原生拒绝。
 - 历史恢复有事件数/UTF-8 字节预算，截断会提示；完整持久日志仍在 DSH 数据 home。工具耗时包含审批/策略等待，不另抓取逐行输出；大 Diff 超预算时提示并保留完整 Before/After 源。

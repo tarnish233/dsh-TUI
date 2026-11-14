@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 
 const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
+const APP_PACKAGE = '@tarnish233/dsh-tui'
 const require = createRequire(import.meta.url)
 
 export interface NativeProfileFixture {
@@ -51,11 +52,11 @@ export async function nativeProfileFixture(patch = '[]\n'): Promise<NativeProfil
   const profileDir = join(home, 'profiles/dsh-tui')
   try {
     await mkdir(cwd, { recursive: true })
-    boot.initProfile(profileDir, ['@deepseek-ai/dsh-base', 'dsh-tui'])
+    boot.initProfile(profileDir, ['@deepseek-ai/dsh-base', APP_PACKAGE])
     const profile = boot.readProfileManifest('dsh-test', profileDir)
-    boot.writeProfileManifest(profileDir, { ...profile, dependencies: { 'dsh-tui': `link:${PROJECT}` } })
-    await mkdir(join(profileDir, 'node_modules'), { recursive: true })
-    await symlink(PROJECT, join(profileDir, 'node_modules/dsh-tui'), 'dir')
+    boot.writeProfileManifest(profileDir, { ...profile, dependencies: { [APP_PACKAGE]: `link:${PROJECT}` } })
+    await mkdir(join(profileDir, 'node_modules/@tarnish233'), { recursive: true })
+    await symlink(PROJECT, join(profileDir, 'node_modules/@tarnish233/dsh-tui'), 'dir')
     await writeFile(join(profileDir, 'cordis.patch.yml'), patch)
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,

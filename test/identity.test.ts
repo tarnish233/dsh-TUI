@@ -26,9 +26,12 @@ test('the application has one package, command, service and source identity', ()
     for (const name of RETIRED) assert.ok(!source.includes(name), `${path.slice(ROOT.length)} retains an old application identity`)
   }
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
-    name?: unknown; bin?: unknown; exports?: Record<string, unknown>; imports?: Record<string, unknown>
+    name?: unknown; private?: unknown; bin?: unknown; exports?: Record<string, unknown>; imports?: Record<string, unknown>;
+    publishConfig?: { access?: unknown }
   }
-  assert.equal(manifest.name, 'dsh-tui')
+  assert.equal(manifest.name, '@tarnish233/dsh-tui')
+  assert.equal(manifest.private, false, 'the npm plugin package must be publicly installable')
+  assert.equal(manifest.publishConfig?.access, 'public')
   assert.deepEqual(manifest.bin, { 'dsh-tui': './bin/dsh-tui.mjs' })
   assert.ok(manifest.exports?.['./startup'])
   assert.ok(manifest.exports?.['./launcher-check'])
@@ -38,13 +41,15 @@ test('the application has one package, command, service and source identity', ()
 
 test('native bundle entries and lifecycle services use the same application identity', () => {
   const patch = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8')
+  const launcher = readFileSync(join(ROOT, 'assets/launcher.patch.yml'), 'utf8')
   const options = readFileSync(join(ROOT, 'src/plugin/options.ts'), 'utf8')
   const plugin = readFileSync(join(ROOT, 'src/plugin/index.ts'), 'utf8')
   const startup = readFileSync(join(ROOT, 'src/plugin/startup.ts'), 'utf8')
   assert.match(patch, /id: file-reference-local\s+name: '@deepseek-ai\/dsh-file-reference-local'/)
   assert.doesNotMatch(patch, /@deepseek-ai\/dsh-client-ui-reference/, 'the terminal mounts the Host provider, never the Web frontend')
-  assert.match(patch, /name: 'dsh-tui\/startup'/)
-  assert.match(patch, /name: 'dsh-tui'/)
+  assert.match(patch, /name: '@tarnish233\/dsh-tui\/startup'/)
+  assert.match(patch, /name: '@tarnish233\/dsh-tui'/)
+  assert.match(launcher, /name: '@tarnish233\/dsh-tui\/launcher-check'/)
   assert.match(options, /STARTUP_SERVICE = 'dshTuiStartup'/)
   assert.match(plugin, /provide = 'dshTui'/)
   assert.match(startup, /ctx\.get\('dshTui'\)/)

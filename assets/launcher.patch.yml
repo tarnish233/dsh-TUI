@@ -1,5 +1,5 @@
 # Startup assertion only. Native DSH still composes and owns the selected profile.
 - insert:
     - id: dsh-tui-launcher-check
-      name: 'dsh-tui/launcher-check'
+      name: '@tarnish233/dsh-tui/launcher-check'
       required: true

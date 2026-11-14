@@ -40,7 +40,10 @@ metadata 返回后会重新校验 pending/live 路由与 attachment identity，�
 默认 profile 仍是 `dsh-tui`。生产启动由 native DSH launcher 完成，本插件只是该 profile 组合的一部分：
 
 ```bash
-# 首次安装（用户自行执行；本轮未改真实安装）
+# npm 安装（推荐）
+dsh plugin --profile dsh-tui add @tarnish233/dsh-tui
+
+# 本地源码安装（开发）
 dsh plugin --profile dsh-tui add /Users/fulei/workspace/dsh-tui
 
 # 启动

@@ -1,6 +1,6 @@
 # DSH TUI integration contract
 
-Application/package/entry identity is `dsh-tui`. Read `AGENTS.md` and `docs/PROPOSAL.zh-CN.md`, especially section 5. The upstream vendored package remains Pi TUI and every app import goes through `#pi-tui`.
+Application/command identity is `dsh-tui`; the public npm package is `@tarnish233/dsh-tui`. Read `AGENTS.md` and `docs/PROPOSAL.zh-CN.md`, especially section 5. The upstream vendored package remains Pi TUI and every app import goes through `#pi-tui`.
 
 ## Native application
 

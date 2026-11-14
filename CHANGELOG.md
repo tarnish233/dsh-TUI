@@ -1,5 +1,13 @@
 # 版本记录
 
+## v0.1.8：npm 公开发布
+
+- **发布身份**：npm 包改为 `@tarnish233/dsh-tui`（原 `dsh-tui` 已被另一项目占用），移除 `private`，bundle patch 与 launcher assertion 同步 scoped package name；默认 profile、命令名与服务名仍为 `dsh-tui`。
+- **发布内容**：tarball 只包含编译后的 `lib/`、vendored Pi TUI dist、三平台 native prebuilds、bundle patch 与第三方许可证；不含应用/native 源码或构建脚本。
+- **分发**：GitHub 仓库标记 `dsh-plugin` topic，并创建与 npm 版本对应的 release/tag。DSH 官方插件市场截至 2026-11-14 尚未上线，当前按官方 bundle 规范以 npm 公开包 + topic 作为发现与安装路径。
+- **验证**：完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，598290ms，EXIT 0）；547 个 tracked/untracked 输入前后一致。首轮 2904/2905 仅 `test/app.test.ts` 的 `/reload` 旧文案断言未匹配稳定输出 “Keybindings were not applied”，修正断言后复跑通过。证据 `.cache/publish/{before2.sha256,full-check.log,after2.sha256}`。
+- **边界**：不发布到 `@deepseek-ai` scope、不替换全局可执行文件、不修改用户 profile/credentials/session；npm 发布使用用户明确授权的账号与公开包。
+
 ## v0.1.7：Settings 默认模型、Review 修复与简化优化
 
 - **入口**：现有 `/settings → DSH` 新增 `Default model`／`Default model effort`，保留连续单页、同一主 Editor、搜索／滚动返回状态与原有当前模型／effort 操作。
