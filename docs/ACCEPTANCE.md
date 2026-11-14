@@ -15,13 +15,13 @@
 
 ## v0.1.9：未公开的暂存候选
 
-0.1.8 registry 传播延迟期间按 phantom-stage 误判提升的候选。stage id `e55612ac-1522-4aff-a7af-22a144456144`，391 files，1,251,358 B tarball / 5,040,611 B unpacked；下载检查确认 `bin/dsh-tui.mjs` 和 `lib/version.js=0.1.9` 存在，但同样没有六个 native prebuilds，README 记录也已被 0.1.10 取代。没有 approve、没有 GitHub tag/release，不构成公开版本。
+0.1.8 registry 传播延迟期间按 phantom-stage 误判提升的候选。stage id `e55612ac-1522-4aff-a7af-22a144456144`，391 files，1,251,358 B tarball / 5,040,611 B unpacked；下载检查确认 `bin/dsh-tui.mjs` 和 `lib/version.js=0.1.9` 存在，但同样没有六个 native prebuilds，README 记录也已被 0.1.10 取代。没有 approve、没有 GitHub tag/release，不构成公开版本；stage 已 reject，`npm view @tarnish233/dsh-tui@0.1.9` 返回 404。
 
 ## v0.1.8：npm 公开发布（prebuild 缺失）
 
 v0.1.7 功能冻结后，按用户授权准备 DSH 插件公开发布。
 
-- **npm 状态**：0.1.8 于 2026-11-14T08:16:27Z 公开，初始 `latest` 指向它；registry 读路径曾短暂 404，随后可见。npm 同时保留 staged-publishing 的 `0.0.0-stage` 占位版本。
+- **npm 状态**：0.1.8 于 2026-11-14T08:16:27Z 公开，初始 `latest` 指向它；registry 读路径曾短暂 404，随后可见。npm 同时保留 staged-publishing 的 `0.0.0-stage` 占位版本。0.1.8 现已标记 deprecated：`0.1.8 tarball is missing native prebuilds; install 0.1.10 or newer`。
 - **包身份**：npm 包 `@tarnish233/dsh-tui`，`private:false`，`publishConfig.access:'public'`；`cordis.patch.yml` 的 startup/main 行与 `assets/launcher.patch.yml` 的 launcher-check 行使用同一 scoped name。默认 profile、`dsh-tui` 命令、Cordis 服务名和配置目录不变。
 - **升级路径**：本地旧 `dsh-tui` link 仍按既有“先 add 新身份、成功后再 remove 旧别名”路径迁移；另一个来源占用同名包、明确禁用 bundle 或其他前端仍不会被覆盖。
 - **打包缺陷**：`npm pack` 生成的 tarball 为 391 files、约 1.25 MB，但不含 `vendor/pi-tui/native/*/prebuilds` 的六个 `.node`；当时 `test/package-pack.test.ts` 只走 `pnpm pack`，未覆盖 npm 的 publish packlist。0.1.10 修复并补回归。

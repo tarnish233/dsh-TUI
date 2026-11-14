@@ -4,7 +4,7 @@
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.10**，npm 包为 `@tarnish233/dsh-tui`（public），GitHub 仓库标记 `dsh-plugin` topic。DSH 官方插件市场截至 2026-11-14 尚未开放第三方提交；本版本按官方 bundle 规范发布到 npm，官方市场上线后可直接从该来源收录。默认 profile 与命令名仍是 `dsh-tui`。v0.1.8 已公开，但 npm 的 publish packlist 漏掉了 `vendor/pi-tui/native/*/prebuilds` 中的六个 native prebuilds；v0.1.10 改用三个显式平台 prebuild 目录修复，并用 npm packlist 回归覆盖。0.1.9 只是传播延迟期间暂存的候选，没有公开。
+当前版本为 **v0.1.10**，npm 包为 `@tarnish233/dsh-tui`（public），GitHub 仓库标记 `dsh-plugin` topic。DSH 官方插件市场截至 2026-11-14 尚未开放第三方提交；本版本按官方 bundle 规范发布到 npm，官方市场上线后可直接从该来源收录。默认 profile 与命令名仍是 `dsh-tui`。v0.1.8 已公开，但 npm 的 publish packlist 漏掉了 `vendor/pi-tui/native/*/prebuilds` 中的六个 native prebuilds，现已在 registry 标记为 deprecated；v0.1.10 改用三个显式平台 prebuild 目录修复，并用 npm packlist 回归覆盖。0.1.9 只是传播延迟期间暂存的候选，没有公开，stage 已 reject。
 
 问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
 
