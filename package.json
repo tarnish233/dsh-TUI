@@ -1,6 +1,6 @@
 {
   "name": "@tarnish233/dsh-tui",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "private": false,
   "description": "A native DeepSeek Harness terminal application plugin, using a vendored Pi TUI.",
   "type": "module",
@@ -50,7 +50,9 @@
     "bin",
     "assets",
     "vendor/pi-tui/dist",
-    "vendor/pi-tui/native/*/prebuilds",
+    "vendor/pi-tui/native/darwin/prebuilds",
+    "vendor/pi-tui/native/linux/prebuilds",
+    "vendor/pi-tui/native/win32/prebuilds",
     "vendor/pi-tui/package.json",
     "vendor/pi-tui/LICENSE",
     "vendor/pi-tui/SOURCE.md",

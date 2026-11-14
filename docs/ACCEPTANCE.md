@@ -1,12 +1,30 @@
 # 原生 DSH 边界与交互语义验收
 
-## v0.1.8：npm 公开发布
+## v0.1.10：npm prebuild 打包修复
+
+0.1.8 已公开，但检查 registry tarball 发现它没有六个 native prebuilds。0.1.8 和暂存的 0.1.9 都存在同一个 npm packlist 缺陷；0.1.10 修复后重新发布。
+
+- **问题定位**：`files: "vendor/pi-tui/native/*/prebuilds"` 在 `pnpm pack` 中匹配嵌套 `.node`，但在 npm 的 publish packlist 中不匹配；因此实际 `npm publish` 的 391-file tarball 只有 vendored dist，没有 native clipboard 预构建。
+- **修复**：`files` 改为 `vendor/pi-tui/native/{darwin,linux,win32}/prebuilds` 三个显式目录；仍只发布预构建 `.node`，不包含 native 源码、头文件或构建脚本。
+- **回归**：`test/package-pack.test.ts` 保留 source-only `pnpm pack` 构建检查，并新增 `npm pack --ignore-scripts` 对实际 publish packlist 的检查；临时恢复旧 glob 时新断言失败，修复后通过。
+- **发布身份**：npm 包 `@tarnish233/dsh-tui`，版本 `0.1.10`，`private:false`，`publishConfig.access:'public'`；`cordis.patch.yml` 的 startup/main 行与 `assets/launcher.patch.yml` 的 launcher-check 行使用同一 scoped name。默认 profile、`dsh-tui` 命令、Cordis 服务名和配置目录不变。
+- **发布路径**：`npm stage publish` 后由维护者以 2FA `npm stage approve` 公开；npm `latest` 已指向 `0.1.10`。tarball 只包含编译入口、vendored dist、三平台 prebuild、patch 与许可证。
+- **发布核验**：registry tarball 为 397 files，1,280,039 B / 5,218,910 B unpacked，包含六个 native prebuilds、`bin/dsh-tui.mjs` 与 `lib/version.js=0.1.10`；临时 DSH profile 执行 `dsh plugin --profile smoke add @tarnish233/dsh-tui@0.1.10` 成功，安装后的应用 `--version` 为 `0.1.10`，prebuild 数量为 6。
+- **验证**：完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，576161ms，EXIT 0），547 个 tracked/untracked 输入前后一致；证据 `.cache/release-v0.1.10/{before.sha256,full-check.log,after.sha256}`。门禁后只补 README／CHANGELOG／本验收文件，未改产品源码或测试。
+- **边界**：没有运行时功能变更；没有发布到 `@deepseek-ai` scope；没有替换全局程序，也没有读写真实用户 profile/credentials/session。
+
+## v0.1.9：未公开的暂存候选
+
+0.1.8 registry 传播延迟期间按 phantom-stage 误判提升的候选。stage id `e55612ac-1522-4aff-a7af-22a144456144`，391 files，1,251,358 B tarball / 5,040,611 B unpacked；下载检查确认 `bin/dsh-tui.mjs` 和 `lib/version.js=0.1.9` 存在，但同样没有六个 native prebuilds，README 记录也已被 0.1.10 取代。没有 approve、没有 GitHub tag/release，不构成公开版本。
+
+## v0.1.8：npm 公开发布（prebuild 缺失）
 
 v0.1.7 功能冻结后，按用户授权准备 DSH 插件公开发布。
 
+- **npm 状态**：0.1.8 于 2026-11-14T08:16:27Z 公开，初始 `latest` 指向它；registry 读路径曾短暂 404，随后可见。npm 同时保留 staged-publishing 的 `0.0.0-stage` 占位版本。
 - **包身份**：npm 包 `@tarnish233/dsh-tui`，`private:false`，`publishConfig.access:'public'`；`cordis.patch.yml` 的 startup/main 行与 `assets/launcher.patch.yml` 的 launcher-check 行使用同一 scoped name。默认 profile、`dsh-tui` 命令、Cordis 服务名和配置目录不变。
 - **升级路径**：本地旧 `dsh-tui` link 仍按既有“先 add 新身份、成功后再 remove 旧别名”路径迁移；另一个来源占用同名包、明确禁用 bundle 或其他前端仍不会被覆盖。
-- **打包**：`npm publish --dry-run` 生成 `@tarnish233/dsh-tui@0.1.8`，391 files，1.3 MB tarball / 5.0 MB unpacked；包含编译入口、vendored dist、三平台 prebuild、patch 与许可证。
+- **打包缺陷**：`npm pack` 生成的 tarball 为 391 files、约 1.25 MB，但不含 `vendor/pi-tui/native/*/prebuilds` 的六个 `.node`；当时 `test/package-pack.test.ts` 只走 `pnpm pack`，未覆盖 npm 的 publish packlist。0.1.10 修复并补回归。
 - **验证**：包身份、旧依赖迁移、launcher patch 与 tarball 内容的聚焦回归已更新；完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，598290ms，EXIT 0），547 个 tracked/untracked 输入前后一致。首轮 2904/2905 仅 `test/app.test.ts` 的 `/reload` 旧文案断言未匹配稳定输出 “Keybindings were not applied”；修正断言后复跑通过。证据 `.cache/publish/{before2.sha256,full-check.log,after2.sha256}`。
 - **边界**：没有运行时功能变更；没有发布到 `@deepseek-ai` scope；没有替换全局程序，也没有读写真实用户 profile/credentials/session。
 

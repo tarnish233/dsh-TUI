@@ -1,10 +1,25 @@
 # 版本记录
 
-## v0.1.8：npm 公开发布
+## v0.1.10：修复 npm prebuild 打包
 
+- **问题**：0.1.8 已于 2026-11-14T08:16:27Z 公开发布，但检查 registry tarball 发现 391 files 中没有六个 native prebuilds。`files: "vendor/pi-tui/native/*/prebuilds"` 在 `pnpm pack` 中生效，在 npm 的 publish packlist 中不匹配嵌套 `.node`；0.1.8 因此缺少 native clipboard 预构建。早期 registry 传播延迟造成 404/409，期间暂存的 0.1.9 候选有同样缺陷，未公开并作废。
+- **修复**：`files` 改为 `vendor/pi-tui/native/{darwin,linux,win32}/prebuilds` 三个显式目录；仍只发布预构建 `.node`，不包含 native 源码、头文件或构建脚本。
+- **回归**：`test/package-pack.test.ts` 保留 source-only `pnpm pack` 构建检查，并新增 `npm pack --ignore-scripts` 对实际 publish packlist 的检查；临时恢复旧 glob 时新断言失败，修复后通过。
+- **发布身份**：包版本 `0.1.10`，npm 包 `@tarnish233/dsh-tui`（public）；bundle patch／launcher assertion 与 package 名一致；默认 profile、命令名与服务名仍为 `dsh-tui`。已通过 staged publish + 2FA approve 发布，npm `latest` 指向 `0.1.10`。
+- **发布核验**：registry tarball 为 397 files，1,280,039 B / 5,218,910 B unpacked，包含六个 native prebuilds、`bin/dsh-tui.mjs` 与 `lib/version.js=0.1.10`；临时 DSH profile 执行 `dsh plugin --profile smoke add @tarnish233/dsh-tui@0.1.10` 成功，安装后的应用 `--version` 为 `0.1.10`，prebuild 数量为 6。
+- **验证**：完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，576161ms，EXIT 0）；547 个 tracked/untracked 输入前后一致。证据 `.cache/release-v0.1.10/{before.sha256,full-check.log,after.sha256}`。
+- **边界**：没有运行时行为变更；不发布到 `@deepseek-ai` scope、不替换全局可执行文件、不修改用户 profile/credentials/session。0.1.8 的 prebuild 缺失在 0.1.10 修复；旧版本不再作为推荐安装。
+
+## v0.1.9：未公开的暂存候选
+
+- 0.1.8 registry 传播延迟期间按 phantom-stage 误判提升的候选；stage id `e55612ac-1522-4aff-a7af-22a144456144`，391 files，同样缺少 native prebuilds，README 记录也已被 0.1.10 取代。没有 approve、没有 GitHub tag/release，不构成公开版本。
+
+## v0.1.8：npm 公开发布（prebuild 缺失）
+
+- **npm 状态**：0.1.8 于 2026-11-14T08:16:27Z 公开，初始 `latest` 指向它；registry 读路径曾短暂 404，随后可见。npm 同时保留 staged-publishing 的 `0.0.0-stage` 占位版本。
 - **发布身份**：npm 包改为 `@tarnish233/dsh-tui`（原 `dsh-tui` 已被另一项目占用），移除 `private`，bundle patch 与 launcher assertion 同步 scoped package name；默认 profile、命令名与服务名仍为 `dsh-tui`。
-- **发布内容**：tarball 只包含编译后的 `lib/`、vendored Pi TUI dist、三平台 native prebuilds、bundle patch 与第三方许可证；不含应用/native 源码或构建脚本。
-- **分发**：GitHub 仓库标记 `dsh-plugin` topic，并创建与 npm 版本对应的 release/tag。DSH 官方插件市场截至 2026-11-14 尚未上线，当前按官方 bundle 规范以 npm 公开包 + topic 作为发现与安装路径。
+- **分发**：GitHub 仓库标记 `dsh-plugin` topic，并创建与 0.1.8 对应的 release/tag。DSH 官方插件市场截至 2026-11-14 尚未上线，当前按官方 bundle 规范以 npm 公开包 + topic 作为发现与安装路径。
+- **打包缺陷**：发布 tarball 为 391 files、约 1.25 MB，但未包含六个 native prebuilds；`test/package-pack.test.ts` 当时只走 `pnpm pack`，没有覆盖 npm 的 publish packlist。0.1.10 修复并补回归。
 - **验证**：完整冻结 `pnpm check` **2905/2905**（227 文件，build＋strict TypeScript，0 fail/cancel/skip/todo，598290ms，EXIT 0）；547 个 tracked/untracked 输入前后一致。首轮 2904/2905 仅 `test/app.test.ts` 的 `/reload` 旧文案断言未匹配稳定输出 “Keybindings were not applied”，修正断言后复跑通过。证据 `.cache/publish/{before2.sha256,full-check.log,after2.sha256}`。
 - **边界**：不发布到 `@deepseek-ai` scope、不替换全局可执行文件、不修改用户 profile/credentials/session；npm 发布使用用户明确授权的账号与公开包。
 

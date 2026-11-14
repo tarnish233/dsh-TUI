@@ -1,14 +1,14 @@
-# DSH TUI · v0.1.8
+# DSH TUI · v0.1.10
 
 ![DSH TUI app icon](assets/icon/dsh-tui.svg)
 
 **DeepSeek Harness 的原生同进程终端应用插件。** Agent、模型、认证、工具、权限、preset、会话与持久化全部归 DSH；本仓库提供 CC 风格终端界面，并 vendored Pi TUI 作为终端/输入组件。它不是另一个 Harness，也不是独立后端。
 
-当前版本为 **v0.1.8**，npm 包为 `@tarnish233/dsh-tui`（public），GitHub 仓库标记 `dsh-plugin` topic。DSH 官方插件市场截至 2026-11-14 尚未开放第三方提交；本版本按官方 bundle 规范发布到 npm，官方市场上线后可直接从该来源收录。默认 profile 与命令名仍是 `dsh-tui`，功能范围与 v0.1.7 一致。
+当前版本为 **v0.1.10**，npm 包为 `@tarnish233/dsh-tui`（public），GitHub 仓库标记 `dsh-plugin` topic。DSH 官方插件市场截至 2026-11-14 尚未开放第三方提交；本版本按官方 bundle 规范发布到 npm，官方市场上线后可直接从该来源收录。默认 profile 与命令名仍是 `dsh-tui`。v0.1.8 已公开，但 npm 的 publish packlist 漏掉了 `vendor/pi-tui/native/*/prebuilds` 中的六个 native prebuilds；v0.1.10 改用三个显式平台 prebuild 目录修复，并用 npm packlist 回归覆盖。0.1.9 只是传播延迟期间暂存的候选，没有公开。
 
 问卷、审批、历史搜索与短选择／输入按用途放到编辑框上方，完整浏览／管理页保留独立面板；主输入采用 **Pi 式 Ctrl+C**：一次清空并保留可恢复草稿，后台继续，500ms 内再按退出。Esc 保留局部优先与原生中断；弹窗内 Ctrl+C 只取消／拒绝当前交互。
 
-v0.1.7 收录 **Default model / Default model effort**、P1/P2 Review 修复和输入/渲染/会话状态简化优化：`/settings → DSH` 直接读写 DSH 原生默认选择；Ctrl+J/LF 与决策面板转义注入、preset 写入取消、pre-ready 事件、packing prebuild、历史空删除/分片 paste、catalog failure/revision 等均已收口。完整边界与验收见 [默认模型设置](docs/MODEL-DEFAULT-SETTINGS.md) 与 [验收记录](docs/ACCEPTANCE.md)。v0.1.8 仅做公开发布准备：npm 包名改为 `@tarnish233/dsh-tui`、移除 `private`、同步 bundle patch／launcher assertion，并发布 npm／GitHub topic；不更换全局程序。完整 `pnpm check` **2905/2905**（227 文件，598290ms，EXIT 0），547 个输入前后一致；首轮 2904/2905 是 `test/app.test.ts` 旧提示文案断言，修正后复跑通过。
+v0.1.7 收录 **Default model / Default model effort**、P1/P2 Review 修复和输入/渲染/会话状态简化优化：`/settings → DSH` 直接读写 DSH 原生默认选择；Ctrl+J/LF 与决策面板转义注入、preset 写入取消、pre-ready 事件、packing prebuild、历史空删除/分片 paste、catalog failure/revision 等均已收口。完整边界与验收见 [默认模型设置](docs/MODEL-DEFAULT-SETTINGS.md) 与 [验收记录](docs/ACCEPTANCE.md)。v0.1.10 完成 npm 打包修复：npm 包名为 `@tarnish233/dsh-tui`、`private:false`，bundle patch／launcher assertion 使用同一 scoped name，并保留旧本地 `dsh-tui` link 的“先 add 新身份、成功后再 remove 旧别名”迁移；不更换全局程序。完整 `pnpm check` **2905/2905**（227 文件，576161ms，EXIT 0），547 个输入前后一致。
 
 Rex 使用原生通用 `>_` 图标，标题只保留静态 `🐳`；窗口状态、通知与工作目录遵循 DSH 原生事实。终端支持与明确限制见 [Rex / Ghostty](docs/TERMINALS.md)。
 
@@ -198,7 +198,7 @@ pnpm test
 pnpm check          # build + typecheck + test
 ```
 
-- **native 二进制只来自 tarball。** `package.json` 的 `files` 只发布 `vendor/pi-tui/native/*/prebuilds` 下的预构建 `.node`；native 源码、header 和 build 脚本只是仓库构建输入，不进安装包。`pnpm build`/`prepack` 只编译 JS，从源码重新生成 native prebuild 不是打包或安装的一部分（需要在对应平台用本地工具链单独构建）。
+- **native 二进制只来自 tarball。** `package.json` 的 `files` 通过 `vendor/pi-tui/native/{darwin,linux,win32}/prebuilds` 三个显式目录只发布预构建 `.node`；native 源码、header 和 build 脚本只是仓库构建输入，不进安装包。`test/package-pack.test.ts` 同时检查 `pnpm pack` 构建产物与 npm 的 publish packlist，防止两者 glob 语义差异再次漏包。`pnpm build`/`prepack` 只编译 JS，从源码重新生成 native prebuild 不是打包或安装的一部分（需要在对应平台用本地工具链单独构建）。
 - 离线测试使用临时 home/workspace 与 fake Cordis 宿主；不读真实 profile、凭据、会话日志，也不访问真实 provider。
 - 覆盖同进程原生流式/结算、模型选择器（搜索/effort）、权限/取消/ask/approval、HMR 配置重组合，以及原有 UI/input/image 回归。插件化之前的图片/PTY 与旧 CloudAgent 实网数字标为**历史记录**，不构成当前健康证明；本轮原生图片与 PTY 验收单独记录。
 - 私有 native PTY（`test/plugin-pty.test.ts`）保留 inline/fullscreen × 正常退出、外部 SIGINT 130、demo 和卸载-重挂载的 8 个 case；`test/plugin-attachment-pty.test.ts` 额外覆盖无参数首启、全新 profile、幂等再启、同源旧名称升级、包操作失败/取消，以及整个前端行被禁用。全部使用临时 profile，要求终端恢复，不发送模型 prompt。当前完整结果见 [验收记录](docs/ACCEPTANCE.md)。
@@ -207,7 +207,7 @@ pnpm check          # build + typecheck + test
 
 ## 已知边界
 
-- 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本地应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。npm publish、GitHub topic/release 与 v0.1.8 版本提交是本轮用户明确授权的发布动作；不安装或替换全局可执行文件。
+- 开发验收没有修改真实 home/profile/global 安装；用户之后运行 `dsh-tui` 时才会按上述规则自动挂载本地应用。其他前端清理与凭据配置仍由用户通过 native DSH 明确完成；不会自动迁移凭据、重建 profile，或重写用户 patch 中的旧 row id。npm publish、GitHub topic/release 与 v0.1.10 版本提交是本轮用户明确授权的发布动作；不安装或替换全局可执行文件。
 - Pi 式 TUI 扩展热插拔暂未纳入；`/reload` 只做 native HMR 配置重组合，不重载 TUI 核心源码。
 - 模型能力、上下文、推理级别与网关参数以 DSH 原生目录为准；TUI 不推断或另存第二份模型定义。默认模型持久化归宿主 ConfigEditor；兼容 setter 不以 fulfilled promise 冒称落盘，显式 Settings 写入则核验 native revision/read-back。临时 profile 重启验收不代表可以绕过只读 composition 或 home／CLI overlay 的原生拒绝。
 - 历史恢复有事件数/UTF-8 字节预算，截断会提示；完整持久日志仍在 DSH 数据 home。工具耗时包含审批/策略等待，不另抓取逐行输出；大 Diff 超预算时提示并保留完整 Before/After 源。
